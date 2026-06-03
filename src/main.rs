@@ -16,9 +16,11 @@ fn main() -> Result<()> {
         Cmd::Integrate { .. } => todo!("rf integrate"),
         Cmd::Graduate { .. } => todo!("rf graduate"),
         Cmd::Promote { .. } => todo!("rf promote"),
-        Cmd::Status { .. } => todo!("rf status"),
+        Cmd::Status { no_tui } => cli::status::run(no_tui)?,
         Cmd::List { .. } => todo!("rf list"),
         Cmd::Update => todo!("rf update"),
         Cmd::TestAll => todo!("rf test-all"),
     }
+
+    Ok(())
 }

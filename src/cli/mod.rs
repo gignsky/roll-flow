@@ -1,3 +1,5 @@
+pub mod status;
+
 use clap::{Parser, Subcommand};
 
 #[derive(Parser)]
