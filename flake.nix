@@ -74,6 +74,9 @@
           rust-analyzer
           pkg-config
           pre-commit
+          upignore
+          locker
+          gitflow
         ];
 
         shellHook = ''
