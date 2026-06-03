@@ -26,8 +26,7 @@
         ],
         "nixos-unstable": "nixos-unstable",
         "nixpkgs": [
-          "gigpkgs",
-          "nixos-unstable"
+          "nixpkgs"
         ],
         "nixpkgs-master": [
           "gigpkgs",
