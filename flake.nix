@@ -80,6 +80,7 @@
           upignore
           locker
           gitflow
+          bacon
         ];
 
         shellHook = ''
