@@ -171,6 +171,10 @@
         "nixpkgs": [
           "gigpkgs",
           "nixpkgs-unstable"
+        ],
+        "pre-commit-hooks": [
+          "gigpkgs",
+          "pre-commit-hooks"
         ]
       }
     }
