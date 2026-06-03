@@ -4,27 +4,30 @@
   inputs = {
     gigpkgs.url = "github:gignsky/gigpkgs";
     nixpkgs.follows = "gigpkgs/nixpkgs-unstable";
+    pre-commit-hooks.follows = "gigpkgs/pre-commit-hooks";
   };
 
   outputs =
-    { self, nixpkgs, ... }:
+    { self, nixpkgs, ... }@inputs:
     let
+      system = "x86_64-linux";
       systems = [
         "x86_64-linux"
         "aarch64-linux"
       ];
       forAllSystems = nixpkgs.lib.genAttrs systems;
-      pkgsFor = system: import nixpkgs { inherit system; };
+      pkgsFor = sys: import nixpkgs { system = sys; };
+      pkgs = pkgsFor system;
     in
     {
       packages = forAllSystems (
-        system:
+        sys:
         let
-          pkgs = pkgsFor system;
+          p = pkgsFor sys;
         in
         {
-          default = pkgs.callPackage ./package.nix { };
-          roll-flow = pkgs.callPackage ./package.nix { };
+          default = p.callPackage ./package.nix { };
+          roll-flow = p.callPackage ./package.nix { };
         }
       );
 
@@ -32,24 +35,51 @@
         roll-flow = final.callPackage ./package.nix { };
       };
 
-      devShells = forAllSystems (
-        system:
-        let
-          pkgs = pkgsFor system;
-        in
-        {
-          default = pkgs.mkShell {
-            nativeBuildInputs = with pkgs; [
-              rustc
-              cargo
-              rustfmt
-              clippy
-              rust-analyzer
-              pkg-config
-            ];
+      pre-commit-check = inputs.pre-commit-hooks.lib.${system}.run {
+        src = ./.;
+        hooks = {
+          nixfmt = {
+            enable = true;
           };
-        }
-      );
+          statix = {
+            enable = true;
+          };
+          deadnix = {
+            enable = true;
+          };
+          rustfmt = {
+            enable = true;
+          };
+          cargo-check = {
+            enable = true;
+          };
+          clippy = {
+            enable = false;
+          };
+          end-of-file-fixer = {
+            enable = true;
+          };
+          markdownlint = {
+            enable = false;
+          };
+        };
+      };
+
+      devShells.${system}.default = pkgs.mkShell {
+        nativeBuildInputs = with pkgs; [
+          rustc
+          cargo
+          rustfmt
+          clippy
+          rust-analyzer
+          pkg-config
+          pre-commit
+        ];
+
+        shellHook = ''
+          ${self.pre-commit-check.shellHook}
+        '';
+      };
 
       homeManagerModules.roll-flow = import ./modules/home-manager/roll-flow.nix;
       nixosModules.roll-flow = import ./modules/nixos/roll-flow.nix;
