@@ -16,7 +16,7 @@
         "aarch64-linux"
       ];
       forAllSystems = nixpkgs.lib.genAttrs systems;
-      pkgsFor = sys: import nixpkgs { system = sys; };
+      pkgsFor = sys: inputs.gigpkgs.legacyPackages.${sys};
       pkgs = pkgsFor system;
     in
     {
