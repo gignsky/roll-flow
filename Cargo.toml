@@ -1,0 +1,8 @@
+[package]
+name = "roll-flow"
+version = "0.0.0"
+edition = "2021"
+
+[[bin]]
+name = "rf"
+path = "src/main.rs"
