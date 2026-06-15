@@ -31,6 +31,7 @@ pub enum RollState {
     Graduated, // merged to rolling, no new commits since
     Diverged,  // merged to rolling, but has new commits since (needs re-graduation)
     Promoted,  // merged to main
+    Blocked,   // active but has ungraduated dependencies
 }
 
 impl RollState {
@@ -40,6 +41,7 @@ impl RollState {
             RollState::Graduated => "✓ graduated",
             RollState::Diverged => "⚠ diverged",
             RollState::Promoted => "✓ promoted",
+            RollState::Blocked => "⛔ blocked",
         }
     }
 }
@@ -51,6 +53,7 @@ pub struct RollInfo {
     pub state: RollState,
     pub location: BranchLocation,
     pub is_current: bool,
+    pub deps: Vec<u32>,
 }
 
 // ── Public API ────────────────────────────────────────────────────────────────
@@ -126,10 +129,36 @@ pub fn list_rolls(config: &Config) -> Result<Vec<RollInfo>, RfError> {
             number,
             state,
             location,
+            deps: Vec::new(),
         });
     }
 
     rolls.sort_by_key(|r| r.number);
+
+    // Compute deps for active rolls and promote to Blocked when needed.
+    let snapshot = rolls.clone();
+    for roll in &mut rolls {
+        if roll.state == RollState::Active {
+            roll.deps = get_deps(
+                repo,
+                &roll.branch,
+                roll.number,
+                &snapshot,
+                &config.stable_branch,
+            );
+            let blocked = roll.deps.iter().any(|dep| {
+                snapshot
+                    .iter()
+                    .find(|r| r.number == *dep)
+                    .map(|r| matches!(r.state, RollState::Active | RollState::Blocked))
+                    .unwrap_or(false)
+            });
+            if blocked {
+                roll.state = RollState::Blocked;
+            }
+        }
+    }
+
     Ok(rolls)
 }
 
@@ -243,6 +272,68 @@ fn subjects_contain_graduation(subjects: &[String], roll_branch: &str) -> bool {
         .iter()
         .filter_map(|s| extract_graduated_branch(s))
         .any(|b| b == roll_branch)
+}
+
+/// Compute deps for one roll using git ancestry (method 2) and file overlap (method 3).
+/// Only considers lower-numbered, non-promoted rolls as candidates.
+fn get_deps(
+    repo: &Path,
+    roll_branch: &str,
+    roll_num: u32,
+    all_rolls: &[RollInfo],
+    stable_ref: &str,
+) -> Vec<u32> {
+    let roll_ref = match git::resolve_branch(repo, roll_branch) {
+        Some(r) => r,
+        None => return Vec::new(),
+    };
+
+    let candidates: Vec<&RollInfo> = all_rolls
+        .iter()
+        .filter(|r| r.number < roll_num && r.state != RollState::Promoted)
+        .collect();
+
+    let mut deps = Vec::new();
+
+    // Method 2: if another roll's tip is an ancestor of this roll, it's a hard dep.
+    for other in &candidates {
+        let other_ref = match git::resolve_branch(repo, &other.branch) {
+            Some(r) => r,
+            None => continue,
+        };
+        if git::is_ancestor(repo, &other_ref, &roll_ref).unwrap_or(false) {
+            deps.push(other.number);
+        }
+    }
+
+    // Method 3: file overlap — rolls touching the same files are ordered deps.
+    let stable = git::resolve_branch(repo, stable_ref).unwrap_or_else(|| stable_ref.to_string());
+    let our_files: HashSet<String> = git::diff_name_only(repo, &stable, &roll_ref)
+        .unwrap_or_default()
+        .into_iter()
+        .collect();
+
+    if !our_files.is_empty() {
+        for other in &candidates {
+            if deps.contains(&other.number) {
+                continue;
+            }
+            let other_ref = match git::resolve_branch(repo, &other.branch) {
+                Some(r) => r,
+                None => continue,
+            };
+            let other_files: HashSet<String> = git::diff_name_only(repo, &stable, &other_ref)
+                .unwrap_or_default()
+                .into_iter()
+                .collect();
+            if our_files.iter().any(|f| other_files.contains(f)) {
+                deps.push(other.number);
+            }
+        }
+    }
+
+    deps.sort_unstable();
+    deps
 }
 
 /// Find the git hash of the merge/graduation commit for `roll_branch` on

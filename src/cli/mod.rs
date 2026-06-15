@@ -77,6 +77,12 @@ pub enum Cmd {
         json: bool,
     },
 
+    /// Merge the stable branch into all active local roll branches.
+    Update {
+        #[arg(long)]
+        dry_run: bool,
+    },
+
     /// Print program version.
     Version,
 }

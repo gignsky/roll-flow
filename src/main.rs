@@ -1,7 +1,9 @@
 mod cli;
 mod core;
 mod error;
+mod tui;
 
+use std::io::IsTerminal;
 use std::process::Command;
 
 use anyhow::{bail, Context, Result};
@@ -52,6 +54,7 @@ fn main() -> Result<()> {
                 cmd_list_text(no_tui, deps)?;
             }
         }
+        Cmd::Update { dry_run } => cmd_update(dry_run)?,
         Cmd::Version => println!("{}", env!("CARGO_PKG_VERSION")),
     }
 
@@ -224,23 +227,122 @@ fn cmd_list_json() -> Result<()> {
     Ok(())
 }
 
-fn cmd_list_text(no_tui: bool, _deps: bool) -> Result<()> {
-    let _ = no_tui;
+fn cmd_update(dry_run: bool) -> Result<()> {
+    let config = Config::load()?;
+    let repo = &config.repo_root;
+    let rolls = branches::list_rolls(&config)?;
+
+    let active: Vec<_> = rolls
+        .iter()
+        .filter(|r| {
+            matches!(
+                r.state,
+                branches::RollState::Active | branches::RollState::Blocked
+            ) && matches!(
+                r.location,
+                branches::BranchLocation::Local | branches::BranchLocation::Both
+            )
+        })
+        .collect();
+
+    if active.is_empty() {
+        println!("no active local rolls to update");
+        return Ok(());
+    }
+
+    let current = git::current_branch(repo)?;
+
+    for roll in &active {
+        if dry_run {
+            println!(
+                "dry-run: would merge '{}' into '{}'",
+                config.stable_branch, roll.branch
+            );
+            continue;
+        }
+        git::run_git(repo, &["checkout", &roll.branch])?;
+        git::run_git(repo, &["merge", "--no-ff", &config.stable_branch])?;
+        println!("updated '{}' with '{}'", roll.branch, config.stable_branch);
+    }
+
+    if !dry_run && !active.is_empty() {
+        git::run_git(repo, &["checkout", &current])?;
+    }
+
+    Ok(())
+}
+
+fn cmd_list_text(no_tui: bool, deps: bool) -> Result<()> {
     let config = Config::load()?;
     let rolls = branches::list_rolls(&config)?;
+
+    if !no_tui && std::io::stdout().is_terminal() {
+        let current = git::current_branch(&config.repo_root)?;
+        return tui::rolls::run(tui::rolls::TuiContext {
+            config: &config,
+            current_branch: &current,
+            rolls: &rolls,
+            show_deps: deps,
+        });
+    }
+
     if rolls.is_empty() {
         println!("(no roll branches)");
         return Ok(());
     }
-    for roll in rolls {
+
+    let name_w = rolls
+        .iter()
+        .map(|r| r.branch.len())
+        .max()
+        .unwrap_or(6)
+        .max(6);
+    let state_w = "⛔ blocked".len();
+
+    println!(
+        "  {num:>3}  {name:<nw$}  {loc:<3}  {state:<sw$}{deps_hdr}",
+        num = "#",
+        name = "branch",
+        loc = "loc",
+        state = "state",
+        deps_hdr = if deps { "  deps" } else { "" },
+        nw = name_w,
+        sw = state_w,
+    );
+    println!(
+        "  {sep_n}  {sep_e}  {sep_l}  {sep_s}{sep_d}",
+        sep_n = "───",
+        sep_e = "─".repeat(name_w),
+        sep_l = "───",
+        sep_s = "─".repeat(state_w),
+        sep_d = if deps { "  ────" } else { "" },
+    );
+
+    for roll in &rolls {
+        let cur = if roll.is_current { ">" } else { " " };
+        let deps_col = if deps && !roll.deps.is_empty() {
+            format!(
+                "  {}",
+                roll.deps
+                    .iter()
+                    .map(|n| n.to_string())
+                    .collect::<Vec<_>>()
+                    .join(",")
+            )
+        } else {
+            String::new()
+        };
         println!(
-            "{}\t{}\t{}\t{}",
-            roll.number,
-            roll.branch,
-            roll.location.symbol(),
-            roll.state.label()
+            "{cur} {num:>3}  {name:<nw$}  {loc:<3}  {state:<sw$}{deps_col}",
+            num = roll.number,
+            name = roll.branch,
+            loc = roll.location.symbol(),
+            state = roll.state.label(),
+            nw = name_w,
+            sw = state_w,
         );
     }
+
     Ok(())
 }
 

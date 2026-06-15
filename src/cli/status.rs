@@ -1,3 +1,5 @@
+use std::io::IsTerminal;
+
 use anyhow::Result;
 
 use crate::core::{
@@ -6,14 +8,22 @@ use crate::core::{
     git,
 };
 
-pub fn run(_no_tui: bool) -> Result<()> {
+pub fn run(no_tui: bool) -> Result<()> {
     let config = Config::load()?;
     let repo = &config.repo_root;
-
     let current_branch = git::current_branch(repo)?;
-    let current_roll = branches::get_current_roll(&config)?;
     let rolls = branches::list_rolls(&config)?;
 
+    if !no_tui && std::io::stdout().is_terminal() {
+        return crate::tui::rolls::run(crate::tui::rolls::TuiContext {
+            config: &config,
+            current_branch: &current_branch,
+            rolls: &rolls,
+            show_deps: false,
+        });
+    }
+
+    let current_roll = branches::get_current_roll(&config)?;
     print_header(&config, &current_branch);
     print_current_roll_line(&config, &current_roll);
     println!();

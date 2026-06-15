@@ -92,6 +92,41 @@ fn promote_requires_clean_tree() {
 }
 
 #[test]
+fn integrate_merges_branch_into_roll() {
+    let repo = init_repo();
+
+    let (ok, out) = rf(repo.path(), &["init"]);
+    assert!(ok, "init: {out}");
+
+    // create a feature branch with unique content
+    git(repo.path(), &["checkout", "-b", "feature/foo"]);
+    fs::write(repo.path().join("foo.txt"), "feature content\n").unwrap();
+    git(repo.path(), &["add", "foo.txt"]);
+    git(repo.path(), &["commit", "-m", "add foo feature"]);
+
+    // create a roll (rf create checks out the new roll branch)
+    let (ok, out) = rf(repo.path(), &["create", "myroll", "--date", "0101"]);
+    assert!(ok, "create: {out}");
+
+    // integrate the feature branch into the roll
+    let (ok, out) = rf(repo.path(), &["integrate", "feature/foo"]);
+    assert!(ok, "integrate: {out}");
+
+    // feature content should now exist on the roll branch
+    assert!(
+        repo.path().join("foo.txt").exists(),
+        "foo.txt missing after integrate"
+    );
+
+    // should have been a --no-ff merge commit
+    let log = git(repo.path(), &["log", "--oneline", "-1"]);
+    assert!(
+        log.contains("Merge branch"),
+        "expected merge commit, got: {log}"
+    );
+}
+
+#[test]
 fn promote_blocks_divergence() {
     let repo = init_repo();
     let (ok, out) = rf(repo.path(), &["init"]);
