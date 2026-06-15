@@ -35,7 +35,7 @@ fn main() -> Result<()> {
             date,
             dry_run,
         } => cmd_create(&slug, date, dry_run)?,
-        Cmd::Integrate { .. } => todo!("rf integrate"),
+        Cmd::Integrate { branch } => cmd_integrate(&branch)?,
         Cmd::Verify { dry_run } => cmd_verify(dry_run)?,
         Cmd::Promote { dry_run } => cmd_promote(dry_run)?,
         Cmd::Status { no_tui, json } => {
@@ -128,6 +128,25 @@ fn cmd_create(slug: &str, date: Option<String>, dry_run: bool) -> Result<()> {
         &["checkout", "-b", &branch_name, &config.rolling_branch],
     )?;
     println!("Created {}", branch_name);
+    Ok(())
+}
+
+fn cmd_integrate(branch: &str) -> Result<()> {
+    let config = Config::load()?;
+    ensure_clean_state(&config)?;
+    let repo = &config.repo_root;
+    let current = git::current_branch(repo)?;
+    if !current.starts_with(&config.roll_prefix) {
+        bail!(
+            "must be on a roll branch to integrate (current: {})",
+            current
+        );
+    }
+    if !git::ref_exists(repo, branch) {
+        bail!("branch not found: {}", branch);
+    }
+    git::run_git(repo, &["merge", "--no-ff", branch])?;
+    println!("integrated {} into {}", branch, current);
     Ok(())
 }
 
