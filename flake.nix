@@ -79,20 +79,23 @@
       };
 
       devShells.${system}.default = pkgs.mkShell {
-        nativeBuildInputs = with pkgs; [
-          rustc
-          cargo
-          rustfmt
-          clippy
-          rust-analyzer
-          pkg-config
-          gcc
-          pre-commit
-          upignore
-          locker
-          gitflow
-          bacon
-        ];
+        nativeBuildInputs =
+          with pkgs;
+          [
+            rustc
+            cargo
+            rustfmt
+            clippy
+            rust-analyzer
+            pkg-config
+            gcc
+            pre-commit
+            upignore
+            locker
+            gitflow
+            bacon
+          ]
+          ++ [ (pkgs.callPackage ./package.nix { }) ];
 
         shellHook = ''
           ${self.pre-commit-check.shellHook}
