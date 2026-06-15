@@ -270,3 +270,15 @@ fn find_graduation_commit(repo: &Path, roll_branch: &str, rolling_ref: &str) -> 
     }
     None
 }
+
+#[cfg(test)]
+mod tests {
+    use super::parse_roll_number;
+
+    #[test]
+    fn parses_roll_number() {
+        assert_eq!(parse_roll_number("roll/12-0611-cli", "roll/"), Some(12));
+        assert_eq!(parse_roll_number("roll/x-0611-cli", "roll/"), None);
+        assert_eq!(parse_roll_number("feature/foo", "roll/"), None);
+    }
+}

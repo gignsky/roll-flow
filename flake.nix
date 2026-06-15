@@ -21,6 +21,14 @@
       forAllSystems = nixpkgs.lib.genAttrs systems;
       pkgsFor = sys: inputs.gigpkgs.legacyPackages.${sys};
       pkgs = pkgsFor system;
+      cargoCheckWrapped = pkgs.writeShellApplication {
+        name = "cargo-check-wrapper";
+        runtimeInputs = [
+          pkgs.cargo
+          pkgs.gcc
+        ];
+        text = "cargo check --locked";
+      };
     in
     {
       packages = forAllSystems (
@@ -55,6 +63,8 @@
           };
           cargo-check = {
             enable = true;
+            entry = pkgs.lib.getExe cargoCheckWrapped;
+            pass_filenames = false;
           };
           clippy = {
             enable = false;
@@ -76,6 +86,7 @@
           clippy
           rust-analyzer
           pkg-config
+          gcc
           pre-commit
           upignore
           locker

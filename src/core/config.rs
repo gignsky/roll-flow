@@ -5,10 +5,12 @@ use serde::{Deserialize, Serialize};
 
 use crate::error::RfError;
 
-const CONFIG_REL: &str = ".config/roll-flow/config.toml";
+const CONFIG_NAME: &str = ".roll-flow.toml";
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Config {
+    #[serde(default = "default_config_version")]
+    pub config_version: u32,
     pub repo_root: PathBuf,
     pub rolling_branch: String,
     pub stable_branch: String,
@@ -17,6 +19,10 @@ pub struct Config {
     pub hosts: Vec<String>,
     #[serde(default)]
     pub host_active: HashMap<String, bool>,
+    #[serde(default)]
+    pub roll_to_rolling_gates: Vec<String>,
+    #[serde(default)]
+    pub rolling_to_main_gates: Vec<String>,
 }
 
 impl Config {
@@ -29,24 +35,27 @@ impl Config {
             .collect()
     }
 
-    /// Load config from `~/.config/roll-flow/config.toml`, or auto-detect if
-    /// the file doesn't exist yet.
+    /// Load config from `<repo>/.roll-flow.toml`, or auto-detect if it does not
+    /// exist yet.
     pub fn load() -> Result<Self, RfError> {
-        let path = Self::config_path()?;
+        let repo_root =
+            crate::core::git::capture_git(Path::new("."), &["rev-parse", "--show-toplevel"])
+                .map(PathBuf::from)?;
+        let path = Self::config_path(&repo_root);
         if path.exists() {
             let content = std::fs::read_to_string(&path)?;
-            toml::from_str(&content).map_err(|e| RfError::Config(e.to_string()))
+            let mut config: Config =
+                toml::from_str(&content).map_err(|e| RfError::Config(e.to_string()))?;
+            config.repo_root = repo_root;
+            Ok(config)
         } else {
             Self::auto_detect()
         }
     }
 
-    /// Write current config to `~/.config/roll-flow/config.toml`.
+    /// Write current config to `<repo>/.roll-flow.toml`.
     pub fn save(&self) -> Result<(), RfError> {
-        let path = Self::config_path()?;
-        if let Some(parent) = path.parent() {
-            std::fs::create_dir_all(parent)?;
-        }
+        let path = Self::config_path(&self.repo_root);
         let content = toml::to_string_pretty(self).map_err(|e| RfError::Config(e.to_string()))?;
         std::fs::write(&path, content)?;
         Ok(())
@@ -66,6 +75,7 @@ impl Config {
             .unwrap_or_else(|| (vec![], HashMap::new(), "gig".to_string()));
 
         Ok(Config {
+            config_version: default_config_version(),
             repo_root,
             rolling_branch,
             stable_branch,
@@ -73,12 +83,92 @@ impl Config {
             username,
             hosts,
             host_active,
+            roll_to_rolling_gates: vec![],
+            rolling_to_main_gates: vec![],
         })
     }
 
-    fn config_path() -> Result<PathBuf, RfError> {
-        let home = std::env::var("HOME").map_err(|_| RfError::Config("HOME not set".into()))?;
-        Ok(PathBuf::from(home).join(CONFIG_REL))
+    pub fn with_overrides(
+        &self,
+        rolling_branch: Option<String>,
+        stable_branch: Option<String>,
+        roll_prefix: Option<String>,
+        username: Option<String>,
+        hosts: Option<String>,
+    ) -> Self {
+        let mut updated = self.clone();
+        if let Some(v) = rolling_branch {
+            updated.rolling_branch = v;
+        }
+        if let Some(v) = stable_branch {
+            updated.stable_branch = v;
+        }
+        if let Some(v) = roll_prefix {
+            updated.roll_prefix = if v.ends_with('/') { v } else { format!("{v}/") };
+        }
+        if let Some(v) = username {
+            updated.username = v;
+        }
+        if let Some(v) = hosts {
+            let parsed: Vec<String> = v
+                .split(',')
+                .map(|h| h.trim())
+                .filter(|h| !h.is_empty())
+                .map(ToString::to_string)
+                .collect();
+            if !parsed.is_empty() {
+                updated.hosts = parsed;
+            }
+        }
+        updated
+    }
+
+    pub fn config_path(repo_root: &Path) -> PathBuf {
+        repo_root.join(CONFIG_NAME)
+    }
+}
+
+fn default_config_version() -> u32 {
+    1
+}
+
+#[cfg(test)]
+mod tests {
+    use std::path::PathBuf;
+
+    use super::Config;
+
+    #[test]
+    fn overrides_hosts_and_prefix() {
+        let cfg = Config {
+            config_version: 1,
+            repo_root: PathBuf::from("/tmp/repo"),
+            rolling_branch: "rolling".to_string(),
+            stable_branch: "main".to_string(),
+            roll_prefix: "roll/".to_string(),
+            username: "old".to_string(),
+            hosts: vec!["x".to_string()],
+            host_active: Default::default(),
+            roll_to_rolling_gates: vec![],
+            rolling_to_main_gates: vec![],
+        };
+        let updated = cfg.with_overrides(
+            Some("rolling".to_string()),
+            Some("main".to_string()),
+            Some("roll".to_string()),
+            Some("me".to_string()),
+            Some("a,b".to_string()),
+        );
+        assert_eq!(updated.roll_prefix, "roll/");
+        assert_eq!(updated.username, "me");
+        assert_eq!(updated.hosts, vec!["a".to_string(), "b".to_string()]);
+    }
+
+    #[test]
+    fn config_path_is_repo_local() {
+        let repo = PathBuf::from("/tmp/repo");
+        let path = Config::config_path(&repo);
+        assert_eq!(path, PathBuf::from("/tmp/repo/.roll-flow.toml"));
     }
 }
 
