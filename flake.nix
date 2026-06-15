@@ -95,7 +95,7 @@
             gitflow
             bacon
           ]
-          ++ [ (pkgs.callPackage ./package.nix { }) ];
+          ++ [ self.packages.${system}.default ];
 
         shellHook = ''
           ${self.pre-commit-check.shellHook}
