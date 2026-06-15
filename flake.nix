@@ -21,6 +21,14 @@
       forAllSystems = nixpkgs.lib.genAttrs systems;
       pkgsFor = sys: inputs.gigpkgs.legacyPackages.${sys};
       pkgs = pkgsFor system;
+      cargoCheckWrapped = pkgs.writeShellApplication {
+        name = "cargo-check-wrapper";
+        runtimeInputs = [
+          pkgs.cargo
+          pkgs.gcc
+        ];
+        text = "cargo check --locked";
+      };
     in
     {
       packages = forAllSystems (
@@ -55,6 +63,8 @@
           };
           cargo-check = {
             enable = true;
+            entry = pkgs.lib.getExe cargoCheckWrapped;
+            pass_filenames = false;
           };
           clippy = {
             enable = false;
@@ -69,19 +79,23 @@
       };
 
       devShells.${system}.default = pkgs.mkShell {
-        nativeBuildInputs = with pkgs; [
-          rustc
-          cargo
-          rustfmt
-          clippy
-          rust-analyzer
-          pkg-config
-          pre-commit
-          upignore
-          locker
-          gitflow
-          bacon
-        ];
+        nativeBuildInputs =
+          with pkgs;
+          [
+            rustc
+            cargo
+            rustfmt
+            clippy
+            rust-analyzer
+            pkg-config
+            gcc
+            pre-commit
+            upignore
+            locker
+            gitflow
+            bacon
+          ]
+          ++ [ (pkgs.callPackage ./package.nix { }) ];
 
         shellHook = ''
           ${self.pre-commit-check.shellHook}

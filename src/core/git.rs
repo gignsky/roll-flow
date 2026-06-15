@@ -47,6 +47,19 @@ pub fn current_branch(repo: &Path) -> Result<String, RfError> {
     capture_git(repo, &["branch", "--show-current"])
 }
 
+pub fn is_detached_head(repo: &Path) -> Result<bool, RfError> {
+    let out = capture_git(repo, &["symbolic-ref", "--quiet", "--short", "HEAD"]);
+    match out {
+        Ok(_) => Ok(false),
+        Err(_) => Ok(true),
+    }
+}
+
+pub fn working_tree_clean(repo: &Path) -> Result<bool, RfError> {
+    let out = capture_git(repo, &["status", "--porcelain"])?;
+    Ok(out.trim().is_empty())
+}
+
 /// True if `refspec` resolves (local branch, remote branch, tag, commit, etc.).
 pub fn ref_exists(repo: &Path, refspec: &str) -> bool {
     Command::new("git")

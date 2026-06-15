@@ -28,34 +28,42 @@ pub enum Cmd {
         /// Comma-separated list of hosts (e.g. ganoslal,merlin,wsl)
         #[arg(long)]
         hosts: Option<String>,
+        #[arg(long)]
+        force: bool,
     },
 
-    /// Start a new roll branch: roll/N-<theme>.
-    Start { theme: String },
+    /// Create a new roll branch from rolling: roll/N-MMDD-slug.
+    #[command(visible_alias = "start")]
+    Create {
+        slug: String,
+        #[arg(long)]
+        date: Option<String>,
+        #[arg(long)]
+        dry_run: bool,
+    },
 
     /// Merge a feature branch into the current roll.
     Integrate { branch: String },
 
-    /// Graduate rolls from the current branch into rolling.
-    Graduate {
-        /// Specific roll branches to graduate (defaults to interactive selection).
-        branches: Vec<String>,
+    /// Verify current branch can be promoted and run configured gates.
+    Verify {
         #[arg(long)]
-        all: bool,
+        dry_run: bool,
     },
 
-    /// Promote graduated rolls from rolling into main.
+    /// Promote current branch upward (`roll/* -> rolling` or `rolling -> main`).
+    #[command(visible_alias = "graduate")]
     Promote {
-        /// Specific roll branches to promote (defaults to interactive selection).
-        branches: Vec<String>,
         #[arg(long)]
-        all: bool,
+        dry_run: bool,
     },
 
     /// Show current roll-flow status.
     Status {
         #[arg(long)]
         no_tui: bool,
+        #[arg(long)]
+        json: bool,
     },
 
     /// List all rolls with verification state.
@@ -65,12 +73,10 @@ pub enum Cmd {
         /// Include dependency column in the table.
         #[arg(long)]
         deps: bool,
+        #[arg(long)]
+        json: bool,
     },
 
-    /// Merge main into all ungraduated local roll branches.
-    Update,
-
-    /// Run flake check + host builds and record results.
-    #[command(name = "test-all")]
-    TestAll,
+    /// Print program version.
+    Version,
 }

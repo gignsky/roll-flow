@@ -1,9 +1,15 @@
-{ rustPlatform, lib }:
+{
+  rustPlatform,
+  lib,
+  git,
+}:
 rustPlatform.buildRustPackage {
   pname = "roll-flow";
   version = "0.1.0";
   src = lib.cleanSource ./.;
   cargoLock.lockFile = ./Cargo.lock;
+
+  nativeBuildInputs = [ git ];
 
   meta = {
     description = "Structured NixOS dotfiles workflow manager";
