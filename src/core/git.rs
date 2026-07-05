@@ -127,6 +127,8 @@ pub fn log_subjects(repo: &Path, extra_args: &[&str]) -> Result<Vec<String>, RfE
 
 /// Return `(subject, body)` pairs for the given log args.
 /// Body is the raw commit body (everything after the first blank line).
+/// Consumed by the verification/promotion work in later epics.
+#[allow(dead_code)]
 pub fn log_with_body(repo: &Path, extra_args: &[&str]) -> Result<Vec<(String, String)>, RfError> {
     // Use a stable record separator that won't appear in real commit messages.
     const SEP: &str = "\x00RF\x00";
@@ -175,11 +177,14 @@ pub fn is_ancestor(repo: &Path, candidate: &str, descendant: &str) -> Result<boo
 }
 
 /// Return the best common ancestor of `a` and `b`.
+/// Consumed by the divergence-tolerant promotion work in later epics.
+#[allow(dead_code)]
 pub fn merge_base(repo: &Path, a: &str, b: &str) -> Result<String, RfError> {
     capture_git(repo, &["merge-base", a, b])
 }
 
 /// Return the full SHA of the resolved ref.
+#[allow(dead_code)]
 pub fn rev_parse(repo: &Path, refspec: &str) -> Result<String, RfError> {
     capture_git(repo, &["rev-parse", refspec])
 }

@@ -27,6 +27,8 @@ pub struct Config {
 
 impl Config {
     /// Hosts that are currently active (inactive ones are offline/rebuilding).
+    /// Consumed by the multi-source verification work in later epics.
+    #[allow(dead_code)]
     pub fn active_hosts(&self) -> Vec<String> {
         self.hosts
             .iter()
@@ -132,46 +134,6 @@ fn default_config_version() -> u32 {
     1
 }
 
-#[cfg(test)]
-mod tests {
-    use std::path::PathBuf;
-
-    use super::Config;
-
-    #[test]
-    fn overrides_hosts_and_prefix() {
-        let cfg = Config {
-            config_version: 1,
-            repo_root: PathBuf::from("/tmp/repo"),
-            rolling_branch: "rolling".to_string(),
-            stable_branch: "main".to_string(),
-            roll_prefix: "roll/".to_string(),
-            username: "old".to_string(),
-            hosts: vec!["x".to_string()],
-            host_active: Default::default(),
-            roll_to_rolling_gates: vec![],
-            rolling_to_main_gates: vec![],
-        };
-        let updated = cfg.with_overrides(
-            Some("rolling".to_string()),
-            Some("main".to_string()),
-            Some("roll".to_string()),
-            Some("me".to_string()),
-            Some("a,b".to_string()),
-        );
-        assert_eq!(updated.roll_prefix, "roll/");
-        assert_eq!(updated.username, "me");
-        assert_eq!(updated.hosts, vec!["a".to_string(), "b".to_string()]);
-    }
-
-    #[test]
-    fn config_path_is_repo_local() {
-        let repo = PathBuf::from("/tmp/repo");
-        let path = Config::config_path(&repo);
-        assert_eq!(path, PathBuf::from("/tmp/repo/.roll-flow.toml"));
-    }
-}
-
 // ── Auto-detection helpers ────────────────────────────────────────────────────
 
 /// Heuristically find rolling/stable branch names by inspecting the local
@@ -267,4 +229,44 @@ fn parse_nix_string_value(content: &str, key: &str) -> Option<String> {
     let start = content.find(&marker)? + marker.len();
     let end = content[start..].find('"')? + start;
     Some(content[start..end].to_string())
+}
+
+#[cfg(test)]
+mod tests {
+    use std::path::PathBuf;
+
+    use super::Config;
+
+    #[test]
+    fn overrides_hosts_and_prefix() {
+        let cfg = Config {
+            config_version: 1,
+            repo_root: PathBuf::from("/tmp/repo"),
+            rolling_branch: "rolling".to_string(),
+            stable_branch: "main".to_string(),
+            roll_prefix: "roll/".to_string(),
+            username: "old".to_string(),
+            hosts: vec!["x".to_string()],
+            host_active: Default::default(),
+            roll_to_rolling_gates: vec![],
+            rolling_to_main_gates: vec![],
+        };
+        let updated = cfg.with_overrides(
+            Some("rolling".to_string()),
+            Some("main".to_string()),
+            Some("roll".to_string()),
+            Some("me".to_string()),
+            Some("a,b".to_string()),
+        );
+        assert_eq!(updated.roll_prefix, "roll/");
+        assert_eq!(updated.username, "me");
+        assert_eq!(updated.hosts, vec!["a".to_string(), "b".to_string()]);
+    }
+
+    #[test]
+    fn config_path_is_repo_local() {
+        let repo = PathBuf::from("/tmp/repo");
+        let path = Config::config_path(&repo);
+        assert_eq!(path, PathBuf::from("/tmp/repo/.roll-flow.toml"));
+    }
 }
