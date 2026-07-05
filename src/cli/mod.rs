@@ -51,8 +51,13 @@ pub enum Cmd {
         dry_run: bool,
     },
 
-    /// Promote current branch upward (`roll/* -> rolling` or `rolling -> main`).
-    #[command(visible_alias = "graduate")]
+    /// Graduate the current roll into the rolling branch (`roll/* -> rolling`).
+    Graduate {
+        #[arg(long)]
+        dry_run: bool,
+    },
+
+    /// Promote the rolling branch to the stable branch (`rolling -> main`).
     Promote {
         #[arg(long)]
         dry_run: bool,

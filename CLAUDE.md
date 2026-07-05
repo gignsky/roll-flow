@@ -202,12 +202,15 @@ Scope: NHFD
 Verified: ganoslal ✓  merlin ✓
 ```
 
-Promotion:
+Promotion (`rolling` → `main`, a single `--no-ff` merge):
 ```
-Promote roll/N-theme to main
-
-Verified-On: all-hosts
+Promote rolling to main
 ```
+Because `main` only ever receives merges from `rolling` (never individual roll
+branches), the promotion commit names the branch being merged, not a roll. A
+roll is therefore reported as **promoted** when its graduation merge commit is
+reachable from `main` (`branches::graduation_on_stable`), rather than by scanning
+for a per-roll `Promote` subject.
 
 ## Build and test
 
@@ -226,6 +229,13 @@ cargo run -- list --no-tui
 - A roll is "graduated" if a merge commit exists on the rolling branch whose subject
   matches `Merge branch 'roll/N-...'` OR `Graduate roll/N-...`. Both formats must be
   checked everywhere graduation is tested.
+- A roll is "promoted" when its graduation merge commit is reachable from the stable
+  branch (not by matching a subject) — since promotion is a single `rolling → main`
+  merge, per-roll `Promote` subjects don't exist.
+- `graduate` (roll→rolling) and `promote` (rolling→main) are distinct commands, each
+  inferring its direction from the current branch. Promotion is divergence-tolerant:
+  never reject a valid git state `rf` didn't create — only genuinely-bad states
+  (unrelated histories, nothing to merge) error.
 - Branch resolution always tries local first, then `origin/<branch>` as fallback.
   Functions that need the ref string should return `Option<String>` (null = doesn't exist).
 - Active hosts only. Never require verification from inactive hosts.
