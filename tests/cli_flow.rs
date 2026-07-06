@@ -1,150 +1,118 @@
-use std::fs;
-use std::path::Path;
-use std::process::Command;
+//! CLI flow integration tests, driven through the shared [`harness::Sandbox`].
+//!
+//! These assert the workflow as it behaves *today*. The forward-looking
+//! `--no-ff` / divergence-tolerant semantics live in `e2e_lifecycle.rs`
+//! (currently `#[ignore]`d pending the promotion fix, epic #2).
 
-fn init_repo() -> tempfile::TempDir {
-    let dir = tempfile::tempdir().expect("temp dir");
-    git(dir.path(), &["init", "-b", "main"]);
-    git(dir.path(), &["config", "user.email", "test@example.com"]);
-    git(dir.path(), &["config", "user.name", "Test"]);
-    fs::write(dir.path().join("README.md"), "hello\n").expect("write readme");
-    git(dir.path(), &["add", "README.md"]);
-    git(dir.path(), &["commit", "-m", "init"]);
-    dir
-}
+mod harness;
 
-fn rf(repo: &Path, args: &[&str]) -> (bool, String) {
-    let exe = std::env::var("CARGO_BIN_EXE_rf").expect("binary path");
-    let output = Command::new(exe)
-        .current_dir(repo)
-        .args(args)
-        .output()
-        .expect("run rf");
-    let mut text = String::from_utf8_lossy(&output.stdout).to_string();
-    text.push_str(&String::from_utf8_lossy(&output.stderr));
-    (output.status.success(), text)
-}
-
-fn git(repo: &Path, args: &[&str]) -> String {
-    let output = Command::new("git")
-        .current_dir(repo)
-        .args(args)
-        .output()
-        .expect("run git");
-    assert!(
-        output.status.success(),
-        "git {:?} failed: {}",
-        args,
-        String::from_utf8_lossy(&output.stderr)
-    );
-    String::from_utf8_lossy(&output.stdout).trim().to_string()
-}
+use harness::Sandbox;
 
 #[test]
 fn init_create_and_promote_flow() {
-    let repo = init_repo();
+    let sb = Sandbox::plain();
 
-    let (ok, out) = rf(repo.path(), &["init"]);
-    assert!(ok, "init failed: {out}");
+    let out = sb.init();
+    assert!(out.success, "init failed: {}", out.combined());
 
-    let (ok, out) = rf(repo.path(), &["create", "feature", "--date", "0611"]);
-    assert!(ok, "create failed: {out}");
+    let out = sb.create_roll("feature", "0611");
+    assert!(out.success, "create failed: {}", out.combined());
 
-    fs::write(repo.path().join("work.txt"), "w\n").expect("write work");
-    git(repo.path(), &["add", "work.txt"]);
-    git(repo.path(), &["commit", "-m", "roll work"]);
+    sb.commit_file("work.txt", "w\n", "roll work");
 
-    let (ok, out) = rf(repo.path(), &["verify"]);
-    assert!(ok, "verify failed: {out}");
+    let out = sb.rf(&["verify"]);
+    assert!(out.success, "verify failed: {}", out.combined());
 
-    let (ok, out) = rf(repo.path(), &["promote"]);
-    assert!(ok, "promote roll->rolling failed: {out}");
+    let out = sb.rf(&["promote"]);
+    assert!(
+        out.success,
+        "promote roll->rolling failed: {}",
+        out.combined()
+    );
 
-    let roll_sha = git(repo.path(), &["rev-parse", "HEAD"]);
-    let rolling_sha = git(repo.path(), &["rev-parse", "rolling"]);
-    assert_eq!(roll_sha, rolling_sha);
+    assert_eq!(sb.rev("HEAD"), sb.rev("rolling"));
 
-    git(repo.path(), &["checkout", "rolling"]);
-    let (ok, out) = rf(repo.path(), &["promote"]);
-    assert!(ok, "promote rolling->main failed: {out}");
+    sb.git(&["checkout", "rolling"]);
+    let out = sb.rf(&["promote"]);
+    assert!(
+        out.success,
+        "promote rolling->main failed: {}",
+        out.combined()
+    );
 
-    let main_sha = git(repo.path(), &["rev-parse", "main"]);
-    let rolling_sha = git(repo.path(), &["rev-parse", "rolling"]);
-    assert_eq!(main_sha, rolling_sha);
+    assert_eq!(sb.rev("main"), sb.rev("rolling"));
 }
 
 #[test]
 fn promote_requires_clean_tree() {
-    let repo = init_repo();
-    let (ok, out) = rf(repo.path(), &["init"]);
-    assert!(ok, "init failed: {out}");
+    let sb = Sandbox::plain();
+    let out = sb.init();
+    assert!(out.success, "init failed: {}", out.combined());
 
-    let (ok, out) = rf(repo.path(), &["create", "dirty", "--date", "0611"]);
-    assert!(ok, "create failed: {out}");
+    let out = sb.create_roll("dirty", "0611");
+    assert!(out.success, "create failed: {}", out.combined());
 
-    fs::write(repo.path().join("dirty.txt"), "x\n").expect("write dirty");
-    let (ok, out) = rf(repo.path(), &["promote"]);
-    assert!(!ok, "promote should fail on dirty tree");
+    sb.write("dirty.txt", "x\n");
+    let out = sb.rf(&["promote"]);
+    assert!(!out.success, "promote should fail on dirty tree");
     assert!(
-        out.contains("working tree must be clean"),
-        "unexpected: {out}"
+        out.combined().contains("working tree must be clean"),
+        "unexpected: {}",
+        out.combined()
     );
 }
 
 #[test]
 fn integrate_merges_branch_into_roll() {
-    let repo = init_repo();
+    let sb = Sandbox::plain();
 
-    let (ok, out) = rf(repo.path(), &["init"]);
-    assert!(ok, "init: {out}");
+    let out = sb.init();
+    assert!(out.success, "init: {}", out.combined());
 
-    // create a feature branch with unique content
-    git(repo.path(), &["checkout", "-b", "feature/foo"]);
-    fs::write(repo.path().join("foo.txt"), "feature content\n").unwrap();
-    git(repo.path(), &["add", "foo.txt"]);
-    git(repo.path(), &["commit", "-m", "add foo feature"]);
+    // A feature branch with unique content.
+    sb.git(&["checkout", "-b", "feature/foo"]);
+    sb.commit_file("foo.txt", "feature content\n", "add foo feature");
 
-    // create a roll (rf create checks out the new roll branch)
-    let (ok, out) = rf(repo.path(), &["create", "myroll", "--date", "0101"]);
-    assert!(ok, "create: {out}");
+    // Create a roll (rf create checks out the new roll branch).
+    let out = sb.create_roll("myroll", "0101");
+    assert!(out.success, "create: {}", out.combined());
 
-    // integrate the feature branch into the roll
-    let (ok, out) = rf(repo.path(), &["integrate", "feature/foo"]);
-    assert!(ok, "integrate: {out}");
+    // Integrate the feature branch into the roll.
+    let out = sb.rf(&["integrate", "feature/foo"]);
+    assert!(out.success, "integrate: {}", out.combined());
 
-    // feature content should now exist on the roll branch
+    // Feature content should now exist on the roll branch.
+    assert!(sb.exists("foo.txt"), "foo.txt missing after integrate");
+
+    // Should have been a --no-ff merge commit.
     assert!(
-        repo.path().join("foo.txt").exists(),
-        "foo.txt missing after integrate"
-    );
-
-    // should have been a --no-ff merge commit
-    let log = git(repo.path(), &["log", "--oneline", "-1"]);
-    assert!(
-        log.contains("Merge branch"),
-        "expected merge commit, got: {log}"
+        sb.tip_subject("HEAD").contains("Merge branch"),
+        "expected merge commit, got: {}",
+        sb.tip_subject("HEAD")
     );
 }
 
 #[test]
 fn promote_blocks_divergence() {
-    let repo = init_repo();
-    let (ok, out) = rf(repo.path(), &["init"]);
-    assert!(ok, "init failed: {out}");
+    // Documents *today's* behavior: fast-forward-only promotion bails on
+    // divergence. Epic #2 (issue #14) flips this to expect success.
+    let sb = Sandbox::plain();
+    let out = sb.init();
+    assert!(out.success, "init failed: {}", out.combined());
 
-    git(repo.path(), &["checkout", "rolling"]);
-    git(repo.path(), &["checkout", "-b", "roll/1-0611-diverge"]);
-    fs::write(repo.path().join("roll.txt"), "roll\n").expect("write roll");
-    git(repo.path(), &["add", "roll.txt"]);
-    git(repo.path(), &["commit", "-m", "roll commit"]);
+    sb.git(&["checkout", "rolling"]);
+    sb.git(&["checkout", "-b", "roll/1-0611-diverge"]);
+    sb.commit_file("roll.txt", "roll\n", "roll commit");
 
-    git(repo.path(), &["checkout", "rolling"]);
-    fs::write(repo.path().join("rolling.txt"), "rolling\n").expect("write rolling");
-    git(repo.path(), &["add", "rolling.txt"]);
-    git(repo.path(), &["commit", "-m", "rolling diverges"]);
+    sb.git(&["checkout", "rolling"]);
+    sb.commit_file("rolling.txt", "rolling\n", "rolling diverges");
 
-    git(repo.path(), &["checkout", "roll/1-0611-diverge"]);
-    let (ok, out) = rf(repo.path(), &["promote"]);
-    assert!(!ok, "promote should fail when branches diverged");
-    assert!(out.contains("fast-forward-only"), "unexpected: {out}");
+    sb.git(&["checkout", "roll/1-0611-diverge"]);
+    let out = sb.rf(&["promote"]);
+    assert!(!out.success, "promote should fail when branches diverged");
+    assert!(
+        out.combined().contains("fast-forward-only"),
+        "unexpected: {}",
+        out.combined()
+    );
 }

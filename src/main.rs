@@ -310,10 +310,8 @@ fn cmd_list_text(no_tui: bool, deps: bool) -> Result<()> {
         sw = state_w,
     );
     println!(
-        "  {sep_n}  {sep_e}  {sep_l}  {sep_s}{sep_d}",
-        sep_n = "───",
+        "  ───  {sep_e}  ───  {sep_s}{sep_d}",
         sep_e = "─".repeat(name_w),
-        sep_l = "───",
         sep_s = "─".repeat(state_w),
         sep_d = if deps { "  ────" } else { "" },
     );
@@ -446,11 +444,7 @@ fn run_gates(repo: &std::path::Path, gates: &[String], dry_run: bool) -> Result<
 }
 
 fn normalize_slug(input: &str) -> Result<String> {
-    let slug = input
-        .trim()
-        .to_lowercase()
-        .replace('_', "-")
-        .replace(' ', "-");
+    let slug = input.trim().to_lowercase().replace(['_', ' '], "-");
     if slug.is_empty() {
         bail!("slug cannot be empty");
     }

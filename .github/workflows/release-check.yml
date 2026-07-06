@@ -1,0 +1,38 @@
+name: Release version check
+
+# Keeps releases coherent: a pushed `vX.Y.Z` tag must match Cargo.toml's
+# version, and the lockfile must be current. Fails the tag build otherwise.
+on:
+  push:
+    tags:
+      - "v*"
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  version-consistency:
+    name: tag matches Cargo.toml version
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Compare tag to crate version
+        run: |
+          set -euo pipefail
+          tag="${GITHUB_REF_NAME#v}"
+          # First top-level `version = "..."` in Cargo.toml is the package version.
+          crate="$(grep -m1 -E '^version[[:space:]]*=' Cargo.toml \
+            | sed -E 's/^version[[:space:]]*=[[:space:]]*"([^"]+)".*/\1/')"
+          echo "tag version:   $tag"
+          echo "crate version: $crate"
+          if [ "$tag" != "$crate" ]; then
+            echo "::error::tag v$tag does not match Cargo.toml version $crate"
+            exit 1
+          fi
+
+      - name: Cargo.lock is up to date
+        run: cargo update --workspace --locked

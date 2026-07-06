@@ -158,7 +158,7 @@ fn render(f: &mut Frame, state: &mut TableState, ctx: &TuiContext<'_>) {
     let table = Table::new(rows, col_constraints)
         .header(table_header)
         .block(Block::bordered().title(" rolls "))
-        .highlight_style(Style::default().add_modifier(Modifier::REVERSED))
+        .row_highlight_style(Style::default().add_modifier(Modifier::REVERSED))
         .highlight_symbol("▶ ");
 
     f.render_stateful_widget(table, chunks[1], state);

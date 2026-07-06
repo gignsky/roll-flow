@@ -88,19 +88,17 @@ fn print_rolls_table(rolls: &[RollInfo]) {
 
     // Header
     println!(
-        "  {num:>nw$}  {name:<ew$}  {loc:<3}  {state}",
+        "  {num:>nw$}  {name:<ew$}  {loc:<3}  state",
         num = "#",
         name = "roll",
         loc = "loc",
-        state = "state",
         nw = num_w,
         ew = name_w,
     );
     println!(
-        "  {sep_n}  {sep_e}  {sep_l}  {sep_s}",
+        "  {sep_n}  {sep_e}  ───  {sep_s}",
         sep_n = "─".repeat(num_w),
         sep_e = "─".repeat(name_w),
-        sep_l = "───",
         sep_s = "─".repeat(state_w),
     );
 

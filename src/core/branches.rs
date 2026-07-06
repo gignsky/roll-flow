@@ -208,6 +208,8 @@ pub fn check_diverged(repo: &Path, roll_branch: &str, rolling_ref: &str) -> bool
 }
 
 /// True if the roll has a promotion commit on the stable branch.
+/// Consumed by the promotion-state work in later epics.
+#[allow(dead_code)]
 pub fn check_promoted(repo: &Path, roll_branch: &str, stable_ref: &str) -> bool {
     let stable = match git::resolve_branch(repo, stable_ref) {
         Some(r) => r,
