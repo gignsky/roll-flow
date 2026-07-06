@@ -88,9 +88,8 @@ pub fn list_rolls(config: &Config) -> Result<Vec<RollInfo>, RfError> {
     local.sort();
     local.dedup();
 
-    // Single-pass log scans — much faster than per-roll log calls.
+    // Single-pass log scan — much faster than per-roll log calls.
     let graduated_set = scan_graduated(repo, &config.rolling_branch);
-    let promoted_set = scan_promoted(repo, &config.stable_branch);
 
     let mut rolls = Vec::new();
     for branch in local {
@@ -107,14 +106,13 @@ pub fn list_rolls(config: &Config) -> Result<Vec<RollInfo>, RfError> {
             _ => BranchLocation::Neither,
         };
 
-        let is_promoted = promoted_set.contains(&branch);
-        let is_graduated = graduated_set.contains(&branch);
-
-        let state = if is_promoted {
-            RollState::Promoted
-        } else if is_graduated {
-            // Only divergence-check graduated (not-yet-promoted) rolls.
-            if check_diverged(repo, &branch, &config.rolling_branch) {
+        // A roll is promoted once its graduation merge is reachable from the
+        // stable branch (main only receives merges from rolling, so subjects
+        // can't name individual rolls — reachability is the honest signal).
+        let state = if graduated_set.contains(&branch) {
+            if graduation_on_stable(repo, &branch, &config.rolling_branch, &config.stable_branch) {
+                RollState::Promoted
+            } else if check_diverged(repo, &branch, &config.rolling_branch) {
                 RollState::Diverged
             } else {
                 RollState::Graduated
@@ -207,20 +205,6 @@ pub fn check_diverged(repo: &Path, roll_branch: &str, rolling_ref: &str) -> bool
         .unwrap_or(false)
 }
 
-/// True if the roll has a promotion commit on the stable branch.
-/// Consumed by the promotion-state work in later epics.
-#[allow(dead_code)]
-pub fn check_promoted(repo: &Path, roll_branch: &str, stable_ref: &str) -> bool {
-    let stable = match git::resolve_branch(repo, stable_ref) {
-        Some(r) => r,
-        None => return false,
-    };
-    let subjects = git::log_subjects(repo, &[&stable]).unwrap_or_default();
-    subjects
-        .iter()
-        .any(|s| s.starts_with(&format!("Promote {roll_branch}")))
-}
-
 // ── Internal helpers ──────────────────────────────────────────────────────────
 
 /// Scan rolling log once, returning the set of branch names that have been
@@ -237,22 +221,27 @@ fn scan_graduated(repo: &Path, rolling_ref: &str) -> HashSet<String> {
         .collect()
 }
 
-/// Scan stable log once, returning the set of branch names that have been
-/// promoted.
-fn scan_promoted(repo: &Path, stable_ref: &str) -> HashSet<String> {
+/// True if the roll's graduation merge commit is reachable from the stable
+/// branch — i.e. the roll's changes have reached `main` via a rolling→main
+/// promotion.
+fn graduation_on_stable(
+    repo: &Path,
+    roll_branch: &str,
+    rolling_ref: &str,
+    stable_ref: &str,
+) -> bool {
+    let rolling = match git::resolve_branch(repo, rolling_ref) {
+        Some(r) => r,
+        None => return false,
+    };
+    let Some(merge) = find_graduation_commit(repo, roll_branch, &rolling) else {
+        return false;
+    };
     let stable = match git::resolve_branch(repo, stable_ref) {
         Some(r) => r,
-        None => return HashSet::new(),
+        None => return false,
     };
-    git::log_subjects(repo, &[&stable])
-        .unwrap_or_default()
-        .iter()
-        .filter_map(|s| {
-            s.strip_prefix("Promote ")
-                .and_then(|rest| rest.split_whitespace().next())
-                .map(|b| b.to_string())
-        })
-        .collect()
+    git::is_ancestor(repo, &merge, &stable).unwrap_or(false)
 }
 
 /// Extract the branch name from a graduation subject line.

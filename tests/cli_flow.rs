@@ -1,60 +1,65 @@
 //! CLI flow integration tests, driven through the shared [`harness::Sandbox`].
 //!
-//! These assert the workflow as it behaves *today*. The forward-looking
-//! `--no-ff` / divergence-tolerant semantics live in `e2e_lifecycle.rs`
-//! (currently `#[ignore]`d pending the promotion fix, epic #2).
+//! Post-epic-#2 semantics: `graduate` (roll→rolling) and `promote`
+//! (rolling→main) are explicit `--no-ff`, divergence-tolerant merges that write
+//! the structured subjects the state detector reads.
 
 mod harness;
 
 use harness::Sandbox;
 
 #[test]
-fn init_create_and_promote_flow() {
+fn init_create_graduate_promote_flow() {
     let sb = Sandbox::plain();
 
-    let out = sb.init();
-    assert!(out.success, "init failed: {}", out.combined());
-
-    let out = sb.create_roll("feature", "0611");
-    assert!(out.success, "create failed: {}", out.combined());
-
+    assert!(sb.init().success, "init");
+    assert!(sb.create_roll("feature", "0611").success, "create");
     sb.commit_file("work.txt", "w\n", "roll work");
+    let roll_tip = sb.rev("HEAD");
 
-    let out = sb.rf(&["verify"]);
-    assert!(out.success, "verify failed: {}", out.combined());
-
-    let out = sb.rf(&["promote"]);
+    // graduate roll -> rolling as a --no-ff merge with a structured subject.
+    let out = sb.rf(&["graduate"]);
+    assert!(out.success, "graduate failed: {}", out.combined());
     assert!(
-        out.success,
-        "promote roll->rolling failed: {}",
-        out.combined()
+        sb.tip_is_merge("rolling"),
+        "expected a --no-ff graduation merge"
     );
+    assert!(
+        sb.tip_subject("rolling").starts_with("Graduate roll/1"),
+        "unexpected graduation subject: {}",
+        sb.tip_subject("rolling")
+    );
+    // Second parent is the roll tip, so divergence detection's `^2` works.
+    assert_eq!(sb.rev("rolling^2"), roll_tip);
+    // The command leaves you back on the roll, not on rolling.
+    assert_eq!(sb.current_branch(), "roll/1-0611-feature");
 
-    assert_eq!(sb.rev("HEAD"), sb.rev("rolling"));
-
+    // promote rolling -> main, also a --no-ff merge.
     sb.git(&["checkout", "rolling"]);
     let out = sb.rf(&["promote"]);
+    assert!(out.success, "promote failed: {}", out.combined());
     assert!(
-        out.success,
-        "promote rolling->main failed: {}",
-        out.combined()
+        sb.tip_is_merge("main"),
+        "expected a --no-ff promotion merge"
     );
-
-    assert_eq!(sb.rev("main"), sb.rev("rolling"));
+    assert!(
+        sb.tip_subject("main").starts_with("Promote rolling"),
+        "unexpected promotion subject: {}",
+        sb.tip_subject("main")
+    );
+    // The roll's content is now on the stable branch.
+    assert_eq!(sb.git(&["show", "main:work.txt"]), "w");
 }
 
 #[test]
-fn promote_requires_clean_tree() {
+fn graduate_requires_clean_tree() {
     let sb = Sandbox::plain();
-    let out = sb.init();
-    assert!(out.success, "init failed: {}", out.combined());
+    assert!(sb.init().success, "init");
+    assert!(sb.create_roll("dirty", "0611").success, "create");
 
-    let out = sb.create_roll("dirty", "0611");
-    assert!(out.success, "create failed: {}", out.combined());
-
-    sb.write("dirty.txt", "x\n");
-    let out = sb.rf(&["promote"]);
-    assert!(!out.success, "promote should fail on dirty tree");
+    sb.write("dirty.txt", "x\n"); // uncommitted change
+    let out = sb.rf(&["graduate"]);
+    assert!(!out.success, "graduate should fail on a dirty tree");
     assert!(
         out.combined().contains("working tree must be clean"),
         "unexpected: {}",
@@ -65,26 +70,20 @@ fn promote_requires_clean_tree() {
 #[test]
 fn integrate_merges_branch_into_roll() {
     let sb = Sandbox::plain();
-
-    let out = sb.init();
-    assert!(out.success, "init: {}", out.combined());
+    assert!(sb.init().success, "init");
 
     // A feature branch with unique content.
     sb.git(&["checkout", "-b", "feature/foo"]);
     sb.commit_file("foo.txt", "feature content\n", "add foo feature");
 
     // Create a roll (rf create checks out the new roll branch).
-    let out = sb.create_roll("myroll", "0101");
-    assert!(out.success, "create: {}", out.combined());
+    assert!(sb.create_roll("myroll", "0101").success, "create");
 
     // Integrate the feature branch into the roll.
     let out = sb.rf(&["integrate", "feature/foo"]);
     assert!(out.success, "integrate: {}", out.combined());
 
-    // Feature content should now exist on the roll branch.
     assert!(sb.exists("foo.txt"), "foo.txt missing after integrate");
-
-    // Should have been a --no-ff merge commit.
     assert!(
         sb.tip_subject("HEAD").contains("Merge branch"),
         "expected merge commit, got: {}",
@@ -93,25 +92,18 @@ fn integrate_merges_branch_into_roll() {
 }
 
 #[test]
-fn promote_blocks_divergence() {
-    // Documents *today's* behavior: fast-forward-only promotion bails on
-    // divergence. Epic #2 (issue #14) flips this to expect success.
+fn promote_from_main_errors_clearly() {
+    // `main` is not promotable — this must be a clear error, not a panic and
+    // not the old fast-forward rejection. (Replaces the former
+    // `promote_blocks_divergence`; divergence is now supported — see
+    // `e2e_lifecycle::graduation_tolerates_diverged_rolling`.)
     let sb = Sandbox::plain();
-    let out = sb.init();
-    assert!(out.success, "init failed: {}", out.combined());
+    assert!(sb.init().success, "init");
 
-    sb.git(&["checkout", "rolling"]);
-    sb.git(&["checkout", "-b", "roll/1-0611-diverge"]);
-    sb.commit_file("roll.txt", "roll\n", "roll commit");
-
-    sb.git(&["checkout", "rolling"]);
-    sb.commit_file("rolling.txt", "rolling\n", "rolling diverges");
-
-    sb.git(&["checkout", "roll/1-0611-diverge"]);
-    let out = sb.rf(&["promote"]);
-    assert!(!out.success, "promote should fail when branches diverged");
+    let out = sb.rf(&["promote"]); // HEAD is on main after init
+    assert!(!out.success, "promote from main should error");
     assert!(
-        out.combined().contains("fast-forward-only"),
+        out.combined().contains("not promotable"),
         "unexpected: {}",
         out.combined()
     );

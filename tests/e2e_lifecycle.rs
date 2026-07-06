@@ -1,21 +1,16 @@
 //! End-to-end lifecycle + divergence scenarios (issue #9), driven through the
 //! shared [`harness::Sandbox`].
 //!
-//! Two kinds of tests live here:
-//!
-//! * **Active** tests exercise the pipeline as it behaves today and gate every
-//!   PR via CI.
-//! * **`#[ignore]`d** tests encode the *correct* post-fix semantics from
-//!   `CLAUDE.md` (structured `--no-ff` merges, divergence tolerance, a real
-//!   `status --json` reason). They fail against today's fast-forward-only
-//!   promotion and are un-ignored by epic #2 as each piece lands — the `ignore`
-//!   reason names the issue that unblocks them.
+//! Every test here now exercises the epic-#2 promotion semantics directly —
+//! structured `--no-ff` merges, divergence tolerance, and a real
+//! `status --json` reason. (Before epic #2 the forward-looking ones were
+//! `#[ignore]`d against the old fast-forward-only behavior.)
 
 mod harness;
 
 use harness::Sandbox;
 
-// ── active coverage (passes today) ────────────────────────────────────────
+// ── lifecycle ──────────────────────────────────────────────────────────────
 
 #[test]
 fn happy_path_content_reaches_main() {
@@ -24,7 +19,7 @@ fn happy_path_content_reaches_main() {
     assert!(sb.create_roll("feature", "0611").success, "create");
     sb.commit_file("work.txt", "w\n", "roll work");
 
-    assert!(sb.rf(&["promote"]).success, "graduate roll->rolling");
+    assert!(sb.rf(&["graduate"]).success, "graduate roll->rolling");
     sb.git(&["checkout", "rolling"]);
     assert!(sb.rf(&["promote"]).success, "promote rolling->main");
 
@@ -88,10 +83,9 @@ fn listing_tolerates_generation_bump_commits() {
     );
 }
 
-// ── forward-looking coverage (un-ignored by epic #2) ──────────────────────
+// ── promotion mechanics ────────────────────────────────────────────────────
 
 #[test]
-#[ignore = "requires epic #2 / issue #11: --no-ff graduation with structured subject"]
 fn graduate_creates_noff_merge_with_subject() {
     let sb = Sandbox::plain();
     sb.init();
@@ -115,7 +109,6 @@ fn graduate_creates_noff_merge_with_subject() {
 }
 
 #[test]
-#[ignore = "requires epic #2 / issue #11: rolling->main promotion writes a 'Promote …' subject"]
 fn promote_writes_promote_subject_on_main() {
     let sb = Sandbox::plain();
     sb.init();
@@ -134,7 +127,6 @@ fn promote_writes_promote_subject_on_main() {
 }
 
 #[test]
-#[ignore = "requires epic #2 / issue #12: divergence-tolerant graduation"]
 fn graduation_tolerates_diverged_rolling() {
     // rolling advances independently after the roll is branched, so it is no
     // longer an ancestor of the roll — today's fast-forward-only path bails.
@@ -161,29 +153,26 @@ fn graduation_tolerates_diverged_rolling() {
 }
 
 #[test]
-#[ignore = "requires epic #2 / issue #13: status --json explains a non-promotable diverged roll"]
-fn status_json_reason_on_diverged_roll() {
+fn status_json_reason_when_nothing_to_promote() {
+    // Clean tree, but rolling has nothing beyond main — `ready` is false and
+    // `reason` must explain why rather than being null (issue #13). (Divergence
+    // itself is no longer a blocker, so the reason is "nothing to promote".)
     let sb = Sandbox::plain();
     sb.init();
     sb.git(&["checkout", "rolling"]);
-    sb.git(&["checkout", "-b", "roll/1-0611-diverge"]);
-    sb.commit_file("roll.txt", "roll\n", "roll commit");
-    sb.git(&["checkout", "rolling"]);
-    sb.commit_file("rolling.txt", "rolling\n", "rolling diverges");
-    sb.git(&["checkout", "roll/1-0611-diverge"]);
 
     let st = sb.status_json();
     assert_eq!(st["clean_working_tree"].as_bool(), Some(true));
     assert_eq!(st["promotion"]["ready"].as_bool(), Some(false));
+    let reason = st["promotion"]["reason"].as_str();
     assert!(
-        st["promotion"]["reason"].is_string(),
-        "a diverged roll should have a reason, got {}",
+        reason.is_some_and(|r| r.contains("nothing to promote")),
+        "expected a 'nothing to promote' reason, got {}",
         st["promotion"]["reason"]
     );
 }
 
 #[test]
-#[ignore = "requires epic #2: state detection sees the --no-ff graduation merge"]
 fn roll_reports_graduated_after_graduate() {
     let sb = Sandbox::plain();
     sb.init();

@@ -39,6 +39,7 @@ fn main() -> Result<()> {
         } => cmd_create(&slug, date, dry_run)?,
         Cmd::Integrate { branch } => cmd_integrate(&branch)?,
         Cmd::Verify { dry_run } => cmd_verify(dry_run)?,
+        Cmd::Graduate { dry_run } => cmd_graduate(dry_run)?,
         Cmd::Promote { dry_run } => cmd_promote(dry_run)?,
         Cmd::Status { no_tui, json } => {
             if json {
@@ -157,30 +158,82 @@ fn cmd_verify(dry_run: bool) -> Result<()> {
     let config = Config::load()?;
     ensure_clean_state(&config)?;
     let ctx = promotion_context(&config)?;
-    validate_fast_forward(&config, &ctx.source, &ctx.target)?;
+    if let Err(reason) = promotion_readiness(&config, &ctx) {
+        bail!("{reason}");
+    }
     run_gates(&config.repo_root, &ctx.gates, dry_run)?;
     println!("Verification passed: {} -> {}", ctx.source, ctx.target);
     Ok(())
 }
 
+fn cmd_graduate(dry_run: bool) -> Result<()> {
+    let config = Config::load()?;
+    let ctx = promotion_context(&config)?;
+    if ctx.kind != Direction::Graduate {
+        bail!(
+            "`rf graduate` graduates a roll into '{}'; you are on '{}'. \
+             Use `rf promote` to promote '{}' to '{}'.",
+            config.rolling_branch,
+            ctx.source,
+            config.rolling_branch,
+            config.stable_branch
+        );
+    }
+    run_merge(&config, &ctx, dry_run)
+}
+
 fn cmd_promote(dry_run: bool) -> Result<()> {
     let config = Config::load()?;
-    ensure_clean_state(&config)?;
     let ctx = promotion_context(&config)?;
-    validate_fast_forward(&config, &ctx.source, &ctx.target)?;
+    if ctx.kind != Direction::Promote {
+        bail!(
+            "`rf promote` promotes '{}' to '{}'; you are on a roll branch ('{}'). \
+             Use `rf graduate` to graduate it into '{}'.",
+            config.rolling_branch,
+            config.stable_branch,
+            ctx.source,
+            config.rolling_branch
+        );
+    }
+    run_merge(&config, &ctx, dry_run)
+}
+
+/// Shared graduate/promote executor: a divergence-tolerant `--no-ff` merge of
+/// `ctx.source` into `ctx.target` with the structured commit subject the state
+/// detector reads. Leaves the user back on the branch they started from.
+fn run_merge(config: &Config, ctx: &PromotionContext, dry_run: bool) -> Result<()> {
+    ensure_clean_state(config)?;
+    if let Err(reason) = promotion_readiness(config, ctx) {
+        bail!("{reason}");
+    }
     run_gates(&config.repo_root, &ctx.gates, dry_run)?;
 
+    let subject = ctx.merge_subject();
     if dry_run {
-        println!("Dry-run: would promote {} -> {}", ctx.source, ctx.target);
+        println!(
+            "Dry-run: would {} {} -> {} (--no-ff: \"{}\")",
+            ctx.kind.verb(),
+            ctx.source,
+            ctx.target,
+            subject
+        );
         return Ok(());
     }
 
-    git::run_git(&config.repo_root, &["checkout", &ctx.target])?;
-    let merge_result = git::run_git(&config.repo_root, &["merge", "--ff-only", &ctx.source]);
-    let _ = git::run_git(&config.repo_root, &["checkout", &ctx.source]);
-    merge_result?;
+    let repo = &config.repo_root;
+    let origin = git::current_branch(repo)?;
+    git::run_git(repo, &["checkout", &ctx.target])?;
+    let merge = git::run_git(repo, &["merge", "--no-ff", "-m", &subject, &ctx.source]);
+    if merge.is_err() {
+        // Leave the repo in a coherent state on merge failure (e.g. conflicts).
+        let _ = git::run_git(repo, &["merge", "--abort"]);
+        let _ = git::run_git(repo, &["checkout", &origin]);
+        return merge.map_err(Into::into);
+    }
+    // Return to where the user was (the roll, or rolling), not the target.
+    git::run_git(repo, &["checkout", &origin])?;
 
-    println!("Promoted {} -> {}", ctx.source, ctx.target);
+    println!("{} {} -> {}", ctx.kind.past_tense(), ctx.source, ctx.target);
     Ok(())
 }
 
@@ -192,21 +245,27 @@ fn cmd_status_json() -> Result<()> {
     let rolls = branches::list_rolls(&config)?;
     let tier = branch_tier(&config, &current, detached);
 
-    let promotion = promotion_context(&config)
-        .map(|ctx| PromotionReadiness {
-            description: format!("{} -> {}", ctx.source, ctx.target),
-            ready: validate_fast_forward(&config, &ctx.source, &ctx.target).is_ok() && clean,
-            reason: if !clean {
+    let promotion = match promotion_context(&config) {
+        Ok(ctx) => {
+            // Report the *first* blocking condition so `reason` is never null
+            // while `ready` is false (issue #13).
+            let reason = if !clean {
                 Some("working tree must be clean".to_string())
             } else {
-                None
-            },
-        })
-        .unwrap_or(PromotionReadiness {
+                promotion_readiness(&config, &ctx).err()
+            };
+            PromotionReadiness {
+                description: format!("{} -> {}", ctx.source, ctx.target),
+                ready: reason.is_none(),
+                reason,
+            }
+        }
+        Err(e) => PromotionReadiness {
             description: "none".to_string(),
             ready: false,
-            reason: Some("current branch is not promotable".to_string()),
-        });
+            reason: Some(e.to_string()),
+        },
+    };
 
     let payload = StatusPayload {
         current_branch: current,
@@ -372,16 +431,55 @@ fn workflow_clean(config: &Config) -> Result<bool> {
     Ok(all_allowed)
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Direction {
+    /// roll/* → rolling
+    Graduate,
+    /// rolling → main
+    Promote,
+}
+
+impl Direction {
+    fn verb(self) -> &'static str {
+        match self {
+            Direction::Graduate => "graduate",
+            Direction::Promote => "promote",
+        }
+    }
+
+    fn past_tense(self) -> &'static str {
+        match self {
+            Direction::Graduate => "Graduated",
+            Direction::Promote => "Promoted",
+        }
+    }
+}
+
 struct PromotionContext {
+    kind: Direction,
     source: String,
     target: String,
     gates: Vec<String>,
 }
 
+impl PromotionContext {
+    /// The structured merge subject the state detector reads back
+    /// (`branches::extract_graduated_branch` / promoted-reachability).
+    fn merge_subject(&self) -> String {
+        match self.kind {
+            Direction::Graduate => format!("Graduate {} into {}", self.source, self.target),
+            Direction::Promote => format!("Promote {} to {}", self.source, self.target),
+        }
+    }
+}
+
+/// Determine what the current branch would graduate/promote into. Errors only
+/// when the branch is neither the rolling branch nor a roll branch.
 fn promotion_context(config: &Config) -> Result<PromotionContext> {
     let current = git::current_branch(&config.repo_root)?;
     if current == config.rolling_branch {
         return Ok(PromotionContext {
+            kind: Direction::Promote,
             source: config.rolling_branch.clone(),
             target: config.stable_branch.clone(),
             gates: config.rolling_to_main_gates.clone(),
@@ -389,33 +487,59 @@ fn promotion_context(config: &Config) -> Result<PromotionContext> {
     }
     if current.starts_with(&config.roll_prefix) {
         return Ok(PromotionContext {
+            kind: Direction::Graduate,
             source: current,
             target: config.rolling_branch.clone(),
             gates: config.roll_to_rolling_gates.clone(),
         });
     }
     bail!(
-        "branch '{}' is not promotable; expected '{}' or '{}*'",
+        "branch '{}' is not promotable; run from a roll branch ('{}*') to graduate, \
+         or from '{}' to promote",
         current,
-        config.rolling_branch,
-        config.roll_prefix
+        config.roll_prefix,
+        config.rolling_branch
     )
 }
 
-fn validate_fast_forward(config: &Config, source: &str, target: &str) -> Result<()> {
-    if !git::ref_exists(&config.repo_root, source) {
-        bail!("source branch '{}' not found", source);
+/// Whether `ctx.source` can be merged into `ctx.target` right now. Unlike the
+/// old fast-forward gate, ordinary divergence is fine — the `--no-ff` merge
+/// handles it. Returns `Err(reason)` naming a genuinely-bad state (missing
+/// branch, nothing to merge, unrelated histories) so callers can surface *why*.
+fn promotion_readiness(config: &Config, ctx: &PromotionContext) -> std::result::Result<(), String> {
+    let repo = &config.repo_root;
+    if !git::ref_exists(repo, &ctx.source) {
+        return Err(format!("source branch '{}' not found", ctx.source));
     }
-    if !git::ref_exists(&config.repo_root, target) {
-        bail!("target branch '{}' not found", target);
+    if !git::ref_exists(repo, &ctx.target) {
+        return Err(format!("target branch '{}' not found", ctx.target));
     }
-    let ff_ok = git::is_ancestor(&config.repo_root, target, source)?;
-    if !ff_ok {
-        bail!(
-            "fast-forward-only promotion blocked: '{}' is not ancestor of '{}'",
-            target,
-            source
-        );
+    // Nothing to do if the target already contains every commit on the source.
+    let ahead = git::capture_git(
+        repo,
+        &[
+            "rev-list",
+            "--count",
+            &format!("{}..{}", ctx.target, ctx.source),
+        ],
+    )
+    .ok()
+    .and_then(|s| s.trim().parse::<u32>().ok())
+    .unwrap_or(0);
+    if ahead == 0 {
+        return Err(format!(
+            "nothing to {}: '{}' has no commits beyond '{}'",
+            ctx.kind.verb(),
+            ctx.source,
+            ctx.target
+        ));
+    }
+    // Refuse to knit together histories that share no common ancestor.
+    if git::capture_git(repo, &["merge-base", &ctx.source, &ctx.target]).is_err() {
+        return Err(format!(
+            "'{}' and '{}' have unrelated histories",
+            ctx.source, ctx.target
+        ));
     }
     Ok(())
 }
