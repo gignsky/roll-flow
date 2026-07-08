@@ -26,7 +26,8 @@
         ],
         "nixos-unstable": "nixos-unstable",
         "nixpkgs": [
-          "nixpkgs"
+          "gigpkgs",
+          "nixpkgs-unstable"
         ],
         "nixpkgs-master": [
           "gigpkgs",
@@ -168,8 +169,7 @@
       "inputs": {
         "gigpkgs": "gigpkgs",
         "nixpkgs": [
-          "gigpkgs",
-          "nixpkgs-unstable"
+          "gigpkgs"
         ],
         "pre-commit-hooks": [
           "gigpkgs",

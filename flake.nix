@@ -4,9 +4,9 @@
   inputs = {
     gigpkgs = {
       url = "github:gignsky/gigpkgs";
-      inputs.nixpkgs.follows = "nixpkgs";
+      inputs.nixpkgs.follows = "gigpkgs/nixpkgs-unstable";
     };
-    nixpkgs.follows = "gigpkgs/nixpkgs-unstable";
+    nixpkgs.follows = "gigpkgs";
     pre-commit-hooks.follows = "gigpkgs/pre-commit-hooks";
   };
 
