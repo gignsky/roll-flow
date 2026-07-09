@@ -209,6 +209,21 @@ Promote roll/N-theme to main
 Verified-On: all-hosts
 ```
 
+When a single promotion merge carries multiple graduated rolls, the subject is
+`Promote <rolling> to <stable>` and the body lists the rolls it includes:
+```
+Promote rolling to main
+
+Rolls:
+  roll/1-0611-alpha
+  roll/2-0612-beta
+```
+
+A roll counts as "promoted" if a `Promote roll/N-...` subject exists on the stable
+branch, its graduation merge is reachable from stable, or it is named in a `Rolls:`
+body of a Promote commit. All three sources must be checked wherever promotion is
+tested.
+
 ## Build and test
 
 ```bash

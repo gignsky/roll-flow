@@ -1,8 +1,9 @@
 //! CLI flow integration tests, driven through the shared [`harness::Sandbox`].
 //!
-//! These assert the workflow as it behaves *today*. The forward-looking
-//! `--no-ff` / divergence-tolerant semantics live in `e2e_lifecycle.rs`
-//! (currently `#[ignore]`d pending the promotion fix, epic #2).
+//! These assert the merge-based (`--no-ff`) graduate/promote workflow from
+//! epic #2: structured merge subjects, divergence tolerance, and clear errors
+//! for genuinely-bad states. The broader lifecycle scenarios live in
+//! `e2e_lifecycle.rs`.
 
 mod harness;
 
@@ -23,14 +24,18 @@ fn init_create_and_promote_flow() {
     let out = sb.rf(&["verify"]);
     assert!(out.success, "verify failed: {}", out.combined());
 
-    let out = sb.rf(&["promote"]);
-    assert!(
-        out.success,
-        "promote roll->rolling failed: {}",
-        out.combined()
-    );
+    let out = sb.rf(&["graduate"]);
+    assert!(out.success, "graduate failed: {}", out.combined());
 
-    assert_eq!(sb.rev("HEAD"), sb.rev("rolling"));
+    // Graduation is a --no-ff merge with a structured subject, and we are
+    // returned to the roll branch afterward.
+    assert!(sb.tip_is_merge("rolling"), "rolling tip should be a merge");
+    assert!(
+        sb.tip_subject("rolling").starts_with("Graduate roll/1"),
+        "unexpected graduation subject: {}",
+        sb.tip_subject("rolling")
+    );
+    assert_eq!(sb.current_branch(), "roll/1-0611-feature");
 
     sb.git(&["checkout", "rolling"]);
     let out = sb.rf(&["promote"]);
@@ -40,7 +45,16 @@ fn init_create_and_promote_flow() {
         out.combined()
     );
 
-    assert_eq!(sb.rev("main"), sb.rev("rolling"));
+    assert!(sb.tip_is_merge("main"), "main tip should be a merge");
+    assert!(
+        sb.tip_subject("main").starts_with("Promote "),
+        "unexpected promotion subject: {}",
+        sb.tip_subject("main")
+    );
+    assert!(
+        sb.is_ancestor("rolling", "main"),
+        "rolling should be merged into main"
+    );
 }
 
 #[test]
@@ -93,9 +107,10 @@ fn integrate_merges_branch_into_roll() {
 }
 
 #[test]
-fn promote_blocks_divergence() {
-    // Documents *today's* behavior: fast-forward-only promotion bails on
-    // divergence. Epic #2 (issue #14) flips this to expect success.
+fn promote_tolerates_divergence() {
+    // Divergence is a supported state (epic #2): `rf promote` on a roll branch
+    // falls through to graduation and merges with --no-ff even when rolling
+    // has advanced independently.
     let sb = Sandbox::plain();
     let out = sb.init();
     assert!(out.success, "init failed: {}", out.combined());
@@ -109,9 +124,57 @@ fn promote_blocks_divergence() {
 
     sb.git(&["checkout", "roll/1-0611-diverge"]);
     let out = sb.rf(&["promote"]);
-    assert!(!out.success, "promote should fail when branches diverged");
     assert!(
-        out.combined().contains("fast-forward-only"),
+        out.success,
+        "promote should tolerate divergence: {}",
+        out.combined()
+    );
+    assert!(
+        out.combined().contains("use rf graduate"),
+        "expected the graduate redirect note: {}",
+        out.combined()
+    );
+    assert!(
+        sb.tip_is_merge("rolling"),
+        "expected a --no-ff merge on rolling"
+    );
+    assert!(
+        sb.tip_subject("rolling").starts_with("Graduate roll/1"),
+        "unexpected subject: {}",
+        sb.tip_subject("rolling")
+    );
+}
+
+#[test]
+fn graduate_errors_off_roll_branch() {
+    let sb = Sandbox::plain();
+    let out = sb.init();
+    assert!(out.success, "init failed: {}", out.combined());
+
+    // Still on `main` after init.
+    let out = sb.rf(&["graduate"]);
+    assert!(!out.success, "graduate should fail off a roll branch");
+    assert!(
+        out.combined().contains("must be run from a roll branch"),
+        "unexpected: {}",
+        out.combined()
+    );
+}
+
+#[test]
+fn graduate_errors_with_nothing_to_merge() {
+    let sb = Sandbox::plain();
+    let out = sb.init();
+    assert!(out.success, "init failed: {}", out.combined());
+
+    // Fresh roll with no commits of its own.
+    let out = sb.create_roll("empty", "0611");
+    assert!(out.success, "create failed: {}", out.combined());
+
+    let out = sb.rf(&["graduate"]);
+    assert!(!out.success, "graduate should fail with nothing to merge");
+    assert!(
+        out.combined().contains("nothing to graduate"),
         "unexpected: {}",
         out.combined()
     );

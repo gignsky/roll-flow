@@ -207,18 +207,30 @@ pub fn check_diverged(repo: &Path, roll_branch: &str, rolling_ref: &str) -> bool
         .unwrap_or(false)
 }
 
-/// True if the roll has a promotion commit on the stable branch.
-/// Consumed by the promotion-state work in later epics.
-#[allow(dead_code)]
+/// True if the roll has been promoted to the stable branch: either a
+/// `Promote <roll> …` subject exists on stable, or the roll's graduation merge
+/// is reachable from stable (the promote merge carries graduations along).
 pub fn check_promoted(repo: &Path, roll_branch: &str, stable_ref: &str) -> bool {
     let stable = match git::resolve_branch(repo, stable_ref) {
         Some(r) => r,
         None => return false,
     };
     let subjects = git::log_subjects(repo, &[&stable]).unwrap_or_default();
-    subjects
+    if subjects
         .iter()
         .any(|s| s.starts_with(&format!("Promote {roll_branch}")))
+    {
+        return true;
+    }
+    graduation_on_stable(repo, roll_branch, stable_ref).is_some()
+}
+
+/// Graduation merge commit for `roll_branch` reachable from the stable branch —
+/// present once the roll's graduation has been promoted. Reused by the future
+/// revert flow (issue #38).
+pub fn graduation_on_stable(repo: &Path, roll_branch: &str, stable_ref: &str) -> Option<String> {
+    let stable = git::resolve_branch(repo, stable_ref)?;
+    find_graduation_commit(repo, roll_branch, &stable)
 }
 
 // ── Internal helpers ──────────────────────────────────────────────────────────
@@ -238,21 +250,37 @@ fn scan_graduated(repo: &Path, rolling_ref: &str) -> HashSet<String> {
 }
 
 /// Scan stable log once, returning the set of branch names that have been
-/// promoted.
+/// promoted. Three sources over a single log pass:
+/// 1. `Promote <roll> …` subjects (single-roll promotions),
+/// 2. graduation subjects reachable from stable — the promote merge of rolling
+///    carries every graduation merge along, so reachability marks those rolls
+///    promoted (covers multi-roll `Promote <rolling> to <stable>` commits),
+/// 3. `Rolls:` body lines of Promote commits (explicit attribution).
 fn scan_promoted(repo: &Path, stable_ref: &str) -> HashSet<String> {
     let stable = match git::resolve_branch(repo, stable_ref) {
         Some(r) => r,
         None => return HashSet::new(),
     };
-    git::log_subjects(repo, &[&stable])
-        .unwrap_or_default()
-        .iter()
-        .filter_map(|s| {
-            s.strip_prefix("Promote ")
-                .and_then(|rest| rest.split_whitespace().next())
-                .map(|b| b.to_string())
-        })
-        .collect()
+
+    let mut promoted = HashSet::new();
+    for (subject, body) in git::log_with_body(repo, &[&stable]).unwrap_or_default() {
+        if let Some(rest) = subject.strip_prefix("Promote ") {
+            if let Some(branch) = rest.split_whitespace().next() {
+                promoted.insert(branch.to_string());
+            }
+            for line in body.lines() {
+                let line = line.trim();
+                if !line.is_empty() && line != "Rolls:" {
+                    // Lenient: non-branch lines are harmless — the result is
+                    // matched against actual roll branch names.
+                    promoted.insert(line.to_string());
+                }
+            }
+        } else if let Some(branch) = extract_graduated_branch(&subject) {
+            promoted.insert(branch);
+        }
+    }
+    promoted
 }
 
 /// Extract the branch name from a graduation subject line.

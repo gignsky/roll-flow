@@ -8,7 +8,9 @@ main             <- stable
        └─ roll/N-MMDD-slug <- numbered work branches
 ```
 
-`roll-flow` 0.1.0 is local-first, non-interactive, and fast-forward-only.
+`roll-flow` is local-first and merge-based: every graduation and promotion is a
+`--no-ff` merge with a structured commit subject, so workflow state can always
+be re-derived from git history alone.
 
 ## Project ethos
 
@@ -41,6 +43,7 @@ Run:
 rf init [--rolling-branch <name>] [--stable-branch <name>] [--roll-prefix <prefix>] [--username <user>] [--hosts <h1,h2>] [--force]
 rf create <slug> [--date MMDD] [--dry-run]
 rf verify [--dry-run]
+rf graduate [--dry-run]
 rf promote [--dry-run]
 rf status [--json]
 rf list [--json]
@@ -62,7 +65,7 @@ rf version
 
 ### `verify`
 
-Checks promotion readiness for current branch:
+Checks graduation/promotion readiness for the current branch:
 
 - `roll/* -> rolling`
 - `rolling -> main`
@@ -71,13 +74,24 @@ Validation includes:
 
 - clean tree
 - non-detached HEAD
-- fast-forward-only ancestry requirement
+- mergeability (common history, something new to merge; divergence is fine and
+  only produces an informational note)
 - configured gate command execution
+
+### `graduate`
+
+Merges the current roll branch into rolling with `--no-ff` and a structured
+subject (`Graduate roll/N-slug into rolling`), then returns to the roll branch.
+Divergence between the roll and rolling is handled by the merge; a conflicting
+merge is aborted and the original branch restored, leaving the repo clean.
 
 ### `promote`
 
-Runs the same checks as `verify`, then fast-forwards target branch.
-No merge commits are created.
+Merges rolling into the stable branch with `--no-ff` and a structured subject
+(`Promote roll/N-slug to main`, or `Promote rolling to main` with the included
+rolls listed in the body when several graduated rolls ride along). Run from a
+roll branch it redirects to graduation. Conflicts abort and restore, same as
+`graduate`.
 
 ### `status`
 
@@ -116,5 +130,3 @@ cargo test
 
 - local-only behavior (no automatic fetch/push)
 - no daemon/TUI workflow controls
-- no merge-based or rebase-based promotion modes
-- fast-forward-only promotion enforced
