@@ -39,6 +39,7 @@ fn main() -> Result<()> {
         } => cmd_create(&slug, date, dry_run)?,
         Cmd::Integrate { branch } => cmd_integrate(&branch)?,
         Cmd::Verify { dry_run } => cmd_verify(dry_run)?,
+        Cmd::Graduate { dry_run } => cmd_graduate(dry_run)?,
         Cmd::Promote { dry_run } => cmd_promote(dry_run)?,
         Cmd::Status { no_tui, json } => {
             if json {
@@ -156,32 +157,184 @@ fn cmd_integrate(branch: &str) -> Result<()> {
 fn cmd_verify(dry_run: bool) -> Result<()> {
     let config = Config::load()?;
     ensure_clean_state(&config)?;
-    let ctx = promotion_context(&config)?;
-    validate_fast_forward(&config, &ctx.source, &ctx.target)?;
-    run_gates(&config.repo_root, &ctx.gates, dry_run)?;
-    println!("Verification passed: {} -> {}", ctx.source, ctx.target);
+    let current = git::current_branch(&config.repo_root)?;
+    let route =
+        infer_route(&config, &current).ok_or_else(|| not_promotable_error(&config, &current))?;
+
+    let (source, target, gates) = match &route {
+        Route::Graduate { roll } => (
+            roll.clone(),
+            config.rolling_branch.clone(),
+            &config.roll_to_rolling_gates,
+        ),
+        Route::Promote => (
+            config.rolling_branch.clone(),
+            config.stable_branch.clone(),
+            &config.rolling_to_main_gates,
+        ),
+    };
+
+    match classify_merge(&config.repo_root, &source, &target)? {
+        MergeState::TargetMissing => bail!(target_missing_error(&config, &target)),
+        MergeState::UnrelatedHistories => {
+            bail!("'{}' and '{}' share no common history", source, target)
+        }
+        MergeState::NothingToMerge => bail!(
+            "nothing to merge: '{}' has no commits that '{}' lacks (already up to date)",
+            source,
+            target
+        ),
+        MergeState::Diverged => println!(
+            "note: '{}' has commits not in '{}'; graduation/promotion will create a --no-ff merge",
+            target, source
+        ),
+        MergeState::FastForwardable => {}
+    }
+
+    run_gates(&config.repo_root, gates, dry_run)?;
+    println!("Verification passed: {} -> {}", source, target);
     Ok(())
+}
+
+fn cmd_graduate(dry_run: bool) -> Result<()> {
+    let config = Config::load()?;
+    ensure_clean_state(&config)?;
+    let current = git::current_branch(&config.repo_root)?;
+    if !current.starts_with(&config.roll_prefix) {
+        bail!(
+            "rf graduate must be run from a roll branch (current: '{}'); \
+             to promote '{}' -> '{}' use rf promote",
+            current,
+            config.rolling_branch,
+            config.stable_branch
+        );
+    }
+    graduate_branch(&config, &current, dry_run)
 }
 
 fn cmd_promote(dry_run: bool) -> Result<()> {
     let config = Config::load()?;
     ensure_clean_state(&config)?;
-    let ctx = promotion_context(&config)?;
-    validate_fast_forward(&config, &ctx.source, &ctx.target)?;
-    run_gates(&config.repo_root, &ctx.gates, dry_run)?;
+    let current = git::current_branch(&config.repo_root)?;
+    match infer_route(&config, &current) {
+        Some(Route::Graduate { roll }) => {
+            println!(
+                "note: '{}' is a roll branch; graduating into '{}' — use rf graduate directly next time",
+                roll, config.rolling_branch
+            );
+            graduate_branch(&config, &roll, dry_run)
+        }
+        Some(Route::Promote) => promote_rolling(&config, dry_run),
+        None => Err(not_promotable_error(&config, &current)),
+    }
+}
+
+/// Graduate `roll` into the rolling branch with a structured `--no-ff` merge.
+/// Shared by `rf graduate` and the `rf promote` fall-through.
+fn graduate_branch(config: &Config, roll: &str, dry_run: bool) -> Result<()> {
+    let repo = &config.repo_root;
+    if branches::check_promoted(repo, roll, &config.stable_branch) {
+        bail!(
+            "'{}' has already been promoted to '{}'",
+            roll,
+            config.stable_branch
+        );
+    }
+
+    let rolling = &config.rolling_branch;
+    match classify_merge(repo, roll, rolling)? {
+        MergeState::TargetMissing => bail!(target_missing_error(config, rolling)),
+        MergeState::UnrelatedHistories => {
+            bail!("'{}' and '{}' share no common history", roll, rolling)
+        }
+        MergeState::NothingToMerge => bail!(
+            "nothing to graduate: '{}' has no commits that '{}' lacks (already up to date)",
+            roll,
+            rolling
+        ),
+        MergeState::Diverged | MergeState::FastForwardable => {}
+    }
+
+    run_gates(repo, &config.roll_to_rolling_gates, dry_run)?;
 
     if dry_run {
-        println!("Dry-run: would promote {} -> {}", ctx.source, ctx.target);
+        println!("Dry-run: would graduate '{roll}' into '{rolling}' (--no-ff)");
         return Ok(());
     }
 
-    git::run_git(&config.repo_root, &["checkout", &ctx.target])?;
-    let merge_result = git::run_git(&config.repo_root, &["merge", "--ff-only", &ctx.source]);
-    let _ = git::run_git(&config.repo_root, &["checkout", &ctx.source]);
-    merge_result?;
-
-    println!("Promoted {} -> {}", ctx.source, ctx.target);
+    let subject = format!("Graduate {roll} into {rolling}");
+    run_merge(repo, roll, rolling, &subject, None)?;
+    println!("Graduated '{roll}' into '{rolling}'");
     Ok(())
+}
+
+/// Promote the rolling branch into stable with a structured `--no-ff` merge.
+fn promote_rolling(config: &Config, dry_run: bool) -> Result<()> {
+    let repo = &config.repo_root;
+    let rolling = &config.rolling_branch;
+    let stable = &config.stable_branch;
+
+    match classify_merge(repo, rolling, stable)? {
+        MergeState::TargetMissing => bail!(target_missing_error(config, stable)),
+        MergeState::UnrelatedHistories => {
+            bail!("'{}' and '{}' share no common history", rolling, stable)
+        }
+        MergeState::NothingToMerge => bail!(
+            "nothing to promote: '{}' has no commits that '{}' lacks (already up to date)",
+            rolling,
+            stable
+        ),
+        MergeState::Diverged | MergeState::FastForwardable => {}
+    }
+
+    run_gates(repo, &config.rolling_to_main_gates, dry_run)?;
+
+    if dry_run {
+        println!("Dry-run: would promote '{rolling}' into '{stable}' (--no-ff)");
+        return Ok(());
+    }
+
+    let (subject, body) = promote_subject_and_body(config)?;
+    run_merge(repo, rolling, stable, &subject, body.as_deref())?;
+    println!("Promoted '{rolling}' into '{stable}'");
+    Ok(())
+}
+
+/// Subject and body for a promotion merge. Exactly one graduated roll included
+/// → subject names it; otherwise a generic subject with the rolls listed in the
+/// body so promoted-state detection can attribute them.
+fn promote_subject_and_body(config: &Config) -> Result<(String, Option<String>)> {
+    let rolls = branches::list_rolls(config)?;
+    let included: Vec<&branches::RollInfo> = rolls
+        .iter()
+        .filter(|r| {
+            matches!(
+                r.state,
+                branches::RollState::Graduated | branches::RollState::Diverged
+            )
+        })
+        .collect();
+
+    let subject = if included.len() == 1 {
+        format!("Promote {} to {}", included[0].branch, config.stable_branch)
+    } else {
+        format!(
+            "Promote {} to {}",
+            config.rolling_branch, config.stable_branch
+        )
+    };
+
+    let body = if included.is_empty() {
+        None
+    } else {
+        let mut body = String::from("Rolls:\n");
+        for roll in &included {
+            body.push_str(&format!("  {}\n", roll.branch));
+        }
+        Some(body)
+    };
+
+    Ok((subject, body))
 }
 
 fn cmd_status_json() -> Result<()> {
@@ -192,21 +345,7 @@ fn cmd_status_json() -> Result<()> {
     let rolls = branches::list_rolls(&config)?;
     let tier = branch_tier(&config, &current, detached);
 
-    let promotion = promotion_context(&config)
-        .map(|ctx| PromotionReadiness {
-            description: format!("{} -> {}", ctx.source, ctx.target),
-            ready: validate_fast_forward(&config, &ctx.source, &ctx.target).is_ok() && clean,
-            reason: if !clean {
-                Some("working tree must be clean".to_string())
-            } else {
-                None
-            },
-        })
-        .unwrap_or(PromotionReadiness {
-            description: "none".to_string(),
-            ready: false,
-            reason: Some("current branch is not promotable".to_string()),
-        });
+    let promotion = promotion_readiness(&config, &current, clean, detached);
 
     let payload = StatusPayload {
         current_branch: current,
@@ -372,29 +511,28 @@ fn workflow_clean(config: &Config) -> Result<bool> {
     Ok(all_allowed)
 }
 
-struct PromotionContext {
-    source: String,
-    target: String,
-    gates: Vec<String>,
+/// Where a merge would go from the current branch.
+enum Route {
+    /// roll/* -> rolling
+    Graduate { roll: String },
+    /// rolling -> stable
+    Promote,
 }
 
-fn promotion_context(config: &Config) -> Result<PromotionContext> {
-    let current = git::current_branch(&config.repo_root)?;
+fn infer_route(config: &Config, current: &str) -> Option<Route> {
     if current == config.rolling_branch {
-        return Ok(PromotionContext {
-            source: config.rolling_branch.clone(),
-            target: config.stable_branch.clone(),
-            gates: config.rolling_to_main_gates.clone(),
-        });
+        Some(Route::Promote)
+    } else if current.starts_with(&config.roll_prefix) {
+        Some(Route::Graduate {
+            roll: current.to_string(),
+        })
+    } else {
+        None
     }
-    if current.starts_with(&config.roll_prefix) {
-        return Ok(PromotionContext {
-            source: current,
-            target: config.rolling_branch.clone(),
-            gates: config.roll_to_rolling_gates.clone(),
-        });
-    }
-    bail!(
+}
+
+fn not_promotable_error(config: &Config, current: &str) -> anyhow::Error {
+    anyhow::anyhow!(
         "branch '{}' is not promotable; expected '{}' or '{}*'",
         current,
         config.rolling_branch,
@@ -402,21 +540,88 @@ fn promotion_context(config: &Config) -> Result<PromotionContext> {
     )
 }
 
-fn validate_fast_forward(config: &Config, source: &str, target: &str) -> Result<()> {
-    if !git::ref_exists(&config.repo_root, source) {
-        bail!("source branch '{}' not found", source);
+fn target_missing_error(config: &Config, target: &str) -> String {
+    if git::ref_exists(&config.repo_root, &format!("origin/{target}")) {
+        format!(
+            "target branch '{target}' not found locally; create it with `git branch {target} origin/{target}`"
+        )
+    } else {
+        format!("target branch '{target}' not found")
     }
-    if !git::ref_exists(&config.repo_root, target) {
-        bail!("target branch '{}' not found", target);
+}
+
+/// Pure git-topology classification of a prospective merge.
+#[derive(Debug, PartialEq, Eq)]
+enum MergeState {
+    /// Target is strictly behind source; a merge is trivially clean.
+    FastForwardable,
+    /// Both sides have unique commits — mergeable via --no-ff.
+    Diverged,
+    /// Source is an ancestor of target (or tips are equal).
+    NothingToMerge,
+    /// No local target branch.
+    TargetMissing,
+    /// No common merge base.
+    UnrelatedHistories,
+}
+
+fn classify_merge(repo: &std::path::Path, source: &str, target: &str) -> Result<MergeState> {
+    if !git::ref_exists(repo, target) {
+        return Ok(MergeState::TargetMissing);
     }
-    let ff_ok = git::is_ancestor(&config.repo_root, target, source)?;
-    if !ff_ok {
+    let source_sha = git::rev_parse(repo, source)
+        .with_context(|| format!("source branch '{source}' not found"))?;
+    let target_sha = git::rev_parse(repo, target)?;
+    if source_sha == target_sha {
+        return Ok(MergeState::NothingToMerge);
+    }
+    if git::is_ancestor(repo, source, target)? {
+        return Ok(MergeState::NothingToMerge);
+    }
+    if git::is_ancestor(repo, target, source)? {
+        return Ok(MergeState::FastForwardable);
+    }
+    match git::merge_base(repo, source, target) {
+        Ok(_) => Ok(MergeState::Diverged),
+        Err(_) => Ok(MergeState::UnrelatedHistories),
+    }
+}
+
+/// Merge `source` into `target` with `--no-ff` and a structured message, then
+/// return to the branch we started on. On merge failure the merge is aborted
+/// and the original checkout restored. Reused by future hotfix/revert flows.
+fn run_merge(
+    repo: &std::path::Path,
+    source: &str,
+    target: &str,
+    subject: &str,
+    body: Option<&str>,
+) -> Result<()> {
+    let original = git::current_branch(repo)?;
+
+    git::run_git(repo, &["checkout", target])
+        .with_context(|| format!("failed to check out '{target}'"))?;
+
+    let mut merge_args = vec!["merge", "--no-ff", "--no-edit", "-m", subject];
+    if let Some(body) = body {
+        merge_args.push("-m");
+        merge_args.push(body);
+    }
+    merge_args.push(source);
+
+    if let Err(merge_err) = git::run_git(repo, &merge_args) {
+        let _ = git::run_git(repo, &["merge", "--abort"]);
+        let _ = git::run_git(repo, &["checkout", &original]);
         bail!(
-            "fast-forward-only promotion blocked: '{}' is not ancestor of '{}'",
-            target,
-            source
+            "merge of '{source}' into '{target}' failed (likely conflicts); \
+             the merge was aborted and you are back on '{original}'. \
+             Resolve manually: git checkout {target} && git merge --no-ff {source} ({merge_err})"
         );
     }
+
+    git::run_git(repo, &["checkout", &original]).with_context(|| {
+        format!("the merge into '{target}' succeeded, but checking out '{original}' again failed")
+    })?;
     Ok(())
 }
 
@@ -494,6 +699,95 @@ fn branch_tier(config: &Config, current: &str, detached: bool) -> String {
         return "roll".to_string();
     }
     "other".to_string()
+}
+
+/// Advisory promotion readiness for `status --json` (and the future status
+/// TUI). Never errors; whenever `ready` is false, `reason` explains why.
+/// Deliberately conservative: a diverged target reports not-ready with an
+/// explanation even though `rf graduate`/`rf promote` would still succeed.
+fn promotion_readiness(
+    config: &Config,
+    current: &str,
+    clean: bool,
+    detached: bool,
+) -> PromotionReadiness {
+    let not_ready = |description: String, reason: String| PromotionReadiness {
+        description,
+        ready: false,
+        reason: Some(reason),
+    };
+
+    if detached {
+        return not_ready(
+            "none".to_string(),
+            "detached HEAD is not supported".to_string(),
+        );
+    }
+
+    let Some(route) = infer_route(config, current) else {
+        return not_ready(
+            "none".to_string(),
+            not_promotable_error(config, current).to_string(),
+        );
+    };
+
+    let (source, target, verb) = match &route {
+        Route::Graduate { roll } => (roll.clone(), config.rolling_branch.clone(), "graduate"),
+        Route::Promote => (
+            config.rolling_branch.clone(),
+            config.stable_branch.clone(),
+            "promote",
+        ),
+    };
+    let description = format!("{source} -> {target}");
+
+    if !clean {
+        return not_ready(description, "working tree must be clean".to_string());
+    }
+
+    if let Route::Graduate { roll } = &route {
+        if branches::check_promoted(&config.repo_root, roll, &config.stable_branch) {
+            return not_ready(
+                description,
+                format!(
+                    "'{}' has already been promoted to '{}'",
+                    roll, config.stable_branch
+                ),
+            );
+        }
+    }
+
+    match classify_merge(&config.repo_root, &source, &target) {
+        Ok(MergeState::TargetMissing) => {
+            not_ready(description, target_missing_error(config, &target))
+        }
+        Ok(MergeState::UnrelatedHistories) => not_ready(
+            description,
+            format!("'{source}' and '{target}' share no common history"),
+        ),
+        Ok(MergeState::NothingToMerge) => {
+            let graduated = matches!(&route, Route::Graduate { roll }
+                if branches::check_graduated(&config.repo_root, roll, &config.rolling_branch));
+            let reason = if graduated {
+                format!("'{source}' is already graduated into '{target}' — nothing new to merge")
+            } else {
+                format!("nothing to merge: '{source}' has no commits that '{target}' lacks")
+            };
+            not_ready(description, reason)
+        }
+        Ok(MergeState::Diverged) => not_ready(
+            description,
+            format!(
+                "'{target}' has commits not in '{source}'; rf {verb} will create a --no-ff merge"
+            ),
+        ),
+        Ok(MergeState::FastForwardable) => PromotionReadiness {
+            description,
+            ready: true,
+            reason: None,
+        },
+        Err(err) => not_ready(description, err.to_string()),
+    }
 }
 
 #[derive(Serialize)]

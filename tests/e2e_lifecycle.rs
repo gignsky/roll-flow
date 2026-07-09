@@ -1,21 +1,14 @@
 //! End-to-end lifecycle + divergence scenarios (issue #9), driven through the
 //! shared [`harness::Sandbox`].
 //!
-//! Two kinds of tests live here:
-//!
-//! * **Active** tests exercise the pipeline as it behaves today and gate every
-//!   PR via CI.
-//! * **`#[ignore]`d** tests encode the *correct* post-fix semantics from
-//!   `CLAUDE.md` (structured `--no-ff` merges, divergence tolerance, a real
-//!   `status --json` reason). They fail against today's fast-forward-only
-//!   promotion and are un-ignored by epic #2 as each piece lands — the `ignore`
-//!   reason names the issue that unblocks them.
+//! These encode the merge-based semantics from `CLAUDE.md` and epic #2:
+//! structured `--no-ff` graduation/promotion merges, divergence tolerance,
+//! conflict abort-and-restore, and a real `status --json` reason on every
+//! not-ready path.
 
 mod harness;
 
 use harness::Sandbox;
-
-// ── active coverage (passes today) ────────────────────────────────────────
 
 #[test]
 fn happy_path_content_reaches_main() {
@@ -88,10 +81,7 @@ fn listing_tolerates_generation_bump_commits() {
     );
 }
 
-// ── forward-looking coverage (un-ignored by epic #2) ──────────────────────
-
 #[test]
-#[ignore = "requires epic #2 / issue #11: --no-ff graduation with structured subject"]
 fn graduate_creates_noff_merge_with_subject() {
     let sb = Sandbox::plain();
     sb.init();
@@ -115,7 +105,6 @@ fn graduate_creates_noff_merge_with_subject() {
 }
 
 #[test]
-#[ignore = "requires epic #2 / issue #11: rolling->main promotion writes a 'Promote …' subject"]
 fn promote_writes_promote_subject_on_main() {
     let sb = Sandbox::plain();
     sb.init();
@@ -134,10 +123,9 @@ fn promote_writes_promote_subject_on_main() {
 }
 
 #[test]
-#[ignore = "requires epic #2 / issue #12: divergence-tolerant graduation"]
 fn graduation_tolerates_diverged_rolling() {
     // rolling advances independently after the roll is branched, so it is no
-    // longer an ancestor of the roll — today's fast-forward-only path bails.
+    // longer an ancestor of the roll — the --no-ff merge handles it.
     let sb = Sandbox::plain();
     sb.init();
     sb.git(&["checkout", "rolling"]);
@@ -161,7 +149,6 @@ fn graduation_tolerates_diverged_rolling() {
 }
 
 #[test]
-#[ignore = "requires epic #2 / issue #13: status --json explains a non-promotable diverged roll"]
 fn status_json_reason_on_diverged_roll() {
     let sb = Sandbox::plain();
     sb.init();
@@ -183,7 +170,6 @@ fn status_json_reason_on_diverged_roll() {
 }
 
 #[test]
-#[ignore = "requires epic #2: state detection sees the --no-ff graduation merge"]
 fn roll_reports_graduated_after_graduate() {
     let sb = Sandbox::plain();
     sb.init();
@@ -194,5 +180,78 @@ fn roll_reports_graduated_after_graduate() {
     assert_eq!(
         sb.roll_state("roll/1-0611-feature").as_deref(),
         Some("✓ graduated")
+    );
+}
+
+#[test]
+fn graduation_conflict_aborts_and_restores() {
+    // A conflicting merge must be aborted cleanly: no half-merged state, no
+    // MERGE_HEAD left behind, and we end up back on the roll branch.
+    let sb = Sandbox::plain();
+    sb.init();
+    sb.git(&["checkout", "rolling"]);
+    sb.git(&["checkout", "-b", "roll/1-0611-conflict"]);
+    sb.commit_file("clash.txt", "roll side\n", "roll edit");
+
+    sb.git(&["checkout", "rolling"]);
+    sb.commit_file("clash.txt", "rolling side\n", "rolling edit");
+
+    sb.git(&["checkout", "roll/1-0611-conflict"]);
+    let out = sb.rf(&["graduate"]);
+    assert!(!out.success, "conflicting graduation should fail");
+    assert!(
+        out.combined().contains("aborted"),
+        "error should mention the abort: {}",
+        out.combined()
+    );
+
+    assert_eq!(sb.current_branch(), "roll/1-0611-conflict");
+    // Only the untracked config may remain — no conflict/merge entries.
+    let leftover: Vec<String> = sb
+        .git(&["status", "--porcelain"])
+        .lines()
+        .filter(|l| !l.ends_with(".roll-flow.toml"))
+        .map(|l| l.to_string())
+        .collect();
+    assert!(
+        leftover.is_empty(),
+        "working tree should be clean after abort: {leftover:?}"
+    );
+    let (merge_in_progress, _, _) = sb.git_try(&["rev-parse", "-q", "--verify", "MERGE_HEAD"]);
+    assert!(
+        !merge_in_progress,
+        "MERGE_HEAD should not exist after abort"
+    );
+}
+
+#[test]
+fn multi_roll_promote_marks_all_promoted() {
+    // One promotion merge can carry several graduated rolls; all of them must
+    // be detected as promoted afterward.
+    let sb = Sandbox::plain();
+    sb.init();
+
+    sb.create_roll("alpha", "0611");
+    sb.commit_file("alpha.txt", "a\n", "alpha work");
+    assert!(sb.rf(&["graduate"]).success, "graduate alpha");
+
+    sb.git(&["checkout", "rolling"]);
+    let out = sb.create_roll("beta", "0612");
+    assert!(out.success, "create beta: {}", out.combined());
+    sb.commit_file("beta.txt", "b\n", "beta work");
+    assert!(sb.rf(&["graduate"]).success, "graduate beta");
+
+    sb.git(&["checkout", "rolling"]);
+    let out = sb.rf(&["promote"]);
+    assert!(out.success, "promote: {}", out.combined());
+
+    assert_eq!(sb.tip_subject("main"), "Promote rolling to main");
+    assert_eq!(
+        sb.roll_state("roll/1-0611-alpha").as_deref(),
+        Some("✓ promoted")
+    );
+    assert_eq!(
+        sb.roll_state("roll/2-0612-beta").as_deref(),
+        Some("✓ promoted")
     );
 }
