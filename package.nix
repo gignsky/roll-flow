@@ -5,7 +5,7 @@
 }:
 rustPlatform.buildRustPackage {
   pname = "roll-flow";
-  version = "0.1.0";
+  version = "0.0.6";
   src = lib.cleanSource ./.;
   cargoLock.lockFile = ./Cargo.lock;
 
