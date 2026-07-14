@@ -120,6 +120,8 @@ rolling_to_main_gates = []
 
 Gate entries are shell commands run in repo root. Any failure blocks verify/promote.
 
+See [CONTRIBUTING.md](CONTRIBUTING.md) for how this repo uses roll-flow on itself.
+
 ## Testing
 
 ```bash
