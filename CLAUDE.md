@@ -10,6 +10,10 @@ Nushell script (`scripts/roll-flow` in the dotfiles repo) and is packaged via gi
 
 The dotfiles repo is at `~/.dotfiles`. The gigpkgs repo is at `~/local_repos/gigpkgs`.
 
+This repo also dogfoods its own model on itself (see `.roll-flow.toml` at the
+repo root and [CONTRIBUTING.md](CONTRIBUTING.md)) — distinct from, and not to
+be confused with, its role managing the dotfiles repo described below.
+
 ## Architecture
 
 Pure Rust binary. No shell script intermediary layer.
