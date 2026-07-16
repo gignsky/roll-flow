@@ -39,8 +39,16 @@ fn main() -> Result<()> {
         } => cmd_create(&slug, date, dry_run)?,
         Cmd::Integrate { branch } => cmd_integrate(&branch)?,
         Cmd::Verify { dry_run } => cmd_verify(dry_run)?,
-        Cmd::Graduate { dry_run } => cmd_graduate(dry_run)?,
-        Cmd::Promote { dry_run } => cmd_promote(dry_run)?,
+        Cmd::Graduate {
+            dry_run,
+            force,
+            reason,
+        } => cmd_graduate(dry_run, force, reason)?,
+        Cmd::Promote {
+            dry_run,
+            force,
+            reason,
+        } => cmd_promote(dry_run, force, reason)?,
         Cmd::Status { no_tui, json } => {
             if json {
                 cmd_status_json()?;
@@ -191,12 +199,18 @@ fn cmd_verify(dry_run: bool) -> Result<()> {
         MergeState::FastForwardable => {}
     }
 
-    run_gates(&config.repo_root, gates, dry_run)?;
+    run_gates(
+        &config.repo_root,
+        gates,
+        dry_run,
+        &ForceOpts::new(false, None)?,
+    )?;
     println!("Verification passed: {} -> {}", source, target);
     Ok(())
 }
 
-fn cmd_graduate(dry_run: bool) -> Result<()> {
+fn cmd_graduate(dry_run: bool, force: bool, reason: Option<String>) -> Result<()> {
+    let force = ForceOpts::new(force, reason)?;
     let config = Config::load()?;
     ensure_clean_state(&config)?;
     let current = git::current_branch(&config.repo_root)?;
@@ -209,10 +223,11 @@ fn cmd_graduate(dry_run: bool) -> Result<()> {
             config.stable_branch
         );
     }
-    graduate_branch(&config, &current, dry_run)
+    graduate_branch(&config, &current, dry_run, &force)
 }
 
-fn cmd_promote(dry_run: bool) -> Result<()> {
+fn cmd_promote(dry_run: bool, force: bool, reason: Option<String>) -> Result<()> {
+    let force = ForceOpts::new(force, reason)?;
     let config = Config::load()?;
     ensure_clean_state(&config)?;
     let current = git::current_branch(&config.repo_root)?;
@@ -222,16 +237,16 @@ fn cmd_promote(dry_run: bool) -> Result<()> {
                 "note: '{}' is a roll branch; graduating into '{}' — use rf graduate directly next time",
                 roll, config.rolling_branch
             );
-            graduate_branch(&config, &roll, dry_run)
+            graduate_branch(&config, &roll, dry_run, &force)
         }
-        Some(Route::Promote) => promote_rolling(&config, dry_run),
+        Some(Route::Promote) => promote_rolling(&config, dry_run, &force),
         None => Err(not_promotable_error(&config, &current)),
     }
 }
 
 /// Graduate `roll` into the rolling branch with a structured `--no-ff` merge.
 /// Shared by `rf graduate` and the `rf promote` fall-through.
-fn graduate_branch(config: &Config, roll: &str, dry_run: bool) -> Result<()> {
+fn graduate_branch(config: &Config, roll: &str, dry_run: bool, force: &ForceOpts) -> Result<()> {
     let repo = &config.repo_root;
     if branches::check_promoted(repo, roll, &config.stable_branch) {
         bail!(
@@ -255,7 +270,7 @@ fn graduate_branch(config: &Config, roll: &str, dry_run: bool) -> Result<()> {
         MergeState::Diverged | MergeState::FastForwardable => {}
     }
 
-    run_gates(repo, &config.roll_to_rolling_gates, dry_run)?;
+    let bypassed = run_gates(repo, &config.roll_to_rolling_gates, dry_run, force)?;
 
     if dry_run {
         println!("Dry-run: would graduate '{roll}' into '{rolling}' (--no-ff)");
@@ -263,13 +278,14 @@ fn graduate_branch(config: &Config, roll: &str, dry_run: bool) -> Result<()> {
     }
 
     let subject = format!("Graduate {roll} into {rolling}");
-    run_merge(repo, roll, rolling, &subject, None)?;
+    let body = force.trailer(&bypassed);
+    run_merge(repo, roll, rolling, &subject, body.as_deref())?;
     println!("Graduated '{roll}' into '{rolling}'");
     Ok(())
 }
 
 /// Promote the rolling branch into stable with a structured `--no-ff` merge.
-fn promote_rolling(config: &Config, dry_run: bool) -> Result<()> {
+fn promote_rolling(config: &Config, dry_run: bool, force: &ForceOpts) -> Result<()> {
     let repo = &config.repo_root;
     let rolling = &config.rolling_branch;
     let stable = &config.stable_branch;
@@ -287,7 +303,7 @@ fn promote_rolling(config: &Config, dry_run: bool) -> Result<()> {
         MergeState::Diverged | MergeState::FastForwardable => {}
     }
 
-    run_gates(repo, &config.rolling_to_main_gates, dry_run)?;
+    let bypassed = run_gates(repo, &config.rolling_to_main_gates, dry_run, force)?;
 
     if dry_run {
         println!("Dry-run: would promote '{rolling}' into '{stable}' (--no-ff)");
@@ -295,6 +311,7 @@ fn promote_rolling(config: &Config, dry_run: bool) -> Result<()> {
     }
 
     let (subject, body) = promote_subject_and_body(config)?;
+    let body = ForceOpts::append_trailer(body, force.trailer(&bypassed));
     run_merge(repo, rolling, stable, &subject, body.as_deref())?;
     println!("Promoted '{rolling}' into '{stable}'");
     Ok(())
@@ -625,10 +642,27 @@ fn run_merge(
     Ok(())
 }
 
-fn run_gates(repo: &std::path::Path, gates: &[String], dry_run: bool) -> Result<()> {
+/// A gate that failed but was bypassed under `--force`: the command and its
+/// exit code (`None` if terminated by a signal).
+struct GateBypass {
+    gate: String,
+    code: Option<i32>,
+}
+
+/// Run the configured gates. Without `--force`, a failing gate aborts the
+/// operation (the normal hard block). With `--force`, all gates still run but
+/// failures are collected and returned so the caller can record them in the
+/// merge commit instead of aborting.
+fn run_gates(
+    repo: &std::path::Path,
+    gates: &[String],
+    dry_run: bool,
+    force: &ForceOpts,
+) -> Result<Vec<GateBypass>> {
+    let mut bypassed = Vec::new();
     if gates.is_empty() {
         println!("No gates configured");
-        return Ok(());
+        return Ok(bypassed);
     }
     for gate in gates {
         if dry_run {
@@ -642,10 +676,73 @@ fn run_gates(repo: &std::path::Path, gates: &[String], dry_run: bool) -> Result<
             .status()
             .with_context(|| format!("failed to run gate: {gate}"))?;
         if !status.success() {
-            bail!("gate failed: {gate}");
+            if force.enabled {
+                eprintln!(
+                    "warning: gate failed but bypassed (--force): {gate} ({})",
+                    exit_desc(status.code())
+                );
+                bypassed.push(GateBypass {
+                    gate: gate.clone(),
+                    code: status.code(),
+                });
+            } else {
+                bail!("gate failed: {gate}");
+            }
         }
     }
-    Ok(())
+    Ok(bypassed)
+}
+
+fn exit_desc(code: Option<i32>) -> String {
+    code.map(|c| format!("exit {c}"))
+        .unwrap_or_else(|| "terminated by signal".to_string())
+}
+
+/// `--force` / `--reason` for graduate and promote. `--force` proceeds past
+/// failing gates; `--reason` (required with `--force`) is recorded verbatim in
+/// the merge commit so every bypass leaves a permanent, auditable trail.
+struct ForceOpts {
+    enabled: bool,
+    reason: Option<String>,
+}
+
+impl ForceOpts {
+    fn new(enabled: bool, reason: Option<String>) -> Result<Self> {
+        if enabled && reason.as_deref().map(str::trim).unwrap_or("").is_empty() {
+            bail!(
+                "--force requires --reason \"<why>\" (the reason is recorded in the merge commit)"
+            );
+        }
+        if !enabled && reason.is_some() {
+            bail!("--reason is only valid together with --force");
+        }
+        Ok(Self { enabled, reason })
+    }
+
+    /// Build the `Forced-Bypass:` / `Force-Reason:` trailer for a merge commit,
+    /// or `None` when nothing was actually bypassed (a `--force` that hit no
+    /// failing gate leaves no marker).
+    fn trailer(&self, bypassed: &[GateBypass]) -> Option<String> {
+        if bypassed.is_empty() {
+            return None;
+        }
+        let mut s = String::from("Forced-Bypass:\n");
+        for b in bypassed {
+            s.push_str(&format!("  gate: {:?} ({})\n", b.gate, exit_desc(b.code)));
+        }
+        let reason = self.reason.as_deref().unwrap_or("(none given)");
+        s.push_str(&format!("Force-Reason: {reason}"));
+        Some(s)
+    }
+
+    /// Append a force trailer to an existing (optional) merge-commit body.
+    fn append_trailer(body: Option<String>, trailer: Option<String>) -> Option<String> {
+        match (body, trailer) {
+            (Some(b), Some(t)) => Some(format!("{b}\n\n{t}")),
+            (Some(b), None) => Some(b),
+            (None, t) => t,
+        }
+    }
 }
 
 fn normalize_slug(input: &str) -> Result<String> {
