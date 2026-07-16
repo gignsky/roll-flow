@@ -55,6 +55,13 @@ pub enum Cmd {
     Graduate {
         #[arg(long)]
         dry_run: bool,
+        /// Proceed past failing gates, recording the bypass in the merge commit.
+        /// Requires --reason.
+        #[arg(long)]
+        force: bool,
+        /// Justification recorded as `Force-Reason:` in the merge commit.
+        #[arg(long)]
+        reason: Option<String>,
     },
 
     /// Promote rolling into the stable branch (--no-ff merge). On a roll
@@ -62,6 +69,13 @@ pub enum Cmd {
     Promote {
         #[arg(long)]
         dry_run: bool,
+        /// Proceed past failing gates, recording the bypass in the merge commit.
+        /// Requires --reason.
+        #[arg(long)]
+        force: bool,
+        /// Justification recorded as `Force-Reason:` in the merge commit.
+        #[arg(long)]
+        reason: Option<String>,
     },
 
     /// Show current roll-flow status.
