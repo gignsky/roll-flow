@@ -1,0 +1,45 @@
+name: Tag on main
+
+# Auto-tags releases: when a push to `main` changes the crate version, create
+# and push a matching `vX.Y.Z` tag. Idempotent — if the tag already exists
+# (version unchanged) it does nothing. The pushed tag triggers release-check.yml.
+on:
+  push:
+    branches: [main]
+
+# Pushing a tag requires write access to repository contents.
+permissions:
+  contents: write
+
+jobs:
+  tag:
+    name: tag main on version change
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          # Full history and all tags so we can detect an existing tag.
+          fetch-depth: 0
+
+      - name: Create and push version tag
+        run: |
+          set -euo pipefail
+          # First top-level `version = "..."` in Cargo.toml is the package version.
+          # Matches release-check.yml's extraction so the two agree by construction.
+          crate="$(grep -m1 -E '^version[[:space:]]*=' Cargo.toml \
+            | sed -E 's/^version[[:space:]]*=[[:space:]]*"([^"]+)".*/\1/')"
+          tag="v$crate"
+          echo "crate version: $crate"
+          echo "candidate tag: $tag"
+
+          if git rev-parse -q --verify "refs/tags/$tag" >/dev/null 2>&1 \
+            || [ -n "$(git tag -l "$tag")" ]; then
+            echo "tag $tag already exists — no version change, skipping"
+            exit 0
+          fi
+
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git tag -a "$tag" -m "Release $tag"
+          git push origin "$tag"
+          echo "created and pushed $tag"
