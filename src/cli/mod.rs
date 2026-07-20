@@ -32,7 +32,7 @@ pub enum Cmd {
         force: bool,
     },
 
-    /// Create a new roll branch from rolling: roll/N-MMDD-slug.
+    /// Create a new roll branch off the stable branch: roll/N-MMDD-slug.
     #[command(visible_alias = "start")]
     Create {
         slug: String,

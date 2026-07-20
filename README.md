@@ -59,7 +59,8 @@ rf version
 ### `create`
 
 - Requires a clean working tree
-- Creates `roll/N-MMDD-slug` from rolling
+- Creates `roll/N-MMDD-slug` off the stable branch (so the roll starts from a clean
+  baseline; rolling and other rolls become dependencies only via `rf integrate`)
 - Computes `N` as next highest roll number
 - Supports `--dry-run`
 
