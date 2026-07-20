@@ -106,8 +106,13 @@ fn cmd_init(
 fn cmd_create(slug: &str, date: Option<String>, dry_run: bool) -> Result<()> {
     let config = Config::load()?;
     ensure_clean_state(&config)?;
-    if !git::ref_exists(&config.repo_root, &config.rolling_branch) {
-        bail!("rolling branch '{}' not found", config.rolling_branch);
+    // A roll is branched off the stable branch, not rolling: it must start from a
+    // clean baseline so `diff(stable, roll)` is exactly the roll's own changes and
+    // dependency detection (core/branches.rs) does not treat everything already on
+    // rolling as an implicit dependency. Rolling and other rolls become dependencies
+    // only when explicitly merged in via `rf integrate`.
+    if !git::ref_exists(&config.repo_root, &config.stable_branch) {
+        bail!("stable branch '{}' not found", config.stable_branch);
     }
 
     let normalized_slug = normalize_slug(slug)?;
@@ -130,14 +135,14 @@ fn cmd_create(slug: &str, date: Option<String>, dry_run: bool) -> Result<()> {
     if dry_run {
         println!(
             "Dry-run: would create '{}' from '{}'",
-            branch_name, config.rolling_branch
+            branch_name, config.stable_branch
         );
         return Ok(());
     }
 
     git::run_git(
         &config.repo_root,
-        &["checkout", "-b", &branch_name, &config.rolling_branch],
+        &["checkout", "-b", &branch_name, &config.stable_branch],
     )?;
     println!("Created {}", branch_name);
     Ok(())

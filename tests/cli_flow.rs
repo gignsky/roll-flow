@@ -77,6 +77,35 @@ fn promote_requires_clean_tree() {
 }
 
 #[test]
+fn create_branches_off_stable_not_rolling() {
+    // A roll must start from the stable branch so its baseline is clean and it
+    // does not implicitly depend on whatever has accumulated on rolling. Only an
+    // explicit `rf integrate` should pull another branch's work into a roll (#62).
+    let sb = Sandbox::plain();
+    let out = sb.init();
+    assert!(out.success, "init failed: {}", out.combined());
+
+    // Advance rolling beyond stable so the two branch tips genuinely differ.
+    sb.git(&["checkout", "rolling"]);
+    sb.commit_file("rolling-only.txt", "r\n", "rolling advances");
+    sb.git(&["checkout", "main"]);
+
+    let out = sb.create_roll("feature", "0611");
+    assert!(out.success, "create failed: {}", out.combined());
+
+    // The roll is branched off stable (main): main is an ancestor of the roll,
+    // and rolling's extra commit is NOT in the roll's history.
+    assert!(
+        sb.is_ancestor("main", "roll/1-0611-feature"),
+        "stable should be an ancestor of the freshly created roll"
+    );
+    assert!(
+        !sb.is_ancestor("rolling", "roll/1-0611-feature"),
+        "rolling must NOT be an ancestor of a freshly created roll"
+    );
+}
+
+#[test]
 fn integrate_merges_branch_into_roll() {
     let sb = Sandbox::plain();
 
