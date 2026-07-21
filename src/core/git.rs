@@ -151,18 +151,6 @@ pub fn log_with_body(repo: &Path, extra_args: &[&str]) -> Result<Vec<(String, St
     Ok(commits)
 }
 
-// ── Diff helpers ──────────────────────────────────────────────────────────────
-
-/// Files that differ between `from` and `to` (or a single range like `"A..B"`).
-pub fn diff_name_only(repo: &Path, from: &str, to: &str) -> Result<Vec<String>, RfError> {
-    let out = capture_git(repo, &["diff", "--name-only", from, to])?;
-    Ok(out
-        .lines()
-        .map(|l| l.to_string())
-        .filter(|l| !l.is_empty())
-        .collect())
-}
-
 // ── Ancestry / merge helpers ──────────────────────────────────────────────────
 
 /// True if `candidate` is an ancestor of `descendant`.
