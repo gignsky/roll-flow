@@ -933,6 +933,7 @@ fn push_gate_notices(lines: &mut Vec<String>, notices: &[ops::GateNotice]) {
         match notice {
             ops::GateNotice::NoGates => lines.push("No gates configured".to_string()),
             ops::GateNotice::DryRun(gate) => lines.push(format!("Dry-run gate: {gate}")),
+            ops::GateNotice::DryRunHost(gate) => lines.push(format!("Dry-run host gate: {gate}")),
             ops::GateNotice::Bypassed { gate, code } => lines.push(format!(
                 "warning: gate failed but bypassed (--force): {gate} ({})",
                 ops::exit_desc(*code)

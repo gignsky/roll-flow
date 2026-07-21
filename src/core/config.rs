@@ -59,6 +59,12 @@ pub struct Config {
     pub roll_to_rolling_gates: Vec<String>,
     #[serde(default)]
     pub rolling_to_main_gates: Vec<String>,
+    /// Per-host verification gate templates (issue #106). Each entry is a shell
+    /// command in which the token `{host}` is substituted with each active host
+    /// name before running. Empty by default, so configs that predate this field
+    /// (and repos that want no host gating) are a clean no-op.
+    #[serde(default)]
+    pub host_gates: Vec<String>,
 }
 
 impl Config {
@@ -131,6 +137,7 @@ impl Config {
             host_active,
             roll_to_rolling_gates: vec![],
             rolling_to_main_gates: vec![],
+            host_gates: vec![],
         })
     }
 
@@ -309,6 +316,7 @@ mod tests {
             host_active: Default::default(),
             roll_to_rolling_gates: vec![],
             rolling_to_main_gates: vec![],
+            host_gates: vec![],
         };
         let updated = cfg.with_overrides(
             Some("rolling".to_string()),
@@ -337,6 +345,7 @@ mod tests {
             host_active: Default::default(),
             roll_to_rolling_gates: vec![],
             rolling_to_main_gates: vec![],
+            host_gates: vec![],
         };
         let rendered = cfg.to_toml_string().expect("render");
         assert!(
