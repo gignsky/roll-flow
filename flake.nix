@@ -2,8 +2,12 @@
   description = "roll-flow (rf) — structured NixOS dotfiles workflow manager";
 
   inputs = {
-    nixpkgs.url = "github:gignsky/gigpkgs-unstable";
-    pre-commit-hooks.follows = "nixpkgs/pre-commit-hooks";
+    gigpkgs = {
+      url = "github:gignsky/gigpkgs";
+      inputs.nixpkgs.follows = "gigpkgs/nixpkgs-unstable";
+    };
+    nixpkgs.follows = "gigpkgs";
+    pre-commit-hooks.follows = "gigpkgs/pre-commit-hooks";
   };
 
   outputs =
