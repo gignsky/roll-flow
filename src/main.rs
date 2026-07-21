@@ -138,12 +138,27 @@ fn cmd_create(slug: &str, date: Option<String>, dry_run: bool) -> Result<()> {
     Ok(())
 }
 
-fn cmd_integrate(branch: &str) -> Result<()> {
+fn cmd_integrate(arg: &str) -> Result<()> {
     let config = Config::load()?;
     ops::ensure_clean_state(&config)?;
-    let outcome = ops::integrate(&config, branch)?;
+    let branch = resolve_integrate_target(&config, arg)?;
+    let outcome = ops::integrate(&config, &branch)?;
     println!("integrated {} into {}", outcome.branch, outcome.current);
     Ok(())
+}
+
+/// Resolve the `integrate` argument to a branch name. A bare positive integer is
+/// looked up as a roll number and mapped to its `roll/<N>-…` branch; anything
+/// else is treated verbatim as a branch name (back-compatible).
+fn resolve_integrate_target(config: &Config, arg: &str) -> Result<String> {
+    let Ok(number) = arg.parse::<u32>() else {
+        return Ok(arg.to_string());
+    };
+    let rolls = branches::list_rolls(config)?;
+    match rolls.into_iter().find(|r| r.number == number) {
+        Some(roll) => Ok(roll.branch),
+        None => bail!("no roll with number {number}"),
+    }
 }
 
 fn cmd_hotfix_create(slug: &str, date: Option<String>, dry_run: bool) -> Result<()> {
