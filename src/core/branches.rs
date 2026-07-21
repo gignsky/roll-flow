@@ -300,8 +300,12 @@ fn scan_promoted(repo: &Path, stable_ref: &str) -> HashSet<String> {
     promoted
 }
 
-/// Extract the branch name from a graduation subject line.
-/// Handles both `Merge branch 'roll/N-...'[...]` and `Graduate roll/N-... [...]`.
+/// Extract the branch name from a graduation subject line. Handles the three
+/// merge-subject shapes a roll can land through:
+/// - `Merge branch 'roll/N-...'[ into ...]` — a local `git merge --no-ff`.
+/// - `Graduate roll/N-... [...]` — an `rf graduate` structured merge.
+/// - `Merge pull request #M from OWNER/roll/N-...` — a GitHub PR merge, which is
+///   how PR-based repos (including roll-flow dogfooding itself) land rolls.
 fn extract_graduated_branch(subject: &str) -> Option<String> {
     if let Some(rest) = subject.strip_prefix("Merge branch '") {
         // e.g. "roll/5-theme'" or "roll/5-theme' into rolling"
@@ -309,6 +313,13 @@ fn extract_graduated_branch(subject: &str) -> Option<String> {
     } else if let Some(rest) = subject.strip_prefix("Graduate ") {
         // e.g. "roll/5-theme into rolling"
         rest.split_whitespace().next().map(|b| b.to_string())
+    } else if subject.starts_with("Merge pull request #") {
+        // "Merge pull request #M from OWNER/BRANCH" — split off the owner only,
+        // since BRANCH itself contains '/' (e.g. "gignsky/roll/5-theme").
+        subject
+            .split_once(" from ")
+            .and_then(|(_, owner_branch)| owner_branch.split_once('/'))
+            .map(|(_owner, branch)| branch.trim().to_string())
     } else {
         None
     }
@@ -363,26 +374,19 @@ fn integration_deps(
 }
 
 /// Find the git hash of the merge/graduation commit for `roll_branch` on
-/// `rolling_ref`.  Returns `None` if no graduation commit is found.
+/// `rolling_ref`.  Returns `None` if no graduation commit is found. Scans merge
+/// commits and matches subjects through [`extract_graduated_branch`], so all
+/// three merge-subject shapes (local `Merge branch`, `Graduate`, and GitHub
+/// `Merge pull request`) are recognized from one source of truth.
 fn find_graduation_commit(repo: &Path, roll_branch: &str, rolling_ref: &str) -> Option<String> {
-    for pattern in [
-        format!("Merge branch '{roll_branch}'"),
-        format!("Graduate {roll_branch}"),
-    ] {
-        if let Ok(hash) = git::capture_git(
-            repo,
-            &[
-                "log",
-                "--format=%H",
-                &format!("--grep={pattern}"),
-                "--fixed-strings",
-                "-1",
-                rolling_ref,
-            ],
-        ) {
-            if !hash.is_empty() {
-                return Some(hash);
-            }
+    let out =
+        git::capture_git(repo, &["log", "--merges", "--format=%H%x09%s", rolling_ref]).ok()?;
+    for line in out.lines() {
+        let Some((hash, subject)) = line.split_once('\t') else {
+            continue;
+        };
+        if extract_graduated_branch(subject).as_deref() == Some(roll_branch) {
+            return Some(hash.to_string());
         }
     }
     None
@@ -390,12 +394,43 @@ fn find_graduation_commit(repo: &Path, roll_branch: &str, rolling_ref: &str) -> 
 
 #[cfg(test)]
 mod tests {
-    use super::parse_roll_number;
+    use super::{extract_graduated_branch, parse_roll_number};
 
     #[test]
     fn parses_roll_number() {
         assert_eq!(parse_roll_number("roll/12-0611-cli", "roll/"), Some(12));
         assert_eq!(parse_roll_number("roll/x-0611-cli", "roll/"), None);
         assert_eq!(parse_roll_number("feature/foo", "roll/"), None);
+    }
+
+    #[test]
+    fn extracts_branch_from_all_merge_subject_shapes() {
+        // Local `git merge --no-ff`.
+        assert_eq!(
+            extract_graduated_branch("Merge branch 'roll/5-0611-theme' into develop").as_deref(),
+            Some("roll/5-0611-theme")
+        );
+        // `rf graduate` structured merge.
+        assert_eq!(
+            extract_graduated_branch("Graduate roll/5-0611-theme into develop").as_deref(),
+            Some("roll/5-0611-theme")
+        );
+        // GitHub PR merge — the format PR-based repos (and dogfooding) land through.
+        assert_eq!(
+            extract_graduated_branch(
+                "Merge pull request #87 from gignsky/roll/16-0721-tui-dependents"
+            )
+            .as_deref(),
+            Some("roll/16-0721-tui-dependents")
+        );
+        // A non-roll PR merge extracts the branch but won't parse as a roll number.
+        assert_eq!(
+            extract_graduated_branch("Merge pull request #99 from gignsky/claude/some-fix")
+                .as_deref(),
+            Some("claude/some-fix")
+        );
+        assert_eq!(parse_roll_number("claude/some-fix", "roll/"), None);
+        // Unrelated subject.
+        assert_eq!(extract_graduated_branch("chore: bump version"), None);
     }
 }
