@@ -302,6 +302,14 @@ fn cmd_verify(dry_run: bool) -> Result<()> {
         );
     }
     render_gate_notices(&outcome.gate_notices);
+    render_gate_notices(&outcome.host_notices);
+    render_host_results(&outcome.host_results);
+    if !outcome.failed_hosts.is_empty() {
+        bail!(
+            "host verification failed: {}",
+            outcome.failed_hosts.join(", ")
+        );
+    }
     println!(
         "Verification passed: {} -> {}",
         outcome.source, outcome.target
@@ -345,6 +353,8 @@ fn cmd_promote(dry_run: bool, force: bool, reason: Option<String>) -> Result<()>
         Some(ops::Route::Promote) => {
             let outcome = ops::promote(&config, dry_run, &force)?;
             render_gate_notices(&outcome.gate_notices);
+            render_gate_notices(&outcome.host_notices);
+            render_host_results(&outcome.host_results);
             if outcome.dry_run {
                 println!(
                     "Dry-run: would promote '{}' into '{}' (--no-ff)",
@@ -378,11 +388,26 @@ fn render_gate_notices(notices: &[ops::GateNotice]) {
         match notice {
             ops::GateNotice::NoGates => println!("No gates configured"),
             ops::GateNotice::DryRun(gate) => println!("Dry-run gate: {gate}"),
+            ops::GateNotice::DryRunHost(gate) => println!("Dry-run host gate: {gate}"),
             ops::GateNotice::Bypassed { gate, code } => eprintln!(
                 "warning: gate failed but bypassed (--force): {gate} ({})",
                 ops::exit_desc(*code)
             ),
         }
+    }
+}
+
+/// Render the per-host verification summary that `rf verify`/`rf promote`
+/// produce when host gates ran. Prints nothing when no host gates executed (no
+/// host gates configured, or no active hosts), so unaffected repos stay quiet.
+fn render_host_results(results: &[ops::HostResult]) {
+    if results.is_empty() {
+        return;
+    }
+    println!("Host verification:");
+    for result in results {
+        let status = if result.passed() { "PASSED" } else { "FAILED" };
+        println!("  {}: {status}", result.host);
     }
 }
 

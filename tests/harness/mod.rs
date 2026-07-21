@@ -162,6 +162,41 @@ impl Sandbox {
         self.rf(&["create", slug, "--date", date])
     }
 
+    /// Rewrite the `host_gates` array in the sandbox's `.roll-flow.toml`
+    /// in place (call after `rf init`). Each entry is emitted as a TOML string,
+    /// so `{host}` templates and shell snippets round-trip verbatim. Replacing
+    /// the existing line preserves its position ahead of the `[host_active]`
+    /// table, so the key stays a root-level field.
+    pub fn set_host_gates(&self, gates: &[&str]) {
+        let path = self.path().join(".roll-flow.toml");
+        let existing = fs::read_to_string(&path).expect("read config");
+        let rendered = gates
+            .iter()
+            .map(|g| format!("{g:?}"))
+            .collect::<Vec<_>>()
+            .join(", ");
+        let new_line = format!("host_gates = [{rendered}]");
+        let mut replaced = false;
+        let lines: Vec<String> = existing
+            .lines()
+            .map(|l| {
+                if l.trim_start().starts_with("host_gates") {
+                    replaced = true;
+                    new_line.clone()
+                } else {
+                    l.to_string()
+                }
+            })
+            .collect();
+        assert!(
+            replaced,
+            "no host_gates line to replace in config:\n{existing}"
+        );
+        let mut text = lines.join("\n");
+        text.push('\n');
+        fs::write(&path, text).expect("write config");
+    }
+
     // ── assertions on git state ───────────────────────────────────────────
 
     /// True if a local branch named `name` exists.

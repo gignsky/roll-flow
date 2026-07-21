@@ -232,6 +232,8 @@ pub(crate) enum GateNotice {
     NoGates,
     /// Dry-run: a gate that would have executed.
     DryRun(String),
+    /// Dry-run: a per-host gate that would have executed (already `{host}`-substituted).
+    DryRunHost(String),
     /// A gate failed but was bypassed under `--force`.
     Bypassed { gate: String, code: Option<i32> },
 }
@@ -286,6 +288,108 @@ fn run_gates(
         }
     }
     Ok(GateReport { bypassed, notices })
+}
+
+// ── Per-host verification gates (issue #106) ────────────────────────────────
+
+/// Outcome of the host gates for a single active host. A host PASSES iff every
+/// one of its gates exited 0 — i.e. `failures` is empty.
+pub(crate) struct HostResult {
+    pub host: String,
+    pub failures: Vec<GateBypass>,
+}
+
+impl HostResult {
+    pub(crate) fn passed(&self) -> bool {
+        self.failures.is_empty()
+    }
+}
+
+/// The result of running the per-host verification gates across every active
+/// host: the per-host pass/fail breakdown, any bypassed failures (for the merge
+/// trailer, only populated under `--force`), and the notices to render.
+pub(crate) struct HostReport {
+    pub results: Vec<HostResult>,
+    pub notices: Vec<GateNotice>,
+    pub bypassed: Vec<GateBypass>,
+}
+
+impl HostReport {
+    /// Active hosts whose gates failed (non-empty only when a host did not pass).
+    pub(crate) fn failed_hosts(&self) -> Vec<String> {
+        self.results
+            .iter()
+            .filter(|r| !r.passed())
+            .map(|r| r.host.clone())
+            .collect()
+    }
+}
+
+/// Run the configured host gates once per **active** host, substituting the
+/// `{host}` token in each template. A host passes iff all its gates exit 0.
+///
+/// Mirrors [`run_gates`] semantics: `dry_run` prints (via notices) and runs
+/// nothing; under `--force` a failing gate is recorded as a bypass rather than
+/// blocking. Unlike `run_gates`, this never bails on a failing gate on its own —
+/// it always returns the full per-host breakdown so the caller can name every
+/// failed host and still surface the hosts that passed. The caller enforces the
+/// hard block when not forcing.
+///
+/// If `host_gates` is empty or there are no active hosts, the report is empty
+/// (a total no-op — roll-flow's own repo, with no host gates, is unaffected).
+fn run_host_gates(config: &Config, dry_run: bool, force: &ForceOpts) -> Result<HostReport> {
+    let mut results = Vec::new();
+    let mut notices = Vec::new();
+    let mut bypassed = Vec::new();
+
+    let hosts = config.active_hosts();
+    if config.host_gates.is_empty() || hosts.is_empty() {
+        return Ok(HostReport {
+            results,
+            notices,
+            bypassed,
+        });
+    }
+
+    for host in hosts {
+        let mut failures = Vec::new();
+        for template in &config.host_gates {
+            let cmd = template.replace("{host}", &host);
+            if dry_run {
+                notices.push(GateNotice::DryRunHost(cmd));
+                continue;
+            }
+            let status = Command::new("sh")
+                .arg("-c")
+                .arg(&cmd)
+                .current_dir(&config.repo_root)
+                .status()
+                .with_context(|| format!("failed to run host gate: {cmd}"))?;
+            if !status.success() {
+                if force.enabled {
+                    notices.push(GateNotice::Bypassed {
+                        gate: cmd.clone(),
+                        code: status.code(),
+                    });
+                    bypassed.push(GateBypass {
+                        gate: cmd.clone(),
+                        code: status.code(),
+                    });
+                }
+                failures.push(GateBypass {
+                    gate: cmd,
+                    code: status.code(),
+                });
+            }
+        }
+        results.push(HostResult { host, failures });
+    }
+
+    Ok(HostReport {
+        results,
+        notices,
+        bypassed,
+    })
 }
 
 pub(crate) fn exit_desc(code: Option<i32>) -> String {
@@ -624,6 +728,13 @@ pub(crate) struct VerifyOutcome {
     /// note about the eventual `--no-ff` merge.
     pub diverged_note: bool,
     pub gate_notices: Vec<GateNotice>,
+    /// Per-host verification results (empty when no host gates / no active hosts).
+    pub host_results: Vec<HostResult>,
+    /// Dry-run notices for the host gates.
+    pub host_notices: Vec<GateNotice>,
+    /// Active hosts whose gates failed. Non-empty ⇒ verify should fail; the CLI
+    /// still renders the per-host summary (including the hosts that passed) first.
+    pub failed_hosts: Vec<String>,
 }
 
 pub(crate) fn verify(config: &Config, dry_run: bool) -> Result<VerifyOutcome> {
@@ -666,11 +777,20 @@ pub(crate) fn verify(config: &Config, dry_run: bool) -> Result<VerifyOutcome> {
         &ForceOpts::new(false, None)?,
     )?;
 
+    // Host gates run on both routes (issue #106). `rf verify` never forces, so a
+    // failed host is recorded and surfaced to the CLI, which turns it into a hard
+    // error after printing the per-host summary.
+    let host_report = run_host_gates(config, dry_run, &ForceOpts::new(false, None)?)?;
+    let failed_hosts = host_report.failed_hosts();
+
     Ok(VerifyOutcome {
         source,
         target,
         diverged_note,
         gate_notices: report.notices,
+        host_results: host_report.results,
+        host_notices: host_report.notices,
+        failed_hosts,
     })
 }
 
@@ -746,6 +866,10 @@ pub(crate) struct PromoteOutcome {
     pub stable: String,
     pub dry_run: bool,
     pub gate_notices: Vec<GateNotice>,
+    /// Per-host verification results (empty when no host gates / no active hosts).
+    pub host_results: Vec<HostResult>,
+    /// Dry-run notices for the host gates.
+    pub host_notices: Vec<GateNotice>,
 }
 
 /// Promote the rolling branch into stable with a structured `--no-ff` merge.
@@ -770,23 +894,41 @@ pub(crate) fn promote(config: &Config, dry_run: bool, force: &ForceOpts) -> Resu
 
     let report = run_gates(repo, &config.rolling_to_main_gates, dry_run, force)?;
 
+    // Host gates block promotion when an active host fails (issue #106), unless
+    // `--force`, in which case each failing host gate is recorded as a bypass in
+    // the merge trailer alongside the route-gate bypasses.
+    let host_report = run_host_gates(config, dry_run, force)?;
+    if !force.enabled {
+        let failed = host_report.failed_hosts();
+        if !failed.is_empty() {
+            bail!("host verification failed: {}", failed.join(", "));
+        }
+    }
+
     if dry_run {
         return Ok(PromoteOutcome {
             rolling: rolling.clone(),
             stable: stable.clone(),
             dry_run: true,
             gate_notices: report.notices,
+            host_results: host_report.results,
+            host_notices: host_report.notices,
         });
     }
 
+    let mut bypassed = report.bypassed;
+    bypassed.extend(host_report.bypassed);
+
     let (subject, body) = promote_subject_and_body(config)?;
-    let body = ForceOpts::append_trailer(body, force.trailer(&report.bypassed));
+    let body = ForceOpts::append_trailer(body, force.trailer(&bypassed));
     run_merge(repo, rolling, stable, &subject, body.as_deref())?;
     Ok(PromoteOutcome {
         rolling: rolling.clone(),
         stable: stable.clone(),
         dry_run: false,
         gate_notices: report.notices,
+        host_results: host_report.results,
+        host_notices: host_report.notices,
     })
 }
 
