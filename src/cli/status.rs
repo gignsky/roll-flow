@@ -15,12 +15,7 @@ pub fn run(no_tui: bool) -> Result<()> {
     let rolls = branches::list_rolls(&config)?;
 
     if !no_tui && std::io::stdout().is_terminal() {
-        return crate::tui::rolls::run(crate::tui::rolls::TuiContext {
-            config: &config,
-            current_branch: &current_branch,
-            rolls: &rolls,
-            show_deps: false,
-        });
+        return crate::tui::rolls::run(config, current_branch, rolls, false);
     }
 
     let current_roll = branches::get_current_roll(&config)?;

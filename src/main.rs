@@ -349,12 +349,7 @@ fn cmd_list_text(no_tui: bool, deps: bool) -> Result<()> {
 
     if !no_tui && std::io::stdout().is_terminal() {
         let current = git::current_branch(&config.repo_root)?;
-        return tui::rolls::run(tui::rolls::TuiContext {
-            config: &config,
-            current_branch: &current,
-            rolls: &rolls,
-            show_deps: deps,
-        });
+        return tui::rolls::run(config, current, rolls, deps);
     }
 
     if rolls.is_empty() {
