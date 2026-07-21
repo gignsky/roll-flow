@@ -82,12 +82,6 @@ fn cmd_init(
     config = config.with_overrides(rolling_branch, stable_branch, roll_prefix, username, hosts);
 
     let cfg_path = Config::config_path(&config.repo_root);
-    if cfg_path.exists() && !force {
-        bail!(
-            "config already exists at {}; pass --force to overwrite",
-            cfg_path.display()
-        );
-    }
     if !git::ref_exists(&config.repo_root, &config.stable_branch) {
         bail!("stable branch '{}' not found", config.stable_branch);
     }
@@ -98,8 +92,25 @@ fn cmd_init(
         )?;
     }
 
-    config.save()?;
-    println!("Initialized roll-flow at {}", cfg_path.display());
+    // Re-running `rf init` is idempotent and non-destructive: it regenerates the
+    // config from the repo's actual detected state and only rewrites the file
+    // when the result differs. Serialize both sides through the same renderer
+    // (`to_toml_string`) so an unchanged re-run is a true no-op — no rewrite,
+    // and no `--force` required (issue #16).
+    let regenerated = config.to_toml_string()?;
+    if cfg_path.exists() {
+        let existing = std::fs::read_to_string(&cfg_path)
+            .with_context(|| format!("reading existing config at {}", cfg_path.display()))?;
+        if !force && existing == regenerated {
+            println!("roll-flow config already up to date (no changes)");
+            return Ok(());
+        }
+        config.save()?;
+        println!("Updated {} from detected state", cfg_path.display());
+    } else {
+        config.save()?;
+        println!("Initialized roll-flow at {}", cfg_path.display());
+    }
     Ok(())
 }
 

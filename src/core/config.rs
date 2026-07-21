@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
@@ -18,7 +18,7 @@ pub struct Config {
     pub username: String,
     pub hosts: Vec<String>,
     #[serde(default)]
-    pub host_active: HashMap<String, bool>,
+    pub host_active: BTreeMap<String, bool>,
     #[serde(default)]
     pub roll_to_rolling_gates: Vec<String>,
     #[serde(default)]
@@ -55,11 +55,19 @@ impl Config {
         }
     }
 
+    /// Serialize this config to its canonical TOML representation.
+    ///
+    /// The single source of truth for how a config is rendered on disk, shared
+    /// by [`Self::save`] and by the idempotency comparison in `rf init`, so a
+    /// re-run compares like-for-like against the existing file.
+    pub fn to_toml_string(&self) -> Result<String, RfError> {
+        toml::to_string_pretty(self).map_err(|e| RfError::Config(e.to_string()))
+    }
+
     /// Write current config to `<repo>/.roll-flow.toml`.
     pub fn save(&self) -> Result<(), RfError> {
         let path = Self::config_path(&self.repo_root);
-        let content = toml::to_string_pretty(self).map_err(|e| RfError::Config(e.to_string()))?;
-        std::fs::write(&path, content)?;
+        std::fs::write(&path, self.to_toml_string()?)?;
         Ok(())
     }
 
@@ -74,7 +82,7 @@ impl Config {
             .unwrap_or_else(|| ("rolling".to_string(), "main".to_string()));
 
         let (hosts, host_active, username) = detect_hosts_and_user(&repo_root)
-            .unwrap_or_else(|| (vec![], HashMap::new(), "gig".to_string()));
+            .unwrap_or_else(|| (vec![], BTreeMap::new(), "gig".to_string()));
 
         Ok(Config {
             config_version: default_config_version(),
@@ -163,7 +171,9 @@ fn detect_branches(repo_root: &Path) -> Option<(String, String)> {
 
 /// Parse `vars/hosts.nix` for the host list and `host_active` map.
 /// Returns (hosts, host_active, username).  Returns None on parse failure.
-fn detect_hosts_and_user(repo_root: &Path) -> Option<(Vec<String>, HashMap<String, bool>, String)> {
+fn detect_hosts_and_user(
+    repo_root: &Path,
+) -> Option<(Vec<String>, BTreeMap<String, bool>, String)> {
     // Parse vars/hosts.nix with a simple regex-free approach:
     // the file is expected to look like:
     //
@@ -199,8 +209,8 @@ fn parse_nix_string_list(content: &str, key: &str) -> Option<Vec<String>> {
     Some(values)
 }
 
-fn parse_nix_bool_attrs(content: &str, key: &str) -> HashMap<String, bool> {
-    let mut map = HashMap::new();
+fn parse_nix_bool_attrs(content: &str, key: &str) -> BTreeMap<String, bool> {
+    let mut map = BTreeMap::new();
     let marker = format!("{key} = {{");
     let Some(start) = content.find(&marker) else {
         return map;
