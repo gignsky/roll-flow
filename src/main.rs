@@ -13,6 +13,11 @@ use serde::Serialize;
 use cli::{Cli, Cmd};
 use core::{branches, config::Config, git};
 
+/// Prefix for the hotfix tier. Parallel to `roll_prefix`, but fixed rather than
+/// configurable — hotfixes are a rarely-used sanctioned exception with their own
+/// independent numbering.
+const HOTFIX_PREFIX: &str = "hotfix/";
+
 fn main() -> Result<()> {
     let cli = Cli::parse();
 
@@ -38,6 +43,23 @@ fn main() -> Result<()> {
             dry_run,
         } => cmd_create(&slug, date, dry_run)?,
         Cmd::Integrate { branch } => cmd_integrate(&branch)?,
+        Cmd::Hotfix {
+            slug,
+            date,
+            land,
+            dry_run,
+        } => {
+            if land {
+                cmd_hotfix_land(dry_run)?;
+            } else {
+                match slug {
+                    Some(slug) => cmd_hotfix_create(&slug, date, dry_run)?,
+                    None => bail!(
+                        "rf hotfix requires a <slug> (or pass --land to land the current hotfix)"
+                    ),
+                }
+            }
+        }
         Cmd::Verify { dry_run } => cmd_verify(dry_run)?,
         Cmd::Graduate {
             dry_run,
@@ -176,6 +198,147 @@ fn cmd_integrate(branch: &str) -> Result<()> {
     git::run_git(repo, &["merge", "--no-ff", branch])?;
     println!("integrated {} into {}", branch, current);
     Ok(())
+}
+
+/// Create a hotfix branch off the stable branch: `hotfix/N-MMDD-slug`.
+///
+/// Mirrors `cmd_create` but over the `hotfix/` tier, which is branched off
+/// stable (not rolling) and carries its own independent numbering.
+fn cmd_hotfix_create(slug: &str, date: Option<String>, dry_run: bool) -> Result<()> {
+    let config = Config::load()?;
+    ensure_clean_state(&config)?;
+    if !git::ref_exists(&config.repo_root, &config.stable_branch) {
+        bail!("stable branch '{}' not found", config.stable_branch);
+    }
+
+    let normalized_slug = normalize_slug(slug)?;
+    let mmdd = match date {
+        Some(d) => d,
+        None => current_mmdd()?,
+    };
+    validate_mmdd(&mmdd)?;
+
+    let next = next_hotfix_number(&config)?;
+    let branch_name = format!("{HOTFIX_PREFIX}{next}-{mmdd}-{normalized_slug}");
+
+    if git::ref_exists(&config.repo_root, &branch_name) {
+        bail!("hotfix branch '{}' already exists", branch_name);
+    }
+
+    if dry_run {
+        println!(
+            "Dry-run: would create '{}' from '{}'",
+            branch_name, config.stable_branch
+        );
+        return Ok(());
+    }
+
+    git::run_git(
+        &config.repo_root,
+        &["checkout", "-b", &branch_name, &config.stable_branch],
+    )?;
+    println!("Created {}", branch_name);
+    Ok(())
+}
+
+/// Land the current hotfix: `--no-ff` merge into the stable branch, then
+/// immediately reintegrate stable into rolling so the tiers never silently
+/// diverge (the reintegration invariant).
+///
+/// Hotfixes bypass host verification by design, but still run the configured
+/// stable-merge (flake/lint) gates. Both merges reuse `run_merge`, which
+/// returns to the branch we started on (the hotfix branch) and aborts/restores
+/// on conflict.
+fn cmd_hotfix_land(dry_run: bool) -> Result<()> {
+    let config = Config::load()?;
+    ensure_clean_state(&config)?;
+    let repo = &config.repo_root;
+    let current = git::current_branch(repo)?;
+    if !current.starts_with(HOTFIX_PREFIX) {
+        bail!(
+            "rf hotfix --land must be run from a hotfix branch (current: '{}')",
+            current
+        );
+    }
+    let short = hotfix_short_name(&current)
+        .ok_or_else(|| anyhow::anyhow!("could not parse hotfix branch name '{current}'"))?;
+    let stable = config.stable_branch.clone();
+    let rolling = config.rolling_branch.clone();
+
+    // The landing merge (hotfix -> stable) must be viable.
+    match classify_merge(repo, &current, &stable)? {
+        MergeState::TargetMissing => bail!(target_missing_error(&config, &stable)),
+        MergeState::UnrelatedHistories => {
+            bail!("'{}' and '{}' share no common history", current, stable)
+        }
+        MergeState::NothingToMerge => bail!(
+            "nothing to land: '{}' has no commits that '{}' lacks (already up to date)",
+            current,
+            stable
+        ),
+        MergeState::Diverged | MergeState::FastForwardable => {}
+    }
+
+    // Reintegration (stable -> rolling) requires the rolling branch to exist.
+    if !git::ref_exists(repo, &rolling) {
+        bail!(target_missing_error(&config, &rolling));
+    }
+
+    // Host gating is bypassed by design; the stable-merge gates still run.
+    run_gates(
+        repo,
+        &config.rolling_to_main_gates,
+        dry_run,
+        &ForceOpts::new(false, None)?,
+    )?;
+
+    if dry_run {
+        println!(
+            "Dry-run: would land '{current}' into '{stable}' (--no-ff), \
+             then reintegrate '{stable}' into '{rolling}'"
+        );
+        return Ok(());
+    }
+
+    let land_subject = format!("Hotfix {short} into {stable}");
+    run_merge(repo, &current, &stable, &land_subject, None)?;
+    println!("Landed '{current}' into '{stable}'");
+
+    let reintegrate_subject = format!("Reintegrate {stable} into {rolling} (hotfix {short})");
+    run_merge(repo, &stable, &rolling, &reintegrate_subject, None)?;
+    println!("Reintegrated '{stable}' into '{rolling}'");
+
+    Ok(())
+}
+
+/// Next hotfix number: one past the highest existing `hotfix/N-…` (local +
+/// remote), independent of roll numbering.
+fn next_hotfix_number(config: &Config) -> Result<u32> {
+    let repo = &config.repo_root;
+    let pattern = format!("{HOTFIX_PREFIX}*");
+    let mut names = git::local_branches(repo, &pattern)?;
+    names.extend(git::remote_branches(repo, &pattern)?);
+    let max = names
+        .iter()
+        .filter_map(|b| branches::parse_roll_number(b, HOTFIX_PREFIX))
+        .max()
+        .unwrap_or(0);
+    Ok(max + 1)
+}
+
+/// Short reference form used in hotfix merge subjects: the branch
+/// `hotfix/N-MMDD-slug` renders as `hotfix/N-slug` (date dropped), matching the
+/// approved subject format `Hotfix hotfix/N-slug into <stable>`.
+fn hotfix_short_name(branch: &str) -> Option<String> {
+    let rest = branch.strip_prefix(HOTFIX_PREFIX)?;
+    let mut parts = rest.splitn(3, '-');
+    let number = parts.next()?;
+    let _mmdd = parts.next()?;
+    let slug = parts.next()?;
+    if number.is_empty() || slug.is_empty() {
+        return None;
+    }
+    Some(format!("{HOTFIX_PREFIX}{number}-{slug}"))
 }
 
 fn cmd_verify(dry_run: bool) -> Result<()> {
@@ -830,6 +993,9 @@ fn branch_tier(config: &Config, current: &str, detached: bool) -> String {
     }
     if current.starts_with(&config.roll_prefix) {
         return "roll".to_string();
+    }
+    if current.starts_with(HOTFIX_PREFIX) {
+        return "hotfix".to_string();
     }
     "other".to_string()
 }
