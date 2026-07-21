@@ -22,14 +22,18 @@ fn main() -> Result<()> {
             roll_prefix,
             username,
             hosts,
+            mode,
             force,
+            yes,
         } => cmd_init(
             rolling_branch,
             stable_branch,
             roll_prefix,
             username,
             hosts,
+            mode,
             force,
+            yes,
         )?,
         Cmd::Create {
             slug,
@@ -86,13 +90,16 @@ fn main() -> Result<()> {
     Ok(())
 }
 
+#[allow(clippy::too_many_arguments)]
 fn cmd_init(
     rolling_branch: Option<String>,
     stable_branch: Option<String>,
     roll_prefix: Option<String>,
     username: Option<String>,
     hosts: Option<String>,
+    mode: Option<String>,
     force: bool,
+    yes: bool,
 ) -> Result<()> {
     let mut config = Config::auto_detect()?;
     config = config.with_overrides(rolling_branch, stable_branch, roll_prefix, username, hosts);
@@ -108,6 +115,20 @@ fn cmd_init(
         )?;
     }
 
+    // Resolve the workflow mode (issue #18): an explicit `--mode` always wins;
+    // otherwise, if a config already exists, preserve its mode so a bare re-init
+    // never silently resets it (and stays idempotent). Absent both, the field's
+    // serde default (`manage`) applies via `auto_detect`.
+    if let Some(m) = mode {
+        config.mode = core::config::Mode::parse(&m)?;
+    } else if cfg_path.exists() {
+        if let Ok(existing) = std::fs::read_to_string(&cfg_path) {
+            if let Ok(existing_cfg) = toml::from_str::<Config>(&existing) {
+                config.mode = existing_cfg.mode;
+            }
+        }
+    }
+
     // Re-running `rf init` is idempotent and non-destructive: it regenerates the
     // config from the repo's actual detected state and only rewrites the file
     // when the result differs. Serialize both sides through the same renderer
@@ -117,17 +138,79 @@ fn cmd_init(
     if cfg_path.exists() {
         let existing = std::fs::read_to_string(&cfg_path)
             .with_context(|| format!("reading existing config at {}", cfg_path.display()))?;
-        if !force && existing == regenerated {
-            println!("roll-flow config already up to date (no changes)");
+        if existing == regenerated {
+            if !force {
+                println!("roll-flow config already up to date (no changes)");
+                return Ok(());
+            }
+            // Identical content but `--force`: rewrite anyway, matching prior
+            // `--force` semantics.
+            config.save()?;
+            println!("Updated {} from detected state", cfg_path.display());
             return Ok(());
         }
-        config.save()?;
-        println!("Updated {} from detected state", cfg_path.display());
+
+        // The regenerated config differs from what's on disk. Rather than
+        // silently overwriting, show the change and decide non-destructively
+        // (issue #17).
+        println!("Detected config changes for {}:", cfg_path.display());
+        print!("{}", config_diff(&existing, &regenerated));
+
+        let apply = if force || yes {
+            true
+        } else if std::io::stdin().is_terminal() {
+            prompt_yes("Apply these changes to .roll-flow.toml? [y/N] ")?
+        } else {
+            // Non-interactive without --yes/--force: default to keeping the
+            // existing file. Nothing is written; exit 0.
+            false
+        };
+
+        if apply {
+            config.save()?;
+            println!("Updated {} from detected state", cfg_path.display());
+        } else {
+            if !std::io::stdin().is_terminal() {
+                println!("Changes detected but not applied. Run with --yes to apply, or --force.");
+            }
+            println!("Kept existing config at {}", cfg_path.display());
+        }
     } else {
         config.save()?;
         println!("Initialized roll-flow at {}", cfg_path.display());
     }
     Ok(())
+}
+
+/// A dependency-free, line-based diff of two config renderings: lines only in
+/// `current` are prefixed `-`, lines only in `detected` are prefixed `+`.
+fn config_diff(current: &str, detected: &str) -> String {
+    let cur: Vec<&str> = current.lines().collect();
+    let det: Vec<&str> = detected.lines().collect();
+    let mut out = String::new();
+    for line in &cur {
+        if !det.contains(line) {
+            out.push_str(&format!("-{line}\n"));
+        }
+    }
+    for line in &det {
+        if !cur.contains(line) {
+            out.push_str(&format!("+{line}\n"));
+        }
+    }
+    out
+}
+
+/// Prompt on stdout and read a yes/no answer from stdin. `y`/`yes`
+/// (case-insensitive) is affirmative; anything else is negative.
+fn prompt_yes(msg: &str) -> Result<bool> {
+    use std::io::Write;
+    print!("{msg}");
+    std::io::stdout().flush()?;
+    let mut line = String::new();
+    std::io::stdin().read_line(&mut line)?;
+    let ans = line.trim().to_ascii_lowercase();
+    Ok(ans == "y" || ans == "yes")
 }
 
 fn cmd_create(slug: &str, date: Option<String>, dry_run: bool) -> Result<()> {
