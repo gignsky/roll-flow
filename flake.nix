@@ -15,7 +15,7 @@
         "aarch64-linux"
       ];
       forAllSystems = nixpkgs.lib.genAttrs systems;
-      pkgsFor = sys: inputs.gigpkgs.legacyPackages.${sys};
+      pkgsFor = sys: inputs.nixpkgs.legacyPackages.${sys};
       pkgs = pkgsFor system;
       cargoCheckWrapped = pkgs.writeShellApplication {
         name = "cargo-check-wrapper";
