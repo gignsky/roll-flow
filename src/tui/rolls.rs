@@ -45,6 +45,22 @@ enum Mode {
         /// ops (promote / update).
         target: Option<String>,
     },
+    /// Read-only drill-down for a single roll: its identity plus its dependency
+    /// rows (issue #61). A snapshot of the selected roll is captured on open so
+    /// the overlay stays stable regardless of later list reloads.
+    Detail {
+        roll: RollInfo,
+    },
+}
+
+/// One dependency row rendered in the [`Mode::Detail`] view. `is_blocker` marks
+/// a dep that holds the roll back — one that is not yet graduated/promoted.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct DepRow {
+    pub number: u32,
+    pub branch: String,
+    pub state: RollState,
+    pub is_blocker: bool,
 }
 
 /// Owns everything needed to render and to *reload* after an action.
@@ -99,6 +115,39 @@ pub(crate) fn can_update(rolls: &[RollInfo]) -> bool {
         matches!(r.state, RollState::Active | RollState::Blocked)
             && matches!(r.location, BranchLocation::Local | BranchLocation::Both)
     })
+}
+
+/// Build the dependency rows to show in the detail view for `selected`.
+///
+/// Each number in `selected.deps` is looked up in `all` to recover the
+/// dependency's branch and state. A dep is flagged as a *blocker* when it is not
+/// yet graduated/promoted (state is `Active`/`Blocked`/`Diverged`) — those are
+/// what actually hold the roll back. Unknown dep numbers (not present in `all`)
+/// are skipped. The empty result means "no dependencies / not blocked".
+pub(crate) fn dep_rows(selected: &RollInfo, all: &[RollInfo]) -> Vec<DepRow> {
+    selected
+        .deps
+        .iter()
+        .filter_map(|num| all.iter().find(|r| r.number == *num))
+        .map(|dep| DepRow {
+            number: dep.number,
+            branch: dep.branch.clone(),
+            state: dep.state.clone(),
+            is_blocker: !matches!(dep.state, RollState::Graduated | RollState::Promoted),
+        })
+        .collect()
+}
+
+/// Colour used to render a roll state consistently across the table and detail
+/// view.
+fn state_color(state: &RollState) -> Color {
+    match state {
+        RollState::Active => Color::Yellow,
+        RollState::Graduated => Color::Green,
+        RollState::Diverged => Color::Red,
+        RollState::Promoted => Color::DarkGray,
+        RollState::Blocked => Color::Magenta,
+    }
 }
 
 /// Validate an action against the current selection/list. `Ok(())` means the
@@ -169,6 +218,8 @@ impl StatusApp {
                     }
                     if matches!(self.mode, Mode::Confirm { .. }) {
                         self.handle_confirm(terminal, key.code)?;
+                    } else if matches!(self.mode, Mode::Detail { .. }) {
+                        self.handle_detail(key.code);
                     } else if self.handle_browsing(key.code)? {
                         break;
                     }
@@ -192,9 +243,22 @@ impl StatusApp {
             KeyCode::Char('g') => self.request(Action::Graduate),
             KeyCode::Char('p') => self.request(Action::Promote),
             KeyCode::Char('u') => self.request(Action::Update),
+            KeyCode::Enter => {
+                if let Some(roll) = self.selected_roll() {
+                    self.mode = Mode::Detail { roll: roll.clone() };
+                }
+            }
             _ => {}
         }
         Ok(false)
+    }
+
+    /// Handle a keypress while the read-only detail overlay is open. Only close
+    /// keys apply; everything else is ignored so action keys can't fire here.
+    fn handle_detail(&mut self, code: KeyCode) {
+        if matches!(code, KeyCode::Char('q') | KeyCode::Esc) {
+            self.mode = Mode::Browsing;
+        }
     }
 
     /// Handle a keypress while the confirm modal is open.
@@ -371,8 +435,12 @@ impl StatusApp {
         self.render_table(f, chunks[1]);
         self.render_status_bar(f, chunks[2]);
 
-        if let Mode::Confirm { action, target } = &self.mode {
-            render_modal(f, area, &self.config, *action, target.as_deref());
+        match &self.mode {
+            Mode::Confirm { action, target } => {
+                render_modal(f, area, &self.config, *action, target.as_deref());
+            }
+            Mode::Detail { roll } => render_detail(f, area, roll, &self.rolls),
+            Mode::Browsing => {}
         }
     }
 
@@ -427,13 +495,7 @@ impl StatusApp {
             .rolls
             .iter()
             .map(|roll| {
-                let state_color = match roll.state {
-                    RollState::Active => Color::Yellow,
-                    RollState::Graduated => Color::Green,
-                    RollState::Diverged => Color::Red,
-                    RollState::Promoted => Color::DarkGray,
-                    RollState::Blocked => Color::Magenta,
-                };
+                let row_state_color = state_color(&roll.state);
                 let base_style = if roll.is_current {
                     Style::default().add_modifier(Modifier::BOLD)
                 } else {
@@ -443,7 +505,7 @@ impl StatusApp {
                     Cell::from(roll.number.to_string()).style(base_style),
                     Cell::from(roll.branch.clone()).style(base_style),
                     Cell::from(roll.location.symbol()).style(base_style),
-                    Cell::from(roll.state.label()).style(Style::default().fg(state_color)),
+                    Cell::from(roll.state.label()).style(Style::default().fg(row_state_color)),
                 ];
                 if show_deps {
                     let deps_str = if roll.deps.is_empty() {
@@ -478,8 +540,9 @@ impl StatusApp {
             )),
             None => Line::from(""),
         };
-        let hint_line =
-            Line::from(" [q] quit   [j/k ↑/↓] nav   [g]raduate   [p]romote   [u]pdate   [r]efresh");
+        let hint_line = Line::from(
+            " [q] quit   [j/k ↑/↓] nav   [enter] detail   [g]raduate   [p]romote   [u]pdate   [r]efresh",
+        );
         f.render_widget(Paragraph::new(vec![msg_line, hint_line]), area);
     }
 }
@@ -511,6 +574,81 @@ fn render_modal(f: &mut Frame, area: Rect, config: &Config, action: Action, targ
         .alignment(Alignment::Center)
         .block(Block::bordered().title(" confirm "));
     f.render_widget(body, modal);
+}
+
+/// Render the centered read-only detail popup for a single roll: its identity
+/// and its dependency rows, with blockers clearly marked.
+fn render_detail(f: &mut Frame, area: Rect, roll: &RollInfo, all: &[RollInfo]) {
+    let rows = dep_rows(roll, all);
+
+    let mut lines = vec![
+        Line::from(vec![
+            Span::styled("roll #", Style::default().add_modifier(Modifier::BOLD)),
+            Span::styled(
+                roll.number.to_string(),
+                Style::default().add_modifier(Modifier::BOLD),
+            ),
+            Span::raw("  "),
+            Span::styled(roll.branch.clone(), Style::default().fg(Color::Cyan)),
+        ]),
+        Line::from(vec![
+            Span::raw("state: "),
+            Span::styled(
+                roll.state.label(),
+                Style::default().fg(state_color(&roll.state)),
+            ),
+            Span::raw("    location: "),
+            Span::raw(roll.location.symbol()),
+        ]),
+        Line::from(""),
+    ];
+
+    if rows.is_empty() {
+        lines.push(Line::from(Span::styled(
+            "no dependencies / not blocked",
+            Style::default().fg(Color::Green),
+        )));
+    } else {
+        let blockers = rows.iter().filter(|r| r.is_blocker).count();
+        let header = if blockers > 0 {
+            format!("dependencies ({blockers} blocking):")
+        } else {
+            "dependencies (all graduated):".to_string()
+        };
+        lines.push(Line::from(Span::styled(
+            header,
+            Style::default().add_modifier(Modifier::BOLD),
+        )));
+        for r in &rows {
+            let (marker, marker_style) = if r.is_blocker {
+                ("⛔ blocker", Style::default().fg(Color::Red))
+            } else {
+                ("✓ ok", Style::default().fg(Color::Green))
+            };
+            lines.push(Line::from(vec![
+                Span::raw(format!("  #{}  ", r.number)),
+                Span::styled(r.branch.clone(), Style::default().fg(Color::Cyan)),
+                Span::raw("  ["),
+                Span::styled(r.state.label(), Style::default().fg(state_color(&r.state))),
+                Span::raw("]  "),
+                Span::styled(marker, marker_style),
+            ]));
+        }
+    }
+
+    lines.push(Line::from(""));
+    lines.push(Line::from(Span::styled(
+        "[q/esc] back",
+        Style::default().fg(Color::DarkGray),
+    )));
+
+    let width = lines.iter().map(|l| l.width()).max().unwrap_or(20) as u16 + 4;
+    let height = lines.len() as u16 + 2;
+    let popup = centered_rect(area, width.max(32), height);
+
+    f.render_widget(Clear, popup);
+    let body = Paragraph::new(lines).block(Block::bordered().title(" roll detail "));
+    f.render_widget(body, popup);
 }
 
 fn centered_rect(area: Rect, width: u16, height: u16) -> Rect {
@@ -548,6 +686,17 @@ mod tests {
             number: 1,
             state,
             location,
+            is_current: false,
+            deps: Vec::new(),
+        }
+    }
+
+    fn roll_n(number: u32, state: RollState) -> RollInfo {
+        RollInfo {
+            branch: format!("roll/{number}-0101-x"),
+            number,
+            state,
+            location: BranchLocation::Local,
             is_current: false,
             deps: Vec::new(),
         }
@@ -613,5 +762,64 @@ mod tests {
         // Update needs a local active roll.
         assert!(validate_action(Action::Update, None, &active).is_ok());
         assert!(validate_action(Action::Update, None, &graduated).is_err());
+    }
+
+    #[test]
+    fn dep_rows_flag_only_ungraduated_as_blockers() {
+        let all = vec![
+            roll_n(1, RollState::Graduated),
+            roll_n(2, RollState::Active),
+            roll_n(3, RollState::Diverged),
+            roll_n(4, RollState::Promoted),
+        ];
+        let mut selected = roll_n(5, RollState::Blocked);
+        selected.deps = vec![1, 2, 3, 4];
+
+        let rows = dep_rows(&selected, &all);
+        assert_eq!(rows.len(), 4);
+        // Graduated / promoted deps are satisfied — not blockers.
+        assert!(!rows.iter().find(|r| r.number == 1).unwrap().is_blocker);
+        assert!(!rows.iter().find(|r| r.number == 4).unwrap().is_blocker);
+        // Active / diverged deps hold the roll back.
+        assert!(rows.iter().find(|r| r.number == 2).unwrap().is_blocker);
+        assert!(rows.iter().find(|r| r.number == 3).unwrap().is_blocker);
+
+        let blockers: Vec<u32> = rows
+            .iter()
+            .filter(|r| r.is_blocker)
+            .map(|r| r.number)
+            .collect();
+        assert_eq!(blockers, vec![2, 3]);
+    }
+
+    #[test]
+    fn dep_rows_empty_when_no_deps() {
+        let all = vec![roll_n(1, RollState::Graduated)];
+        let selected = roll_n(2, RollState::Active); // deps left empty
+        assert!(dep_rows(&selected, &all).is_empty());
+    }
+
+    #[test]
+    fn dep_rows_all_graduated_has_zero_blockers() {
+        let all = vec![
+            roll_n(1, RollState::Graduated),
+            roll_n(2, RollState::Promoted),
+        ];
+        let mut selected = roll_n(3, RollState::Active);
+        selected.deps = vec![1, 2];
+
+        let rows = dep_rows(&selected, &all);
+        assert_eq!(rows.len(), 2);
+        assert!(rows.iter().all(|r| !r.is_blocker));
+    }
+
+    #[test]
+    fn dep_rows_skip_unknown_dep_numbers() {
+        let all = vec![roll_n(1, RollState::Active)];
+        let mut selected = roll_n(4, RollState::Blocked);
+        selected.deps = vec![1, 99]; // 99 not present in `all`
+        let rows = dep_rows(&selected, &all);
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].number, 1);
     }
 }
