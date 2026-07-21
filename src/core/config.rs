@@ -7,6 +7,38 @@ use crate::error::RfError;
 
 const CONFIG_NAME: &str = ".roll-flow.toml";
 
+/// How rf relates to the repo's workflow.
+///
+/// - [`Mode::Manage`] (default): rf drives the workflow — it creates roll
+///   branches, performs graduation/promotion merges, and owns branch state.
+/// - [`Mode::Assist`]: the human drives the workflow by hand; rf reports and
+///   derives state without taking the wheel.
+///
+/// The mode is persisted in `.roll-flow.toml` (as a lowercase string) and is
+/// currently informational: it is round-tripped and exposed via
+/// [`Config::is_assist`] so later work can gate behavior on it (see the note at
+/// that method) without a config migration.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "lowercase")]
+pub enum Mode {
+    #[default]
+    Manage,
+    Assist,
+}
+
+impl Mode {
+    /// Parse a user-supplied `--mode` value, with a clear error on anything else.
+    pub fn parse(s: &str) -> Result<Self, RfError> {
+        match s.trim().to_ascii_lowercase().as_str() {
+            "manage" => Ok(Mode::Manage),
+            "assist" => Ok(Mode::Assist),
+            other => Err(RfError::Config(format!(
+                "invalid --mode '{other}' (expected 'manage' or 'assist')"
+            ))),
+        }
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Config {
     #[serde(default = "default_config_version")]
@@ -15,6 +47,10 @@ pub struct Config {
     pub rolling_branch: String,
     pub stable_branch: String,
     pub roll_prefix: String,
+    /// Workflow ownership mode. Defaults to [`Mode::Manage`] for configs that
+    /// predate this field (via `#[serde(default)]`).
+    #[serde(default)]
+    pub mode: Mode,
     pub username: String,
     pub hosts: Vec<String>,
     #[serde(default)]
@@ -90,6 +126,7 @@ impl Config {
             rolling_branch,
             stable_branch,
             roll_prefix: "roll/".to_string(),
+            mode: Mode::default(),
             username,
             hosts,
             host_active,
@@ -135,6 +172,18 @@ impl Config {
 
     pub fn config_path(repo_root: &Path) -> PathBuf {
         repo_root.join(CONFIG_NAME)
+    }
+
+    /// True when rf is configured to assist rather than drive the workflow.
+    ///
+    /// Currently informational. This is the intended gate for future
+    /// behavioral divergence: e.g. in assist mode, mutating commands
+    /// (`create`/`graduate`/`promote`) could refuse to perform merges and
+    /// instead report the state and the exact git commands the human should
+    /// run. Kept minimal and bounded on purpose (issue #18).
+    #[allow(dead_code)]
+    pub fn is_assist(&self) -> bool {
+        self.mode == Mode::Assist
     }
 }
 
@@ -255,6 +304,7 @@ mod tests {
             rolling_branch: "rolling".to_string(),
             stable_branch: "main".to_string(),
             roll_prefix: "roll/".to_string(),
+            mode: super::Mode::default(),
             username: "old".to_string(),
             hosts: vec!["x".to_string()],
             host_active: Default::default(),
@@ -271,6 +321,49 @@ mod tests {
         assert_eq!(updated.roll_prefix, "roll/");
         assert_eq!(updated.username, "me");
         assert_eq!(updated.hosts, vec!["a".to_string(), "b".to_string()]);
+    }
+
+    #[test]
+    fn mode_round_trips_through_toml() {
+        use super::Mode;
+        let cfg = Config {
+            config_version: 1,
+            repo_root: PathBuf::from("/tmp/repo"),
+            rolling_branch: "rolling".to_string(),
+            stable_branch: "main".to_string(),
+            roll_prefix: "roll/".to_string(),
+            mode: Mode::Assist,
+            username: "me".to_string(),
+            hosts: vec![],
+            host_active: Default::default(),
+            roll_to_rolling_gates: vec![],
+            rolling_to_main_gates: vec![],
+        };
+        let rendered = cfg.to_toml_string().expect("render");
+        assert!(
+            rendered.contains("mode = \"assist\""),
+            "mode should serialize as a lowercase string: {rendered}"
+        );
+        let parsed: Config = toml::from_str(&rendered).expect("parse");
+        assert_eq!(parsed.mode, Mode::Assist);
+    }
+
+    #[test]
+    fn mode_defaults_to_manage_when_absent() {
+        use super::Mode;
+        // A config written before the `mode` field existed still loads.
+        let legacy = r#"
+            config_version = 1
+            repo_root = "/tmp/repo"
+            rolling_branch = "rolling"
+            stable_branch = "main"
+            roll_prefix = "roll/"
+            username = "me"
+            hosts = []
+        "#;
+        let parsed: Config = toml::from_str(legacy).expect("parse legacy");
+        assert_eq!(parsed.mode, Mode::Manage);
+        assert!(!parsed.is_assist());
     }
 
     #[test]

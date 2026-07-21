@@ -231,6 +231,103 @@ fn init_regenerates_missing_config() {
 }
 
 #[test]
+fn init_applies_detected_changes_with_yes() {
+    let sb = Sandbox::nixos();
+    let cfg_path = sb.path().join(".roll-flow.toml");
+
+    let out = sb.init();
+    assert!(out.success, "first init failed: {}", out.combined());
+    let detected = std::fs::read_to_string(&cfg_path).expect("read config");
+
+    // Perturb the on-disk config so it diverges from the detected state.
+    let stale = detected.replace("username = \"gig\"", "username = \"stale\"");
+    assert_ne!(stale, detected, "perturbation should change the file");
+    std::fs::write(&cfg_path, &stale).expect("write stale config");
+
+    // With --yes, the detected config is applied non-interactively.
+    let out = sb.rf(&["init", "--yes"]);
+    assert!(out.success, "init --yes failed: {}", out.combined());
+    assert!(
+        out.combined().contains("Updated"),
+        "expected an 'Updated' message, got: {}",
+        out.combined()
+    );
+    let after = std::fs::read_to_string(&cfg_path).expect("read config");
+    assert_eq!(after, detected, "--yes should restore the detected config");
+}
+
+#[test]
+fn init_keeps_existing_config_when_non_interactive_without_flags() {
+    let sb = Sandbox::nixos();
+    let cfg_path = sb.path().join(".roll-flow.toml");
+
+    let out = sb.init();
+    assert!(out.success, "first init failed: {}", out.combined());
+    let detected = std::fs::read_to_string(&cfg_path).expect("read config");
+
+    let stale = detected.replace("username = \"gig\"", "username = \"stale\"");
+    assert_ne!(stale, detected, "perturbation should change the file");
+    std::fs::write(&cfg_path, &stale).expect("write stale config");
+
+    // No flags, non-interactive (harness has no TTY): default to keeping the
+    // existing file. Exit 0, nothing written.
+    let out = sb.rf(&["init"]);
+    assert!(out.success, "init should succeed: {}", out.combined());
+    assert_eq!(out.code, Some(0), "non-destructive keep should exit 0");
+    assert!(
+        out.combined().contains("not applied"),
+        "expected a 'not applied' note, got: {}",
+        out.combined()
+    );
+    let after = std::fs::read_to_string(&cfg_path).expect("read config");
+    assert_eq!(after, stale, "file must be left unchanged");
+}
+
+#[test]
+fn init_mode_assist_persists_and_is_preserved_on_reinit() {
+    let sb = Sandbox::nixos();
+    let cfg_path = sb.path().join(".roll-flow.toml");
+
+    let out = sb.rf(&["init", "--mode", "assist"]);
+    assert!(out.success, "init --mode assist failed: {}", out.combined());
+    let first = std::fs::read_to_string(&cfg_path).expect("read config");
+    assert!(
+        first.contains("mode = \"assist\""),
+        "assist mode should persist: {first}"
+    );
+
+    // A plain re-init (no --mode) preserves the assist mode and is a no-op.
+    let out = sb.init();
+    assert!(out.success, "re-init failed: {}", out.combined());
+    assert!(
+        out.combined().contains("already up to date"),
+        "re-init should be a no-op: {}",
+        out.combined()
+    );
+    let second = std::fs::read_to_string(&cfg_path).expect("read config");
+    assert_eq!(
+        first, second,
+        "re-init must preserve the config byte-for-byte"
+    );
+    assert!(
+        second.contains("mode = \"assist\""),
+        "mode must stay assist"
+    );
+}
+
+#[test]
+fn init_rejects_invalid_mode() {
+    let sb = Sandbox::nixos();
+    let out = sb.rf(&["init", "--mode", "bogus"]);
+    assert!(!out.success, "invalid mode should fail");
+    assert!(
+        out.combined().contains("invalid --mode"),
+        "expected a clear error, got: {}",
+        out.combined()
+    );
+}
+
+#[test]
 fn graduate_errors_off_roll_branch() {
     let sb = Sandbox::plain();
     let out = sb.init();
