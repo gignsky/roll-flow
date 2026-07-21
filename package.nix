@@ -6,7 +6,7 @@
 }:
 rustPlatform.buildRustPackage {
   pname = "roll-flow";
-  version = "0.0.7";
+  version = (builtins.fromTOML (builtins.readFile ./Cargo.toml)).package.version;
   src = lib.cleanSource ./.;
   cargoLock.lockFile = ./Cargo.lock;
 
