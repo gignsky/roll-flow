@@ -13,6 +13,11 @@ use serde::Serialize;
 use cli::{Cli, Cmd};
 use core::{branches, config::Config, git};
 
+/// Prefix for the hotfix tier. Parallel to `roll_prefix`, but fixed rather than
+/// configurable — hotfixes are a rarely-used sanctioned exception with their own
+/// independent numbering.
+const HOTFIX_PREFIX: &str = "hotfix/";
+
 fn main() -> Result<()> {
     let cli = Cli::parse();
 
@@ -38,6 +43,23 @@ fn main() -> Result<()> {
             dry_run,
         } => cmd_create(&slug, date, dry_run)?,
         Cmd::Integrate { branch } => cmd_integrate(&branch)?,
+        Cmd::Hotfix {
+            slug,
+            date,
+            land,
+            dry_run,
+        } => {
+            if land {
+                cmd_hotfix_land(dry_run)?;
+            } else {
+                match slug {
+                    Some(slug) => cmd_hotfix_create(&slug, date, dry_run)?,
+                    None => bail!(
+                        "rf hotfix requires a <slug> (or pass --land to land the current hotfix)"
+                    ),
+                }
+            }
+        }
         Cmd::Verify { dry_run } => cmd_verify(dry_run)?,
         Cmd::Graduate {
             dry_run,
@@ -82,12 +104,6 @@ fn cmd_init(
     config = config.with_overrides(rolling_branch, stable_branch, roll_prefix, username, hosts);
 
     let cfg_path = Config::config_path(&config.repo_root);
-    if cfg_path.exists() && !force {
-        bail!(
-            "config already exists at {}; pass --force to overwrite",
-            cfg_path.display()
-        );
-    }
     if !git::ref_exists(&config.repo_root, &config.stable_branch) {
         bail!("stable branch '{}' not found", config.stable_branch);
     }
@@ -98,16 +114,38 @@ fn cmd_init(
         )?;
     }
 
-    config.save()?;
-    println!("Initialized roll-flow at {}", cfg_path.display());
+    // Re-running `rf init` is idempotent and non-destructive: it regenerates the
+    // config from the repo's actual detected state and only rewrites the file
+    // when the result differs. Serialize both sides through the same renderer
+    // (`to_toml_string`) so an unchanged re-run is a true no-op — no rewrite,
+    // and no `--force` required (issue #16).
+    let regenerated = config.to_toml_string()?;
+    if cfg_path.exists() {
+        let existing = std::fs::read_to_string(&cfg_path)
+            .with_context(|| format!("reading existing config at {}", cfg_path.display()))?;
+        if !force && existing == regenerated {
+            println!("roll-flow config already up to date (no changes)");
+            return Ok(());
+        }
+        config.save()?;
+        println!("Updated {} from detected state", cfg_path.display());
+    } else {
+        config.save()?;
+        println!("Initialized roll-flow at {}", cfg_path.display());
+    }
     Ok(())
 }
 
 fn cmd_create(slug: &str, date: Option<String>, dry_run: bool) -> Result<()> {
     let config = Config::load()?;
     ensure_clean_state(&config)?;
-    if !git::ref_exists(&config.repo_root, &config.rolling_branch) {
-        bail!("rolling branch '{}' not found", config.rolling_branch);
+    // A roll is branched off the stable branch, not rolling: it must start from a
+    // clean baseline so `diff(stable, roll)` is exactly the roll's own changes and
+    // dependency detection (core/branches.rs) does not treat everything already on
+    // rolling as an implicit dependency. Rolling and other rolls become dependencies
+    // only when explicitly merged in via `rf integrate`.
+    if !git::ref_exists(&config.repo_root, &config.stable_branch) {
+        bail!("stable branch '{}' not found", config.stable_branch);
     }
 
     let normalized_slug = normalize_slug(slug)?;
@@ -130,14 +168,14 @@ fn cmd_create(slug: &str, date: Option<String>, dry_run: bool) -> Result<()> {
     if dry_run {
         println!(
             "Dry-run: would create '{}' from '{}'",
-            branch_name, config.rolling_branch
+            branch_name, config.stable_branch
         );
         return Ok(());
     }
 
     git::run_git(
         &config.repo_root,
-        &["checkout", "-b", &branch_name, &config.rolling_branch],
+        &["checkout", "-b", &branch_name, &config.stable_branch],
     )?;
     println!("Created {}", branch_name);
     Ok(())
@@ -160,6 +198,147 @@ fn cmd_integrate(branch: &str) -> Result<()> {
     git::run_git(repo, &["merge", "--no-ff", branch])?;
     println!("integrated {} into {}", branch, current);
     Ok(())
+}
+
+/// Create a hotfix branch off the stable branch: `hotfix/N-MMDD-slug`.
+///
+/// Mirrors `cmd_create` but over the `hotfix/` tier, which is branched off
+/// stable (not rolling) and carries its own independent numbering.
+fn cmd_hotfix_create(slug: &str, date: Option<String>, dry_run: bool) -> Result<()> {
+    let config = Config::load()?;
+    ensure_clean_state(&config)?;
+    if !git::ref_exists(&config.repo_root, &config.stable_branch) {
+        bail!("stable branch '{}' not found", config.stable_branch);
+    }
+
+    let normalized_slug = normalize_slug(slug)?;
+    let mmdd = match date {
+        Some(d) => d,
+        None => current_mmdd()?,
+    };
+    validate_mmdd(&mmdd)?;
+
+    let next = next_hotfix_number(&config)?;
+    let branch_name = format!("{HOTFIX_PREFIX}{next}-{mmdd}-{normalized_slug}");
+
+    if git::ref_exists(&config.repo_root, &branch_name) {
+        bail!("hotfix branch '{}' already exists", branch_name);
+    }
+
+    if dry_run {
+        println!(
+            "Dry-run: would create '{}' from '{}'",
+            branch_name, config.stable_branch
+        );
+        return Ok(());
+    }
+
+    git::run_git(
+        &config.repo_root,
+        &["checkout", "-b", &branch_name, &config.stable_branch],
+    )?;
+    println!("Created {}", branch_name);
+    Ok(())
+}
+
+/// Land the current hotfix: `--no-ff` merge into the stable branch, then
+/// immediately reintegrate stable into rolling so the tiers never silently
+/// diverge (the reintegration invariant).
+///
+/// Hotfixes bypass host verification by design, but still run the configured
+/// stable-merge (flake/lint) gates. Both merges reuse `run_merge`, which
+/// returns to the branch we started on (the hotfix branch) and aborts/restores
+/// on conflict.
+fn cmd_hotfix_land(dry_run: bool) -> Result<()> {
+    let config = Config::load()?;
+    ensure_clean_state(&config)?;
+    let repo = &config.repo_root;
+    let current = git::current_branch(repo)?;
+    if !current.starts_with(HOTFIX_PREFIX) {
+        bail!(
+            "rf hotfix --land must be run from a hotfix branch (current: '{}')",
+            current
+        );
+    }
+    let short = hotfix_short_name(&current)
+        .ok_or_else(|| anyhow::anyhow!("could not parse hotfix branch name '{current}'"))?;
+    let stable = config.stable_branch.clone();
+    let rolling = config.rolling_branch.clone();
+
+    // The landing merge (hotfix -> stable) must be viable.
+    match classify_merge(repo, &current, &stable)? {
+        MergeState::TargetMissing => bail!(target_missing_error(&config, &stable)),
+        MergeState::UnrelatedHistories => {
+            bail!("'{}' and '{}' share no common history", current, stable)
+        }
+        MergeState::NothingToMerge => bail!(
+            "nothing to land: '{}' has no commits that '{}' lacks (already up to date)",
+            current,
+            stable
+        ),
+        MergeState::Diverged | MergeState::FastForwardable => {}
+    }
+
+    // Reintegration (stable -> rolling) requires the rolling branch to exist.
+    if !git::ref_exists(repo, &rolling) {
+        bail!(target_missing_error(&config, &rolling));
+    }
+
+    // Host gating is bypassed by design; the stable-merge gates still run.
+    run_gates(
+        repo,
+        &config.rolling_to_main_gates,
+        dry_run,
+        &ForceOpts::new(false, None)?,
+    )?;
+
+    if dry_run {
+        println!(
+            "Dry-run: would land '{current}' into '{stable}' (--no-ff), \
+             then reintegrate '{stable}' into '{rolling}'"
+        );
+        return Ok(());
+    }
+
+    let land_subject = format!("Hotfix {short} into {stable}");
+    run_merge(repo, &current, &stable, &land_subject, None)?;
+    println!("Landed '{current}' into '{stable}'");
+
+    let reintegrate_subject = format!("Reintegrate {stable} into {rolling} (hotfix {short})");
+    run_merge(repo, &stable, &rolling, &reintegrate_subject, None)?;
+    println!("Reintegrated '{stable}' into '{rolling}'");
+
+    Ok(())
+}
+
+/// Next hotfix number: one past the highest existing `hotfix/N-…` (local +
+/// remote), independent of roll numbering.
+fn next_hotfix_number(config: &Config) -> Result<u32> {
+    let repo = &config.repo_root;
+    let pattern = format!("{HOTFIX_PREFIX}*");
+    let mut names = git::local_branches(repo, &pattern)?;
+    names.extend(git::remote_branches(repo, &pattern)?);
+    let max = names
+        .iter()
+        .filter_map(|b| branches::parse_roll_number(b, HOTFIX_PREFIX))
+        .max()
+        .unwrap_or(0);
+    Ok(max + 1)
+}
+
+/// Short reference form used in hotfix merge subjects: the branch
+/// `hotfix/N-MMDD-slug` renders as `hotfix/N-slug` (date dropped), matching the
+/// approved subject format `Hotfix hotfix/N-slug into <stable>`.
+fn hotfix_short_name(branch: &str) -> Option<String> {
+    let rest = branch.strip_prefix(HOTFIX_PREFIX)?;
+    let mut parts = rest.splitn(3, '-');
+    let number = parts.next()?;
+    let _mmdd = parts.next()?;
+    let slug = parts.next()?;
+    if number.is_empty() || slug.is_empty() {
+        return None;
+    }
+    Some(format!("{HOTFIX_PREFIX}{number}-{slug}"))
 }
 
 fn cmd_verify(dry_run: bool) -> Result<()> {
@@ -406,23 +585,43 @@ fn cmd_update(dry_run: bool) -> Result<()> {
         return Ok(());
     }
 
-    let current = git::current_branch(repo)?;
+    let stable = &config.stable_branch;
 
     for roll in &active {
+        // Commits on stable that the roll doesn't already contain. Zero means
+        // stable is already an ancestor of the roll — nothing to merge.
+        let behind = git::capture_git(
+            repo,
+            &[
+                "rev-list",
+                "--count",
+                &format!("{}..{}", roll.branch, stable),
+            ],
+        )?;
+        let behind: u64 = behind.trim().parse().unwrap_or(0);
+
+        if behind == 0 {
+            println!("'{}' is already up to date with '{stable}'", roll.branch);
+            continue;
+        }
+
         if dry_run {
             println!(
-                "dry-run: would merge '{}' into '{}'",
-                config.stable_branch, roll.branch
+                "dry-run: would merge '{stable}' into '{}' ({behind} commit{} ahead)",
+                roll.branch,
+                if behind == 1 { "" } else { "s" },
             );
             continue;
         }
-        git::run_git(repo, &["checkout", &roll.branch])?;
-        git::run_git(repo, &["merge", "--no-ff", &config.stable_branch])?;
-        println!("updated '{}' with '{}'", roll.branch, config.stable_branch);
-    }
 
-    if !dry_run && !active.is_empty() {
-        git::run_git(repo, &["checkout", &current])?;
+        // Short SHA of the roll tip before the merge, recorded in the body so
+        // the merge is self-describing.
+        let before = git::capture_git(repo, &["rev-parse", "--short", &roll.branch])?;
+        let subject = format!("Update {} from {stable}", roll.branch);
+        let body = format!("Brought in: {behind} commits since {before}");
+
+        run_merge(repo, stable, &roll.branch, &subject, Some(&body))?;
+        println!("updated '{}' with '{stable}'", roll.branch);
     }
 
     Ok(())
@@ -794,6 +993,9 @@ fn branch_tier(config: &Config, current: &str, detached: bool) -> String {
     }
     if current.starts_with(&config.roll_prefix) {
         return "roll".to_string();
+    }
+    if current.starts_with(HOTFIX_PREFIX) {
+        return "hotfix".to_string();
     }
     "other".to_string()
 }
