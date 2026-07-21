@@ -155,6 +155,30 @@ pub(crate) fn dep_rows(selected: &RollInfo, all: &[RollInfo]) -> Vec<DepRow> {
         .collect()
 }
 
+/// Build the *reverse*-dependency rows to show in the detail view for `target`:
+/// every roll whose `deps` contains `target.number` (i.e. the rolls that
+/// integrated `target` and therefore depend on it). This is the inverse of
+/// [`dep_rows`] and is *not* symmetric with it.
+///
+/// A row's `is_blocker` here is repurposed to mean "this dependent is still
+/// gated by the target" — true while `target` has not yet graduated/promoted,
+/// since until then the dependent cannot advance past it. The detail view does
+/// not render a per-row blocker marker for dependents, so this flag is purely
+/// informational, but it keeps the field meaningful and testable. A roll is
+/// never its own dependent (a roll cannot list itself in its own `deps`).
+pub(crate) fn dependent_rows(target: &RollInfo, all: &[RollInfo]) -> Vec<DepRow> {
+    let target_gates = !matches!(target.state, RollState::Graduated | RollState::Promoted);
+    all.iter()
+        .filter(|r| r.number != target.number && r.deps.contains(&target.number))
+        .map(|dep| DepRow {
+            number: dep.number,
+            branch: dep.branch.clone(),
+            state: dep.state.clone(),
+            is_blocker: target_gates,
+        })
+        .collect()
+}
+
 /// Colour used to render a roll state consistently across the table and detail
 /// view.
 fn state_color(state: &RollState) -> Color {
@@ -723,6 +747,7 @@ fn render_create_input(f: &mut Frame, area: Rect, config: &Config, buffer: &str)
 /// and its dependency rows, with blockers clearly marked.
 fn render_detail(f: &mut Frame, area: Rect, roll: &RollInfo, all: &[RollInfo]) {
     let rows = dep_rows(roll, all);
+    let dependents = dependent_rows(roll, all);
 
     let mut lines = vec![
         Line::from(vec![
@@ -775,6 +800,30 @@ fn render_detail(f: &mut Frame, area: Rect, roll: &RollInfo, all: &[RollInfo]) {
                 Span::styled(r.state.label(), Style::default().fg(state_color(&r.state))),
                 Span::raw("]  "),
                 Span::styled(marker, marker_style),
+            ]));
+        }
+    }
+
+    // Dependents (reverse dependencies): rolls that integrated this one. Shown
+    // as its own section below dependencies since the relation is not symmetric.
+    lines.push(Line::from(""));
+    if dependents.is_empty() {
+        lines.push(Line::from(Span::styled(
+            "no dependents",
+            Style::default().fg(Color::Green),
+        )));
+    } else {
+        lines.push(Line::from(Span::styled(
+            format!("dependents ({}):", dependents.len()),
+            Style::default().add_modifier(Modifier::BOLD),
+        )));
+        for r in &dependents {
+            lines.push(Line::from(vec![
+                Span::raw(format!("  #{}  ", r.number)),
+                Span::styled(r.branch.clone(), Style::default().fg(Color::Cyan)),
+                Span::raw("  ["),
+                Span::styled(r.state.label(), Style::default().fg(state_color(&r.state))),
+                Span::raw("]"),
             ]));
         }
     }
@@ -954,6 +1003,47 @@ mod tests {
         let rows = dep_rows(&selected, &all);
         assert_eq!(rows.len(), 2);
         assert!(rows.iter().all(|r| !r.is_blocker));
+    }
+
+    #[test]
+    fn dependent_rows_lists_every_roll_that_integrated_target() {
+        // rolls 17 and 18 both integrated roll 14 → both are 14's dependents.
+        let mut r17 = roll_n(17, RollState::Active);
+        r17.deps = vec![14];
+        let mut r18 = roll_n(18, RollState::Blocked);
+        r18.deps = vec![14, 15];
+        let target = roll_n(14, RollState::Active);
+        let all = vec![target.clone(), r17, r18, roll_n(15, RollState::Graduated)];
+
+        let mut nums: Vec<u32> = dependent_rows(&target, &all)
+            .iter()
+            .map(|r| r.number)
+            .collect();
+        nums.sort_unstable();
+        assert_eq!(nums, vec![17, 18]);
+        // Target is ungraduated, so it still gates its dependents.
+        assert!(dependent_rows(&target, &all).iter().all(|r| r.is_blocker));
+    }
+
+    #[test]
+    fn dependent_rows_empty_when_nobody_depends() {
+        let target = roll_n(14, RollState::Graduated);
+        let all = vec![
+            target.clone(),
+            roll_n(15, RollState::Active), // no deps
+            roll_n(16, RollState::Active), // no deps
+        ];
+        assert!(dependent_rows(&target, &all).is_empty());
+    }
+
+    #[test]
+    fn dependent_rows_never_lists_target_itself() {
+        // A self-referential deps entry must not turn the roll into its own
+        // dependent.
+        let mut target = roll_n(14, RollState::Active);
+        target.deps = vec![14];
+        let all = vec![target.clone()];
+        assert!(dependent_rows(&target, &all).is_empty());
     }
 
     #[test]
