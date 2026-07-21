@@ -9,8 +9,11 @@ use clap::{Parser, Subcommand};
     version
 )]
 pub struct Cli {
+    /// Subcommand to run. When omitted, `rf` shows the status dashboard —
+    /// exactly as `rf status` does (issue #100). `--help`/`--version` are still
+    /// intercepted by clap before subcommand resolution.
     #[command(subcommand)]
-    pub command: Cmd,
+    pub command: Option<Cmd>,
 }
 
 #[derive(Subcommand)]
@@ -28,8 +31,17 @@ pub enum Cmd {
         /// Comma-separated list of hosts (e.g. ganoslal,merlin,wsl)
         #[arg(long)]
         hosts: Option<String>,
+        /// Workflow mode: `manage` (rf drives the workflow) or `assist` (human
+        /// drives; rf reports/derives state). Preserved on re-init if omitted.
+        #[arg(long)]
+        mode: Option<String>,
+        /// Overwrite the config even when it already matches, skipping the diff
+        /// prompt.
         #[arg(long)]
         force: bool,
+        /// Apply detected changes without prompting (non-interactive-safe).
+        #[arg(long)]
+        yes: bool,
     },
 
     /// Create a new roll branch off the stable branch: roll/N-MMDD-slug.

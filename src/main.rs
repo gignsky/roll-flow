@@ -15,21 +15,32 @@ use core::{branches, config::Config, git, ops};
 fn main() -> Result<()> {
     let cli = Cli::parse();
 
-    match cli.command {
+    // Bare `rf` (no subcommand) runs the status dashboard, identical to
+    // `rf status` (issue #100). `--help`/`-h`/`--version` never reach here —
+    // clap intercepts them during `parse()`.
+    let Some(command) = cli.command else {
+        return cli::status::run(false);
+    };
+
+    match command {
         Cmd::Init {
             rolling_branch,
             stable_branch,
             roll_prefix,
             username,
             hosts,
+            mode,
             force,
+            yes,
         } => cmd_init(
             rolling_branch,
             stable_branch,
             roll_prefix,
             username,
             hosts,
+            mode,
             force,
+            yes,
         )?,
         Cmd::Create {
             slug,
@@ -86,13 +97,16 @@ fn main() -> Result<()> {
     Ok(())
 }
 
+#[allow(clippy::too_many_arguments)]
 fn cmd_init(
     rolling_branch: Option<String>,
     stable_branch: Option<String>,
     roll_prefix: Option<String>,
     username: Option<String>,
     hosts: Option<String>,
+    mode: Option<String>,
     force: bool,
+    yes: bool,
 ) -> Result<()> {
     let mut config = Config::auto_detect()?;
     config = config.with_overrides(rolling_branch, stable_branch, roll_prefix, username, hosts);
@@ -108,6 +122,20 @@ fn cmd_init(
         )?;
     }
 
+    // Resolve the workflow mode (issue #18): an explicit `--mode` always wins;
+    // otherwise, if a config already exists, preserve its mode so a bare re-init
+    // never silently resets it (and stays idempotent). Absent both, the field's
+    // serde default (`manage`) applies via `auto_detect`.
+    if let Some(m) = mode {
+        config.mode = core::config::Mode::parse(&m)?;
+    } else if cfg_path.exists() {
+        if let Ok(existing) = std::fs::read_to_string(&cfg_path) {
+            if let Ok(existing_cfg) = toml::from_str::<Config>(&existing) {
+                config.mode = existing_cfg.mode;
+            }
+        }
+    }
+
     // Re-running `rf init` is idempotent and non-destructive: it regenerates the
     // config from the repo's actual detected state and only rewrites the file
     // when the result differs. Serialize both sides through the same renderer
@@ -117,17 +145,79 @@ fn cmd_init(
     if cfg_path.exists() {
         let existing = std::fs::read_to_string(&cfg_path)
             .with_context(|| format!("reading existing config at {}", cfg_path.display()))?;
-        if !force && existing == regenerated {
-            println!("roll-flow config already up to date (no changes)");
+        if existing == regenerated {
+            if !force {
+                println!("roll-flow config already up to date (no changes)");
+                return Ok(());
+            }
+            // Identical content but `--force`: rewrite anyway, matching prior
+            // `--force` semantics.
+            config.save()?;
+            println!("Updated {} from detected state", cfg_path.display());
             return Ok(());
         }
-        config.save()?;
-        println!("Updated {} from detected state", cfg_path.display());
+
+        // The regenerated config differs from what's on disk. Rather than
+        // silently overwriting, show the change and decide non-destructively
+        // (issue #17).
+        println!("Detected config changes for {}:", cfg_path.display());
+        print!("{}", config_diff(&existing, &regenerated));
+
+        let apply = if force || yes {
+            true
+        } else if std::io::stdin().is_terminal() {
+            prompt_yes("Apply these changes to .roll-flow.toml? [y/N] ")?
+        } else {
+            // Non-interactive without --yes/--force: default to keeping the
+            // existing file. Nothing is written; exit 0.
+            false
+        };
+
+        if apply {
+            config.save()?;
+            println!("Updated {} from detected state", cfg_path.display());
+        } else {
+            if !std::io::stdin().is_terminal() {
+                println!("Changes detected but not applied. Run with --yes to apply, or --force.");
+            }
+            println!("Kept existing config at {}", cfg_path.display());
+        }
     } else {
         config.save()?;
         println!("Initialized roll-flow at {}", cfg_path.display());
     }
     Ok(())
+}
+
+/// A dependency-free, line-based diff of two config renderings: lines only in
+/// `current` are prefixed `-`, lines only in `detected` are prefixed `+`.
+fn config_diff(current: &str, detected: &str) -> String {
+    let cur: Vec<&str> = current.lines().collect();
+    let det: Vec<&str> = detected.lines().collect();
+    let mut out = String::new();
+    for line in &cur {
+        if !det.contains(line) {
+            out.push_str(&format!("-{line}\n"));
+        }
+    }
+    for line in &det {
+        if !cur.contains(line) {
+            out.push_str(&format!("+{line}\n"));
+        }
+    }
+    out
+}
+
+/// Prompt on stdout and read a yes/no answer from stdin. `y`/`yes`
+/// (case-insensitive) is affirmative; anything else is negative.
+fn prompt_yes(msg: &str) -> Result<bool> {
+    use std::io::Write;
+    print!("{msg}");
+    std::io::stdout().flush()?;
+    let mut line = String::new();
+    std::io::stdin().read_line(&mut line)?;
+    let ans = line.trim().to_ascii_lowercase();
+    Ok(ans == "y" || ans == "yes")
 }
 
 fn cmd_create(slug: &str, date: Option<String>, dry_run: bool) -> Result<()> {
@@ -212,6 +302,14 @@ fn cmd_verify(dry_run: bool) -> Result<()> {
         );
     }
     render_gate_notices(&outcome.gate_notices);
+    render_gate_notices(&outcome.host_notices);
+    render_host_results(&outcome.host_results);
+    if !outcome.failed_hosts.is_empty() {
+        bail!(
+            "host verification failed: {}",
+            outcome.failed_hosts.join(", ")
+        );
+    }
     println!(
         "Verification passed: {} -> {}",
         outcome.source, outcome.target
@@ -255,6 +353,8 @@ fn cmd_promote(dry_run: bool, force: bool, reason: Option<String>) -> Result<()>
         Some(ops::Route::Promote) => {
             let outcome = ops::promote(&config, dry_run, &force)?;
             render_gate_notices(&outcome.gate_notices);
+            render_gate_notices(&outcome.host_notices);
+            render_host_results(&outcome.host_results);
             if outcome.dry_run {
                 println!(
                     "Dry-run: would promote '{}' into '{}' (--no-ff)",
@@ -288,11 +388,26 @@ fn render_gate_notices(notices: &[ops::GateNotice]) {
         match notice {
             ops::GateNotice::NoGates => println!("No gates configured"),
             ops::GateNotice::DryRun(gate) => println!("Dry-run gate: {gate}"),
+            ops::GateNotice::DryRunHost(gate) => println!("Dry-run host gate: {gate}"),
             ops::GateNotice::Bypassed { gate, code } => eprintln!(
                 "warning: gate failed but bypassed (--force): {gate} ({})",
                 ops::exit_desc(*code)
             ),
         }
+    }
+}
+
+/// Render the per-host verification summary that `rf verify`/`rf promote`
+/// produce when host gates ran. Prints nothing when no host gates executed (no
+/// host gates configured, or no active hosts), so unaffected repos stay quiet.
+fn render_host_results(results: &[ops::HostResult]) {
+    if results.is_empty() {
+        return;
+    }
+    println!("Host verification:");
+    for result in results {
+        let status = if result.passed() { "PASSED" } else { "FAILED" };
+        println!("  {}: {status}", result.host);
     }
 }
 

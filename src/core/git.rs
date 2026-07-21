@@ -1,7 +1,30 @@
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::process::Command;
 
 use crate::error::RfError;
+
+// ── Repository discovery ──────────────────────────────────────────────────────
+
+/// Resolve the top-level directory of the git repository containing `dir`.
+///
+/// Produces a clear, actionable error when `dir` is not inside a git repository
+/// (the common "ran `rf` in the wrong place" case), rather than surfacing git's
+/// raw `fatal:` text. Other git failures (e.g. the `git` binary missing) still
+/// propagate as an IO error.
+pub fn repo_root(dir: &Path) -> Result<PathBuf, RfError> {
+    let output = Command::new("git")
+        .arg("-C")
+        .arg(dir)
+        .args(["rev-parse", "--show-toplevel"])
+        .output()?;
+    if output.status.success() {
+        Ok(PathBuf::from(
+            String::from_utf8_lossy(&output.stdout).trim(),
+        ))
+    } else {
+        Err(RfError::Git("not inside a git repository".to_string()))
+    }
+}
 
 // ── Primitives ────────────────────────────────────────────────────────────────
 
@@ -171,4 +194,95 @@ pub fn merge_base(repo: &Path, a: &str, b: &str) -> Result<String, RfError> {
 /// Return the full SHA of the resolved ref.
 pub fn rev_parse(repo: &Path, refspec: &str) -> Result<String, RfError> {
     capture_git(repo, &["rev-parse", refspec])
+}
+
+/// Commits `branch` is ahead of / behind `origin/<branch>`, as `(ahead, behind)`.
+///
+/// `git rev-list --left-right --count <branch>...origin/<branch>` prints two
+/// counts separated by a tab: the left side (commits on `branch` not on the
+/// remote — *ahead*) and the right side (commits on the remote not on `branch`
+/// — *behind*). Fails if either ref does not resolve.
+pub fn ahead_behind(repo: &Path, branch: &str) -> Result<(u32, u32), RfError> {
+    let spec = format!("{branch}...origin/{branch}");
+    let out = capture_git(repo, &["rev-list", "--left-right", "--count", &spec])?;
+    parse_ahead_behind(&out)
+        .ok_or_else(|| RfError::Git(format!("could not parse ahead/behind counts from {out:?}")))
+}
+
+/// Parse the two whitespace-separated counts `git rev-list --left-right
+/// --count` emits into `(ahead, behind)`. Pure so it can be unit-tested without
+/// a repo.
+pub fn parse_ahead_behind(out: &str) -> Option<(u32, u32)> {
+    let mut fields = out.split_whitespace();
+    let ahead = fields.next()?.parse().ok()?;
+    let behind = fields.next()?.parse().ok()?;
+    Some((ahead, behind))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{ahead_behind, parse_ahead_behind};
+    use std::path::Path;
+    use std::process::Command;
+
+    fn git(dir: &Path, args: &[&str]) {
+        let ok = Command::new("git")
+            .arg("-C")
+            .arg(dir)
+            .args(args)
+            .output()
+            .expect("run git")
+            .status
+            .success();
+        assert!(ok, "git {args:?} failed in {dir:?}");
+    }
+
+    #[test]
+    fn ahead_behind_counts_local_vs_origin() {
+        // A bare remote plus a clone, then diverge both sides on `feat`.
+        let remote = tempfile::tempdir().expect("remote dir");
+        let local = tempfile::tempdir().expect("local dir");
+        let (rp, lp) = (remote.path(), local.path());
+
+        git(rp, &["init", "-b", "main", "--bare"]);
+
+        // Seed via a working clone so we can push an initial `feat`.
+        let seed = tempfile::tempdir().expect("seed dir");
+        let sp = seed.path();
+        git(sp, &["clone", rp.to_str().unwrap(), "."]);
+        git(sp, &["config", "user.email", "t@e.test"]);
+        git(sp, &["config", "user.name", "t"]);
+        git(sp, &["commit", "--allow-empty", "-m", "init"]);
+        git(sp, &["branch", "feat"]);
+        git(sp, &["push", "origin", "main", "feat"]);
+
+        // Clone into `local`; it now has origin/feat.
+        git(lp, &["clone", rp.to_str().unwrap(), "."]);
+        git(lp, &["config", "user.email", "t@e.test"]);
+        git(lp, &["config", "user.name", "t"]);
+        git(lp, &["switch", "feat"]);
+        // Two local-only commits → ahead 2.
+        git(lp, &["commit", "--allow-empty", "-m", "local a"]);
+        git(lp, &["commit", "--allow-empty", "-m", "local b"]);
+
+        // Advance origin's feat by one commit from the seed, then fetch.
+        git(sp, &["switch", "feat"]);
+        git(sp, &["commit", "--allow-empty", "-m", "remote c"]);
+        git(sp, &["push", "origin", "feat"]);
+        git(lp, &["fetch", "origin"]);
+
+        assert_eq!(ahead_behind(lp, "feat").unwrap(), (2, 1));
+    }
+
+    #[test]
+    fn parses_left_right_counts() {
+        assert_eq!(parse_ahead_behind("3\t5"), Some((3, 5)));
+        assert_eq!(parse_ahead_behind("0\t0"), Some((0, 0)));
+        // Spaces are tolerated too.
+        assert_eq!(parse_ahead_behind("2 4"), Some((2, 4)));
+        // Malformed / short input yields None rather than a panic.
+        assert_eq!(parse_ahead_behind(""), None);
+        assert_eq!(parse_ahead_behind("7"), None);
+        assert_eq!(parse_ahead_behind("a\tb"), None);
+    }
 }
