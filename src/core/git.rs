@@ -1,7 +1,30 @@
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::process::Command;
 
 use crate::error::RfError;
+
+// ── Repository discovery ──────────────────────────────────────────────────────
+
+/// Resolve the top-level directory of the git repository containing `dir`.
+///
+/// Produces a clear, actionable error when `dir` is not inside a git repository
+/// (the common "ran `rf` in the wrong place" case), rather than surfacing git's
+/// raw `fatal:` text. Other git failures (e.g. the `git` binary missing) still
+/// propagate as an IO error.
+pub fn repo_root(dir: &Path) -> Result<PathBuf, RfError> {
+    let output = Command::new("git")
+        .arg("-C")
+        .arg(dir)
+        .args(["rev-parse", "--show-toplevel"])
+        .output()?;
+    if output.status.success() {
+        Ok(PathBuf::from(
+            String::from_utf8_lossy(&output.stdout).trim(),
+        ))
+    } else {
+        Err(RfError::Git("not inside a git repository".to_string()))
+    }
+}
 
 // ── Primitives ────────────────────────────────────────────────────────────────
 
