@@ -1,0 +1,45 @@
+name: version bump check
+
+# Guards promotion: a PR into develop or main must raise the crate version above
+# whatever the target branch currently has. Roll-flow treats a merge into these
+# branches as a promotion (graduate → develop, promote → main), and every
+# promotion should carry a version bump so releases stay legible and the
+# tag-on-main auto-tagger has a distinct version to tag.
+
+on:
+  pull_request:
+    branches: [develop, main]
+
+jobs:
+  version-bumped:
+    name: version bumped vs base
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Ensure Cargo.toml version is bumped above the base branch
+        run: |
+          extract() {
+            grep -m1 -E '^version[[:space:]]*=' | sed -E 's/^version[[:space:]]*=[[:space:]]*"([^"]+)".*/\1/'
+          }
+          head_ver="$(extract < Cargo.toml)"
+          base_ver="$(git show '${{ github.event.pull_request.base.sha }}:Cargo.toml' | extract)"
+          echo "base (${{ github.base_ref }}) = ${base_ver:-<none>}"
+          echo "head (this PR)               = ${head_ver:-<none>}"
+
+          if [ -z "${head_ver}" ] || [ -z "${base_ver}" ]; then
+            echo "::error::could not read a version from Cargo.toml (head='${head_ver}', base='${base_ver}')."
+            exit 1
+          fi
+          if [ "${head_ver}" = "${base_ver}" ]; then
+            echo "::error::Cargo.toml version (${head_ver}) is unchanged from ${{ github.base_ref }}. Bump the version before this PR can be merged."
+            exit 1
+          fi
+          highest="$(printf '%s\n%s\n' "${base_ver}" "${head_ver}" | sort -V | tail -n1)"
+          if [ "${highest}" != "${head_ver}" ]; then
+            echo "::error::Cargo.toml version (${head_ver}) is lower than ${{ github.base_ref }} (${base_ver}). It must be bumped above the base."
+            exit 1
+          fi
+          echo "OK: version bumped ${base_ver} -> ${head_ver}"
