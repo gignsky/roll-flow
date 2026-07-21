@@ -2,12 +2,8 @@
   description = "roll-flow (rf) — structured NixOS dotfiles workflow manager";
 
   inputs = {
-    gigpkgs = {
-      url = "github:gignsky/gigpkgs";
-      inputs.nixpkgs.follows = "gigpkgs/nixpkgs-unstable";
-    };
-    nixpkgs.follows = "gigpkgs";
-    pre-commit-hooks.follows = "gigpkgs/pre-commit-hooks";
+    nixpkgs.url = "github:gignsky/gigpkgs/gigpkgs-unstable";
+    pre-commit-hooks.follows = "nixpkgs/pre-commit-hooks";
   };
 
   outputs =
@@ -19,7 +15,7 @@
         "aarch64-linux"
       ];
       forAllSystems = nixpkgs.lib.genAttrs systems;
-      pkgsFor = sys: inputs.gigpkgs.legacyPackages.${sys};
+      pkgsFor = sys: inputs.nixpkgs.legacyPackages.${sys};
       pkgs = pkgsFor system;
       cargoCheckWrapped = pkgs.writeShellApplication {
         name = "cargo-check-wrapper";
