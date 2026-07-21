@@ -23,6 +23,17 @@ impl BranchLocation {
             BranchLocation::Neither => "-",
         }
     }
+
+    /// Full word form used in the detail overlay: `"local"` / `"remote"` /
+    /// `"both"` / `"none"`. The compact table keeps [`symbol`](Self::symbol).
+    pub fn label(&self) -> &'static str {
+        match self {
+            BranchLocation::Local => "local",
+            BranchLocation::Remote => "remote",
+            BranchLocation::Both => "both",
+            BranchLocation::Neither => "none",
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -136,14 +147,20 @@ pub fn list_rolls(config: &Config) -> Result<Vec<RollInfo>, RfError> {
     rolls.sort_by_key(|r| r.number);
 
     // Compute deps for active rolls and promote to Blocked when needed.
+    // Deps are the roll's *actual direct integrations* — the roll branches it
+    // pulled in via `rf integrate` — detected from its own first-parent merge
+    // history. A roll is Blocked only when one of those integrations has not yet
+    // graduated. File overlap and broad ancestry are deliberately NOT used here:
+    // in a dotfiles repo nearly every roll touches flake.lock, which made them
+    // spuriously block one another.
     let snapshot = rolls.clone();
     for roll in &mut rolls {
         if roll.state == RollState::Active {
-            roll.deps = get_deps(
+            roll.deps = integration_deps(
                 repo,
                 &roll.branch,
                 roll.number,
-                &snapshot,
+                &config.roll_prefix,
                 &config.stable_branch,
             );
             let blocked = roll.deps.iter().any(|dep| {
@@ -283,8 +300,12 @@ fn scan_promoted(repo: &Path, stable_ref: &str) -> HashSet<String> {
     promoted
 }
 
-/// Extract the branch name from a graduation subject line.
-/// Handles both `Merge branch 'roll/N-...'[...]` and `Graduate roll/N-... [...]`.
+/// Extract the branch name from a graduation subject line. Handles the three
+/// merge-subject shapes a roll can land through:
+/// - `Merge branch 'roll/N-...'[ into ...]` — a local `git merge --no-ff`.
+/// - `Graduate roll/N-... [...]` — an `rf graduate` structured merge.
+/// - `Merge pull request #M from OWNER/roll/N-...` — a GitHub PR merge, which is
+///   how PR-based repos (including roll-flow dogfooding itself) land rolls.
 fn extract_graduated_branch(subject: &str) -> Option<String> {
     if let Some(rest) = subject.strip_prefix("Merge branch '") {
         // e.g. "roll/5-theme'" or "roll/5-theme' into rolling"
@@ -292,6 +313,13 @@ fn extract_graduated_branch(subject: &str) -> Option<String> {
     } else if let Some(rest) = subject.strip_prefix("Graduate ") {
         // e.g. "roll/5-theme into rolling"
         rest.split_whitespace().next().map(|b| b.to_string())
+    } else if subject.starts_with("Merge pull request #") {
+        // "Merge pull request #M from OWNER/BRANCH" — split off the owner only,
+        // since BRANCH itself contains '/' (e.g. "gignsky/roll/5-theme").
+        subject
+            .split_once(" from ")
+            .and_then(|(_, owner_branch)| owner_branch.split_once('/'))
+            .map(|(_owner, branch)| branch.trim().to_string())
     } else {
         None
     }
@@ -304,89 +332,61 @@ fn subjects_contain_graduation(subjects: &[String], roll_branch: &str) -> bool {
         .any(|b| b == roll_branch)
 }
 
-/// Compute deps for one roll using git ancestry (method 2) and file overlap (method 3).
-/// Only considers lower-numbered, non-promoted rolls as candidates.
-fn get_deps(
+/// Roll numbers this roll has *directly integrated* via `rf integrate`
+/// (`git merge --no-ff <branch>`).
+///
+/// Detected by parsing the roll's own first-parent merge history in the range
+/// `<stable>..<roll>`. `--first-parent` combined with the `<stable>..<roll>`
+/// range restricts results to merges THIS roll introduced (direct integrations),
+/// excluding transitive ones carried in by an integrated roll's own history.
+/// Each subject matching `Merge branch 'roll/<N>-…'` yields `<N>`.
+///
+/// This is the only dependency signal that gates blocking: file overlap and
+/// broad ancestry are intentionally excluded (see `list_rolls`).
+fn integration_deps(
     repo: &Path,
     roll_branch: &str,
     roll_num: u32,
-    all_rolls: &[RollInfo],
+    prefix: &str,
     stable_ref: &str,
 ) -> Vec<u32> {
-    let roll_ref = match git::resolve_branch(repo, roll_branch) {
-        Some(r) => r,
-        None => return Vec::new(),
+    let (Some(roll_ref), Some(stable)) = (
+        git::resolve_branch(repo, roll_branch),
+        git::resolve_branch(repo, stable_ref),
+    ) else {
+        return Vec::new();
     };
 
-    let candidates: Vec<&RollInfo> = all_rolls
+    let range = format!("{stable}..{roll_ref}");
+    let subjects =
+        git::log_subjects(repo, &["--first-parent", "--merges", &range]).unwrap_or_default();
+
+    let mut deps: Vec<u32> = subjects
         .iter()
-        .filter(|r| r.number < roll_num && r.state != RollState::Promoted)
+        .filter_map(|s| extract_graduated_branch(s))
+        .filter_map(|b| parse_roll_number(&b, prefix))
+        .filter(|&n| n != roll_num)
         .collect();
-
-    let mut deps = Vec::new();
-
-    // Method 2: if another roll's tip is an ancestor of this roll, it's a hard dep.
-    for other in &candidates {
-        let other_ref = match git::resolve_branch(repo, &other.branch) {
-            Some(r) => r,
-            None => continue,
-        };
-        if git::is_ancestor(repo, &other_ref, &roll_ref).unwrap_or(false) {
-            deps.push(other.number);
-        }
-    }
-
-    // Method 3: file overlap — rolls touching the same files are ordered deps.
-    let stable = git::resolve_branch(repo, stable_ref).unwrap_or_else(|| stable_ref.to_string());
-    let our_files: HashSet<String> = git::diff_name_only(repo, &stable, &roll_ref)
-        .unwrap_or_default()
-        .into_iter()
-        .collect();
-
-    if !our_files.is_empty() {
-        for other in &candidates {
-            if deps.contains(&other.number) {
-                continue;
-            }
-            let other_ref = match git::resolve_branch(repo, &other.branch) {
-                Some(r) => r,
-                None => continue,
-            };
-            let other_files: HashSet<String> = git::diff_name_only(repo, &stable, &other_ref)
-                .unwrap_or_default()
-                .into_iter()
-                .collect();
-            if our_files.iter().any(|f| other_files.contains(f)) {
-                deps.push(other.number);
-            }
-        }
-    }
 
     deps.sort_unstable();
+    deps.dedup();
     deps
 }
 
 /// Find the git hash of the merge/graduation commit for `roll_branch` on
-/// `rolling_ref`.  Returns `None` if no graduation commit is found.
+/// `rolling_ref`.  Returns `None` if no graduation commit is found. Scans merge
+/// commits and matches subjects through [`extract_graduated_branch`], so all
+/// three merge-subject shapes (local `Merge branch`, `Graduate`, and GitHub
+/// `Merge pull request`) are recognized from one source of truth.
 fn find_graduation_commit(repo: &Path, roll_branch: &str, rolling_ref: &str) -> Option<String> {
-    for pattern in [
-        format!("Merge branch '{roll_branch}'"),
-        format!("Graduate {roll_branch}"),
-    ] {
-        if let Ok(hash) = git::capture_git(
-            repo,
-            &[
-                "log",
-                "--format=%H",
-                &format!("--grep={pattern}"),
-                "--fixed-strings",
-                "-1",
-                rolling_ref,
-            ],
-        ) {
-            if !hash.is_empty() {
-                return Some(hash);
-            }
+    let out =
+        git::capture_git(repo, &["log", "--merges", "--format=%H%x09%s", rolling_ref]).ok()?;
+    for line in out.lines() {
+        let Some((hash, subject)) = line.split_once('\t') else {
+            continue;
+        };
+        if extract_graduated_branch(subject).as_deref() == Some(roll_branch) {
+            return Some(hash.to_string());
         }
     }
     None
@@ -394,12 +394,43 @@ fn find_graduation_commit(repo: &Path, roll_branch: &str, rolling_ref: &str) -> 
 
 #[cfg(test)]
 mod tests {
-    use super::parse_roll_number;
+    use super::{extract_graduated_branch, parse_roll_number};
 
     #[test]
     fn parses_roll_number() {
         assert_eq!(parse_roll_number("roll/12-0611-cli", "roll/"), Some(12));
         assert_eq!(parse_roll_number("roll/x-0611-cli", "roll/"), None);
         assert_eq!(parse_roll_number("feature/foo", "roll/"), None);
+    }
+
+    #[test]
+    fn extracts_branch_from_all_merge_subject_shapes() {
+        // Local `git merge --no-ff`.
+        assert_eq!(
+            extract_graduated_branch("Merge branch 'roll/5-0611-theme' into develop").as_deref(),
+            Some("roll/5-0611-theme")
+        );
+        // `rf graduate` structured merge.
+        assert_eq!(
+            extract_graduated_branch("Graduate roll/5-0611-theme into develop").as_deref(),
+            Some("roll/5-0611-theme")
+        );
+        // GitHub PR merge — the format PR-based repos (and dogfooding) land through.
+        assert_eq!(
+            extract_graduated_branch(
+                "Merge pull request #87 from gignsky/roll/16-0721-tui-dependents"
+            )
+            .as_deref(),
+            Some("roll/16-0721-tui-dependents")
+        );
+        // A non-roll PR merge extracts the branch but won't parse as a roll number.
+        assert_eq!(
+            extract_graduated_branch("Merge pull request #99 from gignsky/claude/some-fix")
+                .as_deref(),
+            Some("claude/some-fix")
+        );
+        assert_eq!(parse_roll_number("claude/some-fix", "roll/"), None);
+        // Unrelated subject.
+        assert_eq!(extract_graduated_branch("chore: bump version"), None);
     }
 }

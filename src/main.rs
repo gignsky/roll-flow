@@ -4,19 +4,13 @@ mod error;
 mod tui;
 
 use std::io::IsTerminal;
-use std::process::Command;
 
 use anyhow::{bail, Context, Result};
 use clap::Parser;
 use serde::Serialize;
 
 use cli::{Cli, Cmd};
-use core::{branches, config::Config, git};
-
-/// Prefix for the hotfix tier. Parallel to `roll_prefix`, but fixed rather than
-/// configurable — hotfixes are a rarely-used sanctioned exception with their own
-/// independent numbering.
-const HOTFIX_PREFIX: &str = "hotfix/";
+use core::{branches, config::Config, git, ops};
 
 fn main() -> Result<()> {
     let cli = Cli::parse();
@@ -138,260 +132,97 @@ fn cmd_init(
 
 fn cmd_create(slug: &str, date: Option<String>, dry_run: bool) -> Result<()> {
     let config = Config::load()?;
-    ensure_clean_state(&config)?;
-    // A roll is branched off the stable branch, not rolling: it must start from a
-    // clean baseline so `diff(stable, roll)` is exactly the roll's own changes and
-    // dependency detection (core/branches.rs) does not treat everything already on
-    // rolling as an implicit dependency. Rolling and other rolls become dependencies
-    // only when explicitly merged in via `rf integrate`.
-    if !git::ref_exists(&config.repo_root, &config.stable_branch) {
-        bail!("stable branch '{}' not found", config.stable_branch);
-    }
-
-    let normalized_slug = normalize_slug(slug)?;
-    let mmdd = match date {
-        Some(d) => d,
-        None => current_mmdd()?,
-    };
-    validate_mmdd(&mmdd)?;
-    let rolls = branches::list_rolls(&config)?;
-    let next = rolls.iter().map(|r| r.number).max().unwrap_or(0) + 1;
-    let branch_name = format!(
-        "{}{}-{}-{}",
-        config.roll_prefix, next, mmdd, normalized_slug
-    );
-
-    if git::ref_exists(&config.repo_root, &branch_name) {
-        bail!("roll branch '{}' already exists", branch_name);
-    }
-
-    if dry_run {
-        println!(
-            "Dry-run: would create '{}' from '{}'",
-            branch_name, config.stable_branch
-        );
-        return Ok(());
-    }
-
-    git::run_git(
-        &config.repo_root,
-        &["checkout", "-b", &branch_name, &config.stable_branch],
-    )?;
-    println!("Created {}", branch_name);
+    ops::ensure_clean_state(&config)?;
+    let outcome = ops::create(&config, slug, date, dry_run)?;
+    print_create(&outcome);
     Ok(())
 }
 
-fn cmd_integrate(branch: &str) -> Result<()> {
+fn cmd_integrate(arg: &str) -> Result<()> {
     let config = Config::load()?;
-    ensure_clean_state(&config)?;
-    let repo = &config.repo_root;
-    let current = git::current_branch(repo)?;
-    if !current.starts_with(&config.roll_prefix) {
-        bail!(
-            "must be on a roll branch to integrate (current: {})",
-            current
-        );
-    }
-    if !git::ref_exists(repo, branch) {
-        bail!("branch not found: {}", branch);
-    }
-    git::run_git(repo, &["merge", "--no-ff", branch])?;
-    println!("integrated {} into {}", branch, current);
+    ops::ensure_clean_state(&config)?;
+    let branch = resolve_integrate_target(&config, arg)?;
+    let outcome = ops::integrate(&config, &branch)?;
+    println!("integrated {} into {}", outcome.branch, outcome.current);
     Ok(())
 }
 
-/// Create a hotfix branch off the stable branch: `hotfix/N-MMDD-slug`.
-///
-/// Mirrors `cmd_create` but over the `hotfix/` tier, which is branched off
-/// stable (not rolling) and carries its own independent numbering.
+/// Resolve the `integrate` argument to a branch name. A bare positive integer is
+/// looked up as a roll number and mapped to its `roll/<N>-…` branch; anything
+/// else is treated verbatim as a branch name (back-compatible).
+fn resolve_integrate_target(config: &Config, arg: &str) -> Result<String> {
+    let Ok(number) = arg.parse::<u32>() else {
+        return Ok(arg.to_string());
+    };
+    let rolls = branches::list_rolls(config)?;
+    match rolls.into_iter().find(|r| r.number == number) {
+        Some(roll) => Ok(roll.branch),
+        None => bail!("no roll with number {number}"),
+    }
+}
+
 fn cmd_hotfix_create(slug: &str, date: Option<String>, dry_run: bool) -> Result<()> {
     let config = Config::load()?;
-    ensure_clean_state(&config)?;
-    if !git::ref_exists(&config.repo_root, &config.stable_branch) {
-        bail!("stable branch '{}' not found", config.stable_branch);
-    }
+    ops::ensure_clean_state(&config)?;
+    let outcome = ops::hotfix_create(&config, slug, date, dry_run)?;
+    print_create(&outcome);
+    Ok(())
+}
 
-    let normalized_slug = normalize_slug(slug)?;
-    let mmdd = match date {
-        Some(d) => d,
-        None => current_mmdd()?,
-    };
-    validate_mmdd(&mmdd)?;
-
-    let next = next_hotfix_number(&config)?;
-    let branch_name = format!("{HOTFIX_PREFIX}{next}-{mmdd}-{normalized_slug}");
-
-    if git::ref_exists(&config.repo_root, &branch_name) {
-        bail!("hotfix branch '{}' already exists", branch_name);
-    }
-
-    if dry_run {
+/// Shared renderer for roll/hotfix creation (both emit the same lines).
+fn print_create(outcome: &ops::CreateOutcome) {
+    if outcome.dry_run {
         println!(
             "Dry-run: would create '{}' from '{}'",
-            branch_name, config.stable_branch
+            outcome.branch, outcome.stable
         );
-        return Ok(());
+    } else {
+        println!("Created {}", outcome.branch);
     }
-
-    git::run_git(
-        &config.repo_root,
-        &["checkout", "-b", &branch_name, &config.stable_branch],
-    )?;
-    println!("Created {}", branch_name);
-    Ok(())
 }
 
-/// Land the current hotfix: `--no-ff` merge into the stable branch, then
-/// immediately reintegrate stable into rolling so the tiers never silently
-/// diverge (the reintegration invariant).
-///
-/// Hotfixes bypass host verification by design, but still run the configured
-/// stable-merge (flake/lint) gates. Both merges reuse `run_merge`, which
-/// returns to the branch we started on (the hotfix branch) and aborts/restores
-/// on conflict.
 fn cmd_hotfix_land(dry_run: bool) -> Result<()> {
     let config = Config::load()?;
-    ensure_clean_state(&config)?;
-    let repo = &config.repo_root;
-    let current = git::current_branch(repo)?;
-    if !current.starts_with(HOTFIX_PREFIX) {
-        bail!(
-            "rf hotfix --land must be run from a hotfix branch (current: '{}')",
-            current
-        );
-    }
-    let short = hotfix_short_name(&current)
-        .ok_or_else(|| anyhow::anyhow!("could not parse hotfix branch name '{current}'"))?;
-    let stable = config.stable_branch.clone();
-    let rolling = config.rolling_branch.clone();
-
-    // The landing merge (hotfix -> stable) must be viable.
-    match classify_merge(repo, &current, &stable)? {
-        MergeState::TargetMissing => bail!(target_missing_error(&config, &stable)),
-        MergeState::UnrelatedHistories => {
-            bail!("'{}' and '{}' share no common history", current, stable)
-        }
-        MergeState::NothingToMerge => bail!(
-            "nothing to land: '{}' has no commits that '{}' lacks (already up to date)",
-            current,
-            stable
-        ),
-        MergeState::Diverged | MergeState::FastForwardable => {}
-    }
-
-    // Reintegration (stable -> rolling) requires the rolling branch to exist.
-    if !git::ref_exists(repo, &rolling) {
-        bail!(target_missing_error(&config, &rolling));
-    }
-
-    // Host gating is bypassed by design; the stable-merge gates still run.
-    run_gates(
-        repo,
-        &config.rolling_to_main_gates,
-        dry_run,
-        &ForceOpts::new(false, None)?,
-    )?;
-
-    if dry_run {
+    ops::ensure_clean_state(&config)?;
+    let outcome = ops::hotfix_land(&config, dry_run)?;
+    render_gate_notices(&outcome.gate_notices);
+    if outcome.dry_run {
         println!(
-            "Dry-run: would land '{current}' into '{stable}' (--no-ff), \
-             then reintegrate '{stable}' into '{rolling}'"
+            "Dry-run: would land '{}' into '{}' (--no-ff), then reintegrate '{}' into '{}'",
+            outcome.current, outcome.stable, outcome.stable, outcome.rolling
         );
-        return Ok(());
+    } else {
+        println!("Landed '{}' into '{}'", outcome.current, outcome.stable);
+        println!(
+            "Reintegrated '{}' into '{}'",
+            outcome.stable, outcome.rolling
+        );
     }
-
-    let land_subject = format!("Hotfix {short} into {stable}");
-    run_merge(repo, &current, &stable, &land_subject, None)?;
-    println!("Landed '{current}' into '{stable}'");
-
-    let reintegrate_subject = format!("Reintegrate {stable} into {rolling} (hotfix {short})");
-    run_merge(repo, &stable, &rolling, &reintegrate_subject, None)?;
-    println!("Reintegrated '{stable}' into '{rolling}'");
-
     Ok(())
-}
-
-/// Next hotfix number: one past the highest existing `hotfix/N-…` (local +
-/// remote), independent of roll numbering.
-fn next_hotfix_number(config: &Config) -> Result<u32> {
-    let repo = &config.repo_root;
-    let pattern = format!("{HOTFIX_PREFIX}*");
-    let mut names = git::local_branches(repo, &pattern)?;
-    names.extend(git::remote_branches(repo, &pattern)?);
-    let max = names
-        .iter()
-        .filter_map(|b| branches::parse_roll_number(b, HOTFIX_PREFIX))
-        .max()
-        .unwrap_or(0);
-    Ok(max + 1)
-}
-
-/// Short reference form used in hotfix merge subjects: the branch
-/// `hotfix/N-MMDD-slug` renders as `hotfix/N-slug` (date dropped), matching the
-/// approved subject format `Hotfix hotfix/N-slug into <stable>`.
-fn hotfix_short_name(branch: &str) -> Option<String> {
-    let rest = branch.strip_prefix(HOTFIX_PREFIX)?;
-    let mut parts = rest.splitn(3, '-');
-    let number = parts.next()?;
-    let _mmdd = parts.next()?;
-    let slug = parts.next()?;
-    if number.is_empty() || slug.is_empty() {
-        return None;
-    }
-    Some(format!("{HOTFIX_PREFIX}{number}-{slug}"))
 }
 
 fn cmd_verify(dry_run: bool) -> Result<()> {
     let config = Config::load()?;
-    ensure_clean_state(&config)?;
-    let current = git::current_branch(&config.repo_root)?;
-    let route =
-        infer_route(&config, &current).ok_or_else(|| not_promotable_error(&config, &current))?;
-
-    let (source, target, gates) = match &route {
-        Route::Graduate { roll } => (
-            roll.clone(),
-            config.rolling_branch.clone(),
-            &config.roll_to_rolling_gates,
-        ),
-        Route::Promote => (
-            config.rolling_branch.clone(),
-            config.stable_branch.clone(),
-            &config.rolling_to_main_gates,
-        ),
-    };
-
-    match classify_merge(&config.repo_root, &source, &target)? {
-        MergeState::TargetMissing => bail!(target_missing_error(&config, &target)),
-        MergeState::UnrelatedHistories => {
-            bail!("'{}' and '{}' share no common history", source, target)
-        }
-        MergeState::NothingToMerge => bail!(
-            "nothing to merge: '{}' has no commits that '{}' lacks (already up to date)",
-            source,
-            target
-        ),
-        MergeState::Diverged => println!(
+    ops::ensure_clean_state(&config)?;
+    let outcome = ops::verify(&config, dry_run)?;
+    if outcome.diverged_note {
+        println!(
             "note: '{}' has commits not in '{}'; graduation/promotion will create a --no-ff merge",
-            target, source
-        ),
-        MergeState::FastForwardable => {}
+            outcome.target, outcome.source
+        );
     }
-
-    run_gates(
-        &config.repo_root,
-        gates,
-        dry_run,
-        &ForceOpts::new(false, None)?,
-    )?;
-    println!("Verification passed: {} -> {}", source, target);
+    render_gate_notices(&outcome.gate_notices);
+    println!(
+        "Verification passed: {} -> {}",
+        outcome.source, outcome.target
+    );
     Ok(())
 }
 
 fn cmd_graduate(dry_run: bool, force: bool, reason: Option<String>) -> Result<()> {
-    let force = ForceOpts::new(force, reason)?;
+    let force = ops::ForceOpts::new(force, reason)?;
     let config = Config::load()?;
-    ensure_clean_state(&config)?;
+    ops::ensure_clean_state(&config)?;
     let current = git::current_branch(&config.repo_root)?;
     if !current.starts_with(&config.roll_prefix) {
         bail!(
@@ -402,146 +233,83 @@ fn cmd_graduate(dry_run: bool, force: bool, reason: Option<String>) -> Result<()
             config.stable_branch
         );
     }
-    graduate_branch(&config, &current, dry_run, &force)
+    let outcome = ops::graduate(&config, &current, dry_run, &force)?;
+    print_graduate(&outcome);
+    Ok(())
 }
 
 fn cmd_promote(dry_run: bool, force: bool, reason: Option<String>) -> Result<()> {
-    let force = ForceOpts::new(force, reason)?;
+    let force = ops::ForceOpts::new(force, reason)?;
     let config = Config::load()?;
-    ensure_clean_state(&config)?;
+    ops::ensure_clean_state(&config)?;
     let current = git::current_branch(&config.repo_root)?;
-    match infer_route(&config, &current) {
-        Some(Route::Graduate { roll }) => {
+    match ops::infer_route(&config, &current) {
+        Some(ops::Route::Graduate { roll }) => {
             println!(
                 "note: '{}' is a roll branch; graduating into '{}' — use rf graduate directly next time",
                 roll, config.rolling_branch
             );
-            graduate_branch(&config, &roll, dry_run, &force)
+            let outcome = ops::graduate(&config, &roll, dry_run, &force)?;
+            print_graduate(&outcome);
         }
-        Some(Route::Promote) => promote_rolling(&config, dry_run, &force),
-        None => Err(not_promotable_error(&config, &current)),
+        Some(ops::Route::Promote) => {
+            let outcome = ops::promote(&config, dry_run, &force)?;
+            render_gate_notices(&outcome.gate_notices);
+            if outcome.dry_run {
+                println!(
+                    "Dry-run: would promote '{}' into '{}' (--no-ff)",
+                    outcome.rolling, outcome.stable
+                );
+            } else {
+                println!("Promoted '{}' into '{}'", outcome.rolling, outcome.stable);
+            }
+        }
+        None => return Err(ops::not_promotable_error(&config, &current)),
     }
+    Ok(())
 }
 
-/// Graduate `roll` into the rolling branch with a structured `--no-ff` merge.
-/// Shared by `rf graduate` and the `rf promote` fall-through.
-fn graduate_branch(config: &Config, roll: &str, dry_run: bool, force: &ForceOpts) -> Result<()> {
-    let repo = &config.repo_root;
-    if branches::check_promoted(repo, roll, &config.stable_branch) {
-        bail!(
-            "'{}' has already been promoted to '{}'",
-            roll,
-            config.stable_branch
+fn print_graduate(outcome: &ops::GraduateOutcome) {
+    render_gate_notices(&outcome.gate_notices);
+    if outcome.dry_run {
+        println!(
+            "Dry-run: would graduate '{}' into '{}' (--no-ff)",
+            outcome.roll, outcome.rolling
         );
+    } else {
+        println!("Graduated '{}' into '{}'", outcome.roll, outcome.rolling);
     }
-
-    let rolling = &config.rolling_branch;
-    match classify_merge(repo, roll, rolling)? {
-        MergeState::TargetMissing => bail!(target_missing_error(config, rolling)),
-        MergeState::UnrelatedHistories => {
-            bail!("'{}' and '{}' share no common history", roll, rolling)
-        }
-        MergeState::NothingToMerge => bail!(
-            "nothing to graduate: '{}' has no commits that '{}' lacks (already up to date)",
-            roll,
-            rolling
-        ),
-        MergeState::Diverged | MergeState::FastForwardable => {}
-    }
-
-    let bypassed = run_gates(repo, &config.roll_to_rolling_gates, dry_run, force)?;
-
-    if dry_run {
-        println!("Dry-run: would graduate '{roll}' into '{rolling}' (--no-ff)");
-        return Ok(());
-    }
-
-    let subject = format!("Graduate {roll} into {rolling}");
-    let body = force.trailer(&bypassed);
-    run_merge(repo, roll, rolling, &subject, body.as_deref())?;
-    println!("Graduated '{roll}' into '{rolling}'");
-    Ok(())
 }
 
-/// Promote the rolling branch into stable with a structured `--no-ff` merge.
-fn promote_rolling(config: &Config, dry_run: bool, force: &ForceOpts) -> Result<()> {
-    let repo = &config.repo_root;
-    let rolling = &config.rolling_branch;
-    let stable = &config.stable_branch;
-
-    match classify_merge(repo, rolling, stable)? {
-        MergeState::TargetMissing => bail!(target_missing_error(config, stable)),
-        MergeState::UnrelatedHistories => {
-            bail!("'{}' and '{}' share no common history", rolling, stable)
+/// Render the roll-flow status lines that `ops::run_gates` collects instead of
+/// printing, preserving the exact strings and stdout/stderr streams.
+fn render_gate_notices(notices: &[ops::GateNotice]) {
+    for notice in notices {
+        match notice {
+            ops::GateNotice::NoGates => println!("No gates configured"),
+            ops::GateNotice::DryRun(gate) => println!("Dry-run gate: {gate}"),
+            ops::GateNotice::Bypassed { gate, code } => eprintln!(
+                "warning: gate failed but bypassed (--force): {gate} ({})",
+                ops::exit_desc(*code)
+            ),
         }
-        MergeState::NothingToMerge => bail!(
-            "nothing to promote: '{}' has no commits that '{}' lacks (already up to date)",
-            rolling,
-            stable
-        ),
-        MergeState::Diverged | MergeState::FastForwardable => {}
     }
-
-    let bypassed = run_gates(repo, &config.rolling_to_main_gates, dry_run, force)?;
-
-    if dry_run {
-        println!("Dry-run: would promote '{rolling}' into '{stable}' (--no-ff)");
-        return Ok(());
-    }
-
-    let (subject, body) = promote_subject_and_body(config)?;
-    let body = ForceOpts::append_trailer(body, force.trailer(&bypassed));
-    run_merge(repo, rolling, stable, &subject, body.as_deref())?;
-    println!("Promoted '{rolling}' into '{stable}'");
-    Ok(())
-}
-
-/// Subject and body for a promotion merge. Exactly one graduated roll included
-/// → subject names it; otherwise a generic subject with the rolls listed in the
-/// body so promoted-state detection can attribute them.
-fn promote_subject_and_body(config: &Config) -> Result<(String, Option<String>)> {
-    let rolls = branches::list_rolls(config)?;
-    let included: Vec<&branches::RollInfo> = rolls
-        .iter()
-        .filter(|r| {
-            matches!(
-                r.state,
-                branches::RollState::Graduated | branches::RollState::Diverged
-            )
-        })
-        .collect();
-
-    let subject = if included.len() == 1 {
-        format!("Promote {} to {}", included[0].branch, config.stable_branch)
-    } else {
-        format!(
-            "Promote {} to {}",
-            config.rolling_branch, config.stable_branch
-        )
-    };
-
-    let body = if included.is_empty() {
-        None
-    } else {
-        let mut body = String::from("Rolls:\n");
-        for roll in &included {
-            body.push_str(&format!("  {}\n", roll.branch));
-        }
-        Some(body)
-    };
-
-    Ok((subject, body))
 }
 
 fn cmd_status_json() -> Result<()> {
     let config = Config::load()?;
     let current = git::current_branch(&config.repo_root).unwrap_or_else(|_| "HEAD".to_string());
     let detached = git::is_detached_head(&config.repo_root)?;
-    let clean = workflow_clean(&config)?;
+    let clean = ops::workflow_clean(&config)?;
     let rolls = branches::list_rolls(&config)?;
-    let tier = branch_tier(&config, &current, detached);
+    let tier = ops::branch_tier(&config, &current, detached);
 
-    let promotion = promotion_readiness(&config, &current, clean, detached);
+    let readiness = ops::promotion_readiness(&config, &current, clean, detached);
+    let promotion = PromotionReadiness {
+        description: readiness.description,
+        ready: readiness.ready,
+        reason: readiness.reason,
+    };
 
     let payload = StatusPayload {
         current_branch: current,
@@ -564,66 +332,29 @@ fn cmd_list_json() -> Result<()> {
 
 fn cmd_update(dry_run: bool) -> Result<()> {
     let config = Config::load()?;
-    let repo = &config.repo_root;
-    let rolls = branches::list_rolls(&config)?;
-
-    let active: Vec<_> = rolls
-        .iter()
-        .filter(|r| {
-            matches!(
-                r.state,
-                branches::RollState::Active | branches::RollState::Blocked
-            ) && matches!(
-                r.location,
-                branches::BranchLocation::Local | branches::BranchLocation::Both
-            )
-        })
-        .collect();
-
-    if active.is_empty() {
-        println!("no active local rolls to update");
-        return Ok(());
-    }
-
-    let stable = &config.stable_branch;
-
-    for roll in &active {
-        // Commits on stable that the roll doesn't already contain. Zero means
-        // stable is already an ancestor of the roll — nothing to merge.
-        let behind = git::capture_git(
-            repo,
-            &[
-                "rev-list",
-                "--count",
-                &format!("{}..{}", roll.branch, stable),
-            ],
-        )?;
-        let behind: u64 = behind.trim().parse().unwrap_or(0);
-
-        if behind == 0 {
-            println!("'{}' is already up to date with '{stable}'", roll.branch);
-            continue;
+    match ops::update(&config, dry_run)? {
+        ops::UpdateOutcome::NoActiveRolls => {
+            println!("no active local rolls to update");
         }
-
-        if dry_run {
-            println!(
-                "dry-run: would merge '{stable}' into '{}' ({behind} commit{} ahead)",
-                roll.branch,
-                if behind == 1 { "" } else { "s" },
-            );
-            continue;
+        ops::UpdateOutcome::Ran { stable, items } => {
+            for item in items {
+                match item {
+                    ops::UpdateItem::AlreadyUpToDate { roll } => {
+                        println!("'{roll}' is already up to date with '{stable}'");
+                    }
+                    ops::UpdateItem::WouldMerge { roll, behind } => {
+                        println!(
+                            "dry-run: would merge '{stable}' into '{roll}' ({behind} commit{} ahead)",
+                            if behind == 1 { "" } else { "s" },
+                        );
+                    }
+                    ops::UpdateItem::Updated { roll } => {
+                        println!("updated '{roll}' with '{stable}'");
+                    }
+                }
+            }
         }
-
-        // Short SHA of the roll tip before the merge, recorded in the body so
-        // the merge is self-describing.
-        let before = git::capture_git(repo, &["rev-parse", "--short", &roll.branch])?;
-        let subject = format!("Update {} from {stable}", roll.branch);
-        let body = format!("Brought in: {behind} commits since {before}");
-
-        run_merge(repo, stable, &roll.branch, &subject, Some(&body))?;
-        println!("updated '{}' with '{stable}'", roll.branch);
     }
-
     Ok(())
 }
 
@@ -633,12 +364,7 @@ fn cmd_list_text(no_tui: bool, deps: bool) -> Result<()> {
 
     if !no_tui && std::io::stdout().is_terminal() {
         let current = git::current_branch(&config.repo_root)?;
-        return tui::rolls::run(tui::rolls::TuiContext {
-            config: &config,
-            current_branch: &current,
-            rolls: &rolls,
-            show_deps: deps,
-        });
+        return tui::rolls::run(config, current, rolls, deps);
     }
 
     if rolls.is_empty() {
@@ -697,396 +423,6 @@ fn cmd_list_text(no_tui: bool, deps: bool) -> Result<()> {
     }
 
     Ok(())
-}
-
-fn ensure_clean_state(config: &Config) -> Result<()> {
-    if git::is_detached_head(&config.repo_root)? {
-        bail!("detached HEAD is not supported");
-    }
-    if !workflow_clean(config)? {
-        bail!("working tree must be clean");
-    }
-    Ok(())
-}
-
-fn workflow_clean(config: &Config) -> Result<bool> {
-    if git::working_tree_clean(&config.repo_root)? {
-        return Ok(true);
-    }
-    let status = git::capture_git(&config.repo_root, &["status", "--porcelain"])?;
-    let allowed = Config::config_path(&config.repo_root)
-        .strip_prefix(&config.repo_root)
-        .ok()
-        .and_then(|p| p.to_str())
-        .unwrap_or(".roll-flow.toml")
-        .replace('\\', "/");
-    let all_allowed = status.lines().all(|line| {
-        let trimmed = line.trim();
-        trimmed == format!("?? {allowed}")
-    });
-    Ok(all_allowed)
-}
-
-/// Where a merge would go from the current branch.
-enum Route {
-    /// roll/* -> rolling
-    Graduate { roll: String },
-    /// rolling -> stable
-    Promote,
-}
-
-fn infer_route(config: &Config, current: &str) -> Option<Route> {
-    if current == config.rolling_branch {
-        Some(Route::Promote)
-    } else if current.starts_with(&config.roll_prefix) {
-        Some(Route::Graduate {
-            roll: current.to_string(),
-        })
-    } else {
-        None
-    }
-}
-
-fn not_promotable_error(config: &Config, current: &str) -> anyhow::Error {
-    anyhow::anyhow!(
-        "branch '{}' is not promotable; expected '{}' or '{}*'",
-        current,
-        config.rolling_branch,
-        config.roll_prefix
-    )
-}
-
-fn target_missing_error(config: &Config, target: &str) -> String {
-    if git::ref_exists(&config.repo_root, &format!("origin/{target}")) {
-        format!(
-            "target branch '{target}' not found locally; create it with `git branch {target} origin/{target}`"
-        )
-    } else {
-        format!("target branch '{target}' not found")
-    }
-}
-
-/// Pure git-topology classification of a prospective merge.
-#[derive(Debug, PartialEq, Eq)]
-enum MergeState {
-    /// Target is strictly behind source; a merge is trivially clean.
-    FastForwardable,
-    /// Both sides have unique commits — mergeable via --no-ff.
-    Diverged,
-    /// Source is an ancestor of target (or tips are equal).
-    NothingToMerge,
-    /// No local target branch.
-    TargetMissing,
-    /// No common merge base.
-    UnrelatedHistories,
-}
-
-fn classify_merge(repo: &std::path::Path, source: &str, target: &str) -> Result<MergeState> {
-    if !git::ref_exists(repo, target) {
-        return Ok(MergeState::TargetMissing);
-    }
-    let source_sha = git::rev_parse(repo, source)
-        .with_context(|| format!("source branch '{source}' not found"))?;
-    let target_sha = git::rev_parse(repo, target)?;
-    if source_sha == target_sha {
-        return Ok(MergeState::NothingToMerge);
-    }
-    if git::is_ancestor(repo, source, target)? {
-        return Ok(MergeState::NothingToMerge);
-    }
-    if git::is_ancestor(repo, target, source)? {
-        return Ok(MergeState::FastForwardable);
-    }
-    match git::merge_base(repo, source, target) {
-        Ok(_) => Ok(MergeState::Diverged),
-        Err(_) => Ok(MergeState::UnrelatedHistories),
-    }
-}
-
-/// Merge `source` into `target` with `--no-ff` and a structured message, then
-/// return to the branch we started on. On merge failure the merge is aborted
-/// and the original checkout restored. Reused by future hotfix/revert flows.
-fn run_merge(
-    repo: &std::path::Path,
-    source: &str,
-    target: &str,
-    subject: &str,
-    body: Option<&str>,
-) -> Result<()> {
-    let original = git::current_branch(repo)?;
-
-    git::run_git(repo, &["checkout", target])
-        .with_context(|| format!("failed to check out '{target}'"))?;
-
-    let mut merge_args = vec!["merge", "--no-ff", "--no-edit", "-m", subject];
-    if let Some(body) = body {
-        merge_args.push("-m");
-        merge_args.push(body);
-    }
-    merge_args.push(source);
-
-    if let Err(merge_err) = git::run_git(repo, &merge_args) {
-        let _ = git::run_git(repo, &["merge", "--abort"]);
-        let _ = git::run_git(repo, &["checkout", &original]);
-        bail!(
-            "merge of '{source}' into '{target}' failed (likely conflicts); \
-             the merge was aborted and you are back on '{original}'. \
-             Resolve manually: git checkout {target} && git merge --no-ff {source} ({merge_err})"
-        );
-    }
-
-    git::run_git(repo, &["checkout", &original]).with_context(|| {
-        format!("the merge into '{target}' succeeded, but checking out '{original}' again failed")
-    })?;
-    Ok(())
-}
-
-/// A gate that failed but was bypassed under `--force`: the command and its
-/// exit code (`None` if terminated by a signal).
-struct GateBypass {
-    gate: String,
-    code: Option<i32>,
-}
-
-/// Run the configured gates. Without `--force`, a failing gate aborts the
-/// operation (the normal hard block). With `--force`, all gates still run but
-/// failures are collected and returned so the caller can record them in the
-/// merge commit instead of aborting.
-fn run_gates(
-    repo: &std::path::Path,
-    gates: &[String],
-    dry_run: bool,
-    force: &ForceOpts,
-) -> Result<Vec<GateBypass>> {
-    let mut bypassed = Vec::new();
-    if gates.is_empty() {
-        println!("No gates configured");
-        return Ok(bypassed);
-    }
-    for gate in gates {
-        if dry_run {
-            println!("Dry-run gate: {gate}");
-            continue;
-        }
-        let status = Command::new("sh")
-            .arg("-c")
-            .arg(gate)
-            .current_dir(repo)
-            .status()
-            .with_context(|| format!("failed to run gate: {gate}"))?;
-        if !status.success() {
-            if force.enabled {
-                eprintln!(
-                    "warning: gate failed but bypassed (--force): {gate} ({})",
-                    exit_desc(status.code())
-                );
-                bypassed.push(GateBypass {
-                    gate: gate.clone(),
-                    code: status.code(),
-                });
-            } else {
-                bail!("gate failed: {gate}");
-            }
-        }
-    }
-    Ok(bypassed)
-}
-
-fn exit_desc(code: Option<i32>) -> String {
-    code.map(|c| format!("exit {c}"))
-        .unwrap_or_else(|| "terminated by signal".to_string())
-}
-
-/// `--force` / `--reason` for graduate and promote. `--force` proceeds past
-/// failing gates; `--reason` (required with `--force`) is recorded verbatim in
-/// the merge commit so every bypass leaves a permanent, auditable trail.
-struct ForceOpts {
-    enabled: bool,
-    reason: Option<String>,
-}
-
-impl ForceOpts {
-    fn new(enabled: bool, reason: Option<String>) -> Result<Self> {
-        if enabled && reason.as_deref().map(str::trim).unwrap_or("").is_empty() {
-            bail!(
-                "--force requires --reason \"<why>\" (the reason is recorded in the merge commit)"
-            );
-        }
-        if !enabled && reason.is_some() {
-            bail!("--reason is only valid together with --force");
-        }
-        Ok(Self { enabled, reason })
-    }
-
-    /// Build the `Forced-Bypass:` / `Force-Reason:` trailer for a merge commit,
-    /// or `None` when nothing was actually bypassed (a `--force` that hit no
-    /// failing gate leaves no marker).
-    fn trailer(&self, bypassed: &[GateBypass]) -> Option<String> {
-        if bypassed.is_empty() {
-            return None;
-        }
-        let mut s = String::from("Forced-Bypass:\n");
-        for b in bypassed {
-            s.push_str(&format!("  gate: {:?} ({})\n", b.gate, exit_desc(b.code)));
-        }
-        let reason = self.reason.as_deref().unwrap_or("(none given)");
-        s.push_str(&format!("Force-Reason: {reason}"));
-        Some(s)
-    }
-
-    /// Append a force trailer to an existing (optional) merge-commit body.
-    fn append_trailer(body: Option<String>, trailer: Option<String>) -> Option<String> {
-        match (body, trailer) {
-            (Some(b), Some(t)) => Some(format!("{b}\n\n{t}")),
-            (Some(b), None) => Some(b),
-            (None, t) => t,
-        }
-    }
-}
-
-fn normalize_slug(input: &str) -> Result<String> {
-    let slug = input.trim().to_lowercase().replace(['_', ' '], "-");
-    if slug.is_empty() {
-        bail!("slug cannot be empty");
-    }
-    if !slug
-        .chars()
-        .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '-')
-    {
-        bail!("slug may only contain [a-z0-9-]");
-    }
-    Ok(slug.trim_matches('-').to_string())
-}
-
-fn validate_mmdd(mmdd: &str) -> Result<()> {
-    if mmdd.len() != 4 || !mmdd.chars().all(|c| c.is_ascii_digit()) {
-        bail!("date must be MMDD");
-    }
-    let month: u32 = mmdd[0..2].parse()?;
-    let day: u32 = mmdd[2..4].parse()?;
-    if month == 0 || month > 12 || day == 0 || day > 31 {
-        bail!("invalid MMDD date");
-    }
-    Ok(())
-}
-
-fn current_mmdd() -> Result<String> {
-    let now = time::OffsetDateTime::now_local().unwrap_or_else(|_| time::OffsetDateTime::now_utc());
-    let format = time::format_description::parse("[month repr:numerical][day]")
-        .context("bad date format")?;
-    let mmdd = now
-        .format(&format)
-        .context("failed to format current date")?;
-    validate_mmdd(&mmdd)?;
-    Ok(mmdd)
-}
-
-fn branch_tier(config: &Config, current: &str, detached: bool) -> String {
-    if detached {
-        return "detached".to_string();
-    }
-    if current == config.stable_branch {
-        return "main".to_string();
-    }
-    if current == config.rolling_branch {
-        return "rolling".to_string();
-    }
-    if current.starts_with(&config.roll_prefix) {
-        return "roll".to_string();
-    }
-    if current.starts_with(HOTFIX_PREFIX) {
-        return "hotfix".to_string();
-    }
-    "other".to_string()
-}
-
-/// Advisory promotion readiness for `status --json` (and the future status
-/// TUI). Never errors; whenever `ready` is false, `reason` explains why.
-/// Deliberately conservative: a diverged target reports not-ready with an
-/// explanation even though `rf graduate`/`rf promote` would still succeed.
-fn promotion_readiness(
-    config: &Config,
-    current: &str,
-    clean: bool,
-    detached: bool,
-) -> PromotionReadiness {
-    let not_ready = |description: String, reason: String| PromotionReadiness {
-        description,
-        ready: false,
-        reason: Some(reason),
-    };
-
-    if detached {
-        return not_ready(
-            "none".to_string(),
-            "detached HEAD is not supported".to_string(),
-        );
-    }
-
-    let Some(route) = infer_route(config, current) else {
-        return not_ready(
-            "none".to_string(),
-            not_promotable_error(config, current).to_string(),
-        );
-    };
-
-    let (source, target, verb) = match &route {
-        Route::Graduate { roll } => (roll.clone(), config.rolling_branch.clone(), "graduate"),
-        Route::Promote => (
-            config.rolling_branch.clone(),
-            config.stable_branch.clone(),
-            "promote",
-        ),
-    };
-    let description = format!("{source} -> {target}");
-
-    if !clean {
-        return not_ready(description, "working tree must be clean".to_string());
-    }
-
-    if let Route::Graduate { roll } = &route {
-        if branches::check_promoted(&config.repo_root, roll, &config.stable_branch) {
-            return not_ready(
-                description,
-                format!(
-                    "'{}' has already been promoted to '{}'",
-                    roll, config.stable_branch
-                ),
-            );
-        }
-    }
-
-    match classify_merge(&config.repo_root, &source, &target) {
-        Ok(MergeState::TargetMissing) => {
-            not_ready(description, target_missing_error(config, &target))
-        }
-        Ok(MergeState::UnrelatedHistories) => not_ready(
-            description,
-            format!("'{source}' and '{target}' share no common history"),
-        ),
-        Ok(MergeState::NothingToMerge) => {
-            let graduated = matches!(&route, Route::Graduate { roll }
-                if branches::check_graduated(&config.repo_root, roll, &config.rolling_branch));
-            let reason = if graduated {
-                format!("'{source}' is already graduated into '{target}' — nothing new to merge")
-            } else {
-                format!("nothing to merge: '{source}' has no commits that '{target}' lacks")
-            };
-            not_ready(description, reason)
-        }
-        Ok(MergeState::Diverged) => not_ready(
-            description,
-            format!(
-                "'{target}' has commits not in '{source}'; rf {verb} will create a --no-ff merge"
-            ),
-        ),
-        Ok(MergeState::FastForwardable) => PromotionReadiness {
-            description,
-            ready: true,
-            reason: None,
-        },
-        Err(err) => not_ready(description, err.to_string()),
-    }
 }
 
 #[derive(Serialize)]
