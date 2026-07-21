@@ -45,6 +45,21 @@ pub enum Cmd {
     /// Merge a feature branch into the current roll.
     Integrate { branch: String },
 
+    /// Create a hotfix branch off stable (hotfix/N-MMDD-slug), or land the
+    /// current hotfix into stable and reintegrate rolling with `--land`.
+    Hotfix {
+        /// Slug for the new hotfix. Required when creating; ignored with --land.
+        slug: Option<String>,
+        #[arg(long)]
+        date: Option<String>,
+        /// Land the current hotfix: --no-ff merge into stable, then reintegrate
+        /// stable into rolling. Run from a hotfix branch.
+        #[arg(long)]
+        land: bool,
+        #[arg(long)]
+        dry_run: bool,
+    },
+
     /// Verify current branch can be promoted and run configured gates.
     Verify {
         #[arg(long)]

@@ -175,6 +175,62 @@ fn promote_tolerates_divergence() {
 }
 
 #[test]
+fn init_is_idempotent_no_op_on_rerun() {
+    let sb = Sandbox::nixos();
+    let cfg_path = sb.path().join(".roll-flow.toml");
+
+    // First run writes the config from detected state.
+    let out = sb.init();
+    assert!(out.success, "first init failed: {}", out.combined());
+    assert!(
+        out.combined().contains("Initialized roll-flow"),
+        "unexpected first-run message: {}",
+        out.combined()
+    );
+    assert!(sb.exists(".roll-flow.toml"), "config should exist");
+    let after_first = std::fs::read_to_string(&cfg_path).expect("read config");
+
+    // Second run detects the same state: a no-op that reports "up to date",
+    // exits 0, needs no --force, and leaves the file byte-for-byte unchanged.
+    let out = sb.init();
+    assert!(out.success, "second init failed: {}", out.combined());
+    assert_eq!(out.code, Some(0), "second init should exit 0");
+    assert!(
+        out.combined().contains("already up to date"),
+        "expected 'already up to date', got: {}",
+        out.combined()
+    );
+    let after_second = std::fs::read_to_string(&cfg_path).expect("read config");
+    assert_eq!(
+        after_first, after_second,
+        "idempotent re-run must not rewrite the config"
+    );
+}
+
+#[test]
+fn init_regenerates_missing_config() {
+    let sb = Sandbox::nixos();
+
+    let out = sb.init();
+    assert!(out.success, "first init failed: {}", out.combined());
+    assert!(sb.exists(".roll-flow.toml"), "config should exist");
+
+    // Delete the generated config, then re-init: it regenerates from detected
+    // state rather than treating the file as required.
+    std::fs::remove_file(sb.path().join(".roll-flow.toml")).expect("remove config");
+    assert!(!sb.exists(".roll-flow.toml"), "config should be gone");
+
+    let out = sb.init();
+    assert!(out.success, "regenerating init failed: {}", out.combined());
+    assert!(
+        out.combined().contains("Initialized roll-flow"),
+        "unexpected regenerate message: {}",
+        out.combined()
+    );
+    assert!(sb.exists(".roll-flow.toml"), "config should be regenerated");
+}
+
+#[test]
 fn graduate_errors_off_roll_branch() {
     let sb = Sandbox::plain();
     let out = sb.init();
@@ -207,4 +263,60 @@ fn graduate_errors_with_nothing_to_merge() {
         "unexpected: {}",
         out.combined()
     );
+}
+
+#[test]
+fn update_merges_stable_with_descriptive_subject() {
+    let sb = Sandbox::plain();
+    let out = sb.init();
+    assert!(out.success, "init failed: {}", out.combined());
+
+    let out = sb.create_roll("feature", "0611");
+    assert!(out.success, "create failed: {}", out.combined());
+    sb.commit_file("work.txt", "w\n", "roll work");
+
+    // Advance stable so the roll is behind and has something to merge.
+    sb.git(&["checkout", "main"]);
+    sb.commit_file("stable.txt", "s\n", "advance stable");
+
+    let out = sb.rf(&["update"]);
+    assert!(out.success, "update failed: {}", out.combined());
+
+    let roll = "roll/1-0611-feature";
+    assert!(sb.tip_is_merge(roll), "roll tip should be a merge");
+    assert!(
+        sb.tip_subject(roll)
+            .starts_with(&format!("Update {roll} from main")),
+        "unexpected update subject: {}",
+        sb.tip_subject(roll)
+    );
+    assert!(
+        sb.is_ancestor("main", roll),
+        "main should be merged into the roll"
+    );
+}
+
+#[test]
+fn update_skips_roll_already_up_to_date() {
+    let sb = Sandbox::plain();
+    let out = sb.init();
+    assert!(out.success, "init failed: {}", out.combined());
+
+    let out = sb.create_roll("feature", "0611");
+    assert!(out.success, "create failed: {}", out.combined());
+    sb.commit_file("work.txt", "w\n", "roll work");
+
+    // Stable has not moved, so the roll already contains everything on main.
+    let roll = "roll/1-0611-feature";
+    let before = sb.rev(roll);
+
+    let out = sb.rf(&["update"]);
+    assert!(out.success, "update failed: {}", out.combined());
+    assert!(
+        out.combined().contains("already up to date"),
+        "expected up-to-date message: {}",
+        out.combined()
+    );
+
+    assert_eq!(before, sb.rev(roll), "no new commit should be created");
 }
