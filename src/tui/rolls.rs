@@ -47,9 +47,12 @@ enum Mode {
     },
     /// Read-only drill-down for a single roll: its identity plus its dependency
     /// rows (issue #61). A snapshot of the selected roll is captured on open so
-    /// the overlay stays stable regardless of later list reloads.
+    /// the overlay stays stable regardless of later list reloads. For
+    /// both-location rolls, `ahead_behind` holds the local-vs-`origin` divergence
+    /// captured at open time (issue #99); `None` when not applicable/unknown.
     Detail {
         roll: RollInfo,
+        ahead_behind: Option<(u32, u32)>,
     },
     /// Slug-input modal for creating a new roll (issue #79). Holds the
     /// in-progress text buffer; on Enter it runs `ops::create` through the same
@@ -179,6 +182,14 @@ pub(crate) fn dependent_rows(target: &RollInfo, all: &[RollInfo]) -> Vec<DepRow>
         .collect()
 }
 
+/// Render the ahead/behind divergence of a both-location roll versus its
+/// `origin` remote for the detail overlay (issue #99). `None` in → `None` out
+/// (nothing to show); otherwise a line like `ahead 2 / behind 1 vs origin`.
+/// Pure, so the wording is unit-testable without a terminal.
+pub(crate) fn format_ahead_behind(ahead_behind: Option<(u32, u32)>) -> Option<String> {
+    ahead_behind.map(|(ahead, behind)| format!("ahead {ahead} / behind {behind} vs origin"))
+}
+
 /// Colour used to render a roll state consistently across the table and detail
 /// view.
 fn state_color(state: &RollState) -> Color {
@@ -291,7 +302,7 @@ impl StatusApp {
                         self.handle_detail(key.code);
                     } else if matches!(self.mode, Mode::CreateInput { .. }) {
                         self.handle_create_input(terminal, key.code)?;
-                    } else if self.handle_browsing(key.code)? {
+                    } else if self.handle_browsing(terminal, key.code)? {
                         break;
                     }
                 }
@@ -301,7 +312,7 @@ impl StatusApp {
     }
 
     /// Handle a keypress while browsing. Returns `Ok(true)` to quit.
-    fn handle_browsing(&mut self, code: KeyCode) -> Result<bool> {
+    fn handle_browsing(&mut self, terminal: &mut super::Tui, code: KeyCode) -> Result<bool> {
         self.message = None;
         match code {
             KeyCode::Char('q') | KeyCode::Esc => return Ok(true),
@@ -316,12 +327,28 @@ impl StatusApp {
                     slug: String::new(),
                 }
             }
+            KeyCode::Char(' ') => {
+                if let Some(roll) = self.selected_roll() {
+                    let roll = roll.clone();
+                    self.execute_switch(terminal, roll)?;
+                } else {
+                    self.message = Some("no roll selected".to_string());
+                }
+            }
             KeyCode::Char('g') => self.request(Action::Graduate),
             KeyCode::Char('p') => self.request(Action::Promote),
             KeyCode::Char('u') => self.request(Action::Update),
             KeyCode::Enter => {
                 if let Some(roll) = self.selected_roll() {
-                    self.mode = Mode::Detail { roll: roll.clone() };
+                    let roll = roll.clone();
+                    // Capture the branch's divergence from origin for the overlay
+                    // (issue #99), only meaningful when it exists on both sides.
+                    let ahead_behind = if matches!(roll.location, BranchLocation::Both) {
+                        git::ahead_behind(&self.config.repo_root, &roll.branch).ok()
+                    } else {
+                        None
+                    };
+                    self.mode = Mode::Detail { roll, ahead_behind };
                 }
             }
             _ => {}
@@ -455,6 +482,35 @@ impl StatusApp {
         Ok(())
     }
 
+    /// Switch the working tree to `roll`'s branch (issue #99), through the same
+    /// suspended path as the other actions so git's own output — including a
+    /// conflict refusal — is visible, then reload so the dashboard reflects the
+    /// new current branch. Git natively carries clean uncommitted changes forward
+    /// and refuses (non-zero) when they would conflict; either way the TUI never
+    /// crashes and the error is surfaced.
+    fn execute_switch(&mut self, terminal: &mut super::Tui, roll: RollInfo) -> Result<()> {
+        self.with_suspended(terminal, |app| Ok((app.run_switch(&roll)?, ())))?;
+        Ok(())
+    }
+
+    /// Perform the branch switch for `roll`, returning printable status lines.
+    /// A remote-only roll is fetched first so `git switch` can DWIM-create a
+    /// local tracking branch from `origin/<branch>`.
+    fn run_switch(&self, roll: &RollInfo) -> Result<Vec<String>> {
+        let repo = &self.config.repo_root;
+        if roll.branch == self.current_branch {
+            return Ok(vec![format!("Already on '{}'", roll.branch)]);
+        }
+        let mut lines = Vec::new();
+        if matches!(roll.location, BranchLocation::Remote) {
+            git::run_git(repo, &["fetch", "origin", &roll.branch])?;
+            lines.push(format!("Fetched origin/{}", roll.branch));
+        }
+        git::run_git(repo, &["switch", &roll.branch])?;
+        lines.push(format!("Switched to '{}'", roll.branch));
+        Ok(lines)
+    }
+
     /// Shared suspend → run → show → resume → reload wrapper. Runs `body` with the
     /// TUI suspended so git's own output shows on the normal terminal, prints the
     /// resulting lines (or the error chain) exactly like the actions do, waits for
@@ -577,7 +633,9 @@ impl StatusApp {
             Mode::Confirm { action, target } => {
                 render_modal(f, area, &self.config, *action, target.as_deref());
             }
-            Mode::Detail { roll } => render_detail(f, area, roll, &self.rolls),
+            Mode::Detail { roll, ahead_behind } => {
+                render_detail(f, area, roll, *ahead_behind, &self.rolls)
+            }
             Mode::CreateInput { slug } => render_create_input(f, area, &self.config, slug),
             Mode::Browsing => {}
         }
@@ -680,7 +738,7 @@ impl StatusApp {
             None => Line::from(""),
         };
         let hint_line = Line::from(
-            " [q] quit   [j/k ↑/↓] nav   [enter] detail   [c]reate   [g]raduate   [p]romote   [u]pdate   [r]efresh",
+            " [q] quit   [j/k ↑/↓] nav   [space] switch   [enter] detail   [c]reate   [g]raduate   [p]romote   [u]pdate   [r]efresh",
         );
         f.render_widget(Paragraph::new(vec![msg_line, hint_line]), area);
     }
@@ -745,7 +803,13 @@ fn render_create_input(f: &mut Frame, area: Rect, config: &Config, buffer: &str)
 
 /// Render the centered read-only detail popup for a single roll: its identity
 /// and its dependency rows, with blockers clearly marked.
-fn render_detail(f: &mut Frame, area: Rect, roll: &RollInfo, all: &[RollInfo]) {
+fn render_detail(
+    f: &mut Frame,
+    area: Rect,
+    roll: &RollInfo,
+    ahead_behind: Option<(u32, u32)>,
+    all: &[RollInfo],
+) {
     let rows = dep_rows(roll, all);
     let dependents = dependent_rows(roll, all);
 
@@ -768,8 +832,17 @@ fn render_detail(f: &mut Frame, area: Rect, roll: &RollInfo, all: &[RollInfo]) {
             Span::raw("    location: "),
             Span::raw(roll.location.label()),
         ]),
-        Line::from(""),
     ];
+
+    // Local-vs-origin divergence, only for both-location rolls (issue #99).
+    if let Some(text) = format_ahead_behind(ahead_behind) {
+        lines.push(Line::from(Span::styled(
+            text,
+            Style::default().fg(Color::Yellow),
+        )));
+    }
+
+    lines.push(Line::from(""));
 
     if rows.is_empty() {
         lines.push(Line::from(Span::styled(
@@ -1097,6 +1170,20 @@ mod tests {
         assert!(!is_submittable_slug("   "));
         assert!(is_submittable_slug("theme"));
         assert!(is_submittable_slug("  theme  "));
+    }
+
+    #[test]
+    fn format_ahead_behind_wording() {
+        assert_eq!(
+            format_ahead_behind(Some((2, 1))).as_deref(),
+            Some("ahead 2 / behind 1 vs origin")
+        );
+        assert_eq!(
+            format_ahead_behind(Some((0, 0))).as_deref(),
+            Some("ahead 0 / behind 0 vs origin")
+        );
+        // Nothing to show when the divergence is unknown / not applicable.
+        assert_eq!(format_ahead_behind(None), None);
     }
 
     #[test]

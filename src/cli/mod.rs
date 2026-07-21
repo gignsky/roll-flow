@@ -9,8 +9,11 @@ use clap::{Parser, Subcommand};
     version
 )]
 pub struct Cli {
+    /// Subcommand to run. When omitted, `rf` shows the status dashboard —
+    /// exactly as `rf status` does (issue #100). `--help`/`--version` are still
+    /// intercepted by clap before subcommand resolution.
     #[command(subcommand)]
-    pub command: Cmd,
+    pub command: Option<Cmd>,
 }
 
 #[derive(Subcommand)]

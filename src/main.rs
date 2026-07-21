@@ -15,7 +15,14 @@ use core::{branches, config::Config, git, ops};
 fn main() -> Result<()> {
     let cli = Cli::parse();
 
-    match cli.command {
+    // Bare `rf` (no subcommand) runs the status dashboard, identical to
+    // `rf status` (issue #100). `--help`/`-h`/`--version` never reach here —
+    // clap intercepts them during `parse()`.
+    let Some(command) = cli.command else {
+        return cli::status::run(false);
+    };
+
+    match command {
         Cmd::Init {
             rolling_branch,
             stable_branch,
