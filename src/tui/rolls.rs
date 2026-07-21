@@ -741,7 +741,7 @@ fn render_detail(f: &mut Frame, area: Rect, roll: &RollInfo, all: &[RollInfo]) {
                 Style::default().fg(state_color(&roll.state)),
             ),
             Span::raw("    location: "),
-            Span::raw(roll.location.symbol()),
+            Span::raw(roll.location.label()),
         ]),
         Line::from(""),
     ];

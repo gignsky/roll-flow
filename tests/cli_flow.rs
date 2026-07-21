@@ -320,3 +320,139 @@ fn update_skips_roll_already_up_to_date() {
 
     assert_eq!(before, sb.rev(roll), "no new commit should be created");
 }
+
+// ── #80: blocked-state derives from real integrations, not file overlap ───────
+
+#[test]
+fn overlap_alone_does_not_block() {
+    // The exact bug from #80: two rolls that touch the SAME file but were never
+    // integrated into one another must BOTH stay `active`. In a dotfiles repo
+    // nearly every roll touches flake.lock, so file overlap must not block.
+    let sb = Sandbox::plain();
+    assert!(sb.init().success);
+
+    // Roll A (roll/1) touches shared.txt.
+    assert!(sb.create_roll("alpha", "0101").success);
+    sb.commit_file("shared.txt", "from A\n", "A edits shared");
+
+    // Roll B (roll/2), branched off stable, also touches shared.txt — no
+    // integration between the two.
+    assert!(sb.create_roll("beta", "0102").success);
+    sb.commit_file("shared.txt", "from B\n", "B edits shared");
+
+    assert_eq!(
+        sb.roll_state("roll/1-0101-alpha").as_deref(),
+        Some("active"),
+        "A must not be blocked by mere file overlap"
+    );
+    assert_eq!(
+        sb.roll_state("roll/2-0102-beta").as_deref(),
+        Some("active"),
+        "B must not be blocked by mere file overlap"
+    );
+}
+
+#[test]
+fn integration_of_ungraduated_roll_blocks() {
+    // A roll that has directly integrated another (still-ungraduated) roll is
+    // Blocked until that dependency graduates.
+    let sb = Sandbox::plain();
+    assert!(sb.init().success);
+
+    assert!(sb.create_roll("alpha", "0101").success);
+    sb.commit_file("a.txt", "a\n", "A work");
+
+    assert!(sb.create_roll("beta", "0102").success);
+    sb.commit_file("b.txt", "b\n", "B work");
+
+    // From A, integrate B (a real `git merge --no-ff`).
+    sb.git(&["checkout", "roll/1-0101-alpha"]);
+    let out = sb.rf(&["integrate", "roll/2-0102-beta"]);
+    assert!(out.success, "integrate failed: {}", out.combined());
+
+    assert_eq!(
+        sb.roll_state("roll/1-0101-alpha").as_deref(),
+        Some("⛔ blocked"),
+        "A integrated ungraduated B, so A must be blocked"
+    );
+    assert_eq!(
+        sb.roll_state("roll/2-0102-beta").as_deref(),
+        Some("active"),
+        "B itself is a plain active roll"
+    );
+}
+
+#[test]
+fn graduating_dependency_unblocks_roll() {
+    // Once the integrated dependency graduates, the roll is no longer blocked.
+    let sb = Sandbox::plain();
+    assert!(sb.init().success);
+
+    assert!(sb.create_roll("alpha", "0101").success);
+    sb.commit_file("a.txt", "a\n", "A work");
+
+    assert!(sb.create_roll("beta", "0102").success);
+    sb.commit_file("b.txt", "b\n", "B work");
+
+    sb.git(&["checkout", "roll/1-0101-alpha"]);
+    assert!(sb.rf(&["integrate", "roll/2-0102-beta"]).success);
+    assert_eq!(
+        sb.roll_state("roll/1-0101-alpha").as_deref(),
+        Some("⛔ blocked"),
+    );
+
+    // Graduate B to rolling.
+    sb.git(&["checkout", "roll/2-0102-beta"]);
+    let out = sb.rf(&["graduate"]);
+    assert!(out.success, "graduate B failed: {}", out.combined());
+
+    assert_eq!(
+        sb.roll_state("roll/2-0102-beta").as_deref(),
+        Some("✓ graduated"),
+        "B should now be graduated"
+    );
+    assert_eq!(
+        sb.roll_state("roll/1-0101-alpha").as_deref(),
+        Some("active"),
+        "A's only integration dep graduated, so A is unblocked"
+    );
+}
+
+// ── #81: `rf integrate` accepts a roll number ─────────────────────────────────
+
+#[test]
+fn integrate_accepts_roll_number() {
+    let sb = Sandbox::plain();
+    assert!(sb.init().success);
+
+    assert!(sb.create_roll("alpha", "0101").success);
+    sb.commit_file("a.txt", "a\n", "A work");
+
+    assert!(sb.create_roll("beta", "0102").success);
+    sb.commit_file("b.txt", "b\n", "B work");
+
+    // From A, integrate roll #2 by number.
+    sb.git(&["checkout", "roll/1-0101-alpha"]);
+    let out = sb.rf(&["integrate", "2"]);
+    assert!(
+        out.success,
+        "integrate by number failed: {}",
+        out.combined()
+    );
+    assert!(sb.exists("b.txt"), "B's content should now be on A");
+    assert!(
+        sb.tip_subject("HEAD")
+            .contains("Merge branch 'roll/2-0102-beta'"),
+        "expected merge of roll/2, got: {}",
+        sb.tip_subject("HEAD")
+    );
+
+    // A bogus number errors clearly.
+    let out = sb.rf(&["integrate", "999"]);
+    assert!(!out.success, "integrate of missing roll should fail");
+    assert!(
+        out.combined().contains("no roll with number 999"),
+        "unexpected error: {}",
+        out.combined()
+    );
+}
