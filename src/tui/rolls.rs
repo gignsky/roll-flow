@@ -51,6 +51,23 @@ enum Mode {
     Detail {
         roll: RollInfo,
     },
+    /// Slug-input modal for creating a new roll (issue #79). Holds the
+    /// in-progress text buffer; on Enter it runs `ops::create` through the same
+    /// suspend/resume path as the other actions.
+    CreateInput {
+        slug: String,
+    },
+}
+
+/// What a keystroke in the [`Mode::CreateInput`] modal asks the loop to do.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub(crate) enum InputOutcome {
+    /// Buffer was (maybe) edited in place; stay in the input modal.
+    Continue,
+    /// Esc — discard the buffer and return to browsing.
+    Cancel,
+    /// Enter — attempt to create a roll from the buffer.
+    Submit,
 }
 
 /// One dependency row rendered in the [`Mode::Detail`] view. `is_blocker` marks
@@ -187,6 +204,34 @@ pub(crate) fn validate_action(
     }
 }
 
+/// Apply one keystroke to the create-input `buffer` and report what the loop
+/// should do next. Printable characters append, Backspace deletes the last
+/// character, Enter submits, Esc cancels; other keys are ignored. Control
+/// characters are never inserted. Kept pure (mutates only the buffer) so it can
+/// be unit-tested without a terminal.
+pub(crate) fn handle_create_key(buffer: &mut String, code: KeyCode) -> InputOutcome {
+    match code {
+        KeyCode::Esc => InputOutcome::Cancel,
+        KeyCode::Enter => InputOutcome::Submit,
+        KeyCode::Backspace => {
+            buffer.pop();
+            InputOutcome::Continue
+        }
+        KeyCode::Char(c) if !c.is_control() => {
+            buffer.push(c);
+            InputOutcome::Continue
+        }
+        _ => InputOutcome::Continue,
+    }
+}
+
+/// Whether the create-input buffer holds something worth handing to
+/// `ops::create` — i.e. it is not blank. `ops::create` still does the real
+/// slug normalization/validation; this only guards the empty case up front.
+pub(crate) fn is_submittable_slug(buffer: &str) -> bool {
+    !buffer.trim().is_empty()
+}
+
 // ── App ─────────────────────────────────────────────────────────────────────
 
 impl StatusApp {
@@ -220,6 +265,8 @@ impl StatusApp {
                         self.handle_confirm(terminal, key.code)?;
                     } else if matches!(self.mode, Mode::Detail { .. }) {
                         self.handle_detail(key.code);
+                    } else if matches!(self.mode, Mode::CreateInput { .. }) {
+                        self.handle_create_input(terminal, key.code)?;
                     } else if self.handle_browsing(key.code)? {
                         break;
                     }
@@ -240,6 +287,11 @@ impl StatusApp {
                 self.reload()?;
                 self.message = Some("refreshed".to_string());
             }
+            KeyCode::Char('c') => {
+                self.mode = Mode::CreateInput {
+                    slug: String::new(),
+                }
+            }
             KeyCode::Char('g') => self.request(Action::Graduate),
             KeyCode::Char('p') => self.request(Action::Promote),
             KeyCode::Char('u') => self.request(Action::Update),
@@ -259,6 +311,33 @@ impl StatusApp {
         if matches!(code, KeyCode::Char('q') | KeyCode::Esc) {
             self.mode = Mode::Browsing;
         }
+    }
+
+    /// Handle a keypress while the create-input modal is open: edit the buffer,
+    /// cancel back to browsing, or submit. Submitting an empty buffer surfaces a
+    /// message instead of invoking `ops::create`.
+    fn handle_create_input(&mut self, terminal: &mut super::Tui, code: KeyCode) -> Result<()> {
+        let outcome = if let Mode::CreateInput { slug } = &mut self.mode {
+            handle_create_key(slug, code)
+        } else {
+            return Ok(());
+        };
+        match outcome {
+            InputOutcome::Continue => {}
+            InputOutcome::Cancel => self.mode = Mode::Browsing,
+            InputOutcome::Submit => {
+                let slug = match std::mem::replace(&mut self.mode, Mode::Browsing) {
+                    Mode::CreateInput { slug } => slug,
+                    _ => String::new(),
+                };
+                if is_submittable_slug(&slug) {
+                    self.execute_create(terminal, slug)?;
+                } else {
+                    self.message = Some("slug cannot be empty".to_string());
+                }
+            }
+        }
+        Ok(())
     }
 
     /// Handle a keypress while the confirm modal is open.
@@ -329,23 +408,58 @@ impl StatusApp {
         action: Action,
         target: Option<String>,
     ) -> Result<()> {
+        self.with_suspended(terminal, |app| {
+            Ok((app.run_op(action, target.as_deref())?, ()))
+        })?;
+        Ok(())
+    }
+
+    /// Create a roll from `slug` through the same suspended execution path as the
+    /// other actions, then reload and select the freshly created roll if it is
+    /// present. An `ops::create` error (e.g. an invalid slug) is shown like any
+    /// other action error and never aborts the TUI.
+    fn execute_create(&mut self, terminal: &mut super::Tui, slug: String) -> Result<()> {
+        let created = self.with_suspended(terminal, |app| {
+            let outcome = ops::create(&app.config, &slug, None, false)?;
+            Ok((vec![format!("Created {}", outcome.branch)], outcome.branch))
+        })?;
+        if let Some(branch) = created {
+            if let Some(idx) = self.rolls.iter().position(|r| r.branch == branch) {
+                self.table.select(Some(idx));
+            }
+        }
+        Ok(())
+    }
+
+    /// Shared suspend → run → show → resume → reload wrapper. Runs `body` with the
+    /// TUI suspended so git's own output shows on the normal terminal, prints the
+    /// resulting lines (or the error chain) exactly like the actions do, waits for
+    /// a keypress, resumes, and reloads the list regardless of success. Returns
+    /// the value `body` produced on success, or `None` if it errored.
+    fn with_suspended<T>(
+        &mut self,
+        terminal: &mut super::Tui,
+        body: impl FnOnce(&Self) -> Result<(Vec<String>, T)>,
+    ) -> Result<Option<T>> {
         super::suspend(terminal)?;
 
-        let outcome = self.run_op(action, target.as_deref());
+        let outcome = body(self);
         println!();
-        match &outcome {
-            Ok(lines) => {
-                for line in lines {
+        let value = match outcome {
+            Ok((lines, value)) => {
+                for line in &lines {
                     println!("{line}");
                 }
+                Some(value)
             }
             Err(err) => {
                 eprintln!("Error: {err}");
                 for cause in err.chain().skip(1) {
                     eprintln!("  caused by: {cause}");
                 }
+                None
             }
-        }
+        };
         println!();
         print!("Press any key to continue...");
         let _ = io::stdout().flush();
@@ -356,7 +470,7 @@ impl StatusApp {
 
         // Reflect the new repo state in place regardless of op success/failure.
         self.reload()?;
-        Ok(())
+        Ok(value)
     }
 
     /// Drive the actual operation through `core::ops`, rendering its structured
@@ -440,6 +554,7 @@ impl StatusApp {
                 render_modal(f, area, &self.config, *action, target.as_deref());
             }
             Mode::Detail { roll } => render_detail(f, area, roll, &self.rolls),
+            Mode::CreateInput { slug } => render_create_input(f, area, &self.config, slug),
             Mode::Browsing => {}
         }
     }
@@ -541,7 +656,7 @@ impl StatusApp {
             None => Line::from(""),
         };
         let hint_line = Line::from(
-            " [q] quit   [j/k ↑/↓] nav   [enter] detail   [g]raduate   [p]romote   [u]pdate   [r]efresh",
+            " [q] quit   [j/k ↑/↓] nav   [enter] detail   [c]reate   [g]raduate   [p]romote   [u]pdate   [r]efresh",
         );
         f.render_widget(Paragraph::new(vec![msg_line, hint_line]), area);
     }
@@ -573,6 +688,34 @@ fn render_modal(f: &mut Frame, area: Rect, config: &Config, action: Action, targ
     let body = Paragraph::new(vec![Line::from(prompt), Line::from(hint)])
         .alignment(Alignment::Center)
         .block(Block::bordered().title(" confirm "));
+    f.render_widget(body, modal);
+}
+
+/// Render the centered slug-input popup for creating a new roll. Shows the
+/// prompt, the current buffer with a trailing caret, and the key hints.
+fn render_create_input(f: &mut Frame, area: Rect, config: &Config, buffer: &str) {
+    let prompt = format!("New roll slug (branched from {}):", config.stable_branch);
+    let input_line = format!("{buffer}_");
+    let hint = "[enter] create    [esc] cancel";
+
+    let width = prompt
+        .chars()
+        .count()
+        .max(hint.len())
+        .max(input_line.chars().count()) as u16
+        + 4;
+    let modal = centered_rect(area, width.max(40), 6);
+
+    f.render_widget(Clear, modal);
+    let body = Paragraph::new(vec![
+        Line::from(prompt),
+        Line::from(""),
+        Line::from(Span::styled(input_line, Style::default().fg(Color::Cyan))),
+        Line::from(""),
+        Line::from(Span::styled(hint, Style::default().fg(Color::DarkGray))),
+    ])
+    .alignment(Alignment::Center)
+    .block(Block::bordered().title(" create roll "));
     f.render_widget(body, modal);
 }
 
@@ -811,6 +954,59 @@ mod tests {
         let rows = dep_rows(&selected, &all);
         assert_eq!(rows.len(), 2);
         assert!(rows.iter().all(|r| !r.is_blocker));
+    }
+
+    #[test]
+    fn create_key_edits_buffer_and_reports_intent() {
+        let mut buf = String::new();
+        // Printable chars append.
+        assert_eq!(
+            handle_create_key(&mut buf, KeyCode::Char('a')),
+            InputOutcome::Continue
+        );
+        assert_eq!(
+            handle_create_key(&mut buf, KeyCode::Char('b')),
+            InputOutcome::Continue
+        );
+        assert_eq!(buf, "ab");
+        // Backspace deletes the last char.
+        assert_eq!(
+            handle_create_key(&mut buf, KeyCode::Backspace),
+            InputOutcome::Continue
+        );
+        assert_eq!(buf, "a");
+        // Backspace on an empty buffer is harmless.
+        buf.clear();
+        assert_eq!(
+            handle_create_key(&mut buf, KeyCode::Backspace),
+            InputOutcome::Continue
+        );
+        assert_eq!(buf, "");
+        // Enter submits, Esc cancels — neither mutates the buffer.
+        buf.push_str("theme");
+        assert_eq!(
+            handle_create_key(&mut buf, KeyCode::Enter),
+            InputOutcome::Submit
+        );
+        assert_eq!(
+            handle_create_key(&mut buf, KeyCode::Esc),
+            InputOutcome::Cancel
+        );
+        assert_eq!(buf, "theme");
+        // Non-text keys are ignored without editing.
+        assert_eq!(
+            handle_create_key(&mut buf, KeyCode::Left),
+            InputOutcome::Continue
+        );
+        assert_eq!(buf, "theme");
+    }
+
+    #[test]
+    fn submittable_slug_requires_non_blank() {
+        assert!(!is_submittable_slug(""));
+        assert!(!is_submittable_slug("   "));
+        assert!(is_submittable_slug("theme"));
+        assert!(is_submittable_slug("  theme  "));
     }
 
     #[test]
