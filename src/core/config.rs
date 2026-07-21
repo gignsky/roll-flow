@@ -76,9 +76,7 @@ impl Config {
     /// Load config from `<repo>/.roll-flow.toml`, or auto-detect if it does not
     /// exist yet.
     pub fn load() -> Result<Self, RfError> {
-        let repo_root =
-            crate::core::git::capture_git(Path::new("."), &["rev-parse", "--show-toplevel"])
-                .map(PathBuf::from)?;
+        let repo_root = crate::core::git::repo_root(Path::new("."))?;
         let path = Self::config_path(&repo_root);
         if path.exists() {
             let content = std::fs::read_to_string(&path)?;
@@ -87,7 +85,10 @@ impl Config {
             config.repo_root = repo_root;
             Ok(config)
         } else {
-            Self::auto_detect()
+            Err(RfError::Config(format!(
+                "no roll-flow config found at {}; run `rf init` first",
+                path.display()
+            )))
         }
     }
 
@@ -110,9 +111,7 @@ impl Config {
     /// Detect config from the current git repo without a config file.
     /// Reads `flake.nix` branch names and `vars/hosts.nix` for host list.
     pub fn auto_detect() -> Result<Self, RfError> {
-        let repo_root =
-            crate::core::git::capture_git(Path::new("."), &["rev-parse", "--show-toplevel"])
-                .map(PathBuf::from)?;
+        let repo_root = crate::core::git::repo_root(Path::new("."))?;
 
         let (rolling_branch, stable_branch) = detect_branches(&repo_root)
             .unwrap_or_else(|| ("rolling".to_string(), "main".to_string()));

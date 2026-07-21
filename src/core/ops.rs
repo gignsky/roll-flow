@@ -93,6 +93,32 @@ fn target_missing_error(config: &Config, target: &str) -> String {
     }
 }
 
+/// Make the merge `target` usable as a local branch and return the ref to
+/// classify/merge against.
+///
+/// When the target exists only as `origin/<target>` (a fresh checkout that has
+/// never had the branch locally — issue #32), create the local branch from the
+/// remote so `run_merge` can check it out and merge into it. In `dry_run` mode
+/// nothing is created; the remote ref is returned so a preview still reflects
+/// reality without mutating the repo. Errors (with the existing actionable
+/// message) when the branch exists neither locally nor on `origin`.
+fn ensure_local_target(config: &Config, target: &str, dry_run: bool) -> Result<String> {
+    let repo = &config.repo_root;
+    if git::ref_exists(repo, target) {
+        return Ok(target.to_string());
+    }
+    let remote = format!("origin/{target}");
+    if git::ref_exists(repo, &remote) {
+        if dry_run {
+            return Ok(remote);
+        }
+        git::run_git(repo, &["branch", target, &remote])
+            .with_context(|| format!("failed to create local branch '{target}' from '{remote}'"))?;
+        return Ok(target.to_string());
+    }
+    bail!(target_missing_error(config, target))
+}
+
 /// Pure git-topology classification of a prospective merge.
 #[derive(Debug, PartialEq, Eq)]
 enum MergeState {
@@ -535,8 +561,10 @@ pub(crate) fn hotfix_land(config: &Config, dry_run: bool) -> Result<HotfixLandOu
     let stable = config.stable_branch.clone();
     let rolling = config.rolling_branch.clone();
 
-    // The landing merge (hotfix -> stable) must be viable.
-    match classify_merge(repo, &current, &stable)? {
+    // The landing merge (hotfix -> stable) must be viable. Bring stable local
+    // if it only exists on origin (issue #32).
+    let stable_ref = ensure_local_target(config, &stable, dry_run)?;
+    match classify_merge(repo, &current, &stable_ref)? {
         MergeState::TargetMissing => bail!(target_missing_error(config, &stable)),
         MergeState::UnrelatedHistories => {
             bail!("'{}' and '{}' share no common history", current, stable)
@@ -549,10 +577,9 @@ pub(crate) fn hotfix_land(config: &Config, dry_run: bool) -> Result<HotfixLandOu
         MergeState::Diverged | MergeState::FastForwardable => {}
     }
 
-    // Reintegration (stable -> rolling) requires the rolling branch to exist.
-    if !git::ref_exists(repo, &rolling) {
-        bail!(target_missing_error(config, &rolling));
-    }
+    // Reintegration (stable -> rolling) requires the rolling branch; bring it
+    // local from origin when needed, mirroring the stable target above.
+    ensure_local_target(config, &rolling, dry_run)?;
 
     // Host gating is bypassed by design; the stable-merge gates still run.
     let report = run_gates(
@@ -675,7 +702,8 @@ pub(crate) fn graduate(
     }
 
     let rolling = &config.rolling_branch;
-    match classify_merge(repo, roll, rolling)? {
+    let rolling_ref = ensure_local_target(config, rolling, dry_run)?;
+    match classify_merge(repo, roll, &rolling_ref)? {
         MergeState::TargetMissing => bail!(target_missing_error(config, rolling)),
         MergeState::UnrelatedHistories => {
             bail!("'{}' and '{}' share no common history", roll, rolling)
@@ -726,7 +754,8 @@ pub(crate) fn promote(config: &Config, dry_run: bool, force: &ForceOpts) -> Resu
     let rolling = &config.rolling_branch;
     let stable = &config.stable_branch;
 
-    match classify_merge(repo, rolling, stable)? {
+    let stable_ref = ensure_local_target(config, stable, dry_run)?;
+    match classify_merge(repo, rolling, &stable_ref)? {
         MergeState::TargetMissing => bail!(target_missing_error(config, stable)),
         MergeState::UnrelatedHistories => {
             bail!("'{}' and '{}' share no common history", rolling, stable)
