@@ -208,3 +208,59 @@ fn graduate_errors_with_nothing_to_merge() {
         out.combined()
     );
 }
+
+#[test]
+fn update_merges_stable_with_descriptive_subject() {
+    let sb = Sandbox::plain();
+    let out = sb.init();
+    assert!(out.success, "init failed: {}", out.combined());
+
+    let out = sb.create_roll("feature", "0611");
+    assert!(out.success, "create failed: {}", out.combined());
+    sb.commit_file("work.txt", "w\n", "roll work");
+
+    // Advance stable so the roll is behind and has something to merge.
+    sb.git(&["checkout", "main"]);
+    sb.commit_file("stable.txt", "s\n", "advance stable");
+
+    let out = sb.rf(&["update"]);
+    assert!(out.success, "update failed: {}", out.combined());
+
+    let roll = "roll/1-0611-feature";
+    assert!(sb.tip_is_merge(roll), "roll tip should be a merge");
+    assert!(
+        sb.tip_subject(roll)
+            .starts_with(&format!("Update {roll} from main")),
+        "unexpected update subject: {}",
+        sb.tip_subject(roll)
+    );
+    assert!(
+        sb.is_ancestor("main", roll),
+        "main should be merged into the roll"
+    );
+}
+
+#[test]
+fn update_skips_roll_already_up_to_date() {
+    let sb = Sandbox::plain();
+    let out = sb.init();
+    assert!(out.success, "init failed: {}", out.combined());
+
+    let out = sb.create_roll("feature", "0611");
+    assert!(out.success, "create failed: {}", out.combined());
+    sb.commit_file("work.txt", "w\n", "roll work");
+
+    // Stable has not moved, so the roll already contains everything on main.
+    let roll = "roll/1-0611-feature";
+    let before = sb.rev(roll);
+
+    let out = sb.rf(&["update"]);
+    assert!(out.success, "update failed: {}", out.combined());
+    assert!(
+        out.combined().contains("already up to date"),
+        "expected up-to-date message: {}",
+        out.combined()
+    );
+
+    assert_eq!(before, sb.rev(roll), "no new commit should be created");
+}

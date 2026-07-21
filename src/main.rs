@@ -411,23 +411,43 @@ fn cmd_update(dry_run: bool) -> Result<()> {
         return Ok(());
     }
 
-    let current = git::current_branch(repo)?;
+    let stable = &config.stable_branch;
 
     for roll in &active {
+        // Commits on stable that the roll doesn't already contain. Zero means
+        // stable is already an ancestor of the roll — nothing to merge.
+        let behind = git::capture_git(
+            repo,
+            &[
+                "rev-list",
+                "--count",
+                &format!("{}..{}", roll.branch, stable),
+            ],
+        )?;
+        let behind: u64 = behind.trim().parse().unwrap_or(0);
+
+        if behind == 0 {
+            println!("'{}' is already up to date with '{stable}'", roll.branch);
+            continue;
+        }
+
         if dry_run {
             println!(
-                "dry-run: would merge '{}' into '{}'",
-                config.stable_branch, roll.branch
+                "dry-run: would merge '{stable}' into '{}' ({behind} commit{} ahead)",
+                roll.branch,
+                if behind == 1 { "" } else { "s" },
             );
             continue;
         }
-        git::run_git(repo, &["checkout", &roll.branch])?;
-        git::run_git(repo, &["merge", "--no-ff", &config.stable_branch])?;
-        println!("updated '{}' with '{}'", roll.branch, config.stable_branch);
-    }
 
-    if !dry_run && !active.is_empty() {
-        git::run_git(repo, &["checkout", &current])?;
+        // Short SHA of the roll tip before the merge, recorded in the body so
+        // the merge is self-describing.
+        let before = git::capture_git(repo, &["rev-parse", "--short", &roll.branch])?;
+        let subject = format!("Update {} from {stable}", roll.branch);
+        let body = format!("Brought in: {behind} commits since {before}");
+
+        run_merge(repo, stable, &roll.branch, &subject, Some(&body))?;
+        println!("updated '{}' with '{stable}'", roll.branch);
     }
 
     Ok(())
