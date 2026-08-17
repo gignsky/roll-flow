@@ -1057,6 +1057,239 @@ pub(crate) fn update(config: &Config, dry_run: bool) -> Result<UpdateOutcome> {
     })
 }
 
+// ── prune ───────────────────────────────────────────────────────────────────
+
+/// Which copies of a promoted roll branch `rf prune` may delete, and how strict
+/// to be about it.
+pub(crate) struct PruneScope {
+    pub local: bool,
+    pub remote: bool,
+    /// Delete even when the branch tip holds commits the stable branch lacks.
+    pub force: bool,
+    /// Refresh remote-tracking refs before planning. Only meaningful with
+    /// `remote`.
+    pub fetch: bool,
+}
+
+impl PruneScope {
+    /// The default `rf prune`: both copies, no force, refreshing first.
+    pub fn both() -> Self {
+        PruneScope {
+            local: true,
+            remote: true,
+            force: false,
+            fetch: true,
+        }
+    }
+}
+
+/// A promoted roll branch prune intends to delete, and which copies of it.
+pub(crate) struct PruneCandidate {
+    pub branch: String,
+    pub number: u32,
+    pub delete_local: bool,
+    pub delete_remote: bool,
+}
+
+/// A branch copy prune declined to touch, with the reason to show the user.
+/// Nothing is ever skipped silently.
+pub(crate) struct PruneSkip {
+    pub branch: String,
+    pub reason: String,
+}
+
+/// What a prune would do, computed before anything is deleted so the CLI and the
+/// TUI can both show it, confirm, then apply the very same plan.
+pub(crate) struct PrunePlan {
+    pub candidates: Vec<PruneCandidate>,
+    pub skipped: Vec<PruneSkip>,
+    /// Whether an `origin` remote exists at all — distinct from "no remote
+    /// branches matched".
+    pub has_remote: bool,
+}
+
+impl PrunePlan {
+    pub fn is_empty(&self) -> bool {
+        self.candidates.is_empty()
+    }
+
+    /// Branches whose `origin` copy this plan deletes.
+    fn remote_targets(&self) -> Vec<String> {
+        self.candidates
+            .iter()
+            .filter(|c| c.delete_remote)
+            .map(|c| c.branch.clone())
+            .collect()
+    }
+}
+
+/// Per-branch outcome of applying a [`PrunePlan`]. A branch can partially
+/// succeed (local gone, remote push failed), so both flags and the errors are
+/// reported together rather than as either/or.
+pub(crate) struct PruneResult {
+    pub branch: String,
+    pub local_deleted: bool,
+    pub remote_deleted: bool,
+    pub errors: Vec<String>,
+}
+
+/// Refs that count as "already in stable" for containment checks: the local
+/// stable branch and `origin/<stable>`, whichever resolve.
+///
+/// Both are consulted because they routinely differ — a roll promoted upstream
+/// is contained in `origin/main` while a stale local `main` still lacks it, and
+/// checking only one side would skip branches that are genuinely safe to delete.
+fn stable_containment_refs(config: &Config) -> Vec<String> {
+    let repo = &config.repo_root;
+    let mut refs = Vec::new();
+    if git::ref_exists(repo, &config.stable_branch) {
+        refs.push(config.stable_branch.clone());
+    }
+    let remote_stable = format!("origin/{}", config.stable_branch);
+    if git::ref_exists(repo, &remote_stable) {
+        refs.push(remote_stable);
+    }
+    refs
+}
+
+/// True if every commit reachable from `tip` is already in one of `stable_refs`.
+fn contained_in_stable(repo: &Path, tip: &str, stable_refs: &[String]) -> bool {
+    stable_refs
+        .iter()
+        .any(|stable| git::is_ancestor(repo, tip, stable).unwrap_or(false))
+}
+
+/// Decide what `rf prune` would delete, without deleting anything.
+///
+/// Promoted state alone is not treated as sufficient authority to delete: it is
+/// inferred from commit *subjects* on stable, which says the roll was promoted
+/// but not that this particular branch tip has nothing left on it (a roll can
+/// take commits after its graduation merge). Every copy is additionally checked
+/// for containment in stable, and anything that fails is skipped with a reason
+/// unless `--force` is given.
+pub(crate) fn prune_plan(config: &Config, scope: &PruneScope) -> Result<PrunePlan> {
+    let repo = &config.repo_root;
+    let has_remote = git::has_remote(repo, "origin");
+
+    // Refresh first: `rf` is otherwise local-only, so `origin/*` refs can claim
+    // branches that are already gone upstream — or miss ones that are not.
+    if scope.remote && has_remote && scope.fetch {
+        git::fetch_prune(repo, "origin")
+            .context("refreshing remote-tracking refs before pruning")?;
+    }
+
+    let stable_refs = stable_containment_refs(config);
+    let current = git::current_branch(repo).unwrap_or_default();
+
+    let mut candidates = Vec::new();
+    let mut skipped = Vec::new();
+
+    for roll in branches::list_rolls(config)? {
+        if roll.state != branches::RollState::Promoted {
+            continue;
+        }
+
+        let remote_ref = format!("origin/{}", roll.branch);
+        let has_local_copy = git::ref_exists(repo, &roll.branch);
+        let has_remote_copy = has_remote && git::ref_exists(repo, &remote_ref);
+
+        let mut delete_local = false;
+        let mut delete_remote = false;
+
+        if scope.local && has_local_copy {
+            if roll.branch == current {
+                skipped.push(PruneSkip {
+                    branch: roll.branch.clone(),
+                    reason: "checked out — switch away to prune the local copy".to_string(),
+                });
+            } else if scope.force || contained_in_stable(repo, &roll.branch, &stable_refs) {
+                delete_local = true;
+            } else {
+                skipped.push(PruneSkip {
+                    branch: roll.branch.clone(),
+                    reason: format!(
+                        "local tip has commits not in '{}' — use --force to delete anyway",
+                        config.stable_branch
+                    ),
+                });
+            }
+        }
+
+        if scope.remote && has_remote_copy {
+            if scope.force || contained_in_stable(repo, &remote_ref, &stable_refs) {
+                delete_remote = true;
+            } else {
+                skipped.push(PruneSkip {
+                    branch: roll.branch.clone(),
+                    reason: format!(
+                        "origin copy has commits not in '{}' — use --force to delete anyway",
+                        config.stable_branch
+                    ),
+                });
+            }
+        }
+
+        if delete_local || delete_remote {
+            candidates.push(PruneCandidate {
+                branch: roll.branch,
+                number: roll.number,
+                delete_local,
+                delete_remote,
+            });
+        }
+    }
+
+    Ok(PrunePlan {
+        candidates,
+        skipped,
+        has_remote,
+    })
+}
+
+/// Execute a [`PrunePlan`]. Never prompts and never decides — the caller has
+/// already confirmed.
+///
+/// Remote deletions go out as one batched push (all-or-nothing for that batch);
+/// local deletions run per branch so one failure does not abort the rest.
+pub(crate) fn prune_apply(config: &Config, plan: &PrunePlan) -> Result<Vec<PruneResult>> {
+    let repo = &config.repo_root;
+
+    let remote_targets = plan.remote_targets();
+    let remote_error = match git::delete_remote_branches(repo, "origin", &remote_targets) {
+        Ok(()) => None,
+        Err(err) => Some(err.to_string()),
+    };
+
+    let mut results = Vec::new();
+    for candidate in &plan.candidates {
+        let mut errors = Vec::new();
+        let mut local_deleted = false;
+        let mut remote_deleted = false;
+
+        if candidate.delete_local {
+            match git::delete_local_branch(repo, &candidate.branch) {
+                Ok(()) => local_deleted = true,
+                Err(err) => errors.push(err.to_string()),
+            }
+        }
+        if candidate.delete_remote {
+            match &remote_error {
+                None => remote_deleted = true,
+                Some(err) => errors.push(err.clone()),
+            }
+        }
+
+        results.push(PruneResult {
+            branch: candidate.branch.clone(),
+            local_deleted,
+            remote_deleted,
+            errors,
+        });
+    }
+
+    Ok(results)
+}
+
 // ── promotion readiness (status --json) ─────────────────────────────────────
 
 /// Advisory promotion-readiness data for `status --json` (and the future status

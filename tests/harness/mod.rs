@@ -36,6 +36,9 @@ impl RfOutput {
 /// A throwaway git repository wired up to run `rf`.
 pub struct Sandbox {
     dir: TempDir,
+    /// Bare repo backing `origin`, for sandboxes built with [`Sandbox::with_origin`].
+    /// Held only so the temp dir outlives the sandbox that points at it.
+    origin: Option<TempDir>,
 }
 
 impl Sandbox {
@@ -43,7 +46,7 @@ impl Sandbox {
     /// normal software project — the "non-NixOS repo" configuration path.
     pub fn plain() -> Self {
         let dir = tempfile::tempdir().expect("temp dir");
-        let sb = Sandbox { dir };
+        let sb = Sandbox { dir, origin: None };
         sb.git(&["init", "-b", "main"]);
         sb.git(&["config", "user.email", "test@example.com"]);
         sb.git(&["config", "user.name", "roll-flow tests"]);
@@ -66,6 +69,28 @@ impl Sandbox {
         );
         sb.git(&["add", "flake.nix", "vars/hosts.nix"]);
         sb.git(&["commit", "-m", "nixos fixture"]);
+        sb
+    }
+
+    /// A plain repo with a real bare `origin` behind it, with `main` pushed and
+    /// remote-tracking refs populated. Needed by anything that asserts on the
+    /// remote — `rf` reaches the network only through `rf prune`.
+    pub fn with_origin() -> Self {
+        let mut sb = Sandbox::plain();
+        let origin = tempfile::tempdir().expect("origin dir");
+        let origin_path = origin.path().to_str().expect("origin path").to_string();
+        let ok = Command::new("git")
+            .args(["init", "--bare", "-b", "main", &origin_path])
+            .output()
+            .expect("init bare origin")
+            .status
+            .success();
+        assert!(ok, "git init --bare failed for {origin_path}");
+
+        sb.git(&["remote", "add", "origin", &origin_path]);
+        sb.git(&["push", "-u", "origin", "main"]);
+        sb.git(&["fetch", "origin"]);
+        sb.origin = Some(origin);
         sb
     }
 
@@ -198,6 +223,22 @@ impl Sandbox {
     }
 
     // ── assertions on git state ───────────────────────────────────────────
+
+    /// Push `branch` to origin and refresh remote-tracking refs.
+    pub fn push_branch(&self, branch: &str) {
+        self.git(&["push", "origin", branch]);
+        self.git(&["fetch", "origin"]);
+    }
+
+    /// True if `origin` really carries a branch named `name`.
+    ///
+    /// Asks the remote via `ls-remote` rather than reading `origin/<name>`, so
+    /// the assertion can't be fooled by a stale remote-tracking ref — which is
+    /// exactly the failure mode prune's deletion path could otherwise hide.
+    pub fn remote_branch_exists(&self, name: &str) -> bool {
+        let (ok, out, _) = self.git_try(&["ls-remote", "--heads", "origin", name]);
+        ok && !out.trim().is_empty()
+    }
 
     /// True if a local branch named `name` exists.
     pub fn branch_exists(&self, name: &str) -> bool {

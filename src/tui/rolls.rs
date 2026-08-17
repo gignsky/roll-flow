@@ -34,6 +34,8 @@ pub(crate) enum Action {
     Promote,
     /// Update all active local rolls from stable.
     Update,
+    /// Delete every promoted roll branch, locally and on origin.
+    Prune,
 }
 
 /// App state driving the event loop and the optional modal overlay.
@@ -137,6 +139,24 @@ pub(crate) fn can_update(rolls: &[RollInfo]) -> bool {
     })
 }
 
+/// Prune is offered when at least one roll has been promoted to stable, i.e.
+/// there is something whose branch has outlived its usefulness.
+///
+/// Whether a given branch is *safe* to delete is decided by `ops::prune_plan`,
+/// which re-checks containment in stable; this only answers whether the action
+/// is worth offering at all.
+pub(crate) fn can_prune(rolls: &[RollInfo]) -> bool {
+    rolls.iter().any(|r| matches!(r.state, RollState::Promoted))
+}
+
+/// How many rolls the prune action would consider — shown in the confirm modal.
+pub(crate) fn prunable_count(rolls: &[RollInfo]) -> usize {
+    rolls
+        .iter()
+        .filter(|r| matches!(r.state, RollState::Promoted))
+        .count()
+}
+
 /// Build the dependency rows to show in the detail view for `selected`.
 ///
 /// Each number in `selected.deps` is looked up in `all` to recover the
@@ -234,6 +254,13 @@ pub(crate) fn validate_action(
                 Ok(())
             } else {
                 Err("no active local rolls to update".to_string())
+            }
+        }
+        Action::Prune => {
+            if can_prune(rolls) {
+                Ok(())
+            } else {
+                Err("nothing to prune — no promoted roll branches".to_string())
             }
         }
     }
@@ -338,6 +365,7 @@ impl StatusApp {
             KeyCode::Char('g') => self.request(Action::Graduate),
             KeyCode::Char('p') => self.request(Action::Promote),
             KeyCode::Char('u') => self.request(Action::Update),
+            KeyCode::Char('x') => self.request(Action::Prune),
             KeyCode::Enter => {
                 if let Some(roll) = self.selected_roll() {
                     let roll = roll.clone();
@@ -596,6 +624,40 @@ impl StatusApp {
                     }
                 }
             },
+            Action::Prune => {
+                // The modal was the confirmation, so plan and apply run back to
+                // back here. `PruneScope::both` never forces: a branch holding
+                // commits stable lacks is reported as skipped, and clearing it
+                // needs `rf prune --force` from the CLI, deliberately.
+                let plan = ops::prune_plan(&self.config, &ops::PruneScope::both())?;
+                if plan.is_empty() {
+                    lines.push("no promoted roll branches to prune".to_string());
+                } else {
+                    for result in ops::prune_apply(&self.config, &plan)? {
+                        if result.errors.is_empty() {
+                            let mut where_ = Vec::new();
+                            if result.local_deleted {
+                                where_.push("local");
+                            }
+                            if result.remote_deleted {
+                                where_.push("origin");
+                            }
+                            lines.push(format!(
+                                "deleted '{}' ({})",
+                                result.branch,
+                                where_.join(", ")
+                            ));
+                        } else {
+                            for err in &result.errors {
+                                lines.push(format!("failed to delete '{}': {err}", result.branch));
+                            }
+                        }
+                    }
+                }
+                for skip in &plan.skipped {
+                    lines.push(format!("skipped '{}': {}", skip.branch, skip.reason));
+                }
+            }
         }
         Ok(lines)
     }
@@ -631,7 +693,14 @@ impl StatusApp {
 
         match &self.mode {
             Mode::Confirm { action, target } => {
-                render_modal(f, area, &self.config, *action, target.as_deref());
+                render_modal(
+                    f,
+                    area,
+                    &self.config,
+                    *action,
+                    target.as_deref(),
+                    &self.rolls,
+                );
             }
             Mode::Detail { roll, ahead_behind } => {
                 render_detail(f, area, roll, *ahead_behind, &self.rolls)
@@ -738,14 +807,21 @@ impl StatusApp {
             None => Line::from(""),
         };
         let hint_line = Line::from(
-            " [q] quit   [j/k ↑/↓] nav   [space] switch   [enter] detail   [c]reate   [g]raduate   [p]romote   [u]pdate   [r]efresh",
+            " [q] quit   [j/k ↑/↓] nav   [space] switch   [enter] detail   [c]reate   [g]raduate   [p]romote   [u]pdate   [x] prune   [r]efresh",
         );
         f.render_widget(Paragraph::new(vec![msg_line, hint_line]), area);
     }
 }
 
 /// Render the centered confirmation popup for a pending action.
-fn render_modal(f: &mut Frame, area: Rect, config: &Config, action: Action, target: Option<&str>) {
+fn render_modal(
+    f: &mut Frame,
+    area: Rect,
+    config: &Config,
+    action: Action,
+    target: Option<&str>,
+    rolls: &[RollInfo],
+) {
     let prompt = match action {
         Action::Graduate => format!(
             "Graduate {} into {}?",
@@ -760,6 +836,13 @@ fn render_modal(f: &mut Frame, area: Rect, config: &Config, action: Action, targ
             "Update all active local rolls from {}?",
             config.stable_branch
         ),
+        Action::Prune => {
+            let n = prunable_count(rolls);
+            format!(
+                "Delete {n} promoted roll branch{} (local + origin)?",
+                if n == 1 { "" } else { "es" }
+            )
+        }
     };
     let hint = "[y] confirm    [n] cancel";
 
@@ -975,6 +1058,27 @@ mod tests {
         assert!(!can_graduate(&RollState::Graduated));
         assert!(!can_graduate(&RollState::Promoted));
         assert!(!can_graduate(&RollState::Blocked));
+    }
+
+    #[test]
+    fn prune_valid_only_when_a_promoted_roll_exists() {
+        let unpromoted = vec![
+            roll_n(1, RollState::Active),
+            roll_n(2, RollState::Graduated),
+            roll_n(3, RollState::Diverged),
+            roll_n(4, RollState::Blocked),
+        ];
+        assert!(!can_prune(&unpromoted));
+        assert_eq!(prunable_count(&unpromoted), 0);
+        assert!(validate_action(Action::Prune, None, &unpromoted).is_err());
+
+        let mut with_promoted = unpromoted.clone();
+        with_promoted.push(roll_n(5, RollState::Promoted));
+        with_promoted.push(roll_n(6, RollState::Promoted));
+        assert!(can_prune(&with_promoted));
+        assert_eq!(prunable_count(&with_promoted), 2);
+        // Prune is repo-wide, so it validates with no selection.
+        assert!(validate_action(Action::Prune, None, &with_promoted).is_ok());
     }
 
     #[test]
