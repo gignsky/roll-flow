@@ -130,6 +130,29 @@ pub enum Cmd {
         dry_run: bool,
     },
 
+    /// Delete roll branches already promoted to the stable branch, locally and
+    /// on origin.
+    Prune {
+        #[arg(long)]
+        dry_run: bool,
+        /// Delete only local branches, leaving origin untouched.
+        #[arg(long, conflicts_with = "remote")]
+        local: bool,
+        /// Delete only branches on origin, leaving local ones untouched.
+        #[arg(long, conflicts_with = "local")]
+        remote: bool,
+        /// Delete without prompting for confirmation.
+        #[arg(long)]
+        yes: bool,
+        /// Delete even when a branch has commits not contained in the stable
+        /// branch.
+        #[arg(long)]
+        force: bool,
+        /// Skip the `git fetch --prune origin` refresh that precedes planning.
+        #[arg(long)]
+        no_fetch: bool,
+    },
+
     /// Print program version.
     Version,
 }

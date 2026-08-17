@@ -29,6 +29,10 @@ generically call "rolling."
    structured `--no-ff` commit. Open your PR against `develop`.
 5. Periodically, a maintainer runs `rf promote` from `develop` to merge into
    `main` once enough graduated rolls are ready for a stable release.
+6. Once rolls have reached `main`, `rf prune` clears their branches out of the
+   local repo and `origin`. Start with `rf prune --dry-run` — it only offers
+   branches whose commits are already contained in `main`, and lists anything it
+   skips along with the reason.
 
 Until you have `rf` built locally, `cargo build` produces `target/debug/rf`;
 there is no installed package for this repo (unlike the dotfiles repo, which

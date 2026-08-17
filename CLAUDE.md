@@ -248,6 +248,13 @@ cargo run -- list --no-tui
 - Branch resolution always tries local first, then `origin/<branch>` as fallback.
   Functions that need the ref string should return `Option<String>` (null = doesn't exist).
 - Active hosts only. Never require verification from inactive hosts.
+- Deleting a branch requires more than promoted state. Promotion is read off commit
+  subjects on stable, which does not prove a given branch tip is fully contained —
+  so `rf prune` additionally requires the tip to be an ancestor of the stable branch
+  or of `origin/<stable>`, and `--force` is the only override. Never delete the
+  checked-out branch.
+- `rf prune` is the only command that writes to the remote (`git push --delete`) or
+  fetches. Everything else is local-only; keep it that way.
 
 ## Integration with dotfiles
 
