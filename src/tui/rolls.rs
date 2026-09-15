@@ -62,6 +62,65 @@ enum Mode {
     CreateInput {
         slug: String,
     },
+    /// Destructive per-row branch deletion. Deliberately not a `Confirm`: the
+    /// prompt shape depends on where the branch exists, and the decision
+    /// produces a *scope* (which copies), neither of which `Action` can carry.
+    Delete {
+        preview: DeletePreview,
+    },
+}
+
+/// Which copies of a roll branch a `[d]elete` targets.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub(crate) enum DeleteScope {
+    Local,
+    Remote,
+    Both,
+}
+
+/// The shape of the delete modal, decided from the roll's location when the
+/// modal opens and advanced by the user's answer.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub(crate) enum DeletePrompt {
+    /// Exactly one copy is deletable — a y/N confirmation defaulting to No.
+    Single(DeleteScope),
+    /// Both copies exist — local / origin / both / neither.
+    Choice,
+    /// Second stage: the chosen scope touches a copy holding commits stable
+    /// lacks. y/N again, now stating what would be lost.
+    ForceConfirm(DeleteScope),
+}
+
+/// What a keystroke in the delete modal asks the loop to do.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub(crate) enum DeleteOutcome {
+    /// Key is unbound in this prompt shape — stay open, change nothing.
+    Ignore,
+    /// `n`/`N`/`Esc`, or "neither" — close without deleting.
+    Cancel,
+    /// Proceed with exactly these copies.
+    Confirm(DeleteScope),
+}
+
+/// Everything the delete modal needs to render and to decide whether the second
+/// confirmation is required. Captured once when the modal opens, like
+/// [`Mode::Detail`]'s snapshot.
+///
+/// The counts are *advisory*: they drive the warning, not the permission. The
+/// real decision is re-derived inside `ops::delete_branch_plan` at apply time,
+/// so a repo that changed underneath the modal is still refused by the core.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct DeletePreview {
+    pub branch: String,
+    pub prompt: DeletePrompt,
+    /// Commits on the local copy not in stable/`origin/<stable>`; `None` when
+    /// there is no local copy or the count could not be taken.
+    pub local_unmerged: Option<u32>,
+    /// The same for `origin/<branch>`.
+    pub remote_unmerged: Option<u32>,
+    /// Set when a both-location roll degraded to origin-only because its local
+    /// copy is the checked-out branch — worth saying out loud in the modal.
+    pub local_is_checked_out: bool,
 }
 
 /// What a keystroke in the [`Mode::CreateInput`] modal asks the loop to do.
@@ -403,6 +462,102 @@ pub(crate) fn is_submittable_slug(buffer: &str) -> bool {
     !buffer.trim().is_empty()
 }
 
+/// Decide the delete-modal shape for `roll`, or reject the request outright.
+///
+/// `Both` yields the four-way choice; `Local`/`Remote` a plain y/N. The
+/// checked-out branch's local copy is never deletable, so a both-location
+/// current roll degrades to a remote-only y/N and a local-only current roll is
+/// refused. `Neither` is refused too — the row is stale, there is nothing there.
+pub(crate) fn delete_prompt(roll: &RollInfo) -> Result<DeletePrompt, String> {
+    match (&roll.location, roll.is_current) {
+        (BranchLocation::Neither, _) => Err(format!("{} no longer exists", roll.branch)),
+        (BranchLocation::Local, true) => Err(format!(
+            "{} is checked out — switch away before deleting it",
+            roll.branch
+        )),
+        (BranchLocation::Local, false) => Ok(DeletePrompt::Single(DeleteScope::Local)),
+        (BranchLocation::Remote, _) => Ok(DeletePrompt::Single(DeleteScope::Remote)),
+        // A checked-out both-location roll keeps its origin copy on the table;
+        // only the local one is off limits.
+        (BranchLocation::Both, true) => Ok(DeletePrompt::Single(DeleteScope::Remote)),
+        (BranchLocation::Both, false) => Ok(DeletePrompt::Choice),
+    }
+}
+
+/// Whether `scope` touches a copy that holds commits stable lacks, and so needs
+/// the second explicit confirmation before anything is deleted.
+///
+/// An unknown count (`None` for a copy that is in scope) counts as needing the
+/// confirmation: not knowing what a delete costs is not a reason to skip the
+/// warning.
+pub(crate) fn needs_force_confirm(scope: DeleteScope, preview: &DeletePreview) -> bool {
+    let dirty = |count: Option<u32>| count.is_none_or(|n| n > 0);
+    match scope {
+        DeleteScope::Local => dirty(preview.local_unmerged),
+        DeleteScope::Remote => dirty(preview.remote_unmerged),
+        DeleteScope::Both => dirty(preview.local_unmerged) || dirty(preview.remote_unmerged),
+    }
+}
+
+/// The largest number of commits any copy in `scope` would lose, for the
+/// warning line. `None` when no count is known.
+pub(crate) fn unmerged_for_scope(scope: DeleteScope, preview: &DeletePreview) -> Option<u32> {
+    match scope {
+        DeleteScope::Local => preview.local_unmerged,
+        DeleteScope::Remote => preview.remote_unmerged,
+        DeleteScope::Both => preview
+            .local_unmerged
+            .into_iter()
+            .chain(preview.remote_unmerged)
+            .max(),
+    }
+}
+
+/// Map one keystroke to a delete decision for `prompt`. Pure — the same
+/// contract as [`handle_create_key`] — so every prompt shape is unit-testable
+/// without a terminal.
+///
+/// `Single`/`ForceConfirm`: `y` confirms, `n`/`Esc` cancels, every other key is
+/// ignored. That is exactly what "defaults to No" means here — nothing at all
+/// happens without a deliberate `y`, and Enter is not a shortcut for it.
+///
+/// `Choice`: `l` local, `r` origin, `b` both, `n`/`Esc` neither. `y` is
+/// deliberately unbound: with two copies there is no obvious "yes", and mapping
+/// it to "both" would let muscle memory delete more than the user was looking
+/// at.
+pub(crate) fn handle_delete_key(prompt: DeletePrompt, code: KeyCode) -> DeleteOutcome {
+    match prompt {
+        DeletePrompt::Single(scope) | DeletePrompt::ForceConfirm(scope) => match code {
+            KeyCode::Char('y') | KeyCode::Char('Y') => DeleteOutcome::Confirm(scope),
+            KeyCode::Char('n') | KeyCode::Char('N') | KeyCode::Esc => DeleteOutcome::Cancel,
+            _ => DeleteOutcome::Ignore,
+        },
+        DeletePrompt::Choice => match code {
+            KeyCode::Char('l') | KeyCode::Char('L') => DeleteOutcome::Confirm(DeleteScope::Local),
+            KeyCode::Char('r') | KeyCode::Char('R') => DeleteOutcome::Confirm(DeleteScope::Remote),
+            KeyCode::Char('b') | KeyCode::Char('B') => DeleteOutcome::Confirm(DeleteScope::Both),
+            KeyCode::Char('n') | KeyCode::Char('N') | KeyCode::Esc => DeleteOutcome::Cancel,
+            _ => DeleteOutcome::Ignore,
+        },
+    }
+}
+
+/// The `ops::PruneScope` a delete scope asks for.
+///
+/// `fetch` is on exactly when the remote is in scope, so containment of
+/// `origin/<branch>` is never judged against a stale remote-tracking ref — a
+/// stale one names an old tip, and deleting against it would destroy commits
+/// the check never saw.
+pub(crate) fn prune_scope_for(scope: DeleteScope, force: bool) -> ops::PruneScope {
+    let remote = matches!(scope, DeleteScope::Remote | DeleteScope::Both);
+    ops::PruneScope {
+        local: matches!(scope, DeleteScope::Local | DeleteScope::Both),
+        remote,
+        force,
+        fetch: remote,
+    }
+}
+
 // ── App ─────────────────────────────────────────────────────────────────────
 
 impl StatusApp {
@@ -439,6 +594,8 @@ impl StatusApp {
                         self.handle_detail(key.code);
                     } else if matches!(self.mode, Mode::CreateInput { .. }) {
                         self.handle_create_input(terminal, key.code)?;
+                    } else if matches!(self.mode, Mode::Delete { .. }) {
+                        self.handle_delete(terminal, key.code)?;
                     } else if self.handle_browsing(terminal, key.code)? {
                         break;
                     }
@@ -479,6 +636,7 @@ impl StatusApp {
             KeyCode::Char('p') => self.request(Action::Promote),
             KeyCode::Char('u') => self.request(Action::Update),
             KeyCode::Char('x') => self.request(Action::Prune),
+            KeyCode::Char('d') => self.request_delete()?,
             KeyCode::Enter => {
                 if let Some(RowKind::Base(i)) = self.selected_row() {
                     // Base branches have no roll detail to drill into.
@@ -587,6 +745,73 @@ impl StatusApp {
         }
     }
 
+    /// Open the delete modal for the selected roll, or say why it cannot be
+    /// deleted. The per-copy unmerged counts are taken here, once, so the modal
+    /// can state what a delete would cost without re-shelling out on every draw.
+    fn request_delete(&mut self) -> Result<()> {
+        let Some(roll) = self.selected_roll() else {
+            self.message = Some("no roll selected".to_string());
+            return Ok(());
+        };
+        let roll = roll.clone();
+
+        let prompt = match delete_prompt(&roll) {
+            Ok(prompt) => prompt,
+            Err(msg) => {
+                self.message = Some(msg);
+                return Ok(());
+            }
+        };
+
+        let (local_unmerged, remote_unmerged) =
+            ops::unmerged_commit_counts(&self.config, &roll.branch);
+
+        self.mode = Mode::Delete {
+            preview: DeletePreview {
+                branch: roll.branch,
+                prompt,
+                local_unmerged,
+                remote_unmerged,
+                local_is_checked_out: roll.is_current
+                    && matches!(roll.location, BranchLocation::Both),
+            },
+        };
+        Ok(())
+    }
+
+    /// Handle a keypress while the delete modal is open.
+    ///
+    /// A confirmation that would touch a copy holding commits stable lacks does
+    /// *not* delete: it advances the modal to [`DeletePrompt::ForceConfirm`],
+    /// which states the cost and demands a fresh `y`. That second `y` is the
+    /// only thing that ever sets `force`.
+    fn handle_delete(&mut self, terminal: &mut super::Tui, code: KeyCode) -> Result<()> {
+        let Mode::Delete { preview } = &self.mode else {
+            return Ok(());
+        };
+        let prompt = preview.prompt;
+
+        match handle_delete_key(prompt, code) {
+            DeleteOutcome::Ignore => {}
+            DeleteOutcome::Cancel => self.mode = Mode::Browsing,
+            DeleteOutcome::Confirm(scope) => {
+                let already_forced = matches!(prompt, DeletePrompt::ForceConfirm(_));
+                if !already_forced && needs_force_confirm(scope, preview) {
+                    if let Mode::Delete { preview } = &mut self.mode {
+                        preview.prompt = DeletePrompt::ForceConfirm(scope);
+                    }
+                    return Ok(());
+                }
+                let Mode::Delete { preview } = std::mem::replace(&mut self.mode, Mode::Browsing)
+                else {
+                    return Ok(());
+                };
+                self.execute_delete(terminal, preview.branch, scope, already_forced)?;
+            }
+        }
+        Ok(())
+    }
+
     fn select_next(&mut self) {
         let rows = self.row_count();
         if rows == 0 {
@@ -678,6 +903,38 @@ impl StatusApp {
         git::run_git(repo, &["switch", branch])?;
         lines.push(format!("Switched to '{branch}'"));
         Ok(lines)
+    }
+
+    /// Delete `branch` through the same suspended execution path as the other
+    /// actions, so git's own failures are visible and the list reloads after.
+    fn execute_delete(
+        &mut self,
+        terminal: &mut super::Tui,
+        branch: String,
+        scope: DeleteScope,
+        force: bool,
+    ) -> Result<()> {
+        self.with_suspended(terminal, |app| {
+            Ok((app.run_delete(&branch, scope, force)?, ()))
+        })?;
+        Ok(())
+    }
+
+    /// Plan and apply the deletion of one branch, returning printable lines.
+    ///
+    /// The plan is recomputed here rather than carried over from the modal: the
+    /// preview's commit counts are UI, and the authority to delete has to come
+    /// from the repo as it is *now*. If it changed underneath the modal, the
+    /// core refuses and says so.
+    fn run_delete(&self, branch: &str, scope: DeleteScope, force: bool) -> Result<Vec<String>> {
+        let plan = ops::delete_branch_plan(&self.config, branch, &prune_scope_for(scope, force))?;
+        if plan.is_empty() {
+            let mut lines = vec![format!("nothing to delete for '{branch}'")];
+            push_prune_skips(&mut lines, &plan.skipped);
+            return Ok(lines);
+        }
+        let results = ops::prune_apply(&self.config, &plan)?;
+        Ok(render_prune_outcome(&plan, &results))
     }
 
     /// Shared suspend → run → show → resume → reload wrapper. Runs `body` with the
@@ -773,30 +1030,10 @@ impl StatusApp {
                 let plan = ops::prune_plan(&self.config, &ops::PruneScope::both())?;
                 if plan.is_empty() {
                     lines.push("no promoted roll branches to prune".to_string());
+                    push_prune_skips(&mut lines, &plan.skipped);
                 } else {
-                    for result in ops::prune_apply(&self.config, &plan)? {
-                        if result.errors.is_empty() {
-                            let mut where_ = Vec::new();
-                            if result.local_deleted {
-                                where_.push("local");
-                            }
-                            if result.remote_deleted {
-                                where_.push("origin");
-                            }
-                            lines.push(format!(
-                                "deleted '{}' ({})",
-                                result.branch,
-                                where_.join(", ")
-                            ));
-                        } else {
-                            for err in &result.errors {
-                                lines.push(format!("failed to delete '{}': {err}", result.branch));
-                            }
-                        }
-                    }
-                }
-                for skip in &plan.skipped {
-                    lines.push(format!("skipped '{}': {}", skip.branch, skip.reason));
+                    let results = ops::prune_apply(&self.config, &plan)?;
+                    lines.extend(render_prune_outcome(&plan, &results));
                 }
             }
         }
@@ -827,7 +1064,8 @@ impl StatusApp {
         let chunks = Layout::vertical([
             Constraint::Length(3),
             Constraint::Min(3),
-            Constraint::Length(2),
+            // One message line plus two hint lines.
+            Constraint::Length(3),
         ])
         .split(area);
 
@@ -850,6 +1088,7 @@ impl StatusApp {
                 render_detail(f, area, roll, *ahead_behind, &self.rolls)
             }
             Mode::CreateInput { slug } => render_create_input(f, area, &self.config, slug),
+            Mode::Delete { preview } => render_delete_modal(f, area, &self.config, preview),
             Mode::Browsing => {}
         }
     }
@@ -969,10 +1208,15 @@ impl StatusApp {
             )),
             None => Line::from(""),
         };
-        let hint_line = Line::from(
-            " [q] quit   [j/k ↑/↓] nav   [space] switch   [enter] detail   [c]reate   [g]raduate   [p]romote   [u]pdate   [x] prune   [r]efresh",
-        );
-        f.render_widget(Paragraph::new(vec![msg_line, hint_line]), area);
+        // Two lines, not one: the single-line form was already ~126 columns and
+        // silently truncated on an 80-column terminal, hiding the last few
+        // bindings entirely. `Paragraph` does not wrap unless asked, and a
+        // dynamic line count would overflow whatever fixed height is picked.
+        let nav_line =
+            Line::from(" [q] quit   [j/k ↑/↓] nav   [space] switch   [enter] detail   [r]efresh");
+        let action_line =
+            Line::from(" [c]reate   [g]raduate   [p]romote   [u]pdate   [d]elete   [x] prune");
+        f.render_widget(Paragraph::new(vec![msg_line, nav_line, action_line]), area);
     }
 }
 
@@ -1017,6 +1261,98 @@ fn render_modal(
         .alignment(Alignment::Center)
         .block(Block::bordered().title(" confirm "));
     f.render_widget(body, modal);
+}
+
+/// Render the centered delete popup. Its shape follows `preview.prompt`, and
+/// the border is red throughout so the destructive modal is never mistaken for
+/// the ordinary `" confirm "` one.
+///
+/// Sized from the built lines rather than a fixed height, because the
+/// force-confirm stage adds a warning line the other shapes do not have.
+fn render_delete_modal(f: &mut Frame, area: Rect, config: &Config, preview: &DeletePreview) {
+    let red = Style::default().fg(Color::Red);
+    let dim = Style::default().fg(Color::DarkGray);
+
+    let mut lines: Vec<Line> = Vec::new();
+    let title = match preview.prompt {
+        DeletePrompt::ForceConfirm(_) => " force delete ",
+        _ => " delete ",
+    };
+
+    match preview.prompt {
+        DeletePrompt::Single(DeleteScope::Local) => {
+            lines.push(Line::from(format!(
+                "Delete local branch {}?",
+                preview.branch
+            )));
+        }
+        DeletePrompt::Single(DeleteScope::Remote) | DeletePrompt::Single(DeleteScope::Both) => {
+            lines.push(Line::from(format!("Delete origin/{}?", preview.branch)));
+            if preview.local_is_checked_out {
+                lines.push(Line::from(Span::styled(
+                    "local copy is checked out — origin only",
+                    dim,
+                )));
+            }
+        }
+        DeletePrompt::Choice => {
+            lines.push(Line::from(format!(
+                "Delete {} — it exists locally and on origin.",
+                preview.branch
+            )));
+        }
+        DeletePrompt::ForceConfirm(scope) => {
+            lines.push(Line::from(format!(
+                "Delete {} ({})",
+                preview.branch,
+                scope_label(scope)
+            )));
+            lines.push(Line::from(Span::styled(
+                match unmerged_for_scope(scope, preview) {
+                    Some(n) => format!(
+                        "⚠ {n} commit{} not in {} will be lost — this cannot be undone",
+                        if n == 1 { "" } else { "s" },
+                        config.stable_branch
+                    ),
+                    None => format!(
+                        "⚠ containment in {} is unknown — commits may be lost",
+                        config.stable_branch
+                    ),
+                },
+                red,
+            )));
+        }
+    }
+
+    lines.push(Line::from(""));
+    lines.push(Line::from(Span::styled(
+        match preview.prompt {
+            DeletePrompt::Choice => "[l] local only   [r] origin only   [b] both   [n] neither",
+            DeletePrompt::ForceConfirm(_) => "[y] delete anyway    [n] cancel",
+            DeletePrompt::Single(_) => "[y] delete    [n] cancel",
+        },
+        dim,
+    )));
+
+    let width = lines.iter().map(|l| l.width()).max().unwrap_or(20) as u16 + 4;
+    let height = lines.len() as u16 + 2;
+    let modal = centered_rect(area, width.max(32), height);
+
+    f.render_widget(Clear, modal);
+    let body = Paragraph::new(lines)
+        .alignment(Alignment::Center)
+        .block(Block::bordered().border_style(red).title(title));
+    f.render_widget(body, modal);
+}
+
+/// Human wording for which copies a scope covers, used in the force-confirm
+/// line and nowhere else.
+fn scope_label(scope: DeleteScope) -> &'static str {
+    match scope {
+        DeleteScope::Local => "local",
+        DeleteScope::Remote => "origin",
+        DeleteScope::Both => "local + origin",
+    }
 }
 
 /// Render the centered slug-input popup for creating a new roll. Shows the
@@ -1170,6 +1506,43 @@ fn centered_rect(area: Rect, width: u16, height: u16) -> Rect {
         y: area.y + area.height.saturating_sub(h) / 2,
         width: w,
         height: h,
+    }
+}
+
+/// Render what a deletion actually did, as printable lines.
+///
+/// Shared by `[x] prune` and `[d]elete` so there is one result vocabulary for
+/// branch deletion in the TUI, matching `main.rs`'s `render_prune_results`.
+fn render_prune_outcome(plan: &ops::PrunePlan, results: &[ops::PruneResult]) -> Vec<String> {
+    let mut lines = Vec::new();
+    for result in results {
+        if result.errors.is_empty() {
+            let mut where_ = Vec::new();
+            if result.local_deleted {
+                where_.push("local");
+            }
+            if result.remote_deleted {
+                where_.push("origin");
+            }
+            lines.push(format!(
+                "deleted '{}' ({})",
+                result.branch,
+                where_.join(", ")
+            ));
+        } else {
+            for err in &result.errors {
+                lines.push(format!("failed to delete '{}': {err}", result.branch));
+            }
+        }
+    }
+    push_prune_skips(&mut lines, &plan.skipped);
+    lines
+}
+
+/// Append the copies a deletion declined to touch. Nothing is skipped silently.
+fn push_prune_skips(lines: &mut Vec<String>, skipped: &[ops::PruneSkip]) {
+    for skip in skipped {
+        lines.push(format!("skipped '{}': {}", skip.branch, skip.reason));
     }
 }
 
@@ -1565,6 +1938,327 @@ mod tests {
         let rows = dep_rows(&selected, &all);
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0].number, 1);
+    }
+
+    // ── delete ──────────────────────────────────────────────────────────
+
+    /// A preview with the given per-copy unmerged counts, for the force-confirm
+    /// and key-handling tests.
+    fn preview(
+        prompt: DeletePrompt,
+        local_unmerged: Option<u32>,
+        remote_unmerged: Option<u32>,
+    ) -> DeletePreview {
+        DeletePreview {
+            branch: "roll/1-0101-x".to_string(),
+            prompt,
+            local_unmerged,
+            remote_unmerged,
+            local_is_checked_out: false,
+        }
+    }
+
+    #[test]
+    fn delete_prompt_shape_follows_location() {
+        let single = |loc| delete_prompt(&roll(RollState::Active, loc));
+        assert_eq!(
+            single(BranchLocation::Local),
+            Ok(DeletePrompt::Single(DeleteScope::Local))
+        );
+        assert_eq!(
+            single(BranchLocation::Remote),
+            Ok(DeletePrompt::Single(DeleteScope::Remote))
+        );
+        assert_eq!(single(BranchLocation::Both), Ok(DeletePrompt::Choice));
+        assert!(
+            single(BranchLocation::Neither).is_err(),
+            "a row with no copies anywhere has nothing to delete"
+        );
+    }
+
+    #[test]
+    fn delete_offered_regardless_of_roll_state() {
+        // The rule delete relaxes relative to prune: the user named this row.
+        for state in [
+            RollState::Active,
+            RollState::Graduated,
+            RollState::Diverged,
+            RollState::Promoted,
+            RollState::Blocked,
+        ] {
+            assert_eq!(
+                delete_prompt(&roll(state.clone(), BranchLocation::Local)),
+                Ok(DeletePrompt::Single(DeleteScope::Local)),
+                "{state:?} should still be deletable"
+            );
+        }
+    }
+
+    #[test]
+    fn delete_prompt_never_offers_the_checked_out_local_copy() {
+        let mut local = roll(RollState::Active, BranchLocation::Local);
+        local.is_current = true;
+        let err = delete_prompt(&local).expect_err("checked-out local-only roll");
+        assert!(err.contains("checked out"), "should explain itself: {err}");
+
+        // The origin copy of a checked-out roll is still fair game.
+        let mut both = roll(RollState::Active, BranchLocation::Both);
+        both.is_current = true;
+        assert_eq!(
+            delete_prompt(&both),
+            Ok(DeletePrompt::Single(DeleteScope::Remote)),
+            "a checked-out both-location roll degrades to origin-only"
+        );
+    }
+
+    #[test]
+    fn delete_key_single_prompt_defaults_to_no() {
+        let prompt = DeletePrompt::Single(DeleteScope::Local);
+        for key in [KeyCode::Char('y'), KeyCode::Char('Y')] {
+            assert_eq!(
+                handle_delete_key(prompt, key),
+                DeleteOutcome::Confirm(DeleteScope::Local)
+            );
+        }
+        for key in [KeyCode::Char('n'), KeyCode::Char('N'), KeyCode::Esc] {
+            assert_eq!(handle_delete_key(prompt, key), DeleteOutcome::Cancel);
+        }
+        // Nothing else acts — that is what "defaults to No" means here. Enter in
+        // particular is not a shortcut for yes.
+        for key in [
+            KeyCode::Enter,
+            KeyCode::Char(' '),
+            KeyCode::Char('l'),
+            KeyCode::Char('b'),
+            KeyCode::Char('d'),
+        ] {
+            assert_eq!(
+                handle_delete_key(prompt, key),
+                DeleteOutcome::Ignore,
+                "{key:?} must not delete anything"
+            );
+        }
+    }
+
+    #[test]
+    fn delete_key_choice_prompt_maps_l_r_b_n() {
+        let p = DeletePrompt::Choice;
+        assert_eq!(
+            handle_delete_key(p, KeyCode::Char('l')),
+            DeleteOutcome::Confirm(DeleteScope::Local)
+        );
+        assert_eq!(
+            handle_delete_key(p, KeyCode::Char('R')),
+            DeleteOutcome::Confirm(DeleteScope::Remote)
+        );
+        assert_eq!(
+            handle_delete_key(p, KeyCode::Char('b')),
+            DeleteOutcome::Confirm(DeleteScope::Both)
+        );
+        for key in [KeyCode::Char('n'), KeyCode::Esc] {
+            assert_eq!(handle_delete_key(p, key), DeleteOutcome::Cancel);
+        }
+        // `y` is deliberately unbound here: mapping it to "both" would let
+        // muscle memory delete more than the user was looking at.
+        assert_eq!(
+            handle_delete_key(p, KeyCode::Char('y')),
+            DeleteOutcome::Ignore
+        );
+    }
+
+    #[test]
+    fn delete_force_stage_requires_a_fresh_yes() {
+        let p = DeletePrompt::ForceConfirm(DeleteScope::Both);
+        assert_eq!(
+            handle_delete_key(p, KeyCode::Char('y')),
+            DeleteOutcome::Confirm(DeleteScope::Both)
+        );
+        for key in [KeyCode::Char('n'), KeyCode::Esc] {
+            assert_eq!(handle_delete_key(p, key), DeleteOutcome::Cancel);
+        }
+        for key in [KeyCode::Char('l'), KeyCode::Char('r'), KeyCode::Char('b')] {
+            assert_eq!(handle_delete_key(p, key), DeleteOutcome::Ignore);
+        }
+    }
+
+    #[test]
+    fn needs_force_confirm_only_when_a_selected_copy_is_uncontained() {
+        let clean = preview(DeletePrompt::Choice, Some(0), Some(0));
+        assert!(!needs_force_confirm(DeleteScope::Local, &clean));
+        assert!(!needs_force_confirm(DeleteScope::Remote, &clean));
+        assert!(!needs_force_confirm(DeleteScope::Both, &clean));
+
+        let dirty_local = preview(DeletePrompt::Choice, Some(3), Some(0));
+        assert!(needs_force_confirm(DeleteScope::Local, &dirty_local));
+        assert!(!needs_force_confirm(DeleteScope::Remote, &dirty_local));
+        assert!(needs_force_confirm(DeleteScope::Both, &dirty_local));
+
+        // The asymmetric case: a clean local copy must not launder a dirty
+        // origin one when both are selected.
+        let dirty_remote = preview(DeletePrompt::Choice, Some(0), Some(2));
+        assert!(!needs_force_confirm(DeleteScope::Local, &dirty_remote));
+        assert!(needs_force_confirm(DeleteScope::Remote, &dirty_remote));
+        assert!(needs_force_confirm(DeleteScope::Both, &dirty_remote));
+
+        // An unknown count warns rather than staying quiet: not knowing what a
+        // delete costs is no reason to skip the confirmation.
+        let unknown = preview(DeletePrompt::Choice, None, Some(0));
+        assert!(needs_force_confirm(DeleteScope::Local, &unknown));
+        assert!(needs_force_confirm(DeleteScope::Both, &unknown));
+    }
+
+    #[test]
+    fn unmerged_for_scope_reports_the_worst_selected_copy() {
+        let p = preview(DeletePrompt::Choice, Some(1), Some(4));
+        assert_eq!(unmerged_for_scope(DeleteScope::Local, &p), Some(1));
+        assert_eq!(unmerged_for_scope(DeleteScope::Remote, &p), Some(4));
+        assert_eq!(unmerged_for_scope(DeleteScope::Both, &p), Some(4));
+        assert_eq!(
+            unmerged_for_scope(
+                DeleteScope::Both,
+                &preview(DeletePrompt::Choice, None, None)
+            ),
+            None
+        );
+    }
+
+    #[test]
+    fn prune_scope_for_fetches_only_when_remote_is_in_scope() {
+        let local = prune_scope_for(DeleteScope::Local, false);
+        assert!(local.local && !local.remote);
+        assert!(
+            !local.fetch,
+            "a local-only delete must not touch the network"
+        );
+
+        let remote = prune_scope_for(DeleteScope::Remote, false);
+        assert!(!remote.local && remote.remote);
+        assert!(remote.fetch, "origin containment needs fresh refs");
+
+        let both = prune_scope_for(DeleteScope::Both, true);
+        assert!(both.local && both.remote && both.fetch);
+        assert!(both.force, "force passes through to the plan");
+        assert!(!prune_scope_for(DeleteScope::Both, false).force);
+    }
+
+    // ── rendering ───────────────────────────────────────────────────────
+
+    /// Draw `f` into an 80x24 test terminal and return its text, one row per
+    /// line with trailing spaces trimmed. Lets the modals and the footer be
+    /// asserted on without a real terminal.
+    fn draw(render: impl FnOnce(&mut Frame, Rect)) -> String {
+        use ratatui::backend::TestBackend;
+        use ratatui::Terminal;
+
+        let mut terminal = Terminal::new(TestBackend::new(80, 24)).expect("test terminal");
+        terminal
+            .draw(|f| {
+                let area = f.area();
+                render(f, area)
+            })
+            .expect("draw");
+        let buf = terminal.backend().buffer().clone();
+        (0..buf.area.height)
+            .map(|y| {
+                (0..buf.area.width)
+                    .map(|x| buf[(x, y)].symbol())
+                    .collect::<String>()
+                    .trim_end()
+                    .to_string()
+            })
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
+    /// A minimal config for the render tests — only the branch names are read.
+    fn test_config() -> Config {
+        Config {
+            config_version: 1,
+            repo_root: std::path::PathBuf::from("/nonexistent"),
+            rolling_branch: "rolling".to_string(),
+            stable_branch: "main".to_string(),
+            roll_prefix: "roll/".to_string(),
+            mode: crate::core::config::Mode::default(),
+            username: "test".to_string(),
+            hosts: Vec::new(),
+            host_active: Default::default(),
+            roll_to_rolling_gates: Vec::new(),
+            rolling_to_main_gates: Vec::new(),
+            host_gates: Vec::new(),
+            clean_protect: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn delete_modal_offers_four_choices_for_a_both_location_roll() {
+        let p = preview(DeletePrompt::Choice, Some(0), Some(0));
+        let out = draw(|f, area| render_delete_modal(f, area, &test_config(), &p));
+        assert!(out.contains("delete"), "{out}");
+        assert!(out.contains("exists locally and on origin"), "{out}");
+        for hint in [
+            "[l] local only",
+            "[r] origin only",
+            "[b] both",
+            "[n] neither",
+        ] {
+            assert!(out.contains(hint), "missing {hint}:\n{out}");
+        }
+        assert!(
+            !out.contains("[y]"),
+            "the choice modal must not offer a bare yes:\n{out}"
+        );
+    }
+
+    #[test]
+    fn delete_modal_single_copy_offers_y_n() {
+        let p = preview(DeletePrompt::Single(DeleteScope::Local), Some(0), None);
+        let out = draw(|f, area| render_delete_modal(f, area, &test_config(), &p));
+        assert!(out.contains("Delete local branch"), "{out}");
+        assert!(out.contains("[y] delete"), "{out}");
+        assert!(out.contains("[n] cancel"), "{out}");
+    }
+
+    #[test]
+    fn delete_modal_says_why_a_checked_out_roll_is_origin_only() {
+        let mut p = preview(DeletePrompt::Single(DeleteScope::Remote), Some(0), Some(0));
+        p.local_is_checked_out = true;
+        let out = draw(|f, area| render_delete_modal(f, area, &test_config(), &p));
+        assert!(out.contains("Delete origin/"), "{out}");
+        assert!(out.contains("checked out"), "should explain itself:\n{out}");
+    }
+
+    #[test]
+    fn delete_modal_force_stage_states_the_cost() {
+        let p = preview(
+            DeletePrompt::ForceConfirm(DeleteScope::Both),
+            Some(1),
+            Some(4),
+        );
+        let out = draw(|f, area| render_delete_modal(f, area, &test_config(), &p));
+        assert!(out.contains("force delete"), "{out}");
+        // The worst selected copy, not the first one.
+        assert!(out.contains("4 commits not in main"), "{out}");
+        assert!(out.contains("cannot be undone"), "{out}");
+        assert!(out.contains("[y] delete anyway"), "{out}");
+
+        let one = preview(
+            DeletePrompt::ForceConfirm(DeleteScope::Local),
+            Some(1),
+            None,
+        );
+        let out = draw(|f, area| render_delete_modal(f, area, &test_config(), &one));
+        assert!(out.contains("1 commit not in main"), "singular:\n{out}");
+    }
+
+    #[test]
+    fn status_bar_hints_fit_an_80_column_terminal() {
+        // The single-line footer this replaced was ~126 columns and silently
+        // truncated, hiding the last several bindings. Both lines must fit whole.
+        let app = StatusApp::new(test_config(), "main".to_string(), Vec::new(), false);
+        let out = draw(|f, area| app.render_status_bar(f, area));
+        for key in ["[q] quit", "[r]efresh", "[c]reate", "[d]elete", "[x] prune"] {
+            assert!(out.contains(key), "{key} truncated away:\n{out}");
+        }
     }
 
     /// The pinned base rows render above the rolls, with the role in the
