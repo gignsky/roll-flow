@@ -1,4 +1,4 @@
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::path::Path;
 
 use crate::core::{config::Config, git};
@@ -64,10 +64,32 @@ pub struct RollInfo {
     pub state: RollState,
     pub location: BranchLocation,
     pub is_current: bool,
+    /// Roll numbers this roll integrated — the rolls it depends on. Populated
+    /// for every state, not just `Active`: a graduated roll's dependencies are
+    /// what orders its promotion, and a promoted roll's are still worth showing.
     pub deps: Vec<u32>,
+    /// The inverse of [`deps`](Self::deps): roll numbers that integrated *this*
+    /// roll. Precomputed in [`list_rolls`] from a single reverse index so
+    /// renderers never rescan the whole list per row.
+    pub dependents: Vec<u32>,
+    /// Hash of this roll's graduation merge on the rolling branch, or `None`
+    /// when it has not graduated. This is the commit `rf promote --roll` merges
+    /// into stable: advancing stable to it promotes exactly this roll (and
+    /// whatever graduated before it), which keeps stable a prefix of rolling.
+    pub graduation_commit: Option<String>,
 }
 
 // ── Public API ────────────────────────────────────────────────────────────────
+
+/// Render a roll-number list for the `deps` / `dependants` table columns:
+/// `[2, 3]` → `"2,3"`, empty → `""`. Shared so the TUI table, `rf status
+/// --no-tui` and `rf list --no-tui --deps` cannot drift apart.
+pub fn format_roll_numbers(nums: &[u32]) -> String {
+    nums.iter()
+        .map(|n| n.to_string())
+        .collect::<Vec<_>>()
+        .join(",")
+}
 
 /// Extract the roll number from a branch name given the configured prefix.
 /// `"roll/5-theme"` with prefix `"roll/"` → `Some(5)`.
@@ -100,7 +122,7 @@ pub fn list_rolls(config: &Config) -> Result<Vec<RollInfo>, RfError> {
     local.dedup();
 
     // Single-pass log scans — much faster than per-roll log calls.
-    let graduated_set = scan_graduated(repo, &config.rolling_branch);
+    let graduated = scan_graduated(repo, &config.rolling_branch);
     let promoted_set = scan_promoted(repo, &config.stable_branch);
 
     let mut rolls = Vec::new();
@@ -119,7 +141,8 @@ pub fn list_rolls(config: &Config) -> Result<Vec<RollInfo>, RfError> {
         };
 
         let is_promoted = promoted_set.contains(&branch);
-        let is_graduated = graduated_set.contains(&branch);
+        let graduation_commit = graduated.get(&branch).cloned();
+        let is_graduated = graduation_commit.is_some();
 
         let state = if is_promoted {
             RollState::Promoted
@@ -141,28 +164,33 @@ pub fn list_rolls(config: &Config) -> Result<Vec<RollInfo>, RfError> {
             state,
             location,
             deps: Vec::new(),
+            dependents: Vec::new(),
+            graduation_commit,
         });
     }
 
     rolls.sort_by_key(|r| r.number);
 
-    // Compute deps for active rolls and promote to Blocked when needed.
-    // Deps are the roll's *actual direct integrations* — the roll branches it
-    // pulled in via `rf integrate` — detected from its own first-parent merge
-    // history. A roll is Blocked only when one of those integrations has not yet
-    // graduated. File overlap and broad ancestry are deliberately NOT used here:
-    // in a dotfiles repo nearly every roll touches flake.lock, which made them
-    // spuriously block one another.
+    // Compute deps for *every* roll, whatever its state. Deps are the roll's
+    // actual direct integrations — the roll branches it pulled in via
+    // `rf integrate` — detected from its own first-parent merge history. File
+    // overlap and broad ancestry are deliberately NOT used here: in a dotfiles
+    // repo nearly every roll touches flake.lock, which made them spuriously
+    // block one another.
+    //
+    // Blocking, by contrast, only applies to Active rolls: an ungraduated
+    // integration holds a roll back from graduating, but once the roll itself
+    // has graduated the relationship is history, not a blocker.
     let snapshot = rolls.clone();
     for roll in &mut rolls {
+        roll.deps = integration_deps(
+            repo,
+            &roll.branch,
+            roll.number,
+            &config.roll_prefix,
+            &deps_base_ref(roll, &config.stable_branch),
+        );
         if roll.state == RollState::Active {
-            roll.deps = integration_deps(
-                repo,
-                &roll.branch,
-                roll.number,
-                &config.roll_prefix,
-                &config.stable_branch,
-            );
             let blocked = roll.deps.iter().any(|dep| {
                 snapshot
                     .iter()
@@ -176,7 +204,39 @@ pub fn list_rolls(config: &Config) -> Result<Vec<RollInfo>, RfError> {
         }
     }
 
+    // Reverse index, built once: dependency number -> rolls that integrated it.
+    // Doing this here keeps renderers from rescanning every roll per row.
+    let mut reverse: HashMap<u32, Vec<u32>> = HashMap::new();
+    for roll in &rolls {
+        for dep in &roll.deps {
+            reverse.entry(*dep).or_default().push(roll.number);
+        }
+    }
+    for roll in &mut rolls {
+        if let Some(mut dependents) = reverse.remove(&roll.number) {
+            dependents.sort_unstable();
+            dependents.dedup();
+            roll.dependents = dependents;
+        }
+    }
+
     Ok(rolls)
+}
+
+/// The exclusive lower bound for a roll's [`integration_deps`] scan.
+///
+/// For an ungraduated roll, the stable branch is the right floor: everything
+/// above it is the roll's own work. For a graduated one it is not — once the
+/// roll has been promoted its tip is contained in stable, `<stable>..<roll>` is
+/// empty, and its dependencies would silently vanish. The first parent of the
+/// graduation merge is the rolling branch immediately before the roll landed,
+/// which bounds the scan to exactly what the roll brought in and keeps working
+/// after promotion.
+fn deps_base_ref(roll: &RollInfo, stable_ref: &str) -> String {
+    match &roll.graduation_commit {
+        Some(sha) => format!("{sha}^1"),
+        None => stable_ref.to_string(),
+    }
 }
 
 // ── Per-roll checks (exposed for use in graduate/promote commands) ─────────────
@@ -224,46 +284,72 @@ pub fn check_diverged(repo: &Path, roll_branch: &str, rolling_ref: &str) -> bool
         .unwrap_or(false)
 }
 
-/// True if the roll has been promoted to the stable branch: either a
-/// `Promote <roll> …` subject exists on stable, or the roll's graduation merge
-/// is reachable from stable (the promote merge carries graduations along).
+/// True if the roll has been promoted to the stable branch.
+///
+/// All three attribution sources must agree with [`scan_promoted`], which is why
+/// this defers to it rather than reimplementing two of them: a `Promote <roll> …`
+/// subject, a `Rolls:` body naming the roll, or the roll's graduation merge being
+/// reachable from stable. The body source used to be missing here, so a roll
+/// attributed only by a `Rolls:` list read as promoted in `rf list` but not to
+/// `rf graduate`'s already-promoted guard.
 pub fn check_promoted(repo: &Path, roll_branch: &str, stable_ref: &str) -> bool {
-    let stable = match git::resolve_branch(repo, stable_ref) {
-        Some(r) => r,
-        None => return false,
-    };
-    let subjects = git::log_subjects(repo, &[&stable]).unwrap_or_default();
-    if subjects
-        .iter()
-        .any(|s| s.starts_with(&format!("Promote {roll_branch}")))
-    {
-        return true;
-    }
-    graduation_on_stable(repo, roll_branch, stable_ref).is_some()
-}
-
-/// Graduation merge commit for `roll_branch` reachable from the stable branch —
-/// present once the roll's graduation has been promoted. Reused by the future
-/// revert flow (issue #38).
-pub fn graduation_on_stable(repo: &Path, roll_branch: &str, stable_ref: &str) -> Option<String> {
-    let stable = git::resolve_branch(repo, stable_ref)?;
-    find_graduation_commit(repo, roll_branch, &stable)
+    scan_promoted(repo, stable_ref).contains(roll_branch)
 }
 
 // ── Internal helpers ──────────────────────────────────────────────────────────
 
-/// Scan rolling log once, returning the set of branch names that have been
-/// graduated.  Much cheaper than one `git log` call per roll.
-fn scan_graduated(repo: &Path, rolling_ref: &str) -> HashSet<String> {
+/// Scan the rolling log, mapping each graduated branch name to the hash of its
+/// graduation merge. Much cheaper than one `git log` call per roll, and the hash
+/// is needed anyway — by `deps_base_ref` to bound the dependency scan, and by
+/// `rf promote --roll` as the commit to advance stable to.
+///
+/// Two passes, because "a merge naming this branch is reachable from rolling"
+/// and "this is where the branch landed on rolling" are different questions:
+///
+/// 1. `--first-parent` finds the merge on rolling's own mainline — the actual
+///    graduation.
+/// 2. A full reachability pass then fills in branches with no mainline merge of
+///    their own, which is how a roll that only reached rolling inside another
+///    roll's history still counts as graduated. Membership therefore matches the
+///    long-standing behaviour exactly; only the hash is sharpened.
+///
+/// Without pass 1 the hash can land on an unrelated merge that merely mentions
+/// the branch — an `rf integrate` merge inside a *different* roll, say — which
+/// would make `rf promote --roll` advance stable to the wrong point.
+///
+/// Newest-first log order means a branch graduated more than once (graduate,
+/// diverge, re-graduate) maps to its *latest* graduation, which is the one that
+/// carries all of its work.
+fn scan_graduated(repo: &Path, rolling_ref: &str) -> HashMap<String, String> {
     let rolling = match git::resolve_branch(repo, rolling_ref) {
         Some(r) => r,
-        None => return HashSet::new(),
+        None => return HashMap::new(),
     };
-    git::log_subjects(repo, &[&rolling])
-        .unwrap_or_default()
-        .iter()
-        .filter_map(|s| extract_graduated_branch(s))
-        .collect()
+
+    let mut graduated = HashMap::new();
+    for args in [
+        vec![
+            "log",
+            "--first-parent",
+            "--merges",
+            "--format=%H%x09%s",
+            &rolling,
+        ],
+        vec!["log", "--merges", "--format=%H%x09%s", &rolling],
+    ] {
+        let Ok(out) = git::capture_git(repo, &args) else {
+            continue;
+        };
+        for line in out.lines() {
+            let Some((hash, subject)) = line.split_once('\t') else {
+                continue;
+            };
+            if let Some(branch) = extract_graduated_branch(subject) {
+                graduated.entry(branch).or_insert_with(|| hash.to_string());
+            }
+        }
+    }
+    graduated
 }
 
 /// Scan stable log once, returning the set of branch names that have been
@@ -336,10 +422,15 @@ fn subjects_contain_graduation(subjects: &[String], roll_branch: &str) -> bool {
 /// (`git merge --no-ff <branch>`).
 ///
 /// Detected by parsing the roll's own first-parent merge history in the range
-/// `<stable>..<roll>`. `--first-parent` combined with the `<stable>..<roll>`
-/// range restricts results to merges THIS roll introduced (direct integrations),
-/// excluding transitive ones carried in by an integrated roll's own history.
-/// Each subject matching `Merge branch 'roll/<N>-…'` yields `<N>`.
+/// `<base>..<roll>`. `--first-parent` combined with that range restricts results
+/// to merges THIS roll introduced (direct integrations), excluding transitive
+/// ones carried in by an integrated roll's own history. Each subject matching
+/// `Merge branch 'roll/<N>-…'` yields `<N>`.
+///
+/// `base_ref` is chosen by [`deps_base_ref`] — the stable branch for an
+/// ungraduated roll, the graduation merge's first parent otherwise. It may be a
+/// raw revision (`<sha>^1`) rather than a branch name, so it is resolved with
+/// `rev_parse` and only falls back to branch resolution.
 ///
 /// This is the only dependency signal that gates blocking: file overlap and
 /// broad ancestry are intentionally excluded (see `list_rolls`).
@@ -348,16 +439,18 @@ fn integration_deps(
     roll_branch: &str,
     roll_num: u32,
     prefix: &str,
-    stable_ref: &str,
+    base_ref: &str,
 ) -> Vec<u32> {
-    let (Some(roll_ref), Some(stable)) = (
+    let (Some(roll_ref), Some(base)) = (
         git::resolve_branch(repo, roll_branch),
-        git::resolve_branch(repo, stable_ref),
+        git::rev_parse(repo, base_ref)
+            .ok()
+            .or_else(|| git::resolve_branch(repo, base_ref)),
     ) else {
         return Vec::new();
     };
 
-    let range = format!("{stable}..{roll_ref}");
+    let range = format!("{base}..{roll_ref}");
     let subjects =
         git::log_subjects(repo, &["--first-parent", "--merges", &range]).unwrap_or_default();
 
@@ -374,7 +467,9 @@ fn integration_deps(
 }
 
 /// Find the git hash of the merge/graduation commit for `roll_branch` on
-/// `rolling_ref`.  Returns `None` if no graduation commit is found. Scans merge
+/// `rolling_ref` — pass a stable ref to get the graduation once it has been
+/// promoted, which is what the future revert flow (issue #38) needs. Returns
+/// `None` if no graduation commit is found. Scans merge
 /// commits and matches subjects through [`extract_graduated_branch`], so all
 /// three merge-subject shapes (local `Merge branch`, `Graduate`, and GitHub
 /// `Merge pull request`) are recognized from one source of truth.

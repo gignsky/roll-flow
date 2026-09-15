@@ -226,7 +226,28 @@ Rolls:
 A roll counts as "promoted" if a `Promote roll/N-...` subject exists on the stable
 branch, its graduation merge is reachable from stable, or it is named in a `Rolls:`
 body of a Promote commit. All three sources must be checked wherever promotion is
-tested.
+tested — which is why `check_promoted` defers to `scan_promoted` rather than
+reimplementing them, and why any new promotion path must keep producing one of
+those three shapes.
+
+### Per-roll promotion
+
+`rf promote --roll <branch>` (and `[p]` on a roll row in the TUI) promotes one
+graduated roll by advancing stable to **that roll's graduation merge on rolling**
+— never by merging the roll branch into stable. The invariant below therefore
+still holds: the merge source is always a commit on rolling. The consequence is
+that promoting a roll necessarily carries whatever graduated ahead of it, so
+promotion order is graduation order and dependencies are satisfied for free.
+
+Each `--roll` is a separate merge behind a separate gate run; promoting the whole
+rolling branch is a single merge behind a single gate run.
+
+Promotion gates run against the **staged merge result**, not the pre-merge
+worktree: `merge_gated` stages `git merge --no-ff --no-commit`, runs the gates,
+and commits only if they pass. This is why a gate that rewrites tracked files
+aborts the promotion — `git commit` would drop those changes and record a merge
+whose content the gates never saw. Graduation still uses `run_merge`, which
+merges and commits in one step.
 
 ## Build and test
 
@@ -241,6 +262,9 @@ cargo run -- list --no-tui
 
 - Never fast-forward merge. Always `--no-ff` for traceability.
 - `main` only receives merges from `rolling`, never directly from roll branches.
+  Per-roll promotion does not weaken this: it merges a graduation *commit* that
+  lives on rolling, which is why stable's history stays a prefix of rolling's
+  rather than a divergent line.
 - Roll numbers are monotonically increasing; detect from local + remote branches combined.
 - A roll is "graduated" if a merge commit exists on the rolling branch whose subject
   matches `Merge branch 'roll/N-...'` OR `Graduate roll/N-...`. Both formats must be

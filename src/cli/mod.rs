@@ -143,6 +143,11 @@ pub enum Cmd {
     /// Promote rolling into the stable branch (--no-ff merge). On a roll
     /// branch, redirects to graduate.
     Promote {
+        /// Promote only this graduated roll, by advancing stable to its
+        /// graduation commit on rolling. Repeatable; each roll is a separate
+        /// merge with its own gate run, applied in graduation order.
+        #[arg(long)]
+        roll: Vec<String>,
         #[arg(long)]
         dry_run: bool,
         /// Proceed past failing gates, recording the bypass in the merge commit.
@@ -158,6 +163,9 @@ pub enum Cmd {
     Status {
         #[arg(long)]
         no_tui: bool,
+        /// Hide the deps/dependants columns, which status shows by default.
+        #[arg(long)]
+        no_deps: bool,
         #[arg(long)]
         json: bool,
     },

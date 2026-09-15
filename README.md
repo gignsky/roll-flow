@@ -46,8 +46,8 @@ rf integrate <branch>
 rf hotfix [<slug>] [--date MMDD] [--land] [--dry-run]
 rf verify [--dry-run]
 rf graduate [--dry-run] [--force --reason <text>]
-rf promote [--dry-run] [--force --reason <text>]
-rf status [--no-tui] [--json]
+rf promote [--roll <branch>]... [--dry-run] [--force --reason <text>]
+rf status [--no-tui] [--no-deps] [--json]
 rf list [--no-tui] [--deps] [--json]
 rf update [--dry-run]
 rf prune [--dry-run] [--local | --remote] [--yes] [--force] [--no-fetch]
@@ -120,11 +120,37 @@ rolls listed in the body when several graduated rolls ride along). Run from a
 roll branch it redirects to graduation. Conflicts abort and restore, same as
 `graduate`, and `--force`/`--reason` behave the same way.
 
+The gates run against the *staged merge result* rather than whatever was checked
+out, so what they check is what lands on stable. A gate that modifies tracked
+files mid-merge aborts the promotion rather than committing content the gates
+never saw.
+
+`--roll <branch>` promotes one graduated roll instead of the whole branch, by
+advancing stable to that roll's graduation commit on rolling. Stable therefore
+stays a prefix of rolling, and `main` still only ever receives merges from
+`rolling` — a roll branch is never merged into stable directly. The flag is
+repeatable, works from any branch, and orders the rolls it is given by
+graduation, so promoting a roll necessarily carries whatever graduated ahead of
+it; a roll already contained in stable is reported as skipped rather than
+failing.
+
+Each `--roll` is its own merge behind its own gate run, so a two-roll promotion
+runs the gates twice and verifies both intermediate states of stable. Promoting
+the whole branch is a single merge, so one gate run covers it. If a later step's
+gates fail, the merge is aborted and the earlier steps stay committed.
+
 ### `status`
 
 Shows current branch, tier, cleanliness, pending rolls, and promotion readiness.
 Runs as a full-screen TUI by default; `--no-tui` prints a plain table instead and
 `--json` emits machine-readable output.
+
+The table carries a `deps` column (roll numbers this roll integrated) and a
+`dependants` column (roll numbers that integrated it) — `--no-deps` hides both.
+They are shown whatever the roll's state, so a roll that has already graduated
+still reports what it depends on and what depends on it. Press `[enter]` on a
+roll for the detail overlay, which breaks the same two relationships out with
+per-dependency blocker markers.
 
 The TUI table pins the stable and rolling branches above the rolls, so `[space]`
 switches to them the same way it switches to a roll. A base branch that exists
@@ -133,7 +159,8 @@ neither locally nor on `origin` is not listed.
 ### `list`
 
 Lists roll branches and states, with the same `--no-tui`/`--json` options as
-`status`. `--deps` adds a dependency column to the table.
+`status`. `--deps` adds the `deps`/`dependants` columns, which `list` leaves off
+by default.
 
 ### `update`
 
