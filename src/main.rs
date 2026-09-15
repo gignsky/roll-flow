@@ -91,6 +91,14 @@ fn main() -> Result<()> {
             }
         }
         Cmd::Update { dry_run } => cmd_update(dry_run)?,
+        Cmd::Prune {
+            dry_run,
+            local,
+            remote,
+            yes,
+            force,
+            no_fetch,
+        } => cmd_prune(dry_run, local, remote, yes, force, no_fetch)?,
         Cmd::Version => println!("{}", env!("CARGO_PKG_VERSION")),
     }
 
@@ -471,6 +479,157 @@ fn cmd_update(dry_run: bool) -> Result<()> {
         }
     }
     Ok(())
+}
+
+/// `rf prune` — delete roll branches already promoted to stable.
+///
+/// Deliberately does not call `ops::ensure_clean_state`: unlike graduate/promote
+/// this never moves `HEAD` and never merges, so a dirty working tree is
+/// irrelevant to it.
+fn cmd_prune(
+    dry_run: bool,
+    local: bool,
+    remote: bool,
+    yes: bool,
+    force: bool,
+    no_fetch: bool,
+) -> Result<()> {
+    let config = Config::load()?;
+
+    // Neither flag means both copies; either one narrows to just that side.
+    let scope = ops::PruneScope {
+        local: local || !remote,
+        remote: remote || !local,
+        force,
+        fetch: !no_fetch,
+    };
+
+    let plan = ops::prune_plan(&config, &scope)?;
+
+    if plan.is_empty() {
+        println!("no promoted roll branches to prune");
+        render_prune_skips(&plan.skipped);
+        return Ok(());
+    }
+
+    render_prune_plan(&plan);
+    render_prune_skips(&plan.skipped);
+
+    if dry_run {
+        println!("\nDry-run: nothing deleted");
+        return Ok(());
+    }
+
+    // `--force` widens *what* may be deleted; only `--yes` skips the prompt.
+    // Non-interactive without `--yes` deletes nothing and exits 0, matching how
+    // `rf init` treats an unattended run.
+    let interactive = std::io::stdin().is_terminal();
+    let apply = if yes {
+        true
+    } else if interactive {
+        prompt_yes("\nDelete these branches? [y/N] ")?
+    } else {
+        false
+    };
+
+    if !apply {
+        if interactive {
+            println!("Nothing deleted.");
+        } else {
+            println!("\nNothing deleted. Re-run with --yes to apply.");
+        }
+        return Ok(());
+    }
+
+    println!();
+    let results = ops::prune_apply(&config, &plan)?;
+    let failures = render_prune_results(&results);
+    if failures > 0 {
+        bail!(
+            "{failures} branch{} could not be deleted",
+            if failures == 1 { "" } else { "es" }
+        );
+    }
+    Ok(())
+}
+
+/// Render the branches a prune would delete, and which copies of each.
+fn render_prune_plan(plan: &ops::PrunePlan) {
+    let name_w = plan
+        .candidates
+        .iter()
+        .map(|c| c.branch.len())
+        .max()
+        .unwrap_or(6)
+        .max(6);
+
+    println!("Promoted roll branches to prune:");
+    println!();
+    println!(
+        "  {num:>3}  {name:<nw$}  delete",
+        num = "#",
+        name = "branch",
+        nw = name_w,
+    );
+    println!("  ───  {}  ──────────────", "─".repeat(name_w));
+
+    for candidate in &plan.candidates {
+        let target = match (candidate.delete_local, candidate.delete_remote) {
+            (true, true) => "local + origin",
+            (true, false) => "local",
+            (false, true) => "origin",
+            (false, false) => "—",
+        };
+        println!(
+            "  {num:>3}  {name:<nw$}  {target}",
+            num = candidate.number,
+            name = candidate.branch,
+            nw = name_w,
+        );
+    }
+
+    if !plan.has_remote {
+        println!("\nnote: no 'origin' remote configured — local branches only");
+    }
+}
+
+/// Render branch copies prune declined to touch. Nothing is skipped silently.
+fn render_prune_skips(skipped: &[ops::PruneSkip]) {
+    if skipped.is_empty() {
+        return;
+    }
+    println!("\nSkipped:");
+    for skip in skipped {
+        println!("  {}: {}", skip.branch, skip.reason);
+    }
+}
+
+/// Render what actually happened, returning the number of failed branches.
+fn render_prune_results(results: &[ops::PruneResult]) -> usize {
+    let mut failures = 0;
+    for result in results {
+        if result.errors.is_empty() {
+            let mut where_ = Vec::new();
+            if result.local_deleted {
+                where_.push("local");
+            }
+            if result.remote_deleted {
+                where_.push("origin");
+            }
+            println!("deleted '{}' ({})", result.branch, where_.join(", "));
+        } else {
+            failures += 1;
+            for err in &result.errors {
+                eprintln!("failed to delete '{}': {err}", result.branch);
+            }
+        }
+    }
+    let deleted = results.len() - failures;
+    println!(
+        "\nPruned {deleted} branch{}",
+        if deleted == 1 { "" } else { "es" }
+    );
+    failures
 }
 
 fn cmd_list_text(no_tui: bool, deps: bool) -> Result<()> {

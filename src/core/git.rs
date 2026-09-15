@@ -132,6 +132,59 @@ pub fn remote_branches(repo: &Path, pattern: &str) -> Result<Vec<String>, RfErro
         .collect())
 }
 
+/// True if a remote named `name` is configured.
+///
+/// [`remote_branches`] silently yields nothing for a repo without a remote, so
+/// callers that need to distinguish "no remote" from "no matching branches" —
+/// like `rf prune` — must ask separately.
+pub fn has_remote(repo: &Path, name: &str) -> bool {
+    capture_git(repo, &["remote"])
+        .map(|out| out.lines().any(|l| l.trim() == name))
+        .unwrap_or(false)
+}
+
+// ── Mutating branch helpers ───────────────────────────────────────────────────
+
+/// Refresh remote-tracking refs and drop the ones whose upstream is gone.
+///
+/// `rf` is otherwise local-only, so `origin/*` refs go stale: a branch may
+/// already be deleted upstream, or exist there without a local ref. Commands
+/// that act on the remote call this first so they act on current data.
+pub fn fetch_prune(repo: &Path, remote: &str) -> Result<(), RfError> {
+    run_git(repo, &["fetch", "--prune", remote])
+}
+
+/// Delete a local branch, unconditionally (`git branch -D`).
+///
+/// `-D` rather than `-d` is deliberate. `-d` refuses unless the branch is merged
+/// into `HEAD` or its upstream, which answers the wrong question: it vetoes
+/// correct deletions when an unrelated branch is checked out, and permits ones we
+/// would not want when a descendant is. Callers are expected to have established
+/// containment themselves (see [`is_ancestor`]) so the decision does not depend on
+/// which branch happens to be checked out.
+pub fn delete_local_branch(repo: &Path, branch: &str) -> Result<(), RfError> {
+    capture_git(repo, &["branch", "-D", branch]).map(|_| ())
+}
+
+/// Delete branches on `remote` in a single push.
+///
+/// Batched because each push is a network round-trip and callers routinely have
+/// a dozen-plus branches to remove. Git deletes the corresponding
+/// remote-tracking refs as a side effect, so no follow-up prune is needed.
+/// All-or-nothing: if the push fails, no branch in the batch was deleted.
+pub fn delete_remote_branches(
+    repo: &Path,
+    remote: &str,
+    branches: &[String],
+) -> Result<(), RfError> {
+    if branches.is_empty() {
+        return Ok(());
+    }
+    let mut args = vec!["push", remote, "--delete"];
+    args.extend(branches.iter().map(String::as_str));
+    capture_git(repo, &args).map(|_| ())
+}
+
 // ── Log helpers ───────────────────────────────────────────────────────────────
 
 /// Return commit subjects for the given log range / extra args.
