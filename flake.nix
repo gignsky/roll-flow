@@ -25,6 +25,18 @@
         ];
         text = "cargo check --locked";
       };
+      # Dev-shell onboarding banner. Kept as a package rather than inlined in
+      # the shellHook so it is also callable as `rf-dev` to reprint on demand,
+      # and so the script never has to escape nix string interpolation.
+      rfDev = pkgs.writeShellApplication {
+        name = "rf-dev";
+        runtimeInputs = [
+          pkgs.git
+          pkgs.gnused
+          pkgs.coreutils
+        ];
+        text = builtins.readFile ./scripts/rf-dev.sh;
+      };
     in
     {
       packages = forAllSystems (
@@ -91,10 +103,14 @@
             gitflow
             bacon
           ]
-          ++ [ self.packages.${system}.default ];
+          ++ [
+            self.packages.${system}.default
+            rfDev
+          ];
 
         shellHook = ''
           ${self.pre-commit-check.shellHook}
+          rf-dev
         '';
       };
 

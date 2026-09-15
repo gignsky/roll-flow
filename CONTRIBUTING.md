@@ -20,7 +20,9 @@ generically call "rolling."
 ## Day-to-day workflow
 
 1. Start work with `rf create <slug>` (alias `rf start`), which branches
-   `roll/N-MMDD-slug` off `develop`.
+   `roll/N-MMDD-slug` off `main` — the *stable* branch, so every roll starts
+   from a clean baseline. `develop` and other rolls become dependencies only
+   when you pull them in deliberately with `rf integrate`.
 2. Do the work, integrating any feature branches with `rf integrate <branch>`
    if you split work further.
 3. When ready, run `rf verify` to check the branch is mergeable and run the
@@ -34,9 +36,62 @@ generically call "rolling."
    branches whose commits are already contained in `main`, and lists anything it
    skips along with the reason.
 
-Until you have `rf` built locally, `cargo build` produces `target/debug/rf`;
-there is no installed package for this repo (unlike the dotfiles repo, which
-consumes `rf` via gigpkgs).
+Adding or changing a subcommand or a flag requires a matching `README.md`
+update. This is enforced, not merely requested — see
+[Documentation is a gate](#documentation-is-a-gate) below.
+
+## Two `rf` binaries, and which one you are running
+
+`nix develop` (or direnv) puts an `rf` on `PATH`, but it is the **built flake
+package** — `self.packages.<system>.default` in `flake.nix` — not your working
+tree. It will happily ignore every edit you have just made.
+
+So there are two binaries, with two jobs:
+
+- **`rf ...`** — the packaged build. Use it to *drive the workflow*: `rf create`,
+  `rf verify`, `rf graduate`. This is the bootstrap: a stable `rf` is what moves
+  your changes to `rf` through the pipeline.
+- **`cargo run -- ...`** — your working tree. Use it to *exercise your changes*:
+  `cargo run -- status`, `cargo run -- list --no-tui`. `cargo build` also leaves
+  a binary at `target/debug/rf` if you would rather invoke it directly.
+
+The dev shell prints this distinction on entry; run `rf-dev` to reprint the
+banner once it has scrolled away.
+
+## Documentation is a gate
+
+`tests/docs_sync.rs` asks the freshly built binary for its own CLI surface
+(`rf --help`, then `rf <sub> --help`) and asserts that `README.md` documents
+every subcommand and every long flag — each subcommand needs a line in the
+`## Commands` block listing its flags, plus a `### ` section of its own.
+
+It is an ordinary test on purpose. `cargo test --locked` is already both a CI
+step and a configured gate in `.roll-flow.toml`, so documentation drift fails
+`rf verify`, `rf graduate`, and `rf promote` locally, and the PR check remotely,
+with no separate workflow to keep in sync. Two carve-outs are allowlisted in the
+test: clap's generated `help` subcommand, and the universal `--help`/`--version`.
+
+## Releases and version bumps
+
+Every PR into `develop` or `main` must raise `version` in `Cargo.toml`.
+`.github/workflows/version-bump-check.yml` compares the crate version on your
+head against the target branch and fails the PR if it has not gone up — roll-flow
+treats a merge into either branch as a promotion, and every promotion should
+carry a version the release tooling can point at.
+
+`Cargo.toml` is the single source of truth: `package.nix` reads the version out
+of it, and `rf version` prints it. Bump it in its own commit, following the
+convention already in the history:
+
+```text
+chore(release): bump version to 0.1.2 for <reason>
+```
+
+Once a version change lands on `main`, `.github/workflows/tag-on-main.yml`
+creates and pushes the matching `vX.Y.Z` tag automatically (it is idempotent — an
+unchanged version tags nothing). That pushed tag then triggers
+`.github/workflows/release-check.yml`, which re-checks the tag against
+`Cargo.toml` and confirms the lockfile is current.
 
 ## What CI checks
 
@@ -52,7 +107,11 @@ Every PR is gated by the `build · test · fmt · clippy` job defined in
 These are the same checks configured as this repo's roll-flow gates in
 `.roll-flow.toml` (`roll_to_rolling_gates` / `rolling_to_main_gates`), so
 `rf verify`/`rf graduate`/`rf promote` fail locally before CI would fail
-remotely.
+remotely. Note that `cargo test` carries `tests/docs_sync.rs`, so the README
+check rides along with them.
+
+A second required check, `.github/workflows/version-bump-check.yml`, enforces the
+version bump described under [Releases and version bumps](#releases-and-version-bumps).
 
 ## Branch protection (manual maintainer follow-up — not yet configured)
 
