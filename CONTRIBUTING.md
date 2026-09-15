@@ -35,6 +35,13 @@ generically call "rolling."
    local repo and `origin`. Start with `rf prune --dry-run` — it only offers
    branches whose commits are already contained in `main`, and lists anything it
    skips along with the reason.
+7. `rf clean` goes wider: it prunes stale remote-tracking refs from every remote
+   and additionally clears merged `feature/*` branches and any branch whose
+   upstream was deleted by another host. That last case is the one `rf prune`
+   cannot see — if a branch you pushed was merged and deleted elsewhere, `rf
+   clean` is what removes both your local copy and the stale `origin/<branch>`
+   entry that tools like lazygit still list. Same containment gate, same
+   `--dry-run` first.
 
 Adding or changing a subcommand or a flag requires a matching `README.md`
 update. This is enforced, not merely requested — see

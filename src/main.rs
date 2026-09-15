@@ -99,6 +99,22 @@ fn main() -> Result<()> {
             force,
             no_fetch,
         } => cmd_prune(dry_run, local, remote, yes, force, no_fetch)?,
+        Cmd::Delete {
+            branch,
+            dry_run,
+            local,
+            remote,
+            yes,
+            force,
+            no_fetch,
+        } => cmd_delete(&branch, dry_run, local, remote, yes, force, no_fetch)?,
+        Cmd::Clean {
+            dry_run,
+            yes,
+            force,
+            with_remote,
+            no_fetch,
+        } => cli::clean::run(dry_run, yes, force, with_remote, no_fetch)?,
         Cmd::Version => println!("{}", env!("CARGO_PKG_VERSION")),
     }
 
@@ -174,7 +190,7 @@ fn cmd_init(
         let apply = if force || yes {
             true
         } else if std::io::stdin().is_terminal() {
-            prompt_yes("Apply these changes to .roll-flow.toml? [y/N] ")?
+            cli::prompt_yes("Apply these changes to .roll-flow.toml? [y/N] ")?
         } else {
             // Non-interactive without --yes/--force: default to keeping the
             // existing file. Nothing is written; exit 0.
@@ -214,18 +230,6 @@ fn config_diff(current: &str, detected: &str) -> String {
         }
     }
     out
-}
-
-/// Prompt on stdout and read a yes/no answer from stdin. `y`/`yes`
-/// (case-insensitive) is affirmative; anything else is negative.
-fn prompt_yes(msg: &str) -> Result<bool> {
-    use std::io::Write;
-    print!("{msg}");
-    std::io::stdout().flush()?;
-    let mut line = String::new();
-    std::io::stdin().read_line(&mut line)?;
-    let ans = line.trim().to_ascii_lowercase();
-    Ok(ans == "y" || ans == "yes")
 }
 
 fn cmd_create(slug: &str, date: Option<String>, dry_run: bool) -> Result<()> {
@@ -512,7 +516,7 @@ fn cmd_prune(
         return Ok(());
     }
 
-    render_prune_plan(&plan);
+    render_prune_plan(&plan, "Promoted roll branches to prune:");
     render_prune_skips(&plan.skipped);
 
     if dry_run {
@@ -521,29 +525,21 @@ fn cmd_prune(
     }
 
     // `--force` widens *what* may be deleted; only `--yes` skips the prompt.
-    // Non-interactive without `--yes` deletes nothing and exits 0, matching how
-    // `rf init` treats an unattended run.
-    let interactive = std::io::stdin().is_terminal();
-    let apply = if yes {
-        true
-    } else if interactive {
-        prompt_yes("\nDelete these branches? [y/N] ")?
-    } else {
-        false
-    };
-
-    if !apply {
-        if interactive {
+    match cli::confirm(yes, "\nDelete these branches? [y/N] ")? {
+        cli::Confirm::Yes => {}
+        cli::Confirm::Declined => {
             println!("Nothing deleted.");
-        } else {
-            println!("\nNothing deleted. Re-run with --yes to apply.");
+            return Ok(());
         }
-        return Ok(());
+        cli::Confirm::Unattended => {
+            println!("\nNothing deleted. Re-run with --yes to apply.");
+            return Ok(());
+        }
     }
 
     println!();
     let results = ops::prune_apply(&config, &plan)?;
-    let failures = render_prune_results(&results);
+    let failures = render_prune_results(&results, "Pruned");
     if failures > 0 {
         bail!(
             "{failures} branch{} could not be deleted",
@@ -553,8 +549,75 @@ fn cmd_prune(
     Ok(())
 }
 
+/// `rf delete <branch>` — delete one named roll branch, locally, on origin, or
+/// both.
+///
+/// The CLI twin of the TUI's `[d]elete`, and the reason the shared deletion
+/// rules in `ops` are testable end to end at all. Like `cmd_prune` it never
+/// moves `HEAD`, so a dirty working tree is irrelevant and `ensure_clean_state`
+/// is deliberately not called.
+#[allow(clippy::too_many_arguments)]
+fn cmd_delete(
+    branch: &str,
+    dry_run: bool,
+    local: bool,
+    remote: bool,
+    yes: bool,
+    force: bool,
+    no_fetch: bool,
+) -> Result<()> {
+    let config = Config::load()?;
+
+    // Neither flag means both copies; either one narrows to just that side.
+    let scope = ops::PruneScope {
+        local: local || !remote,
+        remote: remote || !local,
+        force,
+        fetch: !no_fetch,
+    };
+
+    let plan = ops::delete_branch_plan(&config, branch, &scope)?;
+
+    if plan.is_empty() {
+        println!("nothing to delete for '{branch}'");
+        render_prune_skips(&plan.skipped);
+        return Ok(());
+    }
+
+    render_prune_plan(&plan, "Branch to delete:");
+    render_prune_skips(&plan.skipped);
+
+    if dry_run {
+        println!("\nDry-run: nothing deleted");
+        return Ok(());
+    }
+
+    // Same split as `rf prune`: `--force` widens *what* may be deleted, only
+    // `--yes` skips the prompt, and an unattended run without `--yes` deletes
+    // nothing and exits 0.
+    match cli::confirm(yes, &format!("\nDelete '{branch}'? [y/N] "))? {
+        cli::Confirm::Yes => {}
+        cli::Confirm::Declined => {
+            println!("Nothing deleted.");
+            return Ok(());
+        }
+        cli::Confirm::Unattended => {
+            println!("\nNothing deleted. Re-run with --yes to apply.");
+            return Ok(());
+        }
+    }
+
+    println!();
+    let results = ops::prune_apply(&config, &plan)?;
+    let failures = render_prune_results(&results, "Deleted");
+    if failures > 0 {
+        bail!("'{branch}' could not be deleted");
+    }
+    Ok(())
+}
+
 /// Render the branches a prune would delete, and which copies of each.
-fn render_prune_plan(plan: &ops::PrunePlan) {
+fn render_prune_plan(plan: &ops::PrunePlan, title: &str) {
     let name_w = plan
         .candidates
         .iter()
@@ -563,7 +626,7 @@ fn render_prune_plan(plan: &ops::PrunePlan) {
         .unwrap_or(6)
         .max(6);
 
-    println!("Promoted roll branches to prune:");
+    println!("{title}");
     println!();
     println!(
         "  {num:>3}  {name:<nw$}  delete",
@@ -605,7 +668,7 @@ fn render_prune_skips(skipped: &[ops::PruneSkip]) {
 }
 
 /// Render what actually happened, returning the number of failed branches.
-fn render_prune_results(results: &[ops::PruneResult]) -> usize {
+fn render_prune_results(results: &[ops::PruneResult], verb: &str) -> usize {
     let mut failures = 0;
     for result in results {
         if result.errors.is_empty() {
@@ -626,7 +689,7 @@ fn render_prune_results(results: &[ops::PruneResult]) -> usize {
     }
     let deleted = results.len() - failures;
     println!(
-        "\nPruned {deleted} branch{}",
+        "\n{verb} {deleted} branch{}",
         if deleted == 1 { "" } else { "es" }
     );
     failures
