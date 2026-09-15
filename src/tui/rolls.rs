@@ -1035,13 +1035,19 @@ impl StatusApp {
                     Some(roll) => ops::PromoteTarget::Rolls(vec![roll.to_string()]),
                     None => ops::PromoteTarget::Rolling,
                 };
-                let o = ops::promote(&self.config, &promote_target, false, &force)?;
+                // Tagging is on; the version gate hard-fails here rather than
+                // prompting, since the TUI has no place to offer a bump — the
+                // error names the `rf promote --bump` fix.
+                let o = ops::promote(&self.config, &promote_target, false, &force, true)?;
                 for step in &o.steps {
                     push_gate_notices(&mut lines, &step.gate_notices);
                     push_gate_notices(&mut lines, &step.host_notices);
                     push_host_results(&mut lines, &step.host_results);
                     let what = step.roll.as_deref().unwrap_or(&o.rolling);
                     lines.push(format!("Promoted '{}' into '{}'", what, o.stable));
+                    if let Some(line) = step.tag.describe() {
+                        lines.push(line);
+                    }
                 }
                 for skip in &o.skipped {
                     lines.push(format!("skipped '{}': {}", skip.roll, skip.reason));
@@ -1657,6 +1663,9 @@ mod tests {
             username: String::new(),
             hosts: Vec::new(),
             host_active: Default::default(),
+            version_gate: true,
+            tag_on_promote: true,
+            push_tag: true,
             roll_to_rolling_gates: Vec::new(),
             rolling_to_main_gates: Vec::new(),
             host_gates: Vec::new(),
@@ -2343,6 +2352,9 @@ mod tests {
             username: "test".to_string(),
             hosts: Vec::new(),
             host_active: Default::default(),
+            version_gate: true,
+            tag_on_promote: true,
+            push_tag: true,
             roll_to_rolling_gates: Vec::new(),
             rolling_to_main_gates: Vec::new(),
             host_gates: Vec::new(),

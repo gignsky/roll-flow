@@ -16,7 +16,8 @@ use std::process::Command;
 
 use anyhow::{anyhow, bail, Context, Result};
 
-use crate::core::{branches, config::Config, git};
+use crate::core::version::{BumpLevel, Semver, VersionCheck, VersionStatus};
+use crate::core::{branches, config::Config, git, version};
 
 /// Prefix for the hotfix tier. Parallel to `roll_prefix`, but fixed rather than
 /// configurable — hotfixes are a rarely-used sanctioned exception with their own
@@ -817,6 +818,222 @@ pub(crate) fn hotfix_land(config: &Config, dry_run: bool) -> Result<HotfixLandOu
     })
 }
 
+// ── Version gate and release tagging ────────────────────────────────────────
+
+/// What happened to the release tag during a promotion.
+pub(crate) enum TagOutcome {
+    /// A new annotated tag was created on the promotion merge commit.
+    Created { tag: String, sha: String },
+    /// The tag was already present, so nothing was done. Mirrors the
+    /// idempotency of `.github/workflows/tag-on-main.yml`, which skips when the
+    /// tag exists rather than failing.
+    Existed { tag: String },
+    /// Dry-run: the tag that would be created.
+    WouldCreate { tag: String },
+    /// Dry-run: a tag would be created, but the version still needs bumping, so
+    /// its name depends on the bump and cannot be named yet.
+    WouldCreateAfterBump,
+    /// Tagging was disabled (`--no-tag` / `tag_on_promote = false`) or there is
+    /// no version to tag (no `Cargo.toml`).
+    Skipped,
+}
+
+impl TagOutcome {
+    /// The status line describing this outcome, or `None` when there is nothing
+    /// worth saying (tagging was skipped entirely). Shared by the CLI and TUI
+    /// renderers so both report a release identically.
+    pub(crate) fn describe(&self) -> Option<String> {
+        match self {
+            TagOutcome::Created { tag, sha } => Some(format!("Tagged {tag} on {}", short_sha(sha))),
+            TagOutcome::Existed { tag } => {
+                Some(format!("note: tag {tag} already exists - not re-tagging"))
+            }
+            TagOutcome::WouldCreate { tag } => {
+                Some(format!("Dry-run: would tag {tag} on the merge commit"))
+            }
+            TagOutcome::WouldCreateAfterBump => Some(
+                "Dry-run: would tag the merge commit with the version once it is bumped"
+                    .to_string(),
+            ),
+            TagOutcome::Skipped => None,
+        }
+    }
+
+    /// The tag name when one was just created, for the caller's push prompt.
+    pub(crate) fn created_tag(&self) -> Option<&str> {
+        match self {
+            TagOutcome::Created { tag, .. } => Some(tag.as_str()),
+            _ => None,
+        }
+    }
+}
+
+/// Abbreviate a full SHA for display, matching git's default short length.
+fn short_sha(sha: &str) -> &str {
+    let end = sha.len().min(7);
+    &sha[..end]
+}
+
+/// Compare the crate version on `source_ref` against `target_ref`, honouring
+/// the `version_gate` config switch.
+///
+/// Returns `NotApplicable` — never an error — when the gate is off or the repo
+/// has no `Cargo.toml`, so repos that do not version this way (the dotfiles
+/// repo roll-flow was built for) are entirely unaffected.
+pub(crate) fn version_check(
+    config: &Config,
+    source_ref: &str,
+    target_ref: &str,
+) -> Result<VersionCheck> {
+    if !config.version_gate {
+        return Ok(VersionCheck::not_applicable());
+    }
+    Ok(version::check(&config.repo_root, source_ref, target_ref)?)
+}
+
+/// The hard error a failing version gate produces. Shared by `verify` and
+/// `promote` so both routes explain the failure — and the way out — identically.
+pub(crate) fn version_gate_error(
+    check: &VersionCheck,
+    source: &str,
+    target: &str,
+) -> anyhow::Error {
+    let head = check
+        .head
+        .map(|v| v.to_string())
+        .unwrap_or_else(|| "<unreadable>".to_string());
+    let base = check
+        .base
+        .map(|v| v.to_string())
+        .unwrap_or_else(|| "<unreadable>".to_string());
+    match check.status {
+        VersionStatus::Unchanged => anyhow!(
+            "Cargo.toml version ({head}) on '{source}' is unchanged from '{target}'; \
+             every promotion must carry a version bump. \
+             Re-run with --bump <patch|minor|major>, bump it by hand, or \
+             --force --reason \"<why>\" to override"
+        ),
+        VersionStatus::Lower => anyhow!(
+            "Cargo.toml version ({head}) on '{source}' is lower than '{target}' ({base}); \
+             it must be bumped above the branch it is merging into"
+        ),
+        VersionStatus::Unreadable => {
+            anyhow!("could not read a version from Cargo.toml (head='{head}', base='{base}')")
+        }
+        VersionStatus::Ok | VersionStatus::NotApplicable => {
+            anyhow!("version check passed unexpectedly")
+        }
+    }
+}
+
+/// Raise the crate version, refresh the lockfile, and commit both.
+///
+/// The commit lands on whatever branch is checked out, which callers guarantee
+/// is the branch being merged *from*. Deliberately a separate step the CLI runs
+/// **before** the gates: a bump rewrites `Cargo.lock` too, and
+/// `rolling_to_main_gates` contains `cargo update --workspace --locked`, which
+/// would fail against a stale lockfile if the bump came afterwards.
+pub(crate) fn apply_version_bump(
+    config: &Config,
+    level: BumpLevel,
+    reason: &str,
+) -> Result<(Semver, Semver)> {
+    let repo = &config.repo_root;
+    let current = version::read_version(repo)?
+        .ok_or_else(|| anyhow!("no readable version in Cargo.toml to bump"))?;
+    let next = current.bump(level);
+
+    version::write_version(repo, next)?;
+    refresh_lockfile(repo);
+
+    let message = format!("chore(release): bump version to {next} for {reason}");
+    git::commit_paths(repo, &["Cargo.toml", "Cargo.lock"], &message)
+        .with_context(|| format!("failed to commit the version bump to {next}"))?;
+    Ok((current, next))
+}
+
+/// Best-effort `Cargo.lock` refresh after a version rewrite.
+///
+/// A workspace member's own version appears in the lockfile, so it goes stale
+/// the moment `Cargo.toml` changes. Failure is deliberately ignored: there may
+/// be no lockfile, no network, or no cargo at all, and the configured
+/// `cargo update --workspace --locked` gate is the real enforcement. Keeping it
+/// non-fatal also lets the integration tests run offline against fixture
+/// manifests that are not real crates.
+fn refresh_lockfile(repo: &Path) {
+    if !repo.join("Cargo.lock").exists() {
+        return;
+    }
+    let offline = Command::new("cargo")
+        .args(["update", "--workspace", "--offline"])
+        .current_dir(repo)
+        .status();
+    if matches!(&offline, Ok(s) if s.success()) {
+        return;
+    }
+    let _ = Command::new("cargo")
+        .args(["update", "--workspace"])
+        .current_dir(repo)
+        .status();
+}
+
+/// Create the release tag for a completed promotion.
+///
+/// Tags the merge commit by SHA rather than by branch name: `run_merge` has
+/// already returned to the branch we started on, and a SHA cannot drift.
+fn tag_release(
+    config: &Config,
+    check: &VersionCheck,
+    enabled: bool,
+    included: &[String],
+) -> Result<TagOutcome> {
+    if !enabled || !config.tag_on_promote {
+        return Ok(TagOutcome::Skipped);
+    }
+    let Some(version) = check.head else {
+        return Ok(TagOutcome::Skipped);
+    };
+    let repo = &config.repo_root;
+    let tag = version.tag();
+    if git::tag_exists(repo, &tag) {
+        return Ok(TagOutcome::Existed { tag });
+    }
+    let sha = git::rev_parse(repo, &config.stable_branch)?;
+    let message = tag_message(&tag, included);
+    git::create_annotated_tag(repo, &tag, &message, &sha)
+        .with_context(|| format!("failed to create tag {tag}"))?;
+    Ok(TagOutcome::Created { tag, sha })
+}
+
+/// Annotated-tag message. The subject is byte-identical to the one
+/// `tag-on-main.yml` writes, so tags made by `rf` and by CI stay uniform; the
+/// rolls this release carries are listed underneath.
+fn tag_message(tag: &str, included: &[String]) -> String {
+    let mut msg = format!("Release {tag}");
+    if !included.is_empty() {
+        msg.push_str("\n\nRolls:\n");
+        for roll in included {
+            msg.push_str(&format!("  {roll}\n"));
+        }
+    }
+    msg
+}
+
+/// Branch names of the rolls a promotion carries: those graduated (or
+/// re-graduated after diverging) into rolling but not yet on stable.
+fn included_rolls(config: &Config) -> Result<Vec<String>> {
+    Ok(branches::list_rolls(config)?
+        .into_iter()
+        .filter(|r| {
+            matches!(
+                r.state,
+                branches::RollState::Graduated | branches::RollState::Diverged
+            )
+        })
+        .map(|r| r.branch)
+        .collect())
+}
+
 // ── verify ──────────────────────────────────────────────────────────────────
 
 /// Outcome of `rf verify`.
@@ -834,6 +1051,9 @@ pub(crate) struct VerifyOutcome {
     /// Active hosts whose gates failed. Non-empty ⇒ verify should fail; the CLI
     /// still renders the per-host summary (including the hosts that passed) first.
     pub failed_hosts: Vec<String>,
+    /// Crate-version comparison of source against target. `NotApplicable` when
+    /// the repo has no `Cargo.toml` or the gate is disabled.
+    pub version: VersionCheck,
 }
 
 pub(crate) fn verify(config: &Config, dry_run: bool) -> Result<VerifyOutcome> {
@@ -869,6 +1089,15 @@ pub(crate) fn verify(config: &Config, dry_run: bool) -> Result<VerifyOutcome> {
         MergeState::FastForwardable => {}
     }
 
+    // Checked before the gates so an unbumped version fails in milliseconds
+    // rather than after a full `cargo test` run. Only the promotion route
+    // carries the bump requirement — graduating a roll into rolling is
+    // deliberately out of scope, matching what `rf promote` enforces.
+    let version = match route {
+        Route::Promote => version_check(config, &source, &target)?,
+        Route::Graduate { .. } => VersionCheck::not_applicable(),
+    };
+
     let report = run_gates(
         &config.repo_root,
         gates,
@@ -890,6 +1119,7 @@ pub(crate) fn verify(config: &Config, dry_run: bool) -> Result<VerifyOutcome> {
         host_results: host_report.results,
         host_notices: host_report.notices,
         failed_hosts,
+        version,
     })
 }
 
@@ -987,6 +1217,10 @@ pub(crate) struct PromoteStep {
     pub host_results: Vec<HostResult>,
     /// Dry-run notices for the host gates.
     pub host_notices: Vec<GateNotice>,
+    /// Crate-version comparison of rolling against stable.
+    pub version: VersionCheck,
+    /// What happened to the `vX.Y.Z` release tag.
+    pub tag: TagOutcome,
 }
 
 /// Outcome of promoting into stable.
@@ -1018,6 +1252,7 @@ pub(crate) fn promote(
     target: &PromoteTarget,
     dry_run: bool,
     force: &ForceOpts,
+    tag: bool,
 ) -> Result<PromoteOutcome> {
     let rolling = &config.rolling_branch;
     let stable = &config.stable_branch;
@@ -1033,7 +1268,14 @@ pub(crate) fn promote(
 
     let mut steps = Vec::new();
     for step in plan.steps {
-        steps.push(run_promote_step(config, &stable_ref, step, dry_run, force)?);
+        steps.push(run_promote_step(
+            config,
+            &stable_ref,
+            step,
+            dry_run,
+            force,
+            tag,
+        )?);
     }
 
     Ok(PromoteOutcome {
@@ -1051,6 +1293,10 @@ struct PlannedStep {
     source: String,
     subject: String,
     body: Option<String>,
+    /// The rolls this step carries, listed in the annotated tag message.
+    /// Captured at planning time, before any merge: afterwards these rolls read
+    /// as promoted rather than graduated, so the list would come back empty.
+    included: Vec<String>,
 }
 
 /// The steps a promotion will perform, plus the rolls it found nothing to do
@@ -1080,12 +1326,14 @@ fn plan_rolling_step(config: &Config, stable_ref: &str) -> Result<PlannedStep> {
         MergeState::Diverged | MergeState::FastForwardable => {}
     }
 
-    let (subject, body) = promote_subject_and_body(config)?;
+    let included = included_rolls(config)?;
+    let (subject, body) = promote_subject_and_body(config, &included);
     Ok(PlannedStep {
         roll: None,
         source: rolling.clone(),
         subject,
         body,
+        included,
     })
 }
 
@@ -1147,6 +1395,7 @@ fn plan_roll_steps(config: &Config, rolls: &[String], stable_ref: &str) -> Resul
                 // reachability (see `scan_promoted`), so the body only needs to
                 // name this step's own roll.
                 body: Some(format!("Rolls:\n  {name}\n")),
+                included: vec![name.clone()],
             },
         ));
     }
@@ -1187,8 +1436,34 @@ fn run_promote_step(
     step: PlannedStep,
     dry_run: bool,
     force: &ForceOpts,
+    tag: bool,
 ) -> Result<PromoteStep> {
     let repo = &config.repo_root;
+    let stable = &config.stable_branch;
+
+    // The version gate runs before the configured gates: it is nearly free, and
+    // failing fast beats failing after a full build. The source is this step's
+    // merge source, and the target is the *resolved* stable ref — which in
+    // dry-run may be `origin/<stable>`, and which for a per-roll promotion has
+    // already been advanced by the steps ahead of this one.
+    let version = version_check(config, &step.source, stable_ref)?;
+    let mut version_bypass = Vec::new();
+    if !version.is_satisfied() {
+        // `--dry-run` previews rather than enforces, exactly as it does for the
+        // configured gates (which are printed, not executed). The rendered
+        // status line still reports that the version would block a real run.
+        if !force.enabled && !dry_run {
+            return Err(version_gate_error(&version, &step.source, stable));
+        }
+        // Under --force the gate is recorded in the merge trailer exactly like a
+        // bypassed shell gate, so the override leaves the same audit trail.
+        if force.enabled {
+            version_bypass.push(GateBypass {
+                gate: format!("version bump check ({} vs {stable})", step.source),
+                code: None,
+            });
+        }
+    }
 
     // Gates run against the staged merge result, so `report` is produced inside
     // `merge_gated`. In dry-run nothing is staged and nothing is merged.
@@ -1210,12 +1485,21 @@ fn run_promote_step(
 
     if dry_run {
         let (report, host_report) = run_checks()?;
+        let tag_outcome = match (tag && config.tag_on_promote, version.head) {
+            // The version still has to move, so the eventual tag name is not
+            // knowable here — claiming the current one would be wrong.
+            (true, Some(_)) if !version.is_satisfied() => TagOutcome::WouldCreateAfterBump,
+            (true, Some(v)) => TagOutcome::WouldCreate { tag: v.tag() },
+            _ => TagOutcome::Skipped,
+        };
         return Ok(PromoteStep {
             roll: step.roll,
             source: step.source,
             gate_notices: report.notices,
             host_results: host_report.results,
             host_notices: host_report.notices,
+            version,
+            tag: tag_outcome,
         });
     }
 
@@ -1231,11 +1515,16 @@ fn run_promote_step(
         run_checks,
     )?;
 
-    let mut bypassed = report.bypassed;
+    let mut bypassed = version_bypass;
+    bypassed.extend(report.bypassed);
     bypassed.extend(host_report.bypassed);
     if let Some(trailer) = force.trailer(&bypassed) {
         append_commit_trailer(repo, stable_ref, &trailer)?;
     }
+
+    // Tag last of all, so it points at the commit the trailer amend produced
+    // rather than the one it replaced.
+    let tag_outcome = tag_release(config, &version, tag, &step.included)?;
 
     Ok(PromoteStep {
         roll: step.roll,
@@ -1243,6 +1532,8 @@ fn run_promote_step(
         gate_notices: report.notices,
         host_results: host_report.results,
         host_notices: host_report.notices,
+        version,
+        tag: tag_outcome,
     })
 }
 
@@ -1273,20 +1564,9 @@ fn append_commit_trailer(repo: &Path, branch_ref: &str, trailer: &str) -> Result
 /// Subject and body for a promotion merge. Exactly one graduated roll included
 /// → subject names it; otherwise a generic subject with the rolls listed in the
 /// body so promoted-state detection can attribute them.
-fn promote_subject_and_body(config: &Config) -> Result<(String, Option<String>)> {
-    let rolls = branches::list_rolls(config)?;
-    let included: Vec<&branches::RollInfo> = rolls
-        .iter()
-        .filter(|r| {
-            matches!(
-                r.state,
-                branches::RollState::Graduated | branches::RollState::Diverged
-            )
-        })
-        .collect();
-
+fn promote_subject_and_body(config: &Config, included: &[String]) -> (String, Option<String>) {
     let subject = if included.len() == 1 {
-        format!("Promote {} to {}", included[0].branch, config.stable_branch)
+        format!("Promote {} to {}", included[0], config.stable_branch)
     } else {
         format!(
             "Promote {} to {}",
@@ -1298,13 +1578,13 @@ fn promote_subject_and_body(config: &Config) -> Result<(String, Option<String>)>
         None
     } else {
         let mut body = String::from("Rolls:\n");
-        for roll in &included {
-            body.push_str(&format!("  {}\n", roll.branch));
+        for roll in included {
+            body.push_str(&format!("  {roll}\n"));
         }
         Some(body)
     };
 
-    Ok((subject, body))
+    (subject, body)
 }
 
 // ── update ──────────────────────────────────────────────────────────────────

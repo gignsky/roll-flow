@@ -47,12 +47,25 @@ long list — that keeps two rolls adding rules in different areas from collidin
 
 ## Writing to the remote
 
+- `rf promote` may push a release tag, but only after an explicit y/N
+  confirmation (or `--yes`), and only when `push_tag` is enabled.
 - Writing to the remote (`git push --delete`) happens in exactly three places:
   `rf prune`, `rf delete` (including the TUI's `[d]`), and `rf clean --with-remote`.
   All of them `git fetch --prune` before planning a remote delete, so containment is
   never judged against a stale ref — a stale one names an old tip, and deleting against
   it would destroy commits the check never saw. The TUI also fetches a single branch
   when switching to a remote-only roll. Everything else is local-only; keep it that way.
+
+## Versioning and release tags
+
+- The version gate and release tagging mirror the CI workflows exactly —
+  `version-bump-check.yml`, `tag-on-main.yml`, `release-check.yml`. When changing
+  one side, change the other. `src/core/version.rs` records which rule mirrors
+  which workflow.
+- A version bump must be committed **before** the configured gates run, never
+  after: it rewrites `Cargo.lock`, and `rolling_to_main_gates` contains
+  `cargo update --workspace --locked`, which fails on a stale lockfile. This is
+  why the bump is a CLI-level step in `main.rs` rather than part of `ops::promote`.
 
 ## `rf clean`
 

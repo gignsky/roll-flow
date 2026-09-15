@@ -122,6 +122,22 @@ tested — which is why `check_promoted` defers to `scan_promoted` rather than
 reimplementing them, and why any new promotion path must keep producing one of
 those three shapes.
 
+## Version gate and release tags (`core/version.rs`)
+
+When the repo has a `Cargo.toml`, `rf verify` and `rf promote` require the
+`[package]` version on the source branch to be strictly greater than the
+target's, and `rf promote` creates an annotated `vX.Y.Z` tag on the promotion
+merge commit (skipping an existing tag rather than erroring). Repos without a
+`Cargo.toml` — including the dotfiles repo — get `VersionStatus::NotApplicable`
+and skip all of it. Configurable via `version_gate`, `tag_on_promote`, `push_tag`.
+
+The gate and the tag are per promotion *step*, not per invocation: a per-roll
+promotion compares each roll's graduation commit against stable as that step is
+reached, and tags each merge it makes. Only the whole-rolling route offers a
+bump, because only it merges a branch a bump commit could land on — a per-roll
+step merges a commit that already exists on rolling, so a short version there is
+reported, not fixed.
+
 ## Per-roll promotion
 
 `rf promote --roll <branch>` (and `[p]` on a roll row in the TUI) promotes one

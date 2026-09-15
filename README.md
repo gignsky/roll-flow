@@ -44,9 +44,9 @@ rf init [--rolling-branch <name>] [--stable-branch <name>] [--roll-prefix <prefi
 rf create <slug> [--date MMDD] [--dry-run]            (alias: rf start)
 rf integrate <branch>
 rf hotfix [<slug>] [--date MMDD] [--land] [--dry-run]
-rf verify [--dry-run]
+rf verify [--dry-run] [--bump <patch|minor|major>] [--yes]
 rf graduate [--dry-run] [--force --reason <text>]
-rf promote [--roll <branch>]... [--dry-run] [--force --reason <text>]
+rf promote [--roll <branch>]... [--dry-run] [--force --reason <text>] [--bump <patch|minor|major>] [--no-tag] [--yes]
 rf status [--no-tui] [--no-deps] [--json]
 rf list [--no-tui] [--deps] [--json]
 rf update [--dry-run]
@@ -80,6 +80,36 @@ Each command is documented in its own file under [`docs/commands/`](docs/command
 See [docs/config.md](docs/config.md) for `.roll-flow.toml` and its gate and
 `clean_protect` settings.
 
+## Versioning and release tags
+
+When the repository has a `Cargo.toml`, `rf` enforces the same release policy as
+this project's CI, so promoting locally and promoting through a pull request are
+equivalent:
+
+- **Version gate** — `rf verify` and `rf promote` require the `[package]` version
+  on the branch being merged to be strictly greater than the version on the
+  branch it merges into. This mirrors
+  `.github/workflows/version-bump-check.yml`. When the version is unchanged, both
+  commands offer to bump it and commit
+  `chore(release): bump version to X.Y.Z for <branch>`; a version *lower* than the
+  target is always a hard error. The bump is applied before the configured gates
+  run, because it rewrites `Cargo.lock` and the gates include
+  `cargo update --workspace --locked`.
+- **Release tag** — a successful `rf promote` creates an annotated `vX.Y.Z` tag on
+  the promotion merge commit, with the promoted rolls listed in the tag body. The
+  subject matches the one `.github/workflows/tag-on-main.yml` writes, and, like
+  that workflow, an existing tag is left alone rather than treated as an error.
+- **Pushing the tag** — `rf promote` then asks before running
+  `git push origin <tag>`. It never happens without confirmation or `--yes`.
+
+A `--roll` promotion is several merges, so it gates and tags each one as it is
+reached. Only the whole-branch route offers a bump, since only it merges a branch
+a bump commit could land on.
+
+Repos without a `Cargo.toml` — including the dotfiles repo roll-flow was built
+for — skip all of this silently. `version_gate`, `tag_on_promote`, and `push_tag`
+in [docs/config.md](docs/config.md) turn each piece off.
+
 See [CONTRIBUTING.md](CONTRIBUTING.md) for how this repo uses roll-flow on itself,
 and [CLAUDE.md](CLAUDE.md) for the internal domain model.
 
@@ -93,8 +123,9 @@ cargo test
 
 - local-only behavior (no automatic fetch/push), except `rf prune` and
   `rf delete` (and the TUI's `[x]` and `[d]`), which fetch and delete branches
-  on `origin`, and `rf clean`, which fetches from every remote and deletes there
-  only with `--with-remote`
+  on `origin`; `rf clean`, which fetches from every remote and deletes there
+  only with `--with-remote`; and the confirmed release-tag push at the end of
+  `rf promote`
 - no daemon; `rf` only ever runs when invoked. The `status`/`list` TUI does drive
   the workflow (`g` graduate, `p` promote, `u` update, `x` prune, `d` delete),
   but forced operations stay CLI-only by design

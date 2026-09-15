@@ -47,6 +47,21 @@ pub struct Config {
     pub rolling_branch: String,
     pub stable_branch: String,
     pub roll_prefix: String,
+
+    /// Require a version bump in `Cargo.toml` before `rf verify` / `rf promote`
+    /// will pass, mirroring `.github/workflows/version-bump-check.yml`. Repos
+    /// with no `Cargo.toml` skip the check regardless of this setting.
+    #[serde(default = "default_true")]
+    pub version_gate: bool,
+    /// Create an annotated `vX.Y.Z` tag on the promotion merge commit, mirroring
+    /// `.github/workflows/tag-on-main.yml`.
+    #[serde(default = "default_true")]
+    pub tag_on_promote: bool,
+    /// After creating a release tag, offer to push it to `origin`. The push is
+    /// always confirmed interactively (or with `--yes`); this only controls
+    /// whether the offer is made at all.
+    #[serde(default = "default_true")]
+    pub push_tag: bool,
     /// Workflow ownership mode. Defaults to [`Mode::Manage`] for configs that
     /// predate this field (via `#[serde(default)]`).
     #[serde(default)]
@@ -140,6 +155,9 @@ impl Config {
             rolling_branch,
             stable_branch,
             roll_prefix: "roll/".to_string(),
+            version_gate: default_true(),
+            tag_on_promote: default_true(),
+            push_tag: default_true(),
             mode: Mode::default(),
             username,
             hosts,
@@ -205,6 +223,10 @@ impl Config {
 
 fn default_config_version() -> u32 {
     1
+}
+
+fn default_true() -> bool {
+    true
 }
 
 // ── Auto-detection helpers ────────────────────────────────────────────────────
@@ -320,6 +342,9 @@ mod tests {
             rolling_branch: "rolling".to_string(),
             stable_branch: "main".to_string(),
             roll_prefix: "roll/".to_string(),
+            version_gate: true,
+            tag_on_promote: true,
+            push_tag: true,
             mode: super::Mode::default(),
             username: "old".to_string(),
             hosts: vec!["x".to_string()],
@@ -350,6 +375,9 @@ mod tests {
             rolling_branch: "rolling".to_string(),
             stable_branch: "main".to_string(),
             roll_prefix: "roll/".to_string(),
+            version_gate: true,
+            tag_on_promote: true,
+            push_tag: true,
             mode: Mode::Assist,
             username: "me".to_string(),
             hosts: vec![],
@@ -393,5 +421,50 @@ mod tests {
         let repo = PathBuf::from("/tmp/repo");
         let path = Config::config_path(&repo);
         assert_eq!(path, PathBuf::from("/tmp/repo/.roll-flow.toml"));
+    }
+
+    #[test]
+    fn release_flags_default_on_for_legacy_configs() {
+        // A config written before the release fields existed still loads, and
+        // opts in to the version gate and tagging by default.
+        let legacy = r#"
+            config_version = 1
+            repo_root = "/tmp/repo"
+            rolling_branch = "develop"
+            stable_branch = "main"
+            roll_prefix = "roll/"
+            username = "me"
+            hosts = []
+        "#;
+        let parsed: Config = toml::from_str(legacy).expect("parse legacy");
+        assert!(parsed.version_gate);
+        assert!(parsed.tag_on_promote);
+        assert!(parsed.push_tag);
+    }
+
+    #[test]
+    fn release_flags_round_trip_through_toml() {
+        let legacy = r#"
+            config_version = 1
+            repo_root = "/tmp/repo"
+            rolling_branch = "develop"
+            stable_branch = "main"
+            roll_prefix = "roll/"
+            username = "me"
+            hosts = []
+            version_gate = false
+            tag_on_promote = false
+            push_tag = false
+        "#;
+        let parsed: Config = toml::from_str(legacy).expect("parse");
+        assert!(!parsed.version_gate);
+        assert!(!parsed.tag_on_promote);
+        assert!(!parsed.push_tag);
+
+        let rendered = parsed.to_toml_string().expect("render");
+        let reparsed: Config = toml::from_str(&rendered).expect("reparse");
+        assert!(!reparsed.version_gate);
+        assert!(!reparsed.tag_on_promote);
+        assert!(!reparsed.push_tag);
     }
 }

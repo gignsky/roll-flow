@@ -1,6 +1,7 @@
 pub mod clean;
 pub mod status;
 
+use crate::core::version::BumpLevel;
 use std::io::IsTerminal;
 
 use clap::{Parser, Subcommand};
@@ -125,6 +126,13 @@ pub enum Cmd {
     Verify {
         #[arg(long)]
         dry_run: bool,
+        /// Bump the Cargo.toml version by this level and commit it before the
+        /// gates run, instead of prompting. Only acts when a bump is needed.
+        #[arg(long, value_name = "LEVEL")]
+        bump: Option<BumpLevel>,
+        /// Answer yes to prompts (non-interactive).
+        #[arg(long)]
+        yes: bool,
     },
 
     /// Graduate the current roll branch into rolling (--no-ff merge).
@@ -157,6 +165,17 @@ pub enum Cmd {
         /// Justification recorded as `Force-Reason:` in the merge commit.
         #[arg(long)]
         reason: Option<String>,
+        /// Bump the Cargo.toml version by this level and commit it before the
+        /// gates run, instead of prompting. Only acts when a bump is needed.
+        #[arg(long, value_name = "LEVEL")]
+        bump: Option<BumpLevel>,
+        /// Skip creating the vX.Y.Z release tag on the promotion merge commit.
+        #[arg(long)]
+        no_tag: bool,
+        /// Answer yes to prompts (non-interactive): applies the bump and pushes
+        /// the release tag without asking.
+        #[arg(long)]
+        yes: bool,
     },
 
     /// Show current roll-flow status.

@@ -72,6 +72,86 @@ impl Sandbox {
         sb
     }
 
+    /// A plain repo that carries a `Cargo.toml`, so the version gate and release
+    /// tagging engage. Deliberately not a real crate: the gate only ever reads
+    /// `package.version`, and the lockfile refresh is best-effort, so no cargo
+    /// command has to succeed for these tests to be meaningful — which keeps
+    /// them fast and offline.
+    pub fn cargo() -> Self {
+        let sb = Sandbox::plain();
+        sb.write_cargo_version("0.0.1");
+        sb.git(&["add", "Cargo.toml"]);
+        sb.git(&["commit", "-m", "add manifest"]);
+        sb
+    }
+
+    /// Write `Cargo.toml` with `version`, plus a comment and a dependency whose
+    /// own `version` key must never be mistaken for the package version.
+    pub fn write_cargo_version(&self, version: &str) {
+        self.write(
+            "Cargo.toml",
+            &format!(
+                "[package]\n\
+                 name = \"fixture\"  # keep this comment\n\
+                 version = \"{version}\"\n\
+                 edition = \"2021\"\n\
+                 \n\
+                 [dependencies.serde]\n\
+                 version = \"1.0.0\"\n"
+            ),
+        );
+    }
+
+    /// Commit a `Cargo.toml` bumped to `version` on the current branch.
+    pub fn commit_cargo_version(&self, version: &str) {
+        self.write_cargo_version(version);
+        self.git(&["add", "Cargo.toml"]);
+        self.git(&["commit", "-m", &format!("set version {version}")]);
+    }
+
+    /// The `package.version` recorded in `Cargo.toml` at `refspec`.
+    pub fn cargo_version_at(&self, refspec: &str) -> String {
+        let text = self.git(&["show", &format!("{refspec}:Cargo.toml")]);
+        for line in text.lines() {
+            let trimmed = line.trim();
+            if trimmed.starts_with("version") {
+                return trimmed.split('"').nth(1).unwrap_or_default().to_string();
+            }
+        }
+        panic!("no version in Cargo.toml at {refspec}: {text}");
+    }
+
+    /// Flip a boolean key in the sandbox's `.roll-flow.toml` (call after
+    /// `rf init`). Replaces the line in place when present, else appends it
+    /// ahead of the first table header so it stays a root-level key.
+    pub fn set_config_flag(&self, key: &str, value: bool) {
+        let path = self.path().join(".roll-flow.toml");
+        let existing = fs::read_to_string(&path).expect("read config");
+        let new_line = format!("{key} = {value}");
+        let mut replaced = false;
+        let mut lines: Vec<String> = existing
+            .lines()
+            .map(|l| {
+                if l.trim_start().starts_with(&format!("{key} ")) {
+                    replaced = true;
+                    new_line.clone()
+                } else {
+                    l.to_string()
+                }
+            })
+            .collect();
+        if !replaced {
+            let at = lines
+                .iter()
+                .position(|l| l.trim_start().starts_with('['))
+                .unwrap_or(lines.len());
+            lines.insert(at, new_line);
+        }
+        let mut text = lines.join("\n");
+        text.push('\n');
+        fs::write(&path, text).expect("write config");
+    }
+
     /// A plain repo with a real bare `origin` behind it, with `main` pushed and
     /// remote-tracking refs populated. Needed by anything that asserts on the
     /// remote — `rf` reaches the network only through `rf prune`.
@@ -398,6 +478,45 @@ impl Sandbox {
             &format!("refs/heads/{name}"),
         ])
         .0
+    }
+
+    /// True if an annotated or lightweight tag named `tag` exists.
+    pub fn tag_exists(&self, tag: &str) -> bool {
+        self.git_try(&[
+            "rev-parse",
+            "--verify",
+            "--quiet",
+            &format!("refs/tags/{tag}"),
+        ])
+        .0
+    }
+
+    /// Every tag in the repo, sorted.
+    pub fn tags(&self) -> Vec<String> {
+        let out = self.git(&["tag", "-l"]);
+        let mut tags: Vec<String> = out
+            .lines()
+            .map(str::trim)
+            .filter(|l| !l.is_empty())
+            .map(str::to_string)
+            .collect();
+        tags.sort();
+        tags
+    }
+
+    /// The commit a tag points at, peeled through annotation.
+    pub fn tag_target(&self, tag: &str) -> String {
+        self.git(&["rev-list", "-n", "1", tag])
+    }
+
+    /// The message body of an annotated tag.
+    pub fn tag_message(&self, tag: &str) -> String {
+        self.git(&["tag", "-l", "--format=%(contents)", tag])
+    }
+
+    /// True if `tag` is an annotated tag object (not a lightweight ref).
+    pub fn tag_is_annotated(&self, tag: &str) -> bool {
+        self.git(&["cat-file", "-t", tag]) == "tag"
     }
 
     /// True if `ancestor` is an ancestor of `descendant`.
