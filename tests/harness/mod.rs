@@ -102,12 +102,29 @@ impl Sandbox {
 
     /// Run `rf` against the sandbox, capturing stdout/stderr/exit code.
     pub fn rf(&self, args: &[&str]) -> RfOutput {
+        self.rf_at(args, &[])
+    }
+
+    /// `rf` with extra environment variables.
+    ///
+    /// Exists for `GIT_AUTHOR_DATE`/`GIT_COMMITTER_DATE`: a sandbox builds its
+    /// whole history inside one second, so commits are timestamp-tied and
+    /// `git log`'s reverse-chronological order degenerates to a tie-break that
+    /// happens to favour the mainline. Tests that care which of two commits
+    /// `git log` reports first have to set the dates explicitly, or they assert
+    /// nothing.
+    pub fn rf_with_env(&self, args: &[&str], env: &[(&str, &str)]) -> RfOutput {
+        self.rf_at(args, env)
+    }
+
+    fn rf_at(&self, args: &[&str], env: &[(&str, &str)]) -> RfOutput {
         let exe = std::env::var("CARGO_BIN_EXE_rf").expect("CARGO_BIN_EXE_rf");
-        let output = Command::new(exe)
-            .current_dir(self.path())
-            .args(args)
-            .output()
-            .expect("run rf");
+        let mut cmd = Command::new(exe);
+        cmd.current_dir(self.path()).args(args);
+        for (key, value) in env {
+            cmd.env(key, value);
+        }
+        let output = cmd.output().expect("run rf");
         RfOutput {
             success: output.status.success(),
             code: output.status.code(),
@@ -193,19 +210,33 @@ impl Sandbox {
     /// the existing line preserves its position ahead of the `[host_active]`
     /// table, so the key stays a root-level field.
     pub fn set_host_gates(&self, gates: &[&str]) {
+        self.set_gate_array("host_gates", gates);
+    }
+
+    /// Rewrite the `rolling_to_main_gates` array — the gates `rf promote` runs.
+    pub fn set_promote_gates(&self, gates: &[&str]) {
+        self.set_gate_array("rolling_to_main_gates", gates);
+    }
+
+    /// Replace a root-level array-of-strings key in the sandbox's
+    /// `.roll-flow.toml` (call after `rf init`). Each entry is emitted as a TOML
+    /// string, so `{host}` templates and shell snippets round-trip verbatim.
+    /// Replacing the existing line preserves its position ahead of the
+    /// `[host_active]` table, so the key stays a root-level field.
+    fn set_gate_array(&self, key: &str, values: &[&str]) {
         let path = self.path().join(".roll-flow.toml");
         let existing = fs::read_to_string(&path).expect("read config");
-        let rendered = gates
+        let rendered = values
             .iter()
             .map(|g| format!("{g:?}"))
             .collect::<Vec<_>>()
             .join(", ");
-        let new_line = format!("host_gates = [{rendered}]");
+        let new_line = format!("{key} = [{rendered}]");
         let mut replaced = false;
         let lines: Vec<String> = existing
             .lines()
             .map(|l| {
-                if l.trim_start().starts_with("host_gates") {
+                if l.trim_start().starts_with(key) {
                     replaced = true;
                     new_line.clone()
                 } else {
@@ -213,10 +244,7 @@ impl Sandbox {
                 }
             })
             .collect();
-        assert!(
-            replaced,
-            "no host_gates line to replace in config:\n{existing}"
-        );
+        assert!(replaced, "no {key} line to replace in config:\n{existing}");
         let mut text = lines.join("\n");
         text.push('\n');
         fs::write(&path, text).expect("write config");

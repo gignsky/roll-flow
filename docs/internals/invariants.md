@@ -8,6 +8,9 @@ long list — that keeps two rolls adding rules in different areas from collidin
 
 - Never fast-forward merge. Always `--no-ff` for traceability.
 - `main` only receives merges from `rolling`, never directly from roll branches.
+  Per-roll promotion does not weaken this: it merges a graduation *commit* that
+  lives on rolling, which is why stable's history stays a prefix of rolling's
+  rather than a divergent line.
 - A roll is "graduated" if a merge commit exists on the rolling branch whose subject
   matches `Merge branch 'roll/N-...'` OR `Graduate roll/N-...`. Both formats must be
   checked everywhere graduation is tested.

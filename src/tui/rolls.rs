@@ -347,20 +347,27 @@ pub(crate) fn dep_rows(selected: &RollInfo, all: &[RollInfo]) -> Vec<DepRow> {
 }
 
 /// Build the *reverse*-dependency rows to show in the detail view for `target`:
-/// every roll whose `deps` contains `target.number` (i.e. the rolls that
-/// integrated `target` and therefore depend on it). This is the inverse of
-/// [`dep_rows`] and is *not* symmetric with it.
+/// the rolls that integrated `target` and therefore depend on it. This is the
+/// inverse of [`dep_rows`] and is *not* symmetric with it.
+///
+/// Reads `target.dependents`, the reverse index `branches::list_rolls` builds in
+/// one pass, rather than rescanning every roll's `deps` per call — this runs on
+/// every frame the detail overlay is open. Unknown numbers (not present in
+/// `all`) are skipped, mirroring [`dep_rows`].
 ///
 /// A row's `is_blocker` here is repurposed to mean "this dependent is still
 /// gated by the target" — true while `target` has not yet graduated/promoted,
 /// since until then the dependent cannot advance past it. The detail view does
 /// not render a per-row blocker marker for dependents, so this flag is purely
 /// informational, but it keeps the field meaningful and testable. A roll is
-/// never its own dependent (a roll cannot list itself in its own `deps`).
+/// never its own dependent, even if a self-referential entry somehow appears.
 pub(crate) fn dependent_rows(target: &RollInfo, all: &[RollInfo]) -> Vec<DepRow> {
     let target_gates = !matches!(target.state, RollState::Graduated | RollState::Promoted);
-    all.iter()
-        .filter(|r| r.number != target.number && r.deps.contains(&target.number))
+    target
+        .dependents
+        .iter()
+        .filter(|num| **num != target.number)
+        .filter_map(|num| all.iter().find(|r| r.number == *num))
         .map(|dep| DepRow {
             number: dep.number,
             branch: dep.branch.clone(),
@@ -390,6 +397,40 @@ fn state_color(state: &RollState) -> Color {
     }
 }
 
+/// What `[p]` should promote, given the current selection.
+///
+/// `Ok(None)` means the whole rolling branch — one merge behind one gate run,
+/// the long-standing behaviour. `Ok(Some(branch))` means that one graduated
+/// roll, promoted by advancing stable to its graduation commit.
+///
+/// Selecting a base branch or nothing at all yields `None`: both pinned rows are
+/// about the branch as a whole, and an empty selection has no narrower intent to
+/// honour. A roll row that cannot be promoted yields the reason rather than
+/// quietly widening to the whole branch, which would promote far more than the
+/// keystroke asked for.
+pub(crate) fn promote_target_for(
+    selected: Option<&RollInfo>,
+    rolls: &[RollInfo],
+) -> Result<Option<String>, String> {
+    let Some(sel) = selected else {
+        return if can_promote(rolls) {
+            Ok(None)
+        } else {
+            Err("nothing to promote — no graduated rolls on rolling".to_string())
+        };
+    };
+
+    match sel.state {
+        RollState::Graduated | RollState::Diverged => Ok(Some(sel.branch.clone())),
+        RollState::Promoted => Err(format!("{} is already promoted", sel.branch)),
+        RollState::Active | RollState::Blocked => Err(format!(
+            "{} is {} — only graduated rolls can be promoted",
+            sel.branch,
+            sel.state.label()
+        )),
+    }
+}
+
 /// Validate an action against the current selection/list. `Ok(())` means the
 /// confirm modal may open; `Err(msg)` is a brief reason to surface instead.
 pub(crate) fn validate_action(
@@ -410,13 +451,7 @@ pub(crate) fn validate_action(
                 ))
             }
         }
-        Action::Promote => {
-            if can_promote(rolls) {
-                Ok(())
-            } else {
-                Err("nothing to promote — no graduated rolls on rolling".to_string())
-            }
-        }
+        Action::Promote => promote_target_for(selected, rolls).map(|_| ()),
         Action::Update => {
             if can_update(rolls) {
                 Ok(())
@@ -737,6 +772,8 @@ impl StatusApp {
         let validation = validate_action(action, selected, &self.rolls);
         let target = match action {
             Action::Graduate => selected.map(|r| r.branch.clone()),
+            // `None` here means "the whole rolling branch", not "no target".
+            Action::Promote => promote_target_for(selected, &self.rolls).unwrap_or(None),
             _ => None,
         };
         match validation {
@@ -994,9 +1031,21 @@ impl StatusApp {
             }
             Action::Promote => {
                 ops::ensure_clean_state(&self.config)?;
-                let o = ops::promote(&self.config, false, &force)?;
-                push_gate_notices(&mut lines, &o.gate_notices);
-                lines.push(format!("Promoted '{}' into '{}'", o.rolling, o.stable));
+                let promote_target = match target {
+                    Some(roll) => ops::PromoteTarget::Rolls(vec![roll.to_string()]),
+                    None => ops::PromoteTarget::Rolling,
+                };
+                let o = ops::promote(&self.config, &promote_target, false, &force)?;
+                for step in &o.steps {
+                    push_gate_notices(&mut lines, &step.gate_notices);
+                    push_gate_notices(&mut lines, &step.host_notices);
+                    push_host_results(&mut lines, &step.host_results);
+                    let what = step.roll.as_deref().unwrap_or(&o.rolling);
+                    lines.push(format!("Promoted '{}' into '{}'", what, o.stable));
+                }
+                for skip in &o.skipped {
+                    lines.push(format!("skipped '{}': {}", skip.roll, skip.reason));
+                }
             }
             Action::Update => match ops::update(&self.config, false)? {
                 ops::UpdateOutcome::NoActiveRolls => {
@@ -1123,6 +1172,9 @@ impl StatusApp {
         ];
         if self.show_deps {
             col_constraints.push(Constraint::Length(8));
+            // Exactly the header width: the values are short comma lists, and
+            // `branch` is the Fill column that pays for anything wider.
+            col_constraints.push(Constraint::Length(10));
         }
 
         let mut header_cells = vec![
@@ -1134,6 +1186,9 @@ impl StatusApp {
         if self.show_deps {
             header_cells
                 .push(Cell::from("deps").style(Style::default().add_modifier(Modifier::BOLD)));
+            header_cells.push(
+                Cell::from("dependants").style(Style::default().add_modifier(Modifier::BOLD)),
+            );
         }
         let table_header = Row::new(header_cells)
             .style(Style::default().add_modifier(Modifier::UNDERLINED))
@@ -1159,6 +1214,7 @@ impl StatusApp {
                 ];
                 if show_deps {
                     cells.push(Cell::from(""));
+                    cells.push(Cell::from(""));
                 }
                 Row::new(cells)
             })
@@ -1177,16 +1233,8 @@ impl StatusApp {
                 Cell::from(roll.state.label()).style(Style::default().fg(row_state_color)),
             ];
             if show_deps {
-                let deps_str = if roll.deps.is_empty() {
-                    String::new()
-                } else {
-                    roll.deps
-                        .iter()
-                        .map(|n| n.to_string())
-                        .collect::<Vec<_>>()
-                        .join(",")
-                };
-                cells.push(Cell::from(deps_str));
+                cells.push(Cell::from(branches::format_roll_numbers(&roll.deps)));
+                cells.push(Cell::from(branches::format_roll_numbers(&roll.dependents)));
             }
             Row::new(cells)
         }));
@@ -1235,10 +1283,16 @@ fn render_modal(
             target.unwrap_or("(selected roll)"),
             config.rolling_branch
         ),
-        Action::Promote => format!(
-            "Promote {} into {}?",
-            config.rolling_branch, config.stable_branch
-        ),
+        // `target` is the selected roll when `[p]` was pressed on one, and
+        // `None` for a whole-branch promotion — the prompt must say which,
+        // because the two differ enormously in what they land on stable.
+        Action::Promote => match target {
+            Some(roll) => format!("Promote {} into {}?", roll, config.stable_branch),
+            None => format!(
+                "Promote all of {} into {}?",
+                config.rolling_branch, config.stable_branch
+            ),
+        },
         Action::Update => format!(
             "Update all active local rolls from {}?",
             config.stable_branch
@@ -1546,6 +1600,20 @@ fn push_prune_skips(lines: &mut Vec<String>, skipped: &[ops::PruneSkip]) {
     }
 }
 
+/// Append the per-host verification summary as readable lines (mirrors
+/// `main.rs::render_host_results`). The TUI used to drop this on the floor, so a
+/// host-gated repo learned less from `[p]` than from `rf promote`.
+fn push_host_results(lines: &mut Vec<String>, results: &[ops::HostResult]) {
+    if results.is_empty() {
+        return;
+    }
+    lines.push("Host verification:".to_string());
+    for result in results {
+        let status = if result.passed() { "PASSED" } else { "FAILED" };
+        lines.push(format!("  {}: {status}", result.host));
+    }
+}
+
 /// Append the gate-run notices as readable lines (mirrors `main.rs`).
 fn push_gate_notices(lines: &mut Vec<String>, notices: &[ops::GateNotice]) {
     for notice in notices {
@@ -1573,6 +1641,8 @@ mod tests {
             location,
             is_current: false,
             deps: Vec::new(),
+            dependents: Vec::new(),
+            graduation_commit: None,
         }
     }
 
@@ -1687,6 +1757,8 @@ mod tests {
             location: BranchLocation::Local,
             is_current: false,
             deps: Vec::new(),
+            dependents: Vec::new(),
+            graduation_commit: None,
         }
     }
 
@@ -1823,13 +1895,70 @@ mod tests {
     }
 
     #[test]
+    fn promote_target_is_the_selected_graduated_roll() {
+        let rolls = vec![
+            roll_n(1, RollState::Graduated),
+            roll_n(2, RollState::Diverged),
+        ];
+        assert_eq!(
+            promote_target_for(Some(&rolls[0]), &rolls),
+            Ok(Some("roll/1-0101-x".to_string()))
+        );
+        // Diverged still has a graduation commit to advance stable to.
+        assert_eq!(
+            promote_target_for(Some(&rolls[1]), &rolls),
+            Ok(Some("roll/2-0101-x".to_string()))
+        );
+    }
+
+    #[test]
+    fn promote_target_is_the_whole_branch_without_a_roll_selected() {
+        // A base-branch row resolves to `None` the same way an empty selection
+        // does, which is how `[p]` on the rolling row promotes everything.
+        let rolls = vec![roll_n(1, RollState::Graduated)];
+        assert_eq!(promote_target_for(None, &rolls), Ok(None));
+    }
+
+    #[test]
+    fn promote_target_refuses_rolls_with_nothing_to_promote() {
+        for state in [RollState::Active, RollState::Blocked, RollState::Promoted] {
+            let rolls = vec![roll_n(1, state.clone())];
+            let err =
+                promote_target_for(Some(&rolls[0]), &rolls).expect_err("should refuse {state:?}");
+            assert!(
+                err.contains("roll/1-0101-x"),
+                "the message should name the roll: {err}"
+            );
+        }
+    }
+
+    #[test]
+    fn promote_target_refusal_does_not_widen_to_the_whole_branch() {
+        // The dangerous failure mode: pressing [p] on an active roll must not
+        // fall back to promoting everything, which is far more than was asked.
+        let rolls = vec![
+            roll_n(1, RollState::Graduated),
+            roll_n(2, RollState::Active),
+        ];
+        assert!(promote_target_for(Some(&rolls[1]), &rolls).is_err());
+        assert!(validate_action(Action::Promote, Some(&rolls[1]), &rolls).is_err());
+    }
+
+    #[test]
+    fn promote_is_rejected_when_nothing_has_graduated() {
+        let rolls = vec![roll_n(1, RollState::Active)];
+        assert!(promote_target_for(None, &rolls).is_err());
+    }
+
+    #[test]
     fn dependent_rows_lists_every_roll_that_integrated_target() {
         // rolls 17 and 18 both integrated roll 14 → both are 14's dependents.
         let mut r17 = roll_n(17, RollState::Active);
         r17.deps = vec![14];
         let mut r18 = roll_n(18, RollState::Blocked);
         r18.deps = vec![14, 15];
-        let target = roll_n(14, RollState::Active);
+        let mut target = roll_n(14, RollState::Active);
+        target.dependents = vec![17, 18];
         let all = vec![target.clone(), r17, r18, roll_n(15, RollState::Graduated)];
 
         let mut nums: Vec<u32> = dependent_rows(&target, &all)
@@ -1840,6 +1969,25 @@ mod tests {
         assert_eq!(nums, vec![17, 18]);
         // Target is ungraduated, so it still gates its dependents.
         assert!(dependent_rows(&target, &all).iter().all(|r| r.is_blocker));
+    }
+
+    #[test]
+    fn dependent_rows_lists_graduated_dependents_too() {
+        // The regression this whole change exists for: a dependant that has
+        // already graduated must still show up. Before deps were computed for
+        // non-active rolls, `dependents` was empty here and the link vanished.
+        let mut r2 = roll_n(2, RollState::Graduated);
+        r2.deps = vec![3];
+        let mut target = roll_n(3, RollState::Graduated);
+        target.dependents = vec![2];
+        let all = vec![r2, target.clone()];
+
+        let rows = dependent_rows(&target, &all);
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].number, 2);
+        assert_eq!(rows[0].state, RollState::Graduated);
+        // A graduated target no longer gates anything.
+        assert!(!rows[0].is_blocker);
     }
 
     #[test]
@@ -1854,11 +2002,24 @@ mod tests {
     }
 
     #[test]
+    fn dependent_rows_skips_numbers_absent_from_the_list() {
+        // A dependant that is not in `all` (filtered out, or a stale index)
+        // must be skipped rather than rendered as a blank row.
+        let mut target = roll_n(14, RollState::Active);
+        target.dependents = vec![15, 99];
+        let all = vec![target.clone(), roll_n(15, RollState::Active)];
+
+        let rows = dependent_rows(&target, &all);
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].number, 15);
+    }
+
+    #[test]
     fn dependent_rows_never_lists_target_itself() {
-        // A self-referential deps entry must not turn the roll into its own
+        // A self-referential entry must not turn the roll into its own
         // dependent.
         let mut target = roll_n(14, RollState::Active);
-        target.deps = vec![14];
+        target.dependents = vec![14];
         let all = vec![target.clone()];
         assert!(dependent_rows(&target, &all).is_empty());
     }

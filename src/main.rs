@@ -19,7 +19,7 @@ fn main() -> Result<()> {
     // `rf status` (issue #100). `--help`/`-h`/`--version` never reach here —
     // clap intercepts them during `parse()`.
     let Some(command) = cli.command else {
-        return cli::status::run(false);
+        return cli::status::run(false, true);
     };
 
     match command {
@@ -72,15 +72,20 @@ fn main() -> Result<()> {
             reason,
         } => cmd_graduate(dry_run, force, reason)?,
         Cmd::Promote {
+            roll,
             dry_run,
             force,
             reason,
-        } => cmd_promote(dry_run, force, reason)?,
-        Cmd::Status { no_tui, json } => {
+        } => cmd_promote(roll, dry_run, force, reason)?,
+        Cmd::Status {
+            no_tui,
+            no_deps,
+            json,
+        } => {
             if json {
                 cmd_status_json()?;
             } else {
-                cli::status::run(no_tui)?;
+                cli::status::run(no_tui, !no_deps)?;
             }
         }
         Cmd::List { no_tui, deps, json } => {
@@ -348,10 +353,25 @@ fn cmd_graduate(dry_run: bool, force: bool, reason: Option<String>) -> Result<()
     Ok(())
 }
 
-fn cmd_promote(dry_run: bool, force: bool, reason: Option<String>) -> Result<()> {
+fn cmd_promote(
+    rolls: Vec<String>,
+    dry_run: bool,
+    force: bool,
+    reason: Option<String>,
+) -> Result<()> {
     let force = ops::ForceOpts::new(force, reason)?;
     let config = Config::load()?;
     ops::ensure_clean_state(&config)?;
+
+    // `--roll` names what to promote outright, so it needs no route inference —
+    // and deliberately works from any branch, rather than being redirected to
+    // graduate because HEAD happens to sit on a roll.
+    if !rolls.is_empty() {
+        let outcome = ops::promote(&config, &ops::PromoteTarget::Rolls(rolls), dry_run, &force)?;
+        print_promote(&outcome);
+        return Ok(());
+    }
+
     let current = git::current_branch(&config.repo_root)?;
     match ops::infer_route(&config, &current) {
         Some(ops::Route::Graduate { roll }) => {
@@ -363,22 +383,37 @@ fn cmd_promote(dry_run: bool, force: bool, reason: Option<String>) -> Result<()>
             print_graduate(&outcome);
         }
         Some(ops::Route::Promote) => {
-            let outcome = ops::promote(&config, dry_run, &force)?;
-            render_gate_notices(&outcome.gate_notices);
-            render_gate_notices(&outcome.host_notices);
-            render_host_results(&outcome.host_results);
-            if outcome.dry_run {
-                println!(
-                    "Dry-run: would promote '{}' into '{}' (--no-ff)",
-                    outcome.rolling, outcome.stable
-                );
-            } else {
-                println!("Promoted '{}' into '{}'", outcome.rolling, outcome.stable);
-            }
+            let outcome = ops::promote(&config, &ops::PromoteTarget::Rolling, dry_run, &force)?;
+            print_promote(&outcome);
         }
         None => return Err(ops::not_promotable_error(&config, &current)),
     }
     Ok(())
+}
+
+/// Render a promotion outcome: every step in the order it was applied, then the
+/// rolls that needed no work. A whole-rolling promotion is one step, so this
+/// prints exactly what it always did for that case.
+fn print_promote(outcome: &ops::PromoteOutcome) {
+    for step in &outcome.steps {
+        render_gate_notices(&step.gate_notices);
+        render_gate_notices(&step.host_notices);
+        render_host_results(&step.host_results);
+        let what = step.roll.as_deref().unwrap_or(&outcome.rolling);
+        if outcome.dry_run {
+            // Naming the source matters for `--roll`: it shows the merge is of a
+            // graduation commit on rolling, not of the roll branch.
+            println!(
+                "Dry-run: would promote '{}' into '{}' by merging '{}' (--no-ff)",
+                what, outcome.stable, step.source
+            );
+        } else {
+            println!("Promoted '{}' into '{}'", what, outcome.stable);
+        }
+    }
+    for skip in &outcome.skipped {
+        println!("skipped '{}': {}", skip.roll, skip.reason);
+    }
 }
 
 fn print_graduate(outcome: &ops::GraduateOutcome) {
@@ -717,13 +752,19 @@ fn cmd_list_text(no_tui: bool, deps: bool) -> Result<()> {
         .max(6);
     let state_w = "⛔ blocked".len();
 
+    let (dep_w, dependant_w) = dep_column_widths(&rolls);
+
     println!(
         "  {num:>3}  {name:<nw$}  {loc:<3}  {state:<sw$}{deps_hdr}",
         num = "#",
         name = "branch",
         loc = "loc",
         state = "state",
-        deps_hdr = if deps { "  deps" } else { "" },
+        deps_hdr = if deps {
+            format!("  {DEPS_HDR:<dep_w$}  {DEPENDANTS_HDR}")
+        } else {
+            String::new()
+        },
         nw = name_w,
         sw = state_w,
     );
@@ -731,19 +772,20 @@ fn cmd_list_text(no_tui: bool, deps: bool) -> Result<()> {
         "  ───  {sep_e}  ───  {sep_s}{sep_d}",
         sep_e = "─".repeat(name_w),
         sep_s = "─".repeat(state_w),
-        sep_d = if deps { "  ────" } else { "" },
+        sep_d = if deps {
+            format!("  {}  {}", "─".repeat(dep_w), "─".repeat(dependant_w))
+        } else {
+            String::new()
+        },
     );
 
     for roll in &rolls {
         let cur = if roll.is_current { ">" } else { " " };
-        let deps_col = if deps && !roll.deps.is_empty() {
+        let deps_col = if deps {
             format!(
-                "  {}",
-                roll.deps
-                    .iter()
-                    .map(|n| n.to_string())
-                    .collect::<Vec<_>>()
-                    .join(",")
+                "  {:<dep_w$}  {}",
+                branches::format_roll_numbers(&roll.deps),
+                branches::format_roll_numbers(&roll.dependents),
             )
         } else {
             String::new()
@@ -760,6 +802,30 @@ fn cmd_list_text(no_tui: bool, deps: bool) -> Result<()> {
     }
 
     Ok(())
+}
+
+/// Column headers for the dependency pair, shared by `rf list --no-tui --deps`
+/// and `rf status --no-tui` so the two tables read identically.
+pub(crate) const DEPS_HDR: &str = "deps";
+pub(crate) const DEPENDANTS_HDR: &str = "dependants";
+
+/// Widths for the `deps` / `dependants` columns: wide enough for the header and
+/// for the longest comma-joined number list in the table. Trailing whitespace on
+/// the last column is trimmed by the caller's format, so only `deps` needs a
+/// computed width — `dependants` is returned for the separator rule.
+pub(crate) fn dep_column_widths(rolls: &[branches::RollInfo]) -> (usize, usize) {
+    let widest = |pick: fn(&branches::RollInfo) -> &Vec<u32>, hdr: &str| {
+        rolls
+            .iter()
+            .map(|r| branches::format_roll_numbers(pick(r)).chars().count())
+            .max()
+            .unwrap_or(0)
+            .max(hdr.chars().count())
+    };
+    (
+        widest(|r| &r.deps, DEPS_HDR),
+        widest(|r| &r.dependents, DEPENDANTS_HDR),
+    )
 }
 
 #[derive(Serialize)]
@@ -786,6 +852,10 @@ struct JsonRoll {
     state: String,
     location: String,
     is_current: bool,
+    /// Roll numbers this roll integrated, and the inverse. Emitted so scripted
+    /// consumers see the same dependency graph the TUI draws.
+    deps: Vec<u32>,
+    dependants: Vec<u32>,
 }
 
 fn rolls_for_json(rolls: Vec<branches::RollInfo>) -> Vec<JsonRoll> {
@@ -797,6 +867,8 @@ fn rolls_for_json(rolls: Vec<branches::RollInfo>) -> Vec<JsonRoll> {
             state: r.state.label().to_string(),
             location: r.location.symbol().to_string(),
             is_current: r.is_current,
+            deps: r.deps,
+            dependants: r.dependents,
         })
         .collect()
 }

@@ -10,6 +10,7 @@
 //! every user-facing line, so both the CLI and the future TUI can drive the
 //! exact same implementation.
 
+use std::collections::{HashMap, HashSet};
 use std::path::Path;
 use std::process::Command;
 
@@ -213,6 +214,113 @@ fn run_merge(
         format!("the merge into '{target}' succeeded, but checking out '{original}' again failed")
     })?;
     Ok(())
+}
+
+/// Stage a `--no-ff` merge of `source` into `target` without committing it,
+/// hand the resulting worktree to `run_step`, and commit only if that closure
+/// succeeds.
+///
+/// This is [`run_merge`] split at the seam, and it exists so promotion gates can
+/// test *what will land on stable* rather than whatever happened to be checked
+/// out when `rf promote` was typed. Splitting it matters most for per-roll
+/// promotion, where each roll is merged and gated in turn: gating the pre-merge
+/// tree would run the same commands against the same content N times and prove
+/// nothing about the intermediate states.
+///
+/// Failure handling matches `run_merge` exactly — `git merge --abort`, restore
+/// the original checkout, and report how to finish by hand — and applies to a
+/// failing `run_step` as well as a conflicting merge, so a rejected step leaves
+/// no partial commit and no `MERGE_HEAD` behind.
+fn merge_gated<T>(
+    repo: &Path,
+    source: &str,
+    target: &str,
+    subject: &str,
+    body: Option<&str>,
+    run_step: impl FnOnce() -> Result<T>,
+) -> Result<T> {
+    let original = git::current_branch(repo)?;
+
+    git::run_git(repo, &["checkout", target])
+        .with_context(|| format!("failed to check out '{target}'"))?;
+
+    // `--no-ff --no-commit` leaves MERGE_HEAD set and the result staged, which
+    // is precisely the state the gates need to see.
+    if let Err(merge_err) = git::run_git(
+        repo,
+        &["merge", "--no-ff", "--no-commit", "--no-edit", source],
+    ) {
+        unwind_merge(repo, &original);
+        bail!(
+            "merge of '{source}' into '{target}' failed (likely conflicts); \
+             the merge was aborted and you are back on '{original}'. \
+             Resolve manually: git checkout {target} && git merge --no-ff {source} ({merge_err})"
+        );
+    }
+
+    let outcome = match run_step() {
+        Ok(outcome) => outcome,
+        Err(step_err) => {
+            unwind_merge(repo, &original);
+            return Err(step_err.context(format!(
+                "promotion of '{source}' into '{target}' was rolled back; \
+                 the merge was aborted and you are back on '{original}'"
+            )));
+        }
+    };
+
+    // Gates run arbitrary shell commands. One that rewrites a tracked file
+    // (`cargo update` is a configured gate in this very repo) leaves changes
+    // that `git commit` would silently drop, producing a merge commit whose
+    // content the gates never actually saw, plus a dirty tree that blocks the
+    // next operation. Refuse rather than commit something unverified.
+    if let Some(dirty) = unstaged_tracked_changes(repo) {
+        unwind_merge(repo, &original);
+        bail!(
+            "a gate modified tracked files while '{source}' was staged for merge into \
+             '{target}', so the merge would not contain what the gates checked. \
+             The merge was aborted and you are back on '{original}'. Modified: {dirty}"
+        );
+    }
+
+    let mut commit_args = vec!["commit", "--no-edit", "-m", subject];
+    if let Some(body) = body {
+        commit_args.push("-m");
+        commit_args.push(body);
+    }
+    if let Err(commit_err) = git::run_git(repo, &commit_args) {
+        unwind_merge(repo, &original);
+        bail!(
+            "gates passed but committing the merge of '{source}' into '{target}' failed; \
+             the merge was aborted and you are back on '{original}' ({commit_err})"
+        );
+    }
+
+    git::run_git(repo, &["checkout", &original]).with_context(|| {
+        format!("the merge into '{target}' succeeded, but checking out '{original}' again failed")
+    })?;
+    Ok(outcome)
+}
+
+/// Abandon an in-progress merge and return to `original`. Both steps are
+/// best-effort: this runs on paths that are already reporting a failure, and
+/// masking that failure with a cleanup error would hide the real cause.
+fn unwind_merge(repo: &Path, original: &str) {
+    let _ = git::run_git(repo, &["merge", "--abort"]);
+    let _ = git::run_git(repo, &["checkout", original]);
+}
+
+/// Tracked files modified in the worktree but not staged, as a short printable
+/// list, or `None` when there are none. Used to catch gates that mutate the
+/// tree mid-merge. Untracked files are ignored — a gate dropping a build
+/// artifact is noise, not a correctness problem.
+fn unstaged_tracked_changes(repo: &Path) -> Option<String> {
+    let out = git::capture_git(repo, &["diff", "--name-only"]).ok()?;
+    let files: Vec<&str> = out.lines().filter(|l| !l.trim().is_empty()).collect();
+    if files.is_empty() {
+        return None;
+    }
+    Some(files.join(", "))
 }
 
 // ── Gates ───────────────────────────────────────────────────────────────────
@@ -432,15 +540,6 @@ impl ForceOpts {
         let reason = self.reason.as_deref().unwrap_or("(none given)");
         s.push_str(&format!("Force-Reason: {reason}"));
         Some(s)
-    }
-
-    /// Append a force trailer to an existing (optional) merge-commit body.
-    fn append_trailer(body: Option<String>, trailer: Option<String>) -> Option<String> {
-        match (body, trailer) {
-            (Some(b), Some(t)) => Some(format!("{b}\n\n{t}")),
-            (Some(b), None) => Some(b),
-            (None, t) => t,
-        }
     }
 }
 
@@ -860,11 +959,29 @@ pub(crate) fn graduate(
 
 // ── promote ─────────────────────────────────────────────────────────────────
 
-/// Outcome of promoting the rolling branch into stable.
-pub(crate) struct PromoteOutcome {
-    pub rolling: String,
-    pub stable: String,
-    pub dry_run: bool,
+/// What a `rf promote` invocation should carry to stable.
+///
+/// Both variants merge a commit that is *on* the rolling branch, so the
+/// "`main` only ever receives merges from `rolling`" invariant holds for
+/// per-roll promotion too — a roll branch is never merged into stable directly.
+pub(crate) enum PromoteTarget {
+    /// Everything rolling has: one merge, one gate run.
+    Rolling,
+    /// Named graduated rolls. Stable is advanced to each roll's graduation merge
+    /// in turn — one merge and one gate run per roll — which is why promoting a
+    /// roll necessarily carries whatever graduated ahead of it, and why the
+    /// result keeps stable a prefix of rolling rather than a divergent line.
+    Rolls(Vec<String>),
+}
+
+/// One merge performed by [`promote`]: the whole rolling branch, or one roll.
+pub(crate) struct PromoteStep {
+    /// The roll this step promoted, or `None` for a whole-rolling promotion.
+    pub roll: Option<String>,
+    /// What was merged — a branch name, or a graduation commit hash. Reported in
+    /// dry-runs, where naming the commit is the only way to show that a per-roll
+    /// promotion merges a point on rolling rather than the roll branch.
+    pub source: String,
     pub gate_notices: Vec<GateNotice>,
     /// Per-host verification results (empty when no host gates / no active hosts).
     pub host_results: Vec<HostResult>,
@@ -872,14 +989,85 @@ pub(crate) struct PromoteOutcome {
     pub host_notices: Vec<GateNotice>,
 }
 
-/// Promote the rolling branch into stable with a structured `--no-ff` merge.
-pub(crate) fn promote(config: &Config, dry_run: bool, force: &ForceOpts) -> Result<PromoteOutcome> {
-    let repo = &config.repo_root;
+/// Outcome of promoting into stable.
+pub(crate) struct PromoteOutcome {
+    pub rolling: String,
+    pub stable: String,
+    pub dry_run: bool,
+    /// One entry per merge, in the order they were applied.
+    pub steps: Vec<PromoteStep>,
+    /// Rolls that were named but needed no work, with the reason — already
+    /// promoted, or already contained in stable via an earlier step.
+    pub skipped: Vec<SkippedRoll>,
+}
+
+/// A named roll that needed no promotion, and why.
+pub(crate) struct SkippedRoll {
+    pub roll: String,
+    pub reason: String,
+}
+
+/// Promote into stable with structured `--no-ff` merges.
+///
+/// [`PromoteTarget::Rolling`] is one merge behind one gate run.
+/// [`PromoteTarget::Rolls`] is one merge behind one gate run *per roll*, applied
+/// in graduation order, so each intermediate state of stable is verified rather
+/// than only the end state.
+pub(crate) fn promote(
+    config: &Config,
+    target: &PromoteTarget,
+    dry_run: bool,
+    force: &ForceOpts,
+) -> Result<PromoteOutcome> {
     let rolling = &config.rolling_branch;
     let stable = &config.stable_branch;
 
     let stable_ref = ensure_local_target(config, stable, dry_run)?;
-    match classify_merge(repo, rolling, &stable_ref)? {
+    let plan = match target {
+        PromoteTarget::Rolling => PromotePlan {
+            steps: vec![plan_rolling_step(config, &stable_ref)?],
+            skipped: Vec::new(),
+        },
+        PromoteTarget::Rolls(rolls) => plan_roll_steps(config, rolls, &stable_ref)?,
+    };
+
+    let mut steps = Vec::new();
+    for step in plan.steps {
+        steps.push(run_promote_step(config, &stable_ref, step, dry_run, force)?);
+    }
+
+    Ok(PromoteOutcome {
+        rolling: rolling.clone(),
+        stable: stable.clone(),
+        dry_run,
+        steps,
+        skipped: plan.skipped,
+    })
+}
+
+/// A resolved, ready-to-merge promotion step.
+struct PlannedStep {
+    roll: Option<String>,
+    source: String,
+    subject: String,
+    body: Option<String>,
+}
+
+/// The steps a promotion will perform, plus the rolls it found nothing to do
+/// for. Named rather than a tuple because both halves are reported to the user.
+struct PromotePlan {
+    steps: Vec<PlannedStep>,
+    skipped: Vec<SkippedRoll>,
+}
+
+/// Plan the single step of a whole-rolling promotion, reusing the existing
+/// subject/body rules so the commit shape on stable is unchanged.
+fn plan_rolling_step(config: &Config, stable_ref: &str) -> Result<PlannedStep> {
+    let repo = &config.repo_root;
+    let rolling = &config.rolling_branch;
+    let stable = &config.stable_branch;
+
+    match classify_merge(repo, rolling, stable_ref)? {
         MergeState::TargetMissing => bail!(target_missing_error(config, stable)),
         MergeState::UnrelatedHistories => {
             bail!("'{}' and '{}' share no common history", rolling, stable)
@@ -892,44 +1080,194 @@ pub(crate) fn promote(config: &Config, dry_run: bool, force: &ForceOpts) -> Resu
         MergeState::Diverged | MergeState::FastForwardable => {}
     }
 
-    let report = run_gates(repo, &config.rolling_to_main_gates, dry_run, force)?;
+    let (subject, body) = promote_subject_and_body(config)?;
+    Ok(PlannedStep {
+        roll: None,
+        source: rolling.clone(),
+        subject,
+        body,
+    })
+}
 
-    // Host gates block promotion when an active host fails (issue #106), unless
-    // `--force`, in which case each failing host gate is recorded as a bypass in
-    // the merge trailer alongside the route-gate bypasses.
-    let host_report = run_host_gates(config, dry_run, force)?;
-    if !force.enabled {
-        let failed = host_report.failed_hosts();
-        if !failed.is_empty() {
-            bail!("host verification failed: {}", failed.join(", "));
-        }
+/// Resolve named rolls into ordered merge steps, plus the rolls that need no
+/// work. Each step merges the roll's *graduation commit on rolling*, not its
+/// branch, which is what keeps stable a prefix of rolling.
+///
+/// Ordering is by position on rolling, oldest first: promoting out of graduation
+/// order is not expressible, since advancing stable to a later graduation
+/// necessarily includes the earlier ones. Sorting rather than rejecting means
+/// `--roll b --roll a` does the sane thing instead of erroring on argument
+/// order.
+fn plan_roll_steps(config: &Config, rolls: &[String], stable_ref: &str) -> Result<PromotePlan> {
+    let repo = &config.repo_root;
+    let stable = &config.stable_branch;
+    let rolling = &config.rolling_branch;
+
+    if rolls.is_empty() {
+        bail!("no rolls named to promote");
     }
 
+    let known = branches::list_rolls(config)?;
+    let order = rolling_commit_order(config);
+
+    let mut planned: Vec<(usize, PlannedStep)> = Vec::new();
+    let mut skipped = Vec::new();
+    let mut seen = HashSet::new();
+
+    for name in rolls {
+        if !seen.insert(name.clone()) {
+            continue;
+        }
+        let Some(info) = known.iter().find(|r| &r.branch == name) else {
+            bail!(
+                "no such roll: '{name}'. Run `rf list` to see the roll branches roll-flow knows about"
+            );
+        };
+        let Some(graduation) = info.graduation_commit.clone() else {
+            bail!(
+                "'{name}' has not graduated, so there is nothing on '{rolling}' to promote. \
+                 Run `rf graduate` from it first"
+            );
+        };
+        if git::is_ancestor(repo, &graduation, stable_ref).unwrap_or(false) {
+            skipped.push(SkippedRoll {
+                roll: name.clone(),
+                reason: format!("already contained in '{stable}'"),
+            });
+            continue;
+        }
+
+        planned.push((
+            order.get(&graduation).copied().unwrap_or(usize::MAX),
+            PlannedStep {
+                roll: Some(name.clone()),
+                source: graduation,
+                subject: format!("Promote {name} to {stable}"),
+                // Rolls riding along on an earlier graduation are attributed by
+                // reachability (see `scan_promoted`), so the body only needs to
+                // name this step's own roll.
+                body: Some(format!("Rolls:\n  {name}\n")),
+            },
+        ));
+    }
+
+    planned.sort_by_key(|(pos, _)| *pos);
+    Ok(PromotePlan {
+        steps: planned.into_iter().map(|(_, step)| step).collect(),
+        skipped,
+    })
+}
+
+/// Map each commit reachable from rolling to its distance from the tip, so
+/// graduation commits can be ordered oldest-first. Commits missing from the map
+/// sort last, which keeps an unexpectedly unreachable graduation from silently
+/// jumping the queue.
+fn rolling_commit_order(config: &Config) -> HashMap<String, usize> {
+    let Some(rolling) = git::resolve_branch(&config.repo_root, &config.rolling_branch) else {
+        return HashMap::new();
+    };
+    let Ok(out) = git::capture_git(&config.repo_root, &["rev-list", "--first-parent", &rolling])
+    else {
+        return HashMap::new();
+    };
+    // rev-list is newest-first, so reversing the index gives oldest-first order.
+    let hashes: Vec<&str> = out.lines().filter(|l| !l.trim().is_empty()).collect();
+    let total = hashes.len();
+    hashes
+        .into_iter()
+        .enumerate()
+        .map(|(i, h)| (h.to_string(), total - i))
+        .collect()
+}
+
+/// Run one planned step: stage the merge, gate the result, commit if it passes.
+fn run_promote_step(
+    config: &Config,
+    stable_ref: &str,
+    step: PlannedStep,
+    dry_run: bool,
+    force: &ForceOpts,
+) -> Result<PromoteStep> {
+    let repo = &config.repo_root;
+
+    // Gates run against the staged merge result, so `report` is produced inside
+    // `merge_gated`. In dry-run nothing is staged and nothing is merged.
+    let run_checks = || -> Result<(GateReport, HostReport)> {
+        let report = run_gates(repo, &config.rolling_to_main_gates, dry_run, force)?;
+
+        // Host gates block promotion when an active host fails (issue #106),
+        // unless `--force`, in which case each failing host gate is recorded as
+        // a bypass in the merge trailer alongside the route-gate bypasses.
+        let host_report = run_host_gates(config, dry_run, force)?;
+        if !force.enabled {
+            let failed = host_report.failed_hosts();
+            if !failed.is_empty() {
+                bail!("host verification failed: {}", failed.join(", "));
+            }
+        }
+        Ok((report, host_report))
+    };
+
     if dry_run {
-        return Ok(PromoteOutcome {
-            rolling: rolling.clone(),
-            stable: stable.clone(),
-            dry_run: true,
+        let (report, host_report) = run_checks()?;
+        return Ok(PromoteStep {
+            roll: step.roll,
+            source: step.source,
             gate_notices: report.notices,
             host_results: host_report.results,
             host_notices: host_report.notices,
         });
     }
 
+    // The force trailer depends on what the gates bypassed, which is only known
+    // after they run — so the body is finalised inside the closure and the
+    // commit message is assembled once the step returns.
+    let (report, host_report) = merge_gated(
+        repo,
+        &step.source,
+        stable_ref,
+        &step.subject,
+        step.body.as_deref(),
+        run_checks,
+    )?;
+
     let mut bypassed = report.bypassed;
     bypassed.extend(host_report.bypassed);
+    if let Some(trailer) = force.trailer(&bypassed) {
+        append_commit_trailer(repo, stable_ref, &trailer)?;
+    }
 
-    let (subject, body) = promote_subject_and_body(config)?;
-    let body = ForceOpts::append_trailer(body, force.trailer(&bypassed));
-    run_merge(repo, rolling, stable, &subject, body.as_deref())?;
-    Ok(PromoteOutcome {
-        rolling: rolling.clone(),
-        stable: stable.clone(),
-        dry_run: false,
+    Ok(PromoteStep {
+        roll: step.roll,
+        source: step.source,
         gate_notices: report.notices,
         host_results: host_report.results,
         host_notices: host_report.notices,
     })
+}
+
+/// Append a `Forced-Bypass:` trailer to the tip of `branch_ref` after the fact.
+///
+/// Gates have to run before the commit exists (that is the whole point of
+/// `merge_gated`), but which of them were bypassed is only known once they have
+/// run — so the trailer is amended on rather than passed in. Amending the tip of
+/// stable here is safe: it is the merge this step just created, moments ago, and
+/// nothing else can have advanced it in between.
+fn append_commit_trailer(repo: &Path, branch_ref: &str, trailer: &str) -> Result<()> {
+    let original = git::current_branch(repo)?;
+    git::run_git(repo, &["checkout", branch_ref]).with_context(|| {
+        format!("failed to check out '{branch_ref}' to record the force trailer")
+    })?;
+
+    let existing = git::capture_git(repo, &["log", "-1", "--format=%B"])?;
+    let message = format!("{}\n\n{trailer}\n", existing.trim_end());
+    let amend = git::run_git(repo, &["commit", "--amend", "--no-edit", "-m", &message]);
+
+    git::run_git(repo, &["checkout", &original]).with_context(|| {
+        format!("recorded the force trailer, but checking out '{original}' again failed")
+    })?;
+    amend.with_context(|| format!("failed to record the force trailer on '{branch_ref}'"))?;
+    Ok(())
 }
 
 /// Subject and body for a promotion merge. Exactly one graduated roll included
