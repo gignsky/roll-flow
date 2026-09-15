@@ -65,6 +65,15 @@ pub struct Config {
     /// (and repos that want no host gating) are a clean no-op.
     #[serde(default)]
     pub host_gates: Vec<String>,
+    /// Branches `rf clean` must never delete, on top of the stable and rolling
+    /// branches it already protects. Empty by default, so configs that predate
+    /// this field are a clean no-op.
+    ///
+    /// The hardcoded fallback (`main`/`master`/`develop` plus each remote's
+    /// HEAD) only applies to repos with no config at all; a repo that has one
+    /// names its own protected branches here.
+    #[serde(default)]
+    pub clean_protect: Vec<String>,
 }
 
 impl Config {
@@ -138,6 +147,7 @@ impl Config {
             roll_to_rolling_gates: vec![],
             rolling_to_main_gates: vec![],
             host_gates: vec![],
+            clean_protect: vec![],
         })
     }
 
@@ -317,6 +327,7 @@ mod tests {
             roll_to_rolling_gates: vec![],
             rolling_to_main_gates: vec![],
             host_gates: vec![],
+            clean_protect: vec![],
         };
         let updated = cfg.with_overrides(
             Some("rolling".to_string()),
@@ -346,6 +357,7 @@ mod tests {
             roll_to_rolling_gates: vec![],
             rolling_to_main_gates: vec![],
             host_gates: vec![],
+            clean_protect: vec![],
         };
         let rendered = cfg.to_toml_string().expect("render");
         assert!(
@@ -372,6 +384,8 @@ mod tests {
         let parsed: Config = toml::from_str(legacy).expect("parse legacy");
         assert_eq!(parsed.mode, Mode::Manage);
         assert!(!parsed.is_assist());
+        // Fields added later must not make an older config unloadable.
+        assert!(parsed.clean_protect.is_empty());
     }
 
     #[test]

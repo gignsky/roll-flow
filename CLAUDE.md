@@ -253,8 +253,18 @@ cargo run -- list --no-tui
   so `rf prune` additionally requires the tip to be an ancestor of the stable branch
   or of `origin/<stable>`, and `--force` is the only override. Never delete the
   checked-out branch.
-- `rf prune` is the only command that writes to the remote (`git push --delete`) or
-  fetches. Everything else is local-only; keep it that way.
+- `rf prune` and `rf clean` are the only commands that write to the remote
+  (`git push --delete`) or fetch. Everything else is local-only; keep it that way.
+- `rf clean` is the only command that runs without a config and across all remotes.
+  It resolves the repo root itself and treats `Config` as optional — note that
+  `Config::load` resolves the repo root *first*, so `.ok()`-ing it wholesale would
+  swallow "not a git repository" too. Find the repo first, then soften the config.
+- Detecting a gone upstream must happen *after* the pruning fetch.
+  `%(upstream:track)` reports `gone` from the absence of a remote-tracking ref,
+  which a stale cache still supplies — detect first and nothing ever reports gone.
+- A deleted upstream is not proof a branch tip is contained. `rf clean` applies the
+  same containment gate to gone branches as to promoted ones; `--force` is the only
+  override, and it never overrides the checked-out/worktree/protected guards.
 
 ## Integration with dotfiles
 
