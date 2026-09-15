@@ -10,12 +10,14 @@
 //! every user-facing line, so both the CLI and the future TUI can drive the
 //! exact same implementation.
 
+use std::collections::{HashMap, HashSet};
 use std::path::Path;
 use std::process::Command;
 
 use anyhow::{anyhow, bail, Context, Result};
 
-use crate::core::{branches, config::Config, git};
+use crate::core::version::{BumpLevel, Semver, VersionCheck, VersionStatus};
+use crate::core::{branches, config::Config, git, version};
 
 /// Prefix for the hotfix tier. Parallel to `roll_prefix`, but fixed rather than
 /// configurable — hotfixes are a rarely-used sanctioned exception with their own
@@ -213,6 +215,113 @@ fn run_merge(
         format!("the merge into '{target}' succeeded, but checking out '{original}' again failed")
     })?;
     Ok(())
+}
+
+/// Stage a `--no-ff` merge of `source` into `target` without committing it,
+/// hand the resulting worktree to `run_step`, and commit only if that closure
+/// succeeds.
+///
+/// This is [`run_merge`] split at the seam, and it exists so promotion gates can
+/// test *what will land on stable* rather than whatever happened to be checked
+/// out when `rf promote` was typed. Splitting it matters most for per-roll
+/// promotion, where each roll is merged and gated in turn: gating the pre-merge
+/// tree would run the same commands against the same content N times and prove
+/// nothing about the intermediate states.
+///
+/// Failure handling matches `run_merge` exactly — `git merge --abort`, restore
+/// the original checkout, and report how to finish by hand — and applies to a
+/// failing `run_step` as well as a conflicting merge, so a rejected step leaves
+/// no partial commit and no `MERGE_HEAD` behind.
+fn merge_gated<T>(
+    repo: &Path,
+    source: &str,
+    target: &str,
+    subject: &str,
+    body: Option<&str>,
+    run_step: impl FnOnce() -> Result<T>,
+) -> Result<T> {
+    let original = git::current_branch(repo)?;
+
+    git::run_git(repo, &["checkout", target])
+        .with_context(|| format!("failed to check out '{target}'"))?;
+
+    // `--no-ff --no-commit` leaves MERGE_HEAD set and the result staged, which
+    // is precisely the state the gates need to see.
+    if let Err(merge_err) = git::run_git(
+        repo,
+        &["merge", "--no-ff", "--no-commit", "--no-edit", source],
+    ) {
+        unwind_merge(repo, &original);
+        bail!(
+            "merge of '{source}' into '{target}' failed (likely conflicts); \
+             the merge was aborted and you are back on '{original}'. \
+             Resolve manually: git checkout {target} && git merge --no-ff {source} ({merge_err})"
+        );
+    }
+
+    let outcome = match run_step() {
+        Ok(outcome) => outcome,
+        Err(step_err) => {
+            unwind_merge(repo, &original);
+            return Err(step_err.context(format!(
+                "promotion of '{source}' into '{target}' was rolled back; \
+                 the merge was aborted and you are back on '{original}'"
+            )));
+        }
+    };
+
+    // Gates run arbitrary shell commands. One that rewrites a tracked file
+    // (`cargo update` is a configured gate in this very repo) leaves changes
+    // that `git commit` would silently drop, producing a merge commit whose
+    // content the gates never actually saw, plus a dirty tree that blocks the
+    // next operation. Refuse rather than commit something unverified.
+    if let Some(dirty) = unstaged_tracked_changes(repo) {
+        unwind_merge(repo, &original);
+        bail!(
+            "a gate modified tracked files while '{source}' was staged for merge into \
+             '{target}', so the merge would not contain what the gates checked. \
+             The merge was aborted and you are back on '{original}'. Modified: {dirty}"
+        );
+    }
+
+    let mut commit_args = vec!["commit", "--no-edit", "-m", subject];
+    if let Some(body) = body {
+        commit_args.push("-m");
+        commit_args.push(body);
+    }
+    if let Err(commit_err) = git::run_git(repo, &commit_args) {
+        unwind_merge(repo, &original);
+        bail!(
+            "gates passed but committing the merge of '{source}' into '{target}' failed; \
+             the merge was aborted and you are back on '{original}' ({commit_err})"
+        );
+    }
+
+    git::run_git(repo, &["checkout", &original]).with_context(|| {
+        format!("the merge into '{target}' succeeded, but checking out '{original}' again failed")
+    })?;
+    Ok(outcome)
+}
+
+/// Abandon an in-progress merge and return to `original`. Both steps are
+/// best-effort: this runs on paths that are already reporting a failure, and
+/// masking that failure with a cleanup error would hide the real cause.
+fn unwind_merge(repo: &Path, original: &str) {
+    let _ = git::run_git(repo, &["merge", "--abort"]);
+    let _ = git::run_git(repo, &["checkout", original]);
+}
+
+/// Tracked files modified in the worktree but not staged, as a short printable
+/// list, or `None` when there are none. Used to catch gates that mutate the
+/// tree mid-merge. Untracked files are ignored — a gate dropping a build
+/// artifact is noise, not a correctness problem.
+fn unstaged_tracked_changes(repo: &Path) -> Option<String> {
+    let out = git::capture_git(repo, &["diff", "--name-only"]).ok()?;
+    let files: Vec<&str> = out.lines().filter(|l| !l.trim().is_empty()).collect();
+    if files.is_empty() {
+        return None;
+    }
+    Some(files.join(", "))
 }
 
 // ── Gates ───────────────────────────────────────────────────────────────────
@@ -432,15 +541,6 @@ impl ForceOpts {
         let reason = self.reason.as_deref().unwrap_or("(none given)");
         s.push_str(&format!("Force-Reason: {reason}"));
         Some(s)
-    }
-
-    /// Append a force trailer to an existing (optional) merge-commit body.
-    fn append_trailer(body: Option<String>, trailer: Option<String>) -> Option<String> {
-        match (body, trailer) {
-            (Some(b), Some(t)) => Some(format!("{b}\n\n{t}")),
-            (Some(b), None) => Some(b),
-            (None, t) => t,
-        }
     }
 }
 
@@ -718,6 +818,222 @@ pub(crate) fn hotfix_land(config: &Config, dry_run: bool) -> Result<HotfixLandOu
     })
 }
 
+// ── Version gate and release tagging ────────────────────────────────────────
+
+/// What happened to the release tag during a promotion.
+pub(crate) enum TagOutcome {
+    /// A new annotated tag was created on the promotion merge commit.
+    Created { tag: String, sha: String },
+    /// The tag was already present, so nothing was done. Mirrors the
+    /// idempotency of `.github/workflows/tag-on-main.yml`, which skips when the
+    /// tag exists rather than failing.
+    Existed { tag: String },
+    /// Dry-run: the tag that would be created.
+    WouldCreate { tag: String },
+    /// Dry-run: a tag would be created, but the version still needs bumping, so
+    /// its name depends on the bump and cannot be named yet.
+    WouldCreateAfterBump,
+    /// Tagging was disabled (`--no-tag` / `tag_on_promote = false`) or there is
+    /// no version to tag (no `Cargo.toml`).
+    Skipped,
+}
+
+impl TagOutcome {
+    /// The status line describing this outcome, or `None` when there is nothing
+    /// worth saying (tagging was skipped entirely). Shared by the CLI and TUI
+    /// renderers so both report a release identically.
+    pub(crate) fn describe(&self) -> Option<String> {
+        match self {
+            TagOutcome::Created { tag, sha } => Some(format!("Tagged {tag} on {}", short_sha(sha))),
+            TagOutcome::Existed { tag } => {
+                Some(format!("note: tag {tag} already exists - not re-tagging"))
+            }
+            TagOutcome::WouldCreate { tag } => {
+                Some(format!("Dry-run: would tag {tag} on the merge commit"))
+            }
+            TagOutcome::WouldCreateAfterBump => Some(
+                "Dry-run: would tag the merge commit with the version once it is bumped"
+                    .to_string(),
+            ),
+            TagOutcome::Skipped => None,
+        }
+    }
+
+    /// The tag name when one was just created, for the caller's push prompt.
+    pub(crate) fn created_tag(&self) -> Option<&str> {
+        match self {
+            TagOutcome::Created { tag, .. } => Some(tag.as_str()),
+            _ => None,
+        }
+    }
+}
+
+/// Abbreviate a full SHA for display, matching git's default short length.
+fn short_sha(sha: &str) -> &str {
+    let end = sha.len().min(7);
+    &sha[..end]
+}
+
+/// Compare the crate version on `source_ref` against `target_ref`, honouring
+/// the `version_gate` config switch.
+///
+/// Returns `NotApplicable` — never an error — when the gate is off or the repo
+/// has no `Cargo.toml`, so repos that do not version this way (the dotfiles
+/// repo roll-flow was built for) are entirely unaffected.
+pub(crate) fn version_check(
+    config: &Config,
+    source_ref: &str,
+    target_ref: &str,
+) -> Result<VersionCheck> {
+    if !config.version_gate {
+        return Ok(VersionCheck::not_applicable());
+    }
+    Ok(version::check(&config.repo_root, source_ref, target_ref)?)
+}
+
+/// The hard error a failing version gate produces. Shared by `verify` and
+/// `promote` so both routes explain the failure — and the way out — identically.
+pub(crate) fn version_gate_error(
+    check: &VersionCheck,
+    source: &str,
+    target: &str,
+) -> anyhow::Error {
+    let head = check
+        .head
+        .map(|v| v.to_string())
+        .unwrap_or_else(|| "<unreadable>".to_string());
+    let base = check
+        .base
+        .map(|v| v.to_string())
+        .unwrap_or_else(|| "<unreadable>".to_string());
+    match check.status {
+        VersionStatus::Unchanged => anyhow!(
+            "Cargo.toml version ({head}) on '{source}' is unchanged from '{target}'; \
+             every promotion must carry a version bump. \
+             Re-run with --bump <patch|minor|major>, bump it by hand, or \
+             --force --reason \"<why>\" to override"
+        ),
+        VersionStatus::Lower => anyhow!(
+            "Cargo.toml version ({head}) on '{source}' is lower than '{target}' ({base}); \
+             it must be bumped above the branch it is merging into"
+        ),
+        VersionStatus::Unreadable => {
+            anyhow!("could not read a version from Cargo.toml (head='{head}', base='{base}')")
+        }
+        VersionStatus::Ok | VersionStatus::NotApplicable => {
+            anyhow!("version check passed unexpectedly")
+        }
+    }
+}
+
+/// Raise the crate version, refresh the lockfile, and commit both.
+///
+/// The commit lands on whatever branch is checked out, which callers guarantee
+/// is the branch being merged *from*. Deliberately a separate step the CLI runs
+/// **before** the gates: a bump rewrites `Cargo.lock` too, and
+/// `rolling_to_main_gates` contains `cargo update --workspace --locked`, which
+/// would fail against a stale lockfile if the bump came afterwards.
+pub(crate) fn apply_version_bump(
+    config: &Config,
+    level: BumpLevel,
+    reason: &str,
+) -> Result<(Semver, Semver)> {
+    let repo = &config.repo_root;
+    let current = version::read_version(repo)?
+        .ok_or_else(|| anyhow!("no readable version in Cargo.toml to bump"))?;
+    let next = current.bump(level);
+
+    version::write_version(repo, next)?;
+    refresh_lockfile(repo);
+
+    let message = format!("chore(release): bump version to {next} for {reason}");
+    git::commit_paths(repo, &["Cargo.toml", "Cargo.lock"], &message)
+        .with_context(|| format!("failed to commit the version bump to {next}"))?;
+    Ok((current, next))
+}
+
+/// Best-effort `Cargo.lock` refresh after a version rewrite.
+///
+/// A workspace member's own version appears in the lockfile, so it goes stale
+/// the moment `Cargo.toml` changes. Failure is deliberately ignored: there may
+/// be no lockfile, no network, or no cargo at all, and the configured
+/// `cargo update --workspace --locked` gate is the real enforcement. Keeping it
+/// non-fatal also lets the integration tests run offline against fixture
+/// manifests that are not real crates.
+fn refresh_lockfile(repo: &Path) {
+    if !repo.join("Cargo.lock").exists() {
+        return;
+    }
+    let offline = Command::new("cargo")
+        .args(["update", "--workspace", "--offline"])
+        .current_dir(repo)
+        .status();
+    if matches!(&offline, Ok(s) if s.success()) {
+        return;
+    }
+    let _ = Command::new("cargo")
+        .args(["update", "--workspace"])
+        .current_dir(repo)
+        .status();
+}
+
+/// Create the release tag for a completed promotion.
+///
+/// Tags the merge commit by SHA rather than by branch name: `run_merge` has
+/// already returned to the branch we started on, and a SHA cannot drift.
+fn tag_release(
+    config: &Config,
+    check: &VersionCheck,
+    enabled: bool,
+    included: &[String],
+) -> Result<TagOutcome> {
+    if !enabled || !config.tag_on_promote {
+        return Ok(TagOutcome::Skipped);
+    }
+    let Some(version) = check.head else {
+        return Ok(TagOutcome::Skipped);
+    };
+    let repo = &config.repo_root;
+    let tag = version.tag();
+    if git::tag_exists(repo, &tag) {
+        return Ok(TagOutcome::Existed { tag });
+    }
+    let sha = git::rev_parse(repo, &config.stable_branch)?;
+    let message = tag_message(&tag, included);
+    git::create_annotated_tag(repo, &tag, &message, &sha)
+        .with_context(|| format!("failed to create tag {tag}"))?;
+    Ok(TagOutcome::Created { tag, sha })
+}
+
+/// Annotated-tag message. The subject is byte-identical to the one
+/// `tag-on-main.yml` writes, so tags made by `rf` and by CI stay uniform; the
+/// rolls this release carries are listed underneath.
+fn tag_message(tag: &str, included: &[String]) -> String {
+    let mut msg = format!("Release {tag}");
+    if !included.is_empty() {
+        msg.push_str("\n\nRolls:\n");
+        for roll in included {
+            msg.push_str(&format!("  {roll}\n"));
+        }
+    }
+    msg
+}
+
+/// Branch names of the rolls a promotion carries: those graduated (or
+/// re-graduated after diverging) into rolling but not yet on stable.
+fn included_rolls(config: &Config) -> Result<Vec<String>> {
+    Ok(branches::list_rolls(config)?
+        .into_iter()
+        .filter(|r| {
+            matches!(
+                r.state,
+                branches::RollState::Graduated | branches::RollState::Diverged
+            )
+        })
+        .map(|r| r.branch)
+        .collect())
+}
+
 // ── verify ──────────────────────────────────────────────────────────────────
 
 /// Outcome of `rf verify`.
@@ -735,6 +1051,9 @@ pub(crate) struct VerifyOutcome {
     /// Active hosts whose gates failed. Non-empty ⇒ verify should fail; the CLI
     /// still renders the per-host summary (including the hosts that passed) first.
     pub failed_hosts: Vec<String>,
+    /// Crate-version comparison of source against target. `NotApplicable` when
+    /// the repo has no `Cargo.toml` or the gate is disabled.
+    pub version: VersionCheck,
 }
 
 pub(crate) fn verify(config: &Config, dry_run: bool) -> Result<VerifyOutcome> {
@@ -770,6 +1089,15 @@ pub(crate) fn verify(config: &Config, dry_run: bool) -> Result<VerifyOutcome> {
         MergeState::FastForwardable => {}
     }
 
+    // Checked before the gates so an unbumped version fails in milliseconds
+    // rather than after a full `cargo test` run. Only the promotion route
+    // carries the bump requirement — graduating a roll into rolling is
+    // deliberately out of scope, matching what `rf promote` enforces.
+    let version = match route {
+        Route::Promote => version_check(config, &source, &target)?,
+        Route::Graduate { .. } => VersionCheck::not_applicable(),
+    };
+
     let report = run_gates(
         &config.repo_root,
         gates,
@@ -791,6 +1119,7 @@ pub(crate) fn verify(config: &Config, dry_run: bool) -> Result<VerifyOutcome> {
         host_results: host_report.results,
         host_notices: host_report.notices,
         failed_hosts,
+        version,
     })
 }
 
@@ -860,26 +1189,131 @@ pub(crate) fn graduate(
 
 // ── promote ─────────────────────────────────────────────────────────────────
 
-/// Outcome of promoting the rolling branch into stable.
-pub(crate) struct PromoteOutcome {
-    pub rolling: String,
-    pub stable: String,
-    pub dry_run: bool,
+/// What a `rf promote` invocation should carry to stable.
+///
+/// Both variants merge a commit that is *on* the rolling branch, so the
+/// "`main` only ever receives merges from `rolling`" invariant holds for
+/// per-roll promotion too — a roll branch is never merged into stable directly.
+pub(crate) enum PromoteTarget {
+    /// Everything rolling has: one merge, one gate run.
+    Rolling,
+    /// Named graduated rolls. Stable is advanced to each roll's graduation merge
+    /// in turn — one merge and one gate run per roll — which is why promoting a
+    /// roll necessarily carries whatever graduated ahead of it, and why the
+    /// result keeps stable a prefix of rolling rather than a divergent line.
+    Rolls(Vec<String>),
+}
+
+/// One merge performed by [`promote`]: the whole rolling branch, or one roll.
+pub(crate) struct PromoteStep {
+    /// The roll this step promoted, or `None` for a whole-rolling promotion.
+    pub roll: Option<String>,
+    /// What was merged — a branch name, or a graduation commit hash. Reported in
+    /// dry-runs, where naming the commit is the only way to show that a per-roll
+    /// promotion merges a point on rolling rather than the roll branch.
+    pub source: String,
     pub gate_notices: Vec<GateNotice>,
     /// Per-host verification results (empty when no host gates / no active hosts).
     pub host_results: Vec<HostResult>,
     /// Dry-run notices for the host gates.
     pub host_notices: Vec<GateNotice>,
+    /// Crate-version comparison of rolling against stable.
+    pub version: VersionCheck,
+    /// What happened to the `vX.Y.Z` release tag.
+    pub tag: TagOutcome,
 }
 
-/// Promote the rolling branch into stable with a structured `--no-ff` merge.
-pub(crate) fn promote(config: &Config, dry_run: bool, force: &ForceOpts) -> Result<PromoteOutcome> {
-    let repo = &config.repo_root;
+/// Outcome of promoting into stable.
+pub(crate) struct PromoteOutcome {
+    pub rolling: String,
+    pub stable: String,
+    pub dry_run: bool,
+    /// One entry per merge, in the order they were applied.
+    pub steps: Vec<PromoteStep>,
+    /// Rolls that were named but needed no work, with the reason — already
+    /// promoted, or already contained in stable via an earlier step.
+    pub skipped: Vec<SkippedRoll>,
+}
+
+/// A named roll that needed no promotion, and why.
+pub(crate) struct SkippedRoll {
+    pub roll: String,
+    pub reason: String,
+}
+
+/// Promote into stable with structured `--no-ff` merges.
+///
+/// [`PromoteTarget::Rolling`] is one merge behind one gate run.
+/// [`PromoteTarget::Rolls`] is one merge behind one gate run *per roll*, applied
+/// in graduation order, so each intermediate state of stable is verified rather
+/// than only the end state.
+pub(crate) fn promote(
+    config: &Config,
+    target: &PromoteTarget,
+    dry_run: bool,
+    force: &ForceOpts,
+    tag: bool,
+) -> Result<PromoteOutcome> {
     let rolling = &config.rolling_branch;
     let stable = &config.stable_branch;
 
     let stable_ref = ensure_local_target(config, stable, dry_run)?;
-    match classify_merge(repo, rolling, &stable_ref)? {
+    let plan = match target {
+        PromoteTarget::Rolling => PromotePlan {
+            steps: vec![plan_rolling_step(config, &stable_ref)?],
+            skipped: Vec::new(),
+        },
+        PromoteTarget::Rolls(rolls) => plan_roll_steps(config, rolls, &stable_ref)?,
+    };
+
+    let mut steps = Vec::new();
+    for step in plan.steps {
+        steps.push(run_promote_step(
+            config,
+            &stable_ref,
+            step,
+            dry_run,
+            force,
+            tag,
+        )?);
+    }
+
+    Ok(PromoteOutcome {
+        rolling: rolling.clone(),
+        stable: stable.clone(),
+        dry_run,
+        steps,
+        skipped: plan.skipped,
+    })
+}
+
+/// A resolved, ready-to-merge promotion step.
+struct PlannedStep {
+    roll: Option<String>,
+    source: String,
+    subject: String,
+    body: Option<String>,
+    /// The rolls this step carries, listed in the annotated tag message.
+    /// Captured at planning time, before any merge: afterwards these rolls read
+    /// as promoted rather than graduated, so the list would come back empty.
+    included: Vec<String>,
+}
+
+/// The steps a promotion will perform, plus the rolls it found nothing to do
+/// for. Named rather than a tuple because both halves are reported to the user.
+struct PromotePlan {
+    steps: Vec<PlannedStep>,
+    skipped: Vec<SkippedRoll>,
+}
+
+/// Plan the single step of a whole-rolling promotion, reusing the existing
+/// subject/body rules so the commit shape on stable is unchanged.
+fn plan_rolling_step(config: &Config, stable_ref: &str) -> Result<PlannedStep> {
+    let repo = &config.repo_root;
+    let rolling = &config.rolling_branch;
+    let stable = &config.stable_branch;
+
+    match classify_merge(repo, rolling, stable_ref)? {
         MergeState::TargetMissing => bail!(target_missing_error(config, stable)),
         MergeState::UnrelatedHistories => {
             bail!("'{}' and '{}' share no common history", rolling, stable)
@@ -892,63 +1326,247 @@ pub(crate) fn promote(config: &Config, dry_run: bool, force: &ForceOpts) -> Resu
         MergeState::Diverged | MergeState::FastForwardable => {}
     }
 
-    let report = run_gates(repo, &config.rolling_to_main_gates, dry_run, force)?;
+    let included = included_rolls(config)?;
+    let (subject, body) = promote_subject_and_body(config, &included);
+    Ok(PlannedStep {
+        roll: None,
+        source: rolling.clone(),
+        subject,
+        body,
+        included,
+    })
+}
 
-    // Host gates block promotion when an active host fails (issue #106), unless
-    // `--force`, in which case each failing host gate is recorded as a bypass in
-    // the merge trailer alongside the route-gate bypasses.
-    let host_report = run_host_gates(config, dry_run, force)?;
-    if !force.enabled {
-        let failed = host_report.failed_hosts();
-        if !failed.is_empty() {
-            bail!("host verification failed: {}", failed.join(", "));
+/// Resolve named rolls into ordered merge steps, plus the rolls that need no
+/// work. Each step merges the roll's *graduation commit on rolling*, not its
+/// branch, which is what keeps stable a prefix of rolling.
+///
+/// Ordering is by position on rolling, oldest first: promoting out of graduation
+/// order is not expressible, since advancing stable to a later graduation
+/// necessarily includes the earlier ones. Sorting rather than rejecting means
+/// `--roll b --roll a` does the sane thing instead of erroring on argument
+/// order.
+fn plan_roll_steps(config: &Config, rolls: &[String], stable_ref: &str) -> Result<PromotePlan> {
+    let repo = &config.repo_root;
+    let stable = &config.stable_branch;
+    let rolling = &config.rolling_branch;
+
+    if rolls.is_empty() {
+        bail!("no rolls named to promote");
+    }
+
+    let known = branches::list_rolls(config)?;
+    let order = rolling_commit_order(config);
+
+    let mut planned: Vec<(usize, PlannedStep)> = Vec::new();
+    let mut skipped = Vec::new();
+    let mut seen = HashSet::new();
+
+    for name in rolls {
+        if !seen.insert(name.clone()) {
+            continue;
+        }
+        let Some(info) = known.iter().find(|r| &r.branch == name) else {
+            bail!(
+                "no such roll: '{name}'. Run `rf list` to see the roll branches roll-flow knows about"
+            );
+        };
+        let Some(graduation) = info.graduation_commit.clone() else {
+            bail!(
+                "'{name}' has not graduated, so there is nothing on '{rolling}' to promote. \
+                 Run `rf graduate` from it first"
+            );
+        };
+        if git::is_ancestor(repo, &graduation, stable_ref).unwrap_or(false) {
+            skipped.push(SkippedRoll {
+                roll: name.clone(),
+                reason: format!("already contained in '{stable}'"),
+            });
+            continue;
+        }
+
+        planned.push((
+            order.get(&graduation).copied().unwrap_or(usize::MAX),
+            PlannedStep {
+                roll: Some(name.clone()),
+                source: graduation,
+                subject: format!("Promote {name} to {stable}"),
+                // Rolls riding along on an earlier graduation are attributed by
+                // reachability (see `scan_promoted`), so the body only needs to
+                // name this step's own roll.
+                body: Some(format!("Rolls:\n  {name}\n")),
+                included: vec![name.clone()],
+            },
+        ));
+    }
+
+    planned.sort_by_key(|(pos, _)| *pos);
+    Ok(PromotePlan {
+        steps: planned.into_iter().map(|(_, step)| step).collect(),
+        skipped,
+    })
+}
+
+/// Map each commit reachable from rolling to its distance from the tip, so
+/// graduation commits can be ordered oldest-first. Commits missing from the map
+/// sort last, which keeps an unexpectedly unreachable graduation from silently
+/// jumping the queue.
+fn rolling_commit_order(config: &Config) -> HashMap<String, usize> {
+    let Some(rolling) = git::resolve_branch(&config.repo_root, &config.rolling_branch) else {
+        return HashMap::new();
+    };
+    let Ok(out) = git::capture_git(&config.repo_root, &["rev-list", "--first-parent", &rolling])
+    else {
+        return HashMap::new();
+    };
+    // rev-list is newest-first, so reversing the index gives oldest-first order.
+    let hashes: Vec<&str> = out.lines().filter(|l| !l.trim().is_empty()).collect();
+    let total = hashes.len();
+    hashes
+        .into_iter()
+        .enumerate()
+        .map(|(i, h)| (h.to_string(), total - i))
+        .collect()
+}
+
+/// Run one planned step: stage the merge, gate the result, commit if it passes.
+fn run_promote_step(
+    config: &Config,
+    stable_ref: &str,
+    step: PlannedStep,
+    dry_run: bool,
+    force: &ForceOpts,
+    tag: bool,
+) -> Result<PromoteStep> {
+    let repo = &config.repo_root;
+    let stable = &config.stable_branch;
+
+    // The version gate runs before the configured gates: it is nearly free, and
+    // failing fast beats failing after a full build. The source is this step's
+    // merge source, and the target is the *resolved* stable ref — which in
+    // dry-run may be `origin/<stable>`, and which for a per-roll promotion has
+    // already been advanced by the steps ahead of this one.
+    let version = version_check(config, &step.source, stable_ref)?;
+    let mut version_bypass = Vec::new();
+    if !version.is_satisfied() {
+        // `--dry-run` previews rather than enforces, exactly as it does for the
+        // configured gates (which are printed, not executed). The rendered
+        // status line still reports that the version would block a real run.
+        if !force.enabled && !dry_run {
+            return Err(version_gate_error(&version, &step.source, stable));
+        }
+        // Under --force the gate is recorded in the merge trailer exactly like a
+        // bypassed shell gate, so the override leaves the same audit trail.
+        if force.enabled {
+            version_bypass.push(GateBypass {
+                gate: format!("version bump check ({} vs {stable})", step.source),
+                code: None,
+            });
         }
     }
 
+    // Gates run against the staged merge result, so `report` is produced inside
+    // `merge_gated`. In dry-run nothing is staged and nothing is merged.
+    let run_checks = || -> Result<(GateReport, HostReport)> {
+        let report = run_gates(repo, &config.rolling_to_main_gates, dry_run, force)?;
+
+        // Host gates block promotion when an active host fails (issue #106),
+        // unless `--force`, in which case each failing host gate is recorded as
+        // a bypass in the merge trailer alongside the route-gate bypasses.
+        let host_report = run_host_gates(config, dry_run, force)?;
+        if !force.enabled {
+            let failed = host_report.failed_hosts();
+            if !failed.is_empty() {
+                bail!("host verification failed: {}", failed.join(", "));
+            }
+        }
+        Ok((report, host_report))
+    };
+
     if dry_run {
-        return Ok(PromoteOutcome {
-            rolling: rolling.clone(),
-            stable: stable.clone(),
-            dry_run: true,
+        let (report, host_report) = run_checks()?;
+        let tag_outcome = match (tag && config.tag_on_promote, version.head) {
+            // The version still has to move, so the eventual tag name is not
+            // knowable here — claiming the current one would be wrong.
+            (true, Some(_)) if !version.is_satisfied() => TagOutcome::WouldCreateAfterBump,
+            (true, Some(v)) => TagOutcome::WouldCreate { tag: v.tag() },
+            _ => TagOutcome::Skipped,
+        };
+        return Ok(PromoteStep {
+            roll: step.roll,
+            source: step.source,
             gate_notices: report.notices,
             host_results: host_report.results,
             host_notices: host_report.notices,
+            version,
+            tag: tag_outcome,
         });
     }
 
-    let mut bypassed = report.bypassed;
-    bypassed.extend(host_report.bypassed);
+    // The force trailer depends on what the gates bypassed, which is only known
+    // after they run — so the body is finalised inside the closure and the
+    // commit message is assembled once the step returns.
+    let (report, host_report) = merge_gated(
+        repo,
+        &step.source,
+        stable_ref,
+        &step.subject,
+        step.body.as_deref(),
+        run_checks,
+    )?;
 
-    let (subject, body) = promote_subject_and_body(config)?;
-    let body = ForceOpts::append_trailer(body, force.trailer(&bypassed));
-    run_merge(repo, rolling, stable, &subject, body.as_deref())?;
-    Ok(PromoteOutcome {
-        rolling: rolling.clone(),
-        stable: stable.clone(),
-        dry_run: false,
+    let mut bypassed = version_bypass;
+    bypassed.extend(report.bypassed);
+    bypassed.extend(host_report.bypassed);
+    if let Some(trailer) = force.trailer(&bypassed) {
+        append_commit_trailer(repo, stable_ref, &trailer)?;
+    }
+
+    // Tag last of all, so it points at the commit the trailer amend produced
+    // rather than the one it replaced.
+    let tag_outcome = tag_release(config, &version, tag, &step.included)?;
+
+    Ok(PromoteStep {
+        roll: step.roll,
+        source: step.source,
         gate_notices: report.notices,
         host_results: host_report.results,
         host_notices: host_report.notices,
+        version,
+        tag: tag_outcome,
     })
+}
+
+/// Append a `Forced-Bypass:` trailer to the tip of `branch_ref` after the fact.
+///
+/// Gates have to run before the commit exists (that is the whole point of
+/// `merge_gated`), but which of them were bypassed is only known once they have
+/// run — so the trailer is amended on rather than passed in. Amending the tip of
+/// stable here is safe: it is the merge this step just created, moments ago, and
+/// nothing else can have advanced it in between.
+fn append_commit_trailer(repo: &Path, branch_ref: &str, trailer: &str) -> Result<()> {
+    let original = git::current_branch(repo)?;
+    git::run_git(repo, &["checkout", branch_ref]).with_context(|| {
+        format!("failed to check out '{branch_ref}' to record the force trailer")
+    })?;
+
+    let existing = git::capture_git(repo, &["log", "-1", "--format=%B"])?;
+    let message = format!("{}\n\n{trailer}\n", existing.trim_end());
+    let amend = git::run_git(repo, &["commit", "--amend", "--no-edit", "-m", &message]);
+
+    git::run_git(repo, &["checkout", &original]).with_context(|| {
+        format!("recorded the force trailer, but checking out '{original}' again failed")
+    })?;
+    amend.with_context(|| format!("failed to record the force trailer on '{branch_ref}'"))?;
+    Ok(())
 }
 
 /// Subject and body for a promotion merge. Exactly one graduated roll included
 /// → subject names it; otherwise a generic subject with the rolls listed in the
 /// body so promoted-state detection can attribute them.
-fn promote_subject_and_body(config: &Config) -> Result<(String, Option<String>)> {
-    let rolls = branches::list_rolls(config)?;
-    let included: Vec<&branches::RollInfo> = rolls
-        .iter()
-        .filter(|r| {
-            matches!(
-                r.state,
-                branches::RollState::Graduated | branches::RollState::Diverged
-            )
-        })
-        .collect();
-
+fn promote_subject_and_body(config: &Config, included: &[String]) -> (String, Option<String>) {
     let subject = if included.len() == 1 {
-        format!("Promote {} to {}", included[0].branch, config.stable_branch)
+        format!("Promote {} to {}", included[0], config.stable_branch)
     } else {
         format!(
             "Promote {} to {}",
@@ -960,13 +1578,13 @@ fn promote_subject_and_body(config: &Config) -> Result<(String, Option<String>)>
         None
     } else {
         let mut body = String::from("Rolls:\n");
-        for roll in &included {
-            body.push_str(&format!("  {}\n", roll.branch));
+        for roll in included {
+            body.push_str(&format!("  {roll}\n"));
         }
         Some(body)
     };
 
-    Ok((subject, body))
+    (subject, body)
 }
 
 // ── update ──────────────────────────────────────────────────────────────────
@@ -1159,6 +1777,159 @@ fn contained_in_stable(repo: &Path, tip: &str, stable_refs: &[String]) -> bool {
         .any(|stable| git::is_ancestor(repo, tip, stable).unwrap_or(false))
 }
 
+/// Repo facts every deletion decision is made against, gathered once.
+///
+/// Building it performs the `git fetch --prune` when the scope touches the
+/// remote, so a caller planning many branches pays for it a single time.
+struct DeletionContext {
+    has_remote: bool,
+    stable_refs: Vec<String>,
+    current: String,
+}
+
+impl DeletionContext {
+    fn build(config: &Config, scope: &PruneScope) -> Result<Self> {
+        let repo = &config.repo_root;
+        let has_remote = git::has_remote(repo, "origin");
+
+        // Refresh first: `rf` is otherwise local-only, so `origin/*` refs can
+        // claim branches that are already gone upstream — or, worse, name a tip
+        // that is no longer the real one, which would judge containment against
+        // stale history and delete commits the check never saw.
+        if scope.remote && has_remote && scope.fetch {
+            git::fetch_prune(repo, "origin")
+                .context("refreshing remote-tracking refs before deleting")?;
+        }
+
+        Ok(DeletionContext {
+            has_remote,
+            stable_refs: stable_containment_refs(config),
+            current: git::current_branch(repo).unwrap_or_default(),
+        })
+    }
+}
+
+/// Why a branch copy was declined. Kept as data rather than a formatted string
+/// so [`decide_copies`] stays pure and its safety table is unit-testable.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SkipReason {
+    /// The local copy is the checked-out branch.
+    CheckedOut,
+    /// The local tip holds commits stable lacks.
+    LocalUncontained,
+    /// The `origin` tip holds commits stable lacks.
+    RemoteUncontained,
+}
+
+/// Which copies a deletion may touch, given facts already gathered from git.
+///
+/// The single implementation of the safety rules, shared by `rf prune` and
+/// `rf delete`. Two of them matter most: the checked-out branch's local copy is
+/// never deletable — that check sits *before* the force check, so `force` cannot
+/// override it — and a copy holding commits stable lacks needs `force`.
+///
+/// Pure, so the whole table is testable without a repo.
+fn decide_copies(
+    scope: &PruneScope,
+    has_local: bool,
+    has_remote_copy: bool,
+    is_current: bool,
+    local_contained: bool,
+    remote_contained: bool,
+) -> (bool, bool, Vec<SkipReason>) {
+    let mut skips = Vec::new();
+    let mut delete_local = false;
+    let mut delete_remote = false;
+
+    if scope.local && has_local {
+        if is_current {
+            skips.push(SkipReason::CheckedOut);
+        } else if scope.force || local_contained {
+            delete_local = true;
+        } else {
+            skips.push(SkipReason::LocalUncontained);
+        }
+    }
+
+    if scope.remote && has_remote_copy {
+        if scope.force || remote_contained {
+            delete_remote = true;
+        } else {
+            skips.push(SkipReason::RemoteUncontained);
+        }
+    }
+
+    (delete_local, delete_remote, skips)
+}
+
+/// Plan the deletion of one branch, appending a reason to `skipped` for every
+/// copy declined. Shared by [`prune_plan`] (once per promoted roll) and
+/// [`delete_branch_plan`] (one explicitly named branch), so the containment and
+/// checked-out rules have exactly one implementation.
+///
+/// Returns `None` when no copy survives the checks — there is nothing to delete.
+fn plan_branch_deletion(
+    config: &Config,
+    branch: &str,
+    number: u32,
+    scope: &PruneScope,
+    ctx: &DeletionContext,
+    skipped: &mut Vec<PruneSkip>,
+) -> Option<PruneCandidate> {
+    let repo = &config.repo_root;
+    let remote_ref = format!("origin/{branch}");
+    let has_local = git::ref_exists(repo, branch);
+    let has_remote_copy = ctx.has_remote && git::ref_exists(repo, &remote_ref);
+
+    // Containment is only asked about copies whose answer could change the
+    // outcome: `is_ancestor` is a subprocess, and `force` or the checked-out
+    // guard already decide those cases without it.
+    let local_contained = has_local
+        && scope.local
+        && !scope.force
+        && branch != ctx.current
+        && contained_in_stable(repo, branch, &ctx.stable_refs);
+    let remote_contained = has_remote_copy
+        && scope.remote
+        && !scope.force
+        && contained_in_stable(repo, &remote_ref, &ctx.stable_refs);
+
+    let (delete_local, delete_remote, skips) = decide_copies(
+        scope,
+        has_local,
+        has_remote_copy,
+        branch == ctx.current,
+        local_contained,
+        remote_contained,
+    );
+
+    for reason in skips {
+        skipped.push(PruneSkip {
+            branch: branch.to_string(),
+            reason: match reason {
+                SkipReason::CheckedOut => {
+                    "checked out — switch away to delete the local copy".to_string()
+                }
+                SkipReason::LocalUncontained => format!(
+                    "local tip has commits not in '{}' — use --force to delete anyway",
+                    config.stable_branch
+                ),
+                SkipReason::RemoteUncontained => format!(
+                    "origin copy has commits not in '{}' — use --force to delete anyway",
+                    config.stable_branch
+                ),
+            },
+        });
+    }
+
+    (delete_local || delete_remote).then(|| PruneCandidate {
+        branch: branch.to_string(),
+        number,
+        delete_local,
+        delete_remote,
+    })
+}
+
 /// Decide what `rf prune` would delete, without deleting anything.
 ///
 /// Promoted state alone is not treated as sufficient authority to delete: it is
@@ -1168,18 +1939,7 @@ fn contained_in_stable(repo: &Path, tip: &str, stable_refs: &[String]) -> bool {
 /// for containment in stable, and anything that fails is skipped with a reason
 /// unless `--force` is given.
 pub(crate) fn prune_plan(config: &Config, scope: &PruneScope) -> Result<PrunePlan> {
-    let repo = &config.repo_root;
-    let has_remote = git::has_remote(repo, "origin");
-
-    // Refresh first: `rf` is otherwise local-only, so `origin/*` refs can claim
-    // branches that are already gone upstream — or miss ones that are not.
-    if scope.remote && has_remote && scope.fetch {
-        git::fetch_prune(repo, "origin")
-            .context("refreshing remote-tracking refs before pruning")?;
-    }
-
-    let stable_refs = stable_containment_refs(config);
-    let current = git::current_branch(repo).unwrap_or_default();
+    let ctx = DeletionContext::build(config, scope)?;
 
     let mut candidates = Vec::new();
     let mut skipped = Vec::new();
@@ -1188,61 +1948,17 @@ pub(crate) fn prune_plan(config: &Config, scope: &PruneScope) -> Result<PrunePla
         if roll.state != branches::RollState::Promoted {
             continue;
         }
-
-        let remote_ref = format!("origin/{}", roll.branch);
-        let has_local_copy = git::ref_exists(repo, &roll.branch);
-        let has_remote_copy = has_remote && git::ref_exists(repo, &remote_ref);
-
-        let mut delete_local = false;
-        let mut delete_remote = false;
-
-        if scope.local && has_local_copy {
-            if roll.branch == current {
-                skipped.push(PruneSkip {
-                    branch: roll.branch.clone(),
-                    reason: "checked out — switch away to prune the local copy".to_string(),
-                });
-            } else if scope.force || contained_in_stable(repo, &roll.branch, &stable_refs) {
-                delete_local = true;
-            } else {
-                skipped.push(PruneSkip {
-                    branch: roll.branch.clone(),
-                    reason: format!(
-                        "local tip has commits not in '{}' — use --force to delete anyway",
-                        config.stable_branch
-                    ),
-                });
-            }
-        }
-
-        if scope.remote && has_remote_copy {
-            if scope.force || contained_in_stable(repo, &remote_ref, &stable_refs) {
-                delete_remote = true;
-            } else {
-                skipped.push(PruneSkip {
-                    branch: roll.branch.clone(),
-                    reason: format!(
-                        "origin copy has commits not in '{}' — use --force to delete anyway",
-                        config.stable_branch
-                    ),
-                });
-            }
-        }
-
-        if delete_local || delete_remote {
-            candidates.push(PruneCandidate {
-                branch: roll.branch,
-                number: roll.number,
-                delete_local,
-                delete_remote,
-            });
+        if let Some(candidate) =
+            plan_branch_deletion(config, &roll.branch, roll.number, scope, &ctx, &mut skipped)
+        {
+            candidates.push(candidate);
         }
     }
 
     Ok(PrunePlan {
         candidates,
         skipped,
-        has_remote,
+        has_remote: ctx.has_remote,
     })
 }
 
@@ -1288,6 +2004,81 @@ pub(crate) fn prune_apply(config: &Config, plan: &PrunePlan) -> Result<Vec<Prune
     }
 
     Ok(results)
+}
+
+/// Plan the deletion of a single named branch — what `rf delete` and the TUI's
+/// `[d]elete` ask for.
+///
+/// Deliberately returns a [`PrunePlan`] so the caller applies it with
+/// [`prune_apply`] and renders the outcome exactly as a prune does: one
+/// execution path to the remote, one result vocabulary, no second way to delete
+/// a branch.
+///
+/// Unlike [`prune_plan`] this does not filter on roll state — the user named
+/// this branch, rather than the tool inferring it from commit subjects, so an
+/// abandoned or never-promoted roll is a legitimate target. Every other rule is
+/// identical: never the checked-out branch's local copy, and never a copy
+/// holding commits stable lacks unless `scope.force`.
+pub(crate) fn delete_branch_plan(
+    config: &Config,
+    branch: &str,
+    scope: &PruneScope,
+) -> Result<PrunePlan> {
+    // The TUI can only reach roll rows, but this function is the safety
+    // boundary and `rf delete` takes an arbitrary string.
+    if branch == config.stable_branch || branch == config.rolling_branch {
+        bail!("refusing to delete '{branch}' — it is a workflow branch, not a roll");
+    }
+
+    let ctx = DeletionContext::build(config, scope)?;
+    let mut skipped = Vec::new();
+    let number = branches::parse_roll_number(branch, &config.roll_prefix).unwrap_or(0);
+
+    let candidates = match plan_branch_deletion(config, branch, number, scope, &ctx, &mut skipped) {
+        Some(candidate) => vec![candidate],
+        None => {
+            // Nothing declined and nothing to delete means no copy resolved.
+            // Report it rather than erroring: a TUI row can be stale, and a
+            // fetch may have just removed the origin copy out from under it.
+            if skipped.is_empty() {
+                skipped.push(PruneSkip {
+                    branch: branch.to_string(),
+                    reason: "no matching branch in the requested scope".to_string(),
+                });
+            }
+            Vec::new()
+        }
+    };
+
+    Ok(PrunePlan {
+        candidates,
+        skipped,
+        has_remote: ctx.has_remote,
+    })
+}
+
+/// Commits each copy of `branch` holds that stable does not, as
+/// `(local, origin)` — what deleting that copy would actually lose.
+///
+/// `None` means the copy does not exist or the count could not be taken; it is
+/// deliberately distinct from `Some(0)` ("exists, loses nothing"), because the
+/// caller uses this to decide whether to *warn*, and an unknown must not read
+/// as safe. Advisory only: the authority to delete is re-derived inside
+/// [`delete_branch_plan`] at apply time.
+pub(crate) fn unmerged_commit_counts(config: &Config, branch: &str) -> (Option<u32>, Option<u32>) {
+    let repo = &config.repo_root;
+    let stable_refs = stable_containment_refs(config);
+    let remote_ref = format!("origin/{branch}");
+
+    let count = |tip: &str| git::commits_not_in(repo, tip, &stable_refs).ok();
+
+    let local = git::ref_exists(repo, branch)
+        .then(|| count(branch))
+        .flatten();
+    let remote = git::ref_exists(repo, &remote_ref)
+        .then(|| count(&remote_ref))
+        .flatten();
+    (local, remote)
 }
 
 // ── promotion readiness (status --json) ─────────────────────────────────────
@@ -1385,5 +2176,91 @@ pub(crate) fn promotion_readiness(
             reason: None,
         },
         Err(err) => not_ready(description, err.to_string()),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{decide_copies, PruneScope, SkipReason};
+
+    /// A scope covering both copies, with `force` under test.
+    fn both(force: bool) -> PruneScope {
+        PruneScope {
+            local: true,
+            remote: true,
+            force,
+            fetch: false,
+        }
+    }
+
+    #[test]
+    fn deletes_both_copies_when_contained() {
+        let (local, remote, skips) = decide_copies(&both(false), true, true, false, true, true);
+        assert!(local && remote);
+        assert!(skips.is_empty(), "nothing to explain: {skips:?}");
+    }
+
+    #[test]
+    fn uncontained_copies_need_force() {
+        let (local, remote, skips) = decide_copies(&both(false), true, true, false, false, false);
+        assert!(!local && !remote, "neither copy is safe without force");
+        assert_eq!(
+            skips,
+            vec![SkipReason::LocalUncontained, SkipReason::RemoteUncontained]
+        );
+
+        let (local, remote, skips) = decide_copies(&both(true), true, true, false, false, false);
+        assert!(local && remote, "force is the documented override");
+        assert!(skips.is_empty());
+    }
+
+    #[test]
+    fn force_never_deletes_the_checked_out_local_copy() {
+        // The load-bearing rule: the checked-out guard sits ahead of the force
+        // check, so `--force` cannot reach past it. Origin is still fair game.
+        for force in [false, true] {
+            let (local, remote, skips) = decide_copies(&both(force), true, true, true, true, true);
+            assert!(!local, "checked-out local copy must survive force={force}");
+            assert!(remote, "the origin copy is not checked out anywhere");
+            assert_eq!(skips, vec![SkipReason::CheckedOut]);
+        }
+    }
+
+    #[test]
+    fn a_copy_that_does_not_exist_is_neither_deleted_nor_skipped() {
+        let (local, remote, skips) = decide_copies(&both(false), false, true, false, false, true);
+        assert!(!local && remote);
+        assert!(
+            skips.is_empty(),
+            "a missing copy is not a refusal to explain: {skips:?}"
+        );
+    }
+
+    #[test]
+    fn scope_flags_exclude_a_copy_entirely() {
+        let local_only = PruneScope {
+            local: true,
+            remote: false,
+            force: false,
+            fetch: false,
+        };
+        // The origin copy is uncontained, but out of scope — so it is neither
+        // deleted nor reported, rather than surfacing a confusing refusal.
+        let (local, remote, skips) = decide_copies(&local_only, true, true, false, true, false);
+        assert!(local && !remote);
+        assert!(skips.is_empty(), "{skips:?}");
+
+        let remote_only = PruneScope {
+            local: false,
+            remote: true,
+            force: false,
+            fetch: false,
+        };
+        let (local, remote, skips) = decide_copies(&remote_only, true, true, true, true, true);
+        assert!(!local && remote);
+        assert!(
+            skips.is_empty(),
+            "the checked-out local copy is out of scope, not refused: {skips:?}"
+        );
     }
 }
