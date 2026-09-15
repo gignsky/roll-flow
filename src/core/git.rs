@@ -132,14 +132,142 @@ pub fn remote_branches(repo: &Path, pattern: &str) -> Result<Vec<String>, RfErro
         .collect())
 }
 
+/// Every configured remote, in git's own order.
+pub fn remotes(repo: &Path) -> Result<Vec<String>, RfError> {
+    let out = capture_git(repo, &["remote"])?;
+    Ok(out
+        .lines()
+        .map(|l| l.trim().to_string())
+        .filter(|l| !l.is_empty())
+        .collect())
+}
+
 /// True if a remote named `name` is configured.
 ///
 /// [`remote_branches`] silently yields nothing for a repo without a remote, so
 /// callers that need to distinguish "no remote" from "no matching branches" —
 /// like `rf prune` — must ask separately.
 pub fn has_remote(repo: &Path, name: &str) -> bool {
-    capture_git(repo, &["remote"])
-        .map(|out| out.lines().any(|l| l.trim() == name))
+    remotes(repo)
+        .map(|rs| rs.iter().any(|r| r == name))
+        .unwrap_or(false)
+}
+
+/// Remote-tracking ref names under one remote, e.g. `"origin/main"`.
+///
+/// Unlike [`remote_branches`] this keeps the `<remote>/` prefix and takes no
+/// pattern: `rf clean` diffs the full set before and after a prune to report
+/// exactly which stale refs were dropped, without parsing git's human-readable
+/// fetch output.
+pub fn remote_tracking_refs(repo: &Path, remote: &str) -> Result<Vec<String>, RfError> {
+    let pattern = format!("refs/remotes/{remote}/");
+    let out = capture_git(
+        repo,
+        &["for-each-ref", "--format=%(refname:short)", &pattern],
+    )?;
+    Ok(out
+        .lines()
+        .map(|l| l.trim().to_string())
+        .filter(|l| !l.is_empty() && !l.ends_with("/HEAD"))
+        .collect())
+}
+
+/// The branch `<remote>/HEAD` points at (e.g. `"main"`), or `None` when unset.
+///
+/// This is the remote's own idea of its default branch, and the most reliable
+/// base for containment checks in a repo `rf` knows nothing else about. It is
+/// only set when the clone recorded it (or `git remote set-head` was run), so
+/// callers must have a fallback.
+pub fn remote_head_branch(repo: &Path, remote: &str) -> Option<String> {
+    let refspec = format!("refs/remotes/{remote}/HEAD");
+    let out = capture_git(repo, &["symbolic-ref", "--quiet", "--short", &refspec]).ok()?;
+    let prefix = format!("{remote}/");
+    out.strip_prefix(&prefix).map(ToString::to_string)
+}
+
+/// One local branch, as a single `for-each-ref` reports it.
+///
+/// Gathering tracking state and worktree occupancy together matters: `rf clean`
+/// needs both for every branch, and asking per-branch would be one subprocess
+/// each.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LocalBranch {
+    /// `%(refname:short)`.
+    pub name: String,
+    /// `%(upstream:short)`, e.g. `"origin/main"`. Empty when none is configured.
+    pub upstream: String,
+    /// `%(upstream:remotename)`, e.g. `"origin"`. Empty when no upstream.
+    pub remote_name: String,
+    /// `%(upstream:track,nobracket)`: `"gone"` once the upstream is deleted,
+    /// `"ahead 2"` / `"behind 1"` / `"ahead 1, behind 3"` when diverged, and
+    /// empty both when in sync *and* when there is no upstream at all.
+    pub track: String,
+    /// `%(worktreepath)`: the worktree this branch is checked out in, empty when
+    /// it is checked out nowhere. Populated for the main worktree too.
+    pub worktree: String,
+}
+
+impl LocalBranch {
+    /// True when the branch tracks an upstream that no longer exists.
+    ///
+    /// Only meaningful after a `--prune` fetch: git reports `gone` from the
+    /// absence of the remote-tracking ref, which a stale cache still provides.
+    pub fn upstream_gone(&self) -> bool {
+        !self.upstream.is_empty() && matches!(self.track.trim(), "gone" | "[gone]")
+    }
+
+    /// True when some worktree has this branch checked out.
+    pub fn is_checked_out(&self) -> bool {
+        !self.worktree.is_empty()
+    }
+}
+
+/// Field separator for [`local_branch_details`]. Tab is safe: git refnames
+/// forbid ASCII control characters, so only the trailing path could contain one.
+const FIELD_SEP: char = '\t';
+
+/// Every local branch with its tracking and worktree state, in one git call.
+pub fn local_branch_details(repo: &Path) -> Result<Vec<LocalBranch>, RfError> {
+    const FORMAT: &str = concat!(
+        "--format=%(refname:short)\t",
+        "%(upstream:short)\t",
+        "%(upstream:remotename)\t",
+        "%(upstream:track,nobracket)\t",
+        "%(worktreepath)",
+    );
+    let out = capture_git(repo, &["for-each-ref", FORMAT, "refs/heads/"])?;
+    Ok(out.lines().filter_map(parse_local_branch_line).collect())
+}
+
+/// Parse one `--format` line from [`local_branch_details`].
+///
+/// `worktreepath` is last and taken as the remainder: it is a filesystem path
+/// and so is the one field that could itself contain a tab. Pure, so the field
+/// handling is unit-testable without a repo.
+pub fn parse_local_branch_line(line: &str) -> Option<LocalBranch> {
+    let mut fields = line.splitn(5, FIELD_SEP);
+    let name = fields.next()?.trim().to_string();
+    if name.is_empty() {
+        return None;
+    }
+    Some(LocalBranch {
+        name,
+        upstream: fields.next().unwrap_or_default().trim().to_string(),
+        remote_name: fields.next().unwrap_or_default().trim().to_string(),
+        track: fields.next().unwrap_or_default().trim().to_string(),
+        // Not trimmed: a path may legitimately end in whitespace, and only
+        // emptiness is ever asked of it.
+        worktree: fields.next().unwrap_or_default().to_string(),
+    })
+}
+
+/// True when the repository has truncated history.
+///
+/// Merge detection walks ancestry, so a shallow clone can report a branch as
+/// uncontained when the connecting commits simply were not fetched.
+pub fn is_shallow(repo: &Path) -> bool {
+    capture_git(repo, &["rev-parse", "--is-shallow-repository"])
+        .map(|out| out.trim() == "true")
         .unwrap_or(false)
 }
 
@@ -152,6 +280,17 @@ pub fn has_remote(repo: &Path, name: &str) -> bool {
 /// that act on the remote call this first so they act on current data.
 pub fn fetch_prune(repo: &Path, remote: &str) -> Result<(), RfError> {
     run_git(repo, &["fetch", "--prune", remote])
+}
+
+/// [`fetch_prune`], with git's own output captured rather than inherited.
+///
+/// `fetch_prune` shells through `run_git`, which inherits stdio, so git prints
+/// its ` - [deleted] … -> origin/x` table straight to the terminal. `rf clean`
+/// prunes every remote and reports the dropped refs itself — by diffing
+/// [`remote_tracking_refs`] across the call — so git's version would be both
+/// duplicated and inconsistently formatted.
+pub fn fetch_prune_quiet(repo: &Path, remote: &str) -> Result<(), RfError> {
+    capture_git(repo, &["fetch", "--prune", "--quiet", remote]).map(|_| ())
 }
 
 /// Delete a local branch, unconditionally (`git branch -D`).
@@ -249,6 +388,19 @@ pub fn rev_parse(repo: &Path, refspec: &str) -> Result<String, RfError> {
     capture_git(repo, &["rev-parse", refspec])
 }
 
+/// How many commits are reachable from `tip` but from none of `refs`.
+///
+/// Zero means `tip` is fully contained. Used to quantify what a forced
+/// deletion would discard, so the cost is stated before the branch goes.
+pub fn commits_not_in(repo: &Path, tip: &str, refs: &[String]) -> Result<u32, RfError> {
+    let mut args = vec!["rev-list", "--count", tip, "--not"];
+    args.extend(refs.iter().map(String::as_str));
+    let out = capture_git(repo, &args)?;
+    out.trim()
+        .parse()
+        .map_err(|_| RfError::Git(format!("could not parse commit count from {out:?}")))
+}
+
 /// Commits `branch` is ahead of / behind `origin/<branch>`, as `(ahead, behind)`.
 ///
 /// `git rev-list --left-right --count <branch>...origin/<branch>` prints two
@@ -274,7 +426,10 @@ pub fn parse_ahead_behind(out: &str) -> Option<(u32, u32)> {
 
 #[cfg(test)]
 mod tests {
-    use super::{ahead_behind, parse_ahead_behind};
+    use super::{
+        ahead_behind, local_branch_details, parse_ahead_behind, parse_local_branch_line,
+        remote_head_branch, remote_tracking_refs, remotes,
+    };
     use std::path::Path;
     use std::process::Command;
 
@@ -337,5 +492,137 @@ mod tests {
         assert_eq!(parse_ahead_behind(""), None);
         assert_eq!(parse_ahead_behind("7"), None);
         assert_eq!(parse_ahead_behind("a\tb"), None);
+    }
+
+    // ── Branch detail parsing ─────────────────────────────────────────────────
+
+    #[test]
+    fn parses_a_branch_with_no_upstream() {
+        let b = parse_local_branch_line("feature/x\t\t\t\t").expect("parse");
+        assert_eq!(b.name, "feature/x");
+        assert!(b.upstream.is_empty());
+        assert!(b.remote_name.is_empty());
+        assert!(b.track.is_empty());
+        assert!(!b.is_checked_out());
+        // An empty `track` must not read as "gone" when there is no upstream at
+        // all — that is the difference between "never pushed" and "deleted
+        // upstream", and only the latter is safe to treat as cleanup material.
+        assert!(!b.upstream_gone());
+    }
+
+    #[test]
+    fn parses_a_gone_upstream() {
+        let b =
+            parse_local_branch_line("roll/101\torigin/roll/101\torigin\tgone\t").expect("parse");
+        assert_eq!(b.remote_name, "origin");
+        assert!(b.upstream_gone());
+    }
+
+    #[test]
+    fn parses_a_bracketed_gone_upstream() {
+        // Defensive: `nobracket` yields bare `gone`, but accept the bracketed
+        // form too rather than silently classifying the branch as in-sync.
+        let b = parse_local_branch_line("x\torigin/x\torigin\t[gone]\t").expect("parse");
+        assert!(b.upstream_gone());
+    }
+
+    #[test]
+    fn parses_a_diverged_branch_as_not_gone() {
+        let b = parse_local_branch_line("main\torigin/main\torigin\tahead 5\t").expect("parse");
+        assert_eq!(b.track, "ahead 5");
+        assert!(!b.upstream_gone());
+    }
+
+    #[test]
+    fn parses_a_worktree_path_containing_a_tab() {
+        // The path is the final field precisely so an embedded tab cannot shift
+        // the tracking columns.
+        let b = parse_local_branch_line("x\torigin/x\torigin\t\t/tmp/od\td/wt").expect("parse");
+        assert_eq!(b.track, "");
+        assert_eq!(b.worktree, "/tmp/od\td/wt");
+        assert!(b.is_checked_out());
+    }
+
+    #[test]
+    fn skips_blank_lines() {
+        assert!(parse_local_branch_line("").is_none());
+        assert!(parse_local_branch_line("\t\t\t\t").is_none());
+    }
+
+    // ── Branch details against a real repo ────────────────────────────────────
+
+    #[test]
+    fn reports_gone_upstream_after_a_pruning_fetch() {
+        let remote = tempfile::tempdir().expect("remote dir");
+        let local = tempfile::tempdir().expect("local dir");
+        let (rp, lp) = (remote.path(), local.path());
+
+        git(rp, &["init", "-b", "main", "--bare"]);
+        git(lp, &["clone", rp.to_str().unwrap(), "."]);
+        git(lp, &["config", "user.email", "t@e.test"]);
+        git(lp, &["config", "user.name", "t"]);
+        git(lp, &["commit", "--allow-empty", "-m", "init"]);
+        git(lp, &["push", "-u", "origin", "main"]);
+        git(lp, &["switch", "-c", "roll/101"]);
+        git(lp, &["commit", "--allow-empty", "-m", "work"]);
+        git(lp, &["push", "-u", "origin", "roll/101"]);
+        git(lp, &["switch", "main"]);
+
+        // Another host merges and deletes the branch upstream.
+        git(rp, &["branch", "-D", "roll/101"]);
+
+        // Before the prune the stale remote-tracking ref still answers for it,
+        // so git reports the branch as in sync. This is exactly what makes a
+        // detect-then-prune ordering wrong.
+        let before = local_branch_details(lp).expect("details");
+        let roll = before.iter().find(|b| b.name == "roll/101").expect("roll");
+        assert!(!roll.upstream_gone(), "stale ref should still look in-sync");
+
+        git(lp, &["fetch", "--prune", "origin"]);
+
+        let after = local_branch_details(lp).expect("details");
+        let roll = after.iter().find(|b| b.name == "roll/101").expect("roll");
+        assert!(roll.upstream_gone(), "upstream should be gone after prune");
+        assert_eq!(roll.remote_name, "origin");
+
+        // `main` is checked out here, `roll/101` is not.
+        let main = after.iter().find(|b| b.name == "main").expect("main");
+        assert!(main.is_checked_out());
+        assert!(!roll.is_checked_out());
+    }
+
+    #[test]
+    fn lists_remotes_and_their_tracking_refs() {
+        let remote = tempfile::tempdir().expect("remote dir");
+        let local = tempfile::tempdir().expect("local dir");
+        let (rp, lp) = (remote.path(), local.path());
+
+        git(rp, &["init", "-b", "main", "--bare"]);
+        git(lp, &["clone", rp.to_str().unwrap(), "."]);
+        git(lp, &["config", "user.email", "t@e.test"]);
+        git(lp, &["config", "user.name", "t"]);
+        git(lp, &["commit", "--allow-empty", "-m", "init"]);
+        git(lp, &["push", "-u", "origin", "main"]);
+
+        assert_eq!(remotes(lp).expect("remotes"), vec!["origin".to_string()]);
+
+        let refs = remote_tracking_refs(lp, "origin").expect("refs");
+        assert!(refs.contains(&"origin/main".to_string()));
+        // The `origin/HEAD` symref is not a branch and must not be offered as
+        // one to the prune diff.
+        assert!(!refs.iter().any(|r| r.ends_with("/HEAD")));
+
+        // A fresh `git clone` records origin/HEAD; assert only when present so
+        // this does not depend on the git version's clone behavior.
+        if let Some(head) = remote_head_branch(lp, "origin") {
+            assert_eq!(head, "main");
+        }
+    }
+
+    #[test]
+    fn reports_no_remotes_for_a_bare_local_repo() {
+        let dir = tempfile::tempdir().expect("dir");
+        git(dir.path(), &["init", "-b", "main"]);
+        assert!(remotes(dir.path()).expect("remotes").is_empty());
     }
 }
