@@ -1159,6 +1159,159 @@ fn contained_in_stable(repo: &Path, tip: &str, stable_refs: &[String]) -> bool {
         .any(|stable| git::is_ancestor(repo, tip, stable).unwrap_or(false))
 }
 
+/// Repo facts every deletion decision is made against, gathered once.
+///
+/// Building it performs the `git fetch --prune` when the scope touches the
+/// remote, so a caller planning many branches pays for it a single time.
+struct DeletionContext {
+    has_remote: bool,
+    stable_refs: Vec<String>,
+    current: String,
+}
+
+impl DeletionContext {
+    fn build(config: &Config, scope: &PruneScope) -> Result<Self> {
+        let repo = &config.repo_root;
+        let has_remote = git::has_remote(repo, "origin");
+
+        // Refresh first: `rf` is otherwise local-only, so `origin/*` refs can
+        // claim branches that are already gone upstream — or, worse, name a tip
+        // that is no longer the real one, which would judge containment against
+        // stale history and delete commits the check never saw.
+        if scope.remote && has_remote && scope.fetch {
+            git::fetch_prune(repo, "origin")
+                .context("refreshing remote-tracking refs before deleting")?;
+        }
+
+        Ok(DeletionContext {
+            has_remote,
+            stable_refs: stable_containment_refs(config),
+            current: git::current_branch(repo).unwrap_or_default(),
+        })
+    }
+}
+
+/// Why a branch copy was declined. Kept as data rather than a formatted string
+/// so [`decide_copies`] stays pure and its safety table is unit-testable.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SkipReason {
+    /// The local copy is the checked-out branch.
+    CheckedOut,
+    /// The local tip holds commits stable lacks.
+    LocalUncontained,
+    /// The `origin` tip holds commits stable lacks.
+    RemoteUncontained,
+}
+
+/// Which copies a deletion may touch, given facts already gathered from git.
+///
+/// The single implementation of the safety rules, shared by `rf prune` and
+/// `rf delete`. Two of them matter most: the checked-out branch's local copy is
+/// never deletable — that check sits *before* the force check, so `force` cannot
+/// override it — and a copy holding commits stable lacks needs `force`.
+///
+/// Pure, so the whole table is testable without a repo.
+fn decide_copies(
+    scope: &PruneScope,
+    has_local: bool,
+    has_remote_copy: bool,
+    is_current: bool,
+    local_contained: bool,
+    remote_contained: bool,
+) -> (bool, bool, Vec<SkipReason>) {
+    let mut skips = Vec::new();
+    let mut delete_local = false;
+    let mut delete_remote = false;
+
+    if scope.local && has_local {
+        if is_current {
+            skips.push(SkipReason::CheckedOut);
+        } else if scope.force || local_contained {
+            delete_local = true;
+        } else {
+            skips.push(SkipReason::LocalUncontained);
+        }
+    }
+
+    if scope.remote && has_remote_copy {
+        if scope.force || remote_contained {
+            delete_remote = true;
+        } else {
+            skips.push(SkipReason::RemoteUncontained);
+        }
+    }
+
+    (delete_local, delete_remote, skips)
+}
+
+/// Plan the deletion of one branch, appending a reason to `skipped` for every
+/// copy declined. Shared by [`prune_plan`] (once per promoted roll) and
+/// [`delete_branch_plan`] (one explicitly named branch), so the containment and
+/// checked-out rules have exactly one implementation.
+///
+/// Returns `None` when no copy survives the checks — there is nothing to delete.
+fn plan_branch_deletion(
+    config: &Config,
+    branch: &str,
+    number: u32,
+    scope: &PruneScope,
+    ctx: &DeletionContext,
+    skipped: &mut Vec<PruneSkip>,
+) -> Option<PruneCandidate> {
+    let repo = &config.repo_root;
+    let remote_ref = format!("origin/{branch}");
+    let has_local = git::ref_exists(repo, branch);
+    let has_remote_copy = ctx.has_remote && git::ref_exists(repo, &remote_ref);
+
+    // Containment is only asked about copies whose answer could change the
+    // outcome: `is_ancestor` is a subprocess, and `force` or the checked-out
+    // guard already decide those cases without it.
+    let local_contained = has_local
+        && scope.local
+        && !scope.force
+        && branch != ctx.current
+        && contained_in_stable(repo, branch, &ctx.stable_refs);
+    let remote_contained = has_remote_copy
+        && scope.remote
+        && !scope.force
+        && contained_in_stable(repo, &remote_ref, &ctx.stable_refs);
+
+    let (delete_local, delete_remote, skips) = decide_copies(
+        scope,
+        has_local,
+        has_remote_copy,
+        branch == ctx.current,
+        local_contained,
+        remote_contained,
+    );
+
+    for reason in skips {
+        skipped.push(PruneSkip {
+            branch: branch.to_string(),
+            reason: match reason {
+                SkipReason::CheckedOut => {
+                    "checked out — switch away to delete the local copy".to_string()
+                }
+                SkipReason::LocalUncontained => format!(
+                    "local tip has commits not in '{}' — use --force to delete anyway",
+                    config.stable_branch
+                ),
+                SkipReason::RemoteUncontained => format!(
+                    "origin copy has commits not in '{}' — use --force to delete anyway",
+                    config.stable_branch
+                ),
+            },
+        });
+    }
+
+    (delete_local || delete_remote).then(|| PruneCandidate {
+        branch: branch.to_string(),
+        number,
+        delete_local,
+        delete_remote,
+    })
+}
+
 /// Decide what `rf prune` would delete, without deleting anything.
 ///
 /// Promoted state alone is not treated as sufficient authority to delete: it is
@@ -1168,18 +1321,7 @@ fn contained_in_stable(repo: &Path, tip: &str, stable_refs: &[String]) -> bool {
 /// for containment in stable, and anything that fails is skipped with a reason
 /// unless `--force` is given.
 pub(crate) fn prune_plan(config: &Config, scope: &PruneScope) -> Result<PrunePlan> {
-    let repo = &config.repo_root;
-    let has_remote = git::has_remote(repo, "origin");
-
-    // Refresh first: `rf` is otherwise local-only, so `origin/*` refs can claim
-    // branches that are already gone upstream — or miss ones that are not.
-    if scope.remote && has_remote && scope.fetch {
-        git::fetch_prune(repo, "origin")
-            .context("refreshing remote-tracking refs before pruning")?;
-    }
-
-    let stable_refs = stable_containment_refs(config);
-    let current = git::current_branch(repo).unwrap_or_default();
+    let ctx = DeletionContext::build(config, scope)?;
 
     let mut candidates = Vec::new();
     let mut skipped = Vec::new();
@@ -1188,61 +1330,17 @@ pub(crate) fn prune_plan(config: &Config, scope: &PruneScope) -> Result<PrunePla
         if roll.state != branches::RollState::Promoted {
             continue;
         }
-
-        let remote_ref = format!("origin/{}", roll.branch);
-        let has_local_copy = git::ref_exists(repo, &roll.branch);
-        let has_remote_copy = has_remote && git::ref_exists(repo, &remote_ref);
-
-        let mut delete_local = false;
-        let mut delete_remote = false;
-
-        if scope.local && has_local_copy {
-            if roll.branch == current {
-                skipped.push(PruneSkip {
-                    branch: roll.branch.clone(),
-                    reason: "checked out — switch away to prune the local copy".to_string(),
-                });
-            } else if scope.force || contained_in_stable(repo, &roll.branch, &stable_refs) {
-                delete_local = true;
-            } else {
-                skipped.push(PruneSkip {
-                    branch: roll.branch.clone(),
-                    reason: format!(
-                        "local tip has commits not in '{}' — use --force to delete anyway",
-                        config.stable_branch
-                    ),
-                });
-            }
-        }
-
-        if scope.remote && has_remote_copy {
-            if scope.force || contained_in_stable(repo, &remote_ref, &stable_refs) {
-                delete_remote = true;
-            } else {
-                skipped.push(PruneSkip {
-                    branch: roll.branch.clone(),
-                    reason: format!(
-                        "origin copy has commits not in '{}' — use --force to delete anyway",
-                        config.stable_branch
-                    ),
-                });
-            }
-        }
-
-        if delete_local || delete_remote {
-            candidates.push(PruneCandidate {
-                branch: roll.branch,
-                number: roll.number,
-                delete_local,
-                delete_remote,
-            });
+        if let Some(candidate) =
+            plan_branch_deletion(config, &roll.branch, roll.number, scope, &ctx, &mut skipped)
+        {
+            candidates.push(candidate);
         }
     }
 
     Ok(PrunePlan {
         candidates,
         skipped,
-        has_remote,
+        has_remote: ctx.has_remote,
     })
 }
 
@@ -1288,6 +1386,81 @@ pub(crate) fn prune_apply(config: &Config, plan: &PrunePlan) -> Result<Vec<Prune
     }
 
     Ok(results)
+}
+
+/// Plan the deletion of a single named branch — what `rf delete` and the TUI's
+/// `[d]elete` ask for.
+///
+/// Deliberately returns a [`PrunePlan`] so the caller applies it with
+/// [`prune_apply`] and renders the outcome exactly as a prune does: one
+/// execution path to the remote, one result vocabulary, no second way to delete
+/// a branch.
+///
+/// Unlike [`prune_plan`] this does not filter on roll state — the user named
+/// this branch, rather than the tool inferring it from commit subjects, so an
+/// abandoned or never-promoted roll is a legitimate target. Every other rule is
+/// identical: never the checked-out branch's local copy, and never a copy
+/// holding commits stable lacks unless `scope.force`.
+pub(crate) fn delete_branch_plan(
+    config: &Config,
+    branch: &str,
+    scope: &PruneScope,
+) -> Result<PrunePlan> {
+    // The TUI can only reach roll rows, but this function is the safety
+    // boundary and `rf delete` takes an arbitrary string.
+    if branch == config.stable_branch || branch == config.rolling_branch {
+        bail!("refusing to delete '{branch}' — it is a workflow branch, not a roll");
+    }
+
+    let ctx = DeletionContext::build(config, scope)?;
+    let mut skipped = Vec::new();
+    let number = branches::parse_roll_number(branch, &config.roll_prefix).unwrap_or(0);
+
+    let candidates = match plan_branch_deletion(config, branch, number, scope, &ctx, &mut skipped) {
+        Some(candidate) => vec![candidate],
+        None => {
+            // Nothing declined and nothing to delete means no copy resolved.
+            // Report it rather than erroring: a TUI row can be stale, and a
+            // fetch may have just removed the origin copy out from under it.
+            if skipped.is_empty() {
+                skipped.push(PruneSkip {
+                    branch: branch.to_string(),
+                    reason: "no matching branch in the requested scope".to_string(),
+                });
+            }
+            Vec::new()
+        }
+    };
+
+    Ok(PrunePlan {
+        candidates,
+        skipped,
+        has_remote: ctx.has_remote,
+    })
+}
+
+/// Commits each copy of `branch` holds that stable does not, as
+/// `(local, origin)` — what deleting that copy would actually lose.
+///
+/// `None` means the copy does not exist or the count could not be taken; it is
+/// deliberately distinct from `Some(0)` ("exists, loses nothing"), because the
+/// caller uses this to decide whether to *warn*, and an unknown must not read
+/// as safe. Advisory only: the authority to delete is re-derived inside
+/// [`delete_branch_plan`] at apply time.
+pub(crate) fn unmerged_commit_counts(config: &Config, branch: &str) -> (Option<u32>, Option<u32>) {
+    let repo = &config.repo_root;
+    let stable_refs = stable_containment_refs(config);
+    let remote_ref = format!("origin/{branch}");
+
+    let count = |tip: &str| git::commits_not_in(repo, tip, &stable_refs).ok();
+
+    let local = git::ref_exists(repo, branch)
+        .then(|| count(branch))
+        .flatten();
+    let remote = git::ref_exists(repo, &remote_ref)
+        .then(|| count(&remote_ref))
+        .flatten();
+    (local, remote)
 }
 
 // ── promotion readiness (status --json) ─────────────────────────────────────
@@ -1385,5 +1558,91 @@ pub(crate) fn promotion_readiness(
             reason: None,
         },
         Err(err) => not_ready(description, err.to_string()),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{decide_copies, PruneScope, SkipReason};
+
+    /// A scope covering both copies, with `force` under test.
+    fn both(force: bool) -> PruneScope {
+        PruneScope {
+            local: true,
+            remote: true,
+            force,
+            fetch: false,
+        }
+    }
+
+    #[test]
+    fn deletes_both_copies_when_contained() {
+        let (local, remote, skips) = decide_copies(&both(false), true, true, false, true, true);
+        assert!(local && remote);
+        assert!(skips.is_empty(), "nothing to explain: {skips:?}");
+    }
+
+    #[test]
+    fn uncontained_copies_need_force() {
+        let (local, remote, skips) = decide_copies(&both(false), true, true, false, false, false);
+        assert!(!local && !remote, "neither copy is safe without force");
+        assert_eq!(
+            skips,
+            vec![SkipReason::LocalUncontained, SkipReason::RemoteUncontained]
+        );
+
+        let (local, remote, skips) = decide_copies(&both(true), true, true, false, false, false);
+        assert!(local && remote, "force is the documented override");
+        assert!(skips.is_empty());
+    }
+
+    #[test]
+    fn force_never_deletes_the_checked_out_local_copy() {
+        // The load-bearing rule: the checked-out guard sits ahead of the force
+        // check, so `--force` cannot reach past it. Origin is still fair game.
+        for force in [false, true] {
+            let (local, remote, skips) = decide_copies(&both(force), true, true, true, true, true);
+            assert!(!local, "checked-out local copy must survive force={force}");
+            assert!(remote, "the origin copy is not checked out anywhere");
+            assert_eq!(skips, vec![SkipReason::CheckedOut]);
+        }
+    }
+
+    #[test]
+    fn a_copy_that_does_not_exist_is_neither_deleted_nor_skipped() {
+        let (local, remote, skips) = decide_copies(&both(false), false, true, false, false, true);
+        assert!(!local && remote);
+        assert!(
+            skips.is_empty(),
+            "a missing copy is not a refusal to explain: {skips:?}"
+        );
+    }
+
+    #[test]
+    fn scope_flags_exclude_a_copy_entirely() {
+        let local_only = PruneScope {
+            local: true,
+            remote: false,
+            force: false,
+            fetch: false,
+        };
+        // The origin copy is uncontained, but out of scope — so it is neither
+        // deleted nor reported, rather than surfacing a confusing refusal.
+        let (local, remote, skips) = decide_copies(&local_only, true, true, false, true, false);
+        assert!(local && !remote);
+        assert!(skips.is_empty(), "{skips:?}");
+
+        let remote_only = PruneScope {
+            local: false,
+            remote: true,
+            force: false,
+            fetch: false,
+        };
+        let (local, remote, skips) = decide_copies(&remote_only, true, true, true, true, true);
+        assert!(!local && remote);
+        assert!(
+            skips.is_empty(),
+            "the checked-out local copy is out of scope, not refused: {skips:?}"
+        );
     }
 }
