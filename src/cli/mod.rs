@@ -153,6 +153,34 @@ pub enum Cmd {
         no_fetch: bool,
     },
 
+    /// Delete a single roll branch locally, on origin, or both.
+    ///
+    /// Unlike `prune` this does not require the roll to be promoted — the
+    /// branch is named explicitly. Copies holding commits the stable branch
+    /// lacks still need `--force`, and the checked-out branch is never deleted.
+    Delete {
+        /// The roll branch to delete.
+        branch: String,
+        #[arg(long)]
+        dry_run: bool,
+        /// Delete only the local branch, leaving origin untouched.
+        #[arg(long, conflicts_with = "remote")]
+        local: bool,
+        /// Delete only the branch on origin, leaving the local one untouched.
+        #[arg(long, conflicts_with = "local")]
+        remote: bool,
+        /// Delete without prompting for confirmation.
+        #[arg(long)]
+        yes: bool,
+        /// Delete even when the branch has commits not contained in the stable
+        /// branch.
+        #[arg(long)]
+        force: bool,
+        /// Skip the `git fetch --prune origin` refresh that precedes planning.
+        #[arg(long)]
+        no_fetch: bool,
+    },
+
     /// Print program version.
     Version,
 }

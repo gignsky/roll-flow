@@ -252,9 +252,22 @@ cargo run -- list --no-tui
   subjects on stable, which does not prove a given branch tip is fully contained —
   so `rf prune` additionally requires the tip to be an ancestor of the stable branch
   or of `origin/<stable>`, and `--force` is the only override. Never delete the
-  checked-out branch.
-- `rf prune` is the only command that writes to the remote (`git push --delete`) or
-  fetches. Everything else is local-only; keep it that way.
+  checked-out branch — that guard sits ahead of the force check and is not an
+  override target.
+- `rf delete <branch>` and the TUI's `[d]` are the one place a *non-promoted* branch
+  may be deleted, because the user named it explicitly rather than the tool inferring
+  it from commit subjects. Every other rule is unchanged: an uncontained copy still
+  needs `force`, and in the TUI that means a second, separate confirmation stating how
+  many commits would be lost. That confirmation is the only thing that sets `force`.
+- All branch deletion goes through `ops::decide_copies` → `plan_branch_deletion` →
+  `prune_apply`. There is deliberately one implementation of the safety rules and one
+  path to the remote; do not add a second way to delete a branch.
+- Writing to the remote (`git push --delete`) happens in exactly two places: `rf prune`
+  and `rf delete` (including the TUI's `[d]`). Both `git fetch --prune` before planning
+  a remote delete, so containment is never judged against a stale ref — a stale one
+  names an old tip, and deleting against it would destroy commits the check never saw.
+  The TUI also fetches a single branch when switching to a remote-only roll. Everything
+  else is local-only; keep it that way.
 
 ## Integration with dotfiles
 

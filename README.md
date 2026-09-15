@@ -51,6 +51,7 @@ rf status [--no-tui] [--json]
 rf list [--no-tui] [--deps] [--json]
 rf update [--dry-run]
 rf prune [--dry-run] [--local | --remote] [--yes] [--force] [--no-fetch]
+rf delete <branch> [--dry-run] [--local | --remote] [--yes] [--force] [--no-fetch]
 rf version
 ```
 
@@ -162,6 +163,28 @@ so it never acts on stale remote-tracking refs (`--no-fetch` opts out).
 
 Prints the crate version — the same value `Cargo.toml` carries and the Nix
 package derives from.
+### `delete`
+
+Deletes one named roll branch — locally, on `origin`, or both. Reachable from the
+TUI with `[d]` on the selected row, and accepts the same flags as `prune`.
+
+It relaxes exactly one of prune's rules: the roll need not be promoted. Prune
+picks its own targets by inferring promotion from commit subjects, so it must
+refuse on doubt; `delete` acts on a branch the user named, which makes an
+abandoned or superseded roll a legitimate target. Everything else still holds —
+an uncontained copy needs `--force`, the checked-out branch is never deleted
+locally, and `main`/`rolling` are refused outright.
+
+In the TUI the prompt follows where the branch actually lives:
+
+- **local-only or remote-only** — a `[y]`/`[n]` confirmation defaulting to no.
+  Nothing happens without a deliberate `y`; Enter is not a shortcut for it
+- **both** — `[l]` local only, `[r]` origin only, `[b]` both, `[n]` neither
+
+If the copies you chose hold commits the stable branch lacks, that keypress does
+*not* delete. It swaps the modal for a second one naming how many commits would
+be lost, which needs a fresh `y` — and that second `y` is the only thing that
+ever forces.
 
 ## Config
 
@@ -196,3 +219,7 @@ cargo test
 - no daemon; `rf` only ever runs when invoked. The `status`/`list` TUI does drive
   the workflow (`g` graduate, `p` promote, `u` update, `x` prune), but forced
   operations stay CLI-only by design
+- local-only behavior (no automatic fetch/push), except `rf prune` and
+  `rf delete` (and the TUI's `[x]` and `[d]`), which fetch and delete branches
+  on `origin`
+- no daemon

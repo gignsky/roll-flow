@@ -239,6 +239,26 @@ pub fn is_ancestor(repo: &Path, candidate: &str, descendant: &str) -> Result<boo
     Ok(status.success())
 }
 
+/// Number of commits reachable from `tip` but from none of `excludes` —
+/// `git rev-list --count <tip> --not <e1> <e2> ...`.
+///
+/// Used to say how much a deletion would actually lose. Returns 0 when
+/// `excludes` is empty: with nothing to exclude the count would be the branch's
+/// entire history, which reads as a catastrophic loss and is never what the
+/// caller means — an empty exclude set means stable could not be resolved at
+/// all, so no honest claim about lost commits can be made.
+pub fn commits_not_in(repo: &Path, tip: &str, excludes: &[String]) -> Result<u32, RfError> {
+    if excludes.is_empty() {
+        return Ok(0);
+    }
+    let mut args = vec!["rev-list", "--count", tip, "--not"];
+    args.extend(excludes.iter().map(String::as_str));
+    let out = capture_git(repo, &args)?;
+    out.trim()
+        .parse()
+        .map_err(|_| RfError::Git(format!("could not parse commit count from {out:?}")))
+}
+
 /// Return the best common ancestor of `a` and `b`.
 pub fn merge_base(repo: &Path, a: &str, b: &str) -> Result<String, RfError> {
     capture_git(repo, &["merge-base", a, b])
