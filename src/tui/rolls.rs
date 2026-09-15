@@ -1217,6 +1217,7 @@ mod tests {
             roll_to_rolling_gates: Vec::new(),
             rolling_to_main_gates: Vec::new(),
             host_gates: Vec::new(),
+            clean_protect: Vec::new(),
         }
     }
 
