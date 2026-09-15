@@ -134,6 +134,112 @@ pub(crate) enum InputOutcome {
     Submit,
 }
 
+/// Which role a pinned base-branch row plays. These are the two long-lived
+/// branches rolls flow through; they are listed above the rolls so the same
+/// keys reach them.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub(crate) enum BaseRole {
+    Stable,
+    Rolling,
+}
+
+impl BaseRole {
+    pub(crate) fn label(&self) -> &'static str {
+        match self {
+            BaseRole::Stable => "stable",
+            BaseRole::Rolling => "rolling",
+        }
+    }
+
+    /// Matches the colours the header uses for the same two branches.
+    fn color(&self) -> Color {
+        match self {
+            BaseRole::Stable => Color::Green,
+            BaseRole::Rolling => Color::Cyan,
+        }
+    }
+}
+
+/// A pinned row for one of the configured base branches (stable / rolling).
+/// Carries only what the table and the switch action need — base branches have
+/// no roll number, state or dependencies.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct BaseBranch {
+    pub role: BaseRole,
+    pub branch: String,
+    pub location: BranchLocation,
+    pub is_current: bool,
+}
+
+/// Which table row a selection index lands on: one of the pinned base branches
+/// at the top, or one of the rolls below them.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub(crate) enum RowKind {
+    Base(usize),
+    Roll(usize),
+}
+
+/// Map a flat table index onto the base-then-roll row layout. `None` when the
+/// index is past the last row.
+pub(crate) fn row_at(index: usize, base_count: usize, roll_count: usize) -> Option<RowKind> {
+    if index < base_count {
+        Some(RowKind::Base(index))
+    } else if index - base_count < roll_count {
+        Some(RowKind::Roll(index - base_count))
+    } else {
+        None
+    }
+}
+
+/// Build the pinned base-branch rows, stable first then rolling. `exists`
+/// answers whether a refspec resolves in the repo — injected so this stays pure
+/// and unit-testable. A branch that is present neither locally nor on `origin`
+/// is omitted, as is a rolling branch configured identically to stable.
+pub(crate) fn base_branches(
+    config: &Config,
+    current_branch: &str,
+    exists: impl Fn(&str) -> bool,
+) -> Vec<BaseBranch> {
+    let mut out: Vec<BaseBranch> = Vec::new();
+    for (role, name) in [
+        (BaseRole::Stable, &config.stable_branch),
+        (BaseRole::Rolling, &config.rolling_branch),
+    ] {
+        if name.is_empty() || out.iter().any(|b| b.branch == *name) {
+            continue;
+        }
+        let location = match (exists(name), exists(&format!("origin/{name}"))) {
+            (true, true) => BranchLocation::Both,
+            (true, false) => BranchLocation::Local,
+            (false, true) => BranchLocation::Remote,
+            (false, false) => continue,
+        };
+        out.push(BaseBranch {
+            role,
+            branch: name.clone(),
+            location,
+            is_current: current_branch == name,
+        });
+    }
+    out
+}
+
+/// Initial table selection: the row for the current branch when it is on
+/// screen (a base branch or one of the rolls), else the first row. `None` only
+/// when there is nothing to select at all.
+pub(crate) fn initial_selection(bases: &[BaseBranch], rolls: &[RollInfo]) -> Option<usize> {
+    if bases.is_empty() && rolls.is_empty() {
+        return None;
+    }
+    if let Some(i) = bases.iter().position(|b| b.is_current) {
+        return Some(i);
+    }
+    if let Some(i) = rolls.iter().position(|r| r.is_current) {
+        return Some(bases.len() + i);
+    }
+    Some(0)
+}
+
 /// One dependency row rendered in the [`Mode::Detail`] view. `is_blocker` marks
 /// a dep that holds the roll back — one that is not yet graduated/promoted.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -148,6 +254,9 @@ pub(crate) struct DepRow {
 struct StatusApp {
     config: Config,
     current_branch: String,
+    /// Pinned stable/rolling rows shown above the rolls; recomputed on reload
+    /// so `is_current` tracks the branch actually checked out.
+    bases: Vec<BaseBranch>,
     rolls: Vec<RollInfo>,
     show_deps: bool,
     table: TableState,
@@ -453,14 +562,15 @@ pub(crate) fn prune_scope_for(scope: DeleteScope, force: bool) -> ops::PruneScop
 
 impl StatusApp {
     fn new(config: Config, current_branch: String, rolls: Vec<RollInfo>, show_deps: bool) -> Self {
+        let bases = base_branches(&config, &current_branch, |refspec| {
+            git::ref_exists(&config.repo_root, refspec)
+        });
         let mut table = TableState::default();
-        let initial = rolls.iter().position(|r| r.is_current).unwrap_or(0);
-        if !rolls.is_empty() {
-            table.select(Some(initial));
-        }
+        table.select(initial_selection(&bases, &rolls));
         Self {
             config,
             current_branch,
+            bases,
             rolls,
             show_deps,
             table,
@@ -511,21 +621,27 @@ impl StatusApp {
                     slug: String::new(),
                 }
             }
-            KeyCode::Char(' ') => {
-                if let Some(roll) = self.selected_roll() {
-                    let roll = roll.clone();
-                    self.execute_switch(terminal, roll)?;
-                } else {
-                    self.message = Some("no roll selected".to_string());
+            KeyCode::Char(' ') => match self.selected_row() {
+                Some(RowKind::Roll(i)) => {
+                    let roll = self.rolls[i].clone();
+                    self.execute_switch(terminal, roll.branch, roll.location)?;
                 }
-            }
+                Some(RowKind::Base(i)) => {
+                    let base = self.bases[i].clone();
+                    self.execute_switch(terminal, base.branch, base.location)?;
+                }
+                None => self.message = Some("no branch selected".to_string()),
+            },
             KeyCode::Char('g') => self.request(Action::Graduate),
             KeyCode::Char('p') => self.request(Action::Promote),
             KeyCode::Char('u') => self.request(Action::Update),
             KeyCode::Char('x') => self.request(Action::Prune),
             KeyCode::Char('d') => self.request_delete()?,
             KeyCode::Enter => {
-                if let Some(roll) = self.selected_roll() {
+                if let Some(RowKind::Base(i)) = self.selected_row() {
+                    // Base branches have no roll detail to drill into.
+                    self.message = Some(format!("'{}' is a base branch", self.bases[i].branch));
+                } else if let Some(roll) = self.selected_roll() {
                     let roll = roll.clone();
                     // Capture the branch's divergence from origin for the overlay
                     // (issue #99), only meaningful when it exists on both sides.
@@ -595,8 +711,24 @@ impl StatusApp {
         Ok(())
     }
 
+    /// Total number of table rows: the pinned base branches plus the rolls.
+    fn row_count(&self) -> usize {
+        self.bases.len() + self.rolls.len()
+    }
+
+    /// Which row the cursor is on, or `None` when the table is empty.
+    fn selected_row(&self) -> Option<RowKind> {
+        let index = self.table.selected()?;
+        row_at(index, self.bases.len(), self.rolls.len())
+    }
+
+    /// The selected roll, or `None` when the cursor is on a base-branch row —
+    /// roll-only actions treat that the same as no selection.
     fn selected_roll(&self) -> Option<&RollInfo> {
-        self.table.selected().and_then(|i| self.rolls.get(i))
+        match self.selected_row()? {
+            RowKind::Roll(i) => self.rolls.get(i),
+            RowKind::Base(_) => None,
+        }
     }
 
     /// Validate an action and either open the confirm modal or set a message.
@@ -681,19 +813,20 @@ impl StatusApp {
     }
 
     fn select_next(&mut self) {
-        if self.rolls.is_empty() {
+        let rows = self.row_count();
+        if rows == 0 {
             return;
         }
         let next = self
             .table
             .selected()
-            .map(|i| (i + 1).min(self.rolls.len() - 1))
+            .map(|i| (i + 1).min(rows - 1))
             .unwrap_or(0);
         self.table.select(Some(next));
     }
 
     fn select_prev(&mut self) {
-        if self.rolls.is_empty() {
+        if self.row_count() == 0 {
             return;
         }
         let prev = self
@@ -735,32 +868,40 @@ impl StatusApp {
         Ok(())
     }
 
-    /// Switch the working tree to `roll`'s branch (issue #99), through the same
+    /// Switch the working tree to `branch` (issue #99), through the same
     /// suspended path as the other actions so git's own output — including a
     /// conflict refusal — is visible, then reload so the dashboard reflects the
     /// new current branch. Git natively carries clean uncommitted changes forward
     /// and refuses (non-zero) when they would conflict; either way the TUI never
-    /// crashes and the error is surfaced.
-    fn execute_switch(&mut self, terminal: &mut super::Tui, roll: RollInfo) -> Result<()> {
-        self.with_suspended(terminal, |app| Ok((app.run_switch(&roll)?, ())))?;
+    /// crashes and the error is surfaced. Serves both roll rows and the pinned
+    /// base-branch rows.
+    fn execute_switch(
+        &mut self,
+        terminal: &mut super::Tui,
+        branch: String,
+        location: BranchLocation,
+    ) -> Result<()> {
+        self.with_suspended(terminal, |app| {
+            Ok((app.run_switch(&branch, &location)?, ()))
+        })?;
         Ok(())
     }
 
-    /// Perform the branch switch for `roll`, returning printable status lines.
-    /// A remote-only roll is fetched first so `git switch` can DWIM-create a
+    /// Perform the branch switch, returning printable status lines. A
+    /// remote-only branch is fetched first so `git switch` can DWIM-create a
     /// local tracking branch from `origin/<branch>`.
-    fn run_switch(&self, roll: &RollInfo) -> Result<Vec<String>> {
+    fn run_switch(&self, branch: &str, location: &BranchLocation) -> Result<Vec<String>> {
         let repo = &self.config.repo_root;
-        if roll.branch == self.current_branch {
-            return Ok(vec![format!("Already on '{}'", roll.branch)]);
+        if branch == self.current_branch {
+            return Ok(vec![format!("Already on '{branch}'")]);
         }
         let mut lines = Vec::new();
-        if matches!(roll.location, BranchLocation::Remote) {
-            git::run_git(repo, &["fetch", "origin", &roll.branch])?;
-            lines.push(format!("Fetched origin/{}", roll.branch));
+        if matches!(location, BranchLocation::Remote) {
+            git::run_git(repo, &["fetch", "origin", branch])?;
+            lines.push(format!("Fetched origin/{branch}"));
         }
-        git::run_git(repo, &["switch", &roll.branch])?;
-        lines.push(format!("Switched to '{}'", roll.branch));
+        git::run_git(repo, &["switch", branch])?;
+        lines.push(format!("Switched to '{branch}'"));
         Ok(lines)
     }
 
@@ -903,8 +1044,11 @@ impl StatusApp {
     /// selection in bounds.
     fn reload(&mut self) -> Result<()> {
         self.current_branch = git::current_branch(&self.config.repo_root)?;
+        self.bases = base_branches(&self.config, &self.current_branch, |refspec| {
+            git::ref_exists(&self.config.repo_root, refspec)
+        });
         self.rolls = branches::list_rolls(&self.config)?;
-        let len = self.rolls.len();
+        let len = self.row_count();
         if len == 0 {
             self.table.select(None);
         } else {
@@ -996,41 +1140,60 @@ impl StatusApp {
             .height(1);
 
         let show_deps = self.show_deps;
-        let rows: Vec<Row> = self
-            .rolls
+        // Base branches are pinned above the rolls: no number and no state, the
+        // `state` column carrying their role instead.
+        let mut rows: Vec<Row> = self
+            .bases
             .iter()
-            .map(|roll| {
-                let row_state_color = state_color(&roll.state);
-                let base_style = if roll.is_current {
+            .map(|base| {
+                let base_style = if base.is_current {
                     Style::default().add_modifier(Modifier::BOLD)
                 } else {
                     Style::default()
                 };
                 let mut cells = vec![
-                    Cell::from(roll.number.to_string()).style(base_style),
-                    Cell::from(roll.branch.clone()).style(base_style),
-                    Cell::from(roll.location.symbol()).style(base_style),
-                    Cell::from(roll.state.label()).style(Style::default().fg(row_state_color)),
+                    Cell::from(""),
+                    Cell::from(base.branch.clone()).style(base_style.fg(base.role.color())),
+                    Cell::from(base.location.symbol()).style(base_style),
+                    Cell::from(base.role.label()).style(Style::default().fg(base.role.color())),
                 ];
                 if show_deps {
-                    let deps_str = if roll.deps.is_empty() {
-                        String::new()
-                    } else {
-                        roll.deps
-                            .iter()
-                            .map(|n| n.to_string())
-                            .collect::<Vec<_>>()
-                            .join(",")
-                    };
-                    cells.push(Cell::from(deps_str));
+                    cells.push(Cell::from(""));
                 }
                 Row::new(cells)
             })
             .collect();
+        rows.extend(self.rolls.iter().map(|roll| {
+            let row_state_color = state_color(&roll.state);
+            let base_style = if roll.is_current {
+                Style::default().add_modifier(Modifier::BOLD)
+            } else {
+                Style::default()
+            };
+            let mut cells = vec![
+                Cell::from(roll.number.to_string()).style(base_style),
+                Cell::from(roll.branch.clone()).style(base_style),
+                Cell::from(roll.location.symbol()).style(base_style),
+                Cell::from(roll.state.label()).style(Style::default().fg(row_state_color)),
+            ];
+            if show_deps {
+                let deps_str = if roll.deps.is_empty() {
+                    String::new()
+                } else {
+                    roll.deps
+                        .iter()
+                        .map(|n| n.to_string())
+                        .collect::<Vec<_>>()
+                        .join(",")
+                };
+                cells.push(Cell::from(deps_str));
+            }
+            Row::new(cells)
+        }));
 
         let table = Table::new(rows, col_constraints)
             .header(table_header)
-            .block(Block::bordered().title(" rolls "))
+            .block(Block::bordered().title(" branches "))
             .row_highlight_style(Style::default().add_modifier(Modifier::REVERSED))
             .highlight_symbol("▶ ");
 
@@ -1411,6 +1574,108 @@ mod tests {
             is_current: false,
             deps: Vec::new(),
         }
+    }
+
+    fn config(stable: &str, rolling: &str) -> Config {
+        Config {
+            config_version: 1,
+            repo_root: std::path::PathBuf::from("/tmp/repo"),
+            rolling_branch: rolling.to_string(),
+            stable_branch: stable.to_string(),
+            roll_prefix: "roll/".to_string(),
+            mode: Default::default(),
+            username: String::new(),
+            hosts: Vec::new(),
+            host_active: Default::default(),
+            roll_to_rolling_gates: Vec::new(),
+            rolling_to_main_gates: Vec::new(),
+            host_gates: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn base_rows_list_stable_then_rolling() {
+        let cfg = config("main", "develop");
+        // Both exist locally only.
+        let bases = base_branches(&cfg, "roll/1-0101-x", |r| !r.starts_with("origin/"));
+        assert_eq!(bases.len(), 2);
+        assert_eq!(bases[0].role, BaseRole::Stable);
+        assert_eq!(bases[0].branch, "main");
+        assert_eq!(bases[0].location, BranchLocation::Local);
+        assert_eq!(bases[1].role, BaseRole::Rolling);
+        assert_eq!(bases[1].branch, "develop");
+        // Neither is checked out here.
+        assert!(bases.iter().all(|b| !b.is_current));
+    }
+
+    #[test]
+    fn base_rows_track_location_and_current_branch() {
+        let cfg = config("main", "develop");
+        // main on both sides, develop only on origin.
+        let bases = base_branches(&cfg, "main", |r| {
+            matches!(r, "main" | "origin/main" | "origin/develop")
+        });
+        assert_eq!(bases[0].location, BranchLocation::Both);
+        assert!(bases[0].is_current);
+        assert_eq!(bases[1].location, BranchLocation::Remote);
+        assert!(!bases[1].is_current);
+    }
+
+    #[test]
+    fn base_rows_omit_missing_and_duplicate_branches() {
+        let cfg = config("main", "develop");
+        // develop exists nowhere → only stable is shown.
+        let bases = base_branches(&cfg, "main", |r| r == "main");
+        assert_eq!(bases.len(), 1);
+        assert_eq!(bases[0].branch, "main");
+
+        // Rolling configured the same as stable collapses to one row.
+        let same = config("main", "main");
+        let bases = base_branches(&same, "main", |_| true);
+        assert_eq!(bases.len(), 1);
+        assert_eq!(bases[0].role, BaseRole::Stable);
+
+        // Nothing resolves at all → no pinned rows.
+        assert!(base_branches(&cfg, "main", |_| false).is_empty());
+    }
+
+    #[test]
+    fn row_at_maps_indices_over_bases_then_rolls() {
+        assert_eq!(row_at(0, 2, 3), Some(RowKind::Base(0)));
+        assert_eq!(row_at(1, 2, 3), Some(RowKind::Base(1)));
+        assert_eq!(row_at(2, 2, 3), Some(RowKind::Roll(0)));
+        assert_eq!(row_at(4, 2, 3), Some(RowKind::Roll(2)));
+        // Past the last row.
+        assert_eq!(row_at(5, 2, 3), None);
+        // No bases → rolls start at 0; no rolls → only bases.
+        assert_eq!(row_at(0, 0, 1), Some(RowKind::Roll(0)));
+        assert_eq!(row_at(1, 1, 0), None);
+        assert_eq!(row_at(0, 0, 0), None);
+    }
+
+    #[test]
+    fn initial_selection_prefers_the_current_branch() {
+        let cfg = config("main", "develop");
+        let bases = base_branches(&cfg, "develop", |_| true);
+        let mut rolls = vec![roll_n(1, RollState::Active), roll_n(2, RollState::Active)];
+
+        // Current branch is the rolling base → its own row.
+        assert_eq!(initial_selection(&bases, &rolls), Some(1));
+
+        // Current branch is a roll → offset past the bases.
+        let off_bases = base_branches(&cfg, "roll/2-0101-x", |_| true);
+        rolls[1].is_current = true;
+        assert_eq!(initial_selection(&off_bases, &rolls), Some(3));
+
+        // Nothing current → first row.
+        rolls[1].is_current = false;
+        assert_eq!(initial_selection(&off_bases, &rolls), Some(0));
+
+        // Rolls but no bases still selects the first roll.
+        assert_eq!(initial_selection(&[], &rolls), Some(0));
+
+        // Nothing at all → no selection.
+        assert_eq!(initial_selection(&[], &[]), None);
     }
 
     fn roll_n(number: u32, state: RollState) -> RollInfo {
@@ -1992,5 +2257,48 @@ mod tests {
         for key in ["[q] quit", "[r]efresh", "[c]reate", "[d]elete", "[x] prune"] {
             assert!(out.contains(key), "{key} truncated away:\n{out}");
         }
+    }
+
+    /// The pinned base rows render above the rolls, with the role in the
+    /// `state` column and no roll number, and the cursor starts on the checked
+    /// out base branch.
+    #[test]
+    fn base_rows_render_above_the_rolls() {
+        use ratatui::{backend::TestBackend, Terminal};
+
+        let cfg = config("main", "develop");
+        let bases = base_branches(&cfg, "develop", |_| true);
+        let mut table = TableState::default();
+        table.select(initial_selection(&bases, &[]));
+        let mut app = StatusApp {
+            config: cfg,
+            current_branch: "develop".to_string(),
+            bases,
+            rolls: vec![roll_n(1, RollState::Active)],
+            show_deps: false,
+            table,
+            mode: Mode::Browsing,
+            message: None,
+        };
+
+        let mut term = Terminal::new(TestBackend::new(60, 12)).unwrap();
+        term.draw(|f| app.render(f)).unwrap();
+        let line = |row: u16| -> String {
+            (0..60)
+                .map(|x| term.backend().buffer()[(x, row)].symbol().to_string())
+                .collect::<String>()
+                .trim_end()
+                .to_string()
+        };
+
+        // Row 4 is the table header, then stable, rolling, and the roll.
+        assert!(line(5).contains("main"), "{}", line(5));
+        assert!(line(5).contains("stable"), "{}", line(5));
+        assert!(line(6).contains("develop"), "{}", line(6));
+        assert!(line(6).contains("rolling"), "{}", line(6));
+        assert!(line(7).contains("roll/1-0101-x"), "{}", line(7));
+        // Cursor sits on the current branch (the rolling base), not the roll.
+        assert!(line(6).contains('▶'), "{}", line(6));
+        assert!(!line(5).contains('▶') && !line(7).contains('▶'));
     }
 }
