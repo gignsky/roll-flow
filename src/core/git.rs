@@ -272,6 +272,79 @@ pub fn parse_ahead_behind(out: &str) -> Option<(u32, u32)> {
     Some((ahead, behind))
 }
 
+// ── Blob reads ────────────────────────────────────────────────────────────────
+
+/// Read `path` as it exists at `refspec` (`git show <ref>:<path>`).
+///
+/// Returns `Ok(None)` when the path does not exist at that ref — the common
+/// "this repo has no Cargo.toml" / "the file was added later" case — so callers
+/// can treat absence as data rather than as an error. Other git failures still
+/// propagate.
+pub fn show_file_at_ref(repo: &Path, refspec: &str, path: &str) -> Result<Option<String>, RfError> {
+    let spec = format!("{refspec}:{path}");
+    let output = Command::new("git")
+        .arg("-C")
+        .arg(repo)
+        .args(["show", &spec])
+        .output()?;
+    if output.status.success() {
+        // Not trimmed: callers parse file content, where trailing newlines and
+        // leading whitespace are meaningful.
+        return Ok(Some(String::from_utf8_lossy(&output.stdout).to_string()));
+    }
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    if stderr.contains("does not exist") || stderr.contains("exists on disk, but not in") {
+        return Ok(None);
+    }
+    Err(RfError::Git(format!("`git show {spec}` failed: {stderr}")))
+}
+
+// ── Tags ──────────────────────────────────────────────────────────────────────
+
+/// True if `tag` already exists. Checked under `refs/tags/` specifically so a
+/// branch or commit sharing the name cannot be mistaken for the tag.
+pub fn tag_exists(repo: &Path, tag: &str) -> bool {
+    ref_exists(repo, &format!("refs/tags/{tag}"))
+}
+
+/// Create an annotated tag pointing at `target`.
+pub fn create_annotated_tag(
+    repo: &Path,
+    tag: &str,
+    message: &str,
+    target: &str,
+) -> Result<(), RfError> {
+    run_git(repo, &["tag", "-a", tag, "-m", message, target])
+}
+
+/// Push a single tag to `remote`.
+pub fn push_tag(repo: &Path, remote: &str, tag: &str) -> Result<(), RfError> {
+    run_git(repo, &["push", remote, &format!("refs/tags/{tag}")])
+}
+
+// ── Commits ───────────────────────────────────────────────────────────────────
+
+/// Stage `paths` and commit them with `message`.
+///
+/// Paths that do not exist are skipped rather than failing the whole commit, so
+/// a caller can offer e.g. `["Cargo.toml", "Cargo.lock"]` without knowing
+/// whether a lockfile is present.
+pub fn commit_paths(repo: &Path, paths: &[&str], message: &str) -> Result<(), RfError> {
+    let present: Vec<&str> = paths
+        .iter()
+        .copied()
+        .filter(|p| repo.join(p).exists())
+        .collect();
+    if present.is_empty() {
+        return Err(RfError::Git(
+            "nothing to commit: none of the requested paths exist".to_string(),
+        ));
+    }
+    let mut add_args = vec!["add", "--"];
+    add_args.extend_from_slice(&present);
+    run_git(repo, &add_args)?;
+    run_git(repo, &["commit", "-m", message])
+}
 #[cfg(test)]
 mod tests {
     use super::{ahead_behind, parse_ahead_behind};

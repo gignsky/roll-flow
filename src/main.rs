@@ -10,6 +10,7 @@ use clap::Parser;
 use serde::Serialize;
 
 use cli::{Cli, Cmd};
+use core::version::{BumpLevel, VersionCheck, VersionStatus};
 use core::{branches, config::Config, git, ops};
 
 fn main() -> Result<()> {
@@ -65,7 +66,7 @@ fn main() -> Result<()> {
                 }
             }
         }
-        Cmd::Verify { dry_run } => cmd_verify(dry_run)?,
+        Cmd::Verify { dry_run, bump, yes } => cmd_verify(dry_run, bump, yes)?,
         Cmd::Graduate {
             dry_run,
             force,
@@ -75,7 +76,10 @@ fn main() -> Result<()> {
             dry_run,
             force,
             reason,
-        } => cmd_promote(dry_run, force, reason)?,
+            bump,
+            no_tag,
+            yes,
+        } => cmd_promote(dry_run, force, reason, bump, !no_tag, yes)?,
         Cmd::Status { no_tui, json } => {
             if json {
                 cmd_status_json()?;
@@ -299,9 +303,14 @@ fn cmd_hotfix_land(dry_run: bool) -> Result<()> {
     Ok(())
 }
 
-fn cmd_verify(dry_run: bool) -> Result<()> {
+fn cmd_verify(dry_run: bool, bump: Option<BumpLevel>, yes: bool) -> Result<()> {
     let config = Config::load()?;
     ops::ensure_clean_state(&config)?;
+
+    // Resolved before `ops::verify` so an accepted bump is already committed by
+    // the time the gates (and their `--locked` cargo commands) run.
+    resolve_version_gate(&config, bump, yes, false, dry_run)?;
+
     let outcome = ops::verify(&config, dry_run)?;
     if outcome.diverged_note {
         println!(
@@ -309,6 +318,7 @@ fn cmd_verify(dry_run: bool) -> Result<()> {
             outcome.target, outcome.source
         );
     }
+    render_version_check(&outcome.version, &outcome.source, &outcome.target);
     render_gate_notices(&outcome.gate_notices);
     render_gate_notices(&outcome.host_notices);
     render_host_results(&outcome.host_results);
@@ -318,10 +328,192 @@ fn cmd_verify(dry_run: bool) -> Result<()> {
             outcome.failed_hosts.join(", ")
         );
     }
+    // `--dry-run` previews rather than enforces, matching how it treats the
+    // configured gates (printed, never executed) and `rf promote --dry-run`.
+    if !dry_run && !outcome.version.is_satisfied() {
+        return Err(ops::version_gate_error(
+            &outcome.version,
+            &outcome.source,
+            &outcome.target,
+        ));
+    }
     println!(
         "Verification passed: {} -> {}",
         outcome.source, outcome.target
     );
+    Ok(())
+}
+
+// ── Version gate ────────────────────────────────────────────────────────────
+
+/// Enforce the crate-version bump requirement before the expensive gates run,
+/// offering to apply the bump when it is missing.
+///
+/// Sequencing matters: a bump rewrites `Cargo.lock` as well as `Cargo.toml`, and
+/// the configured gates include `cargo update --workspace --locked`, which would
+/// fail against a stale lockfile. So the bump has to land *first*, which is why
+/// this is a CLI-level step rather than something inside `ops::promote`.
+///
+/// Mirrors `.github/workflows/version-bump-check.yml`, so a promotion done with
+/// `rf` and one done through a PR are held to the same standard.
+fn resolve_version_gate(
+    config: &Config,
+    bump: Option<BumpLevel>,
+    yes: bool,
+    forced: bool,
+    dry_run: bool,
+) -> Result<()> {
+    let current = git::current_branch(&config.repo_root)?;
+    let route = match ops::infer_route(config, &current) {
+        Some(route) => route,
+        // Not a promotable branch: the caller raises its own clearer error.
+        None => return Ok(()),
+    };
+    let (source, target) = match &route {
+        ops::Route::Graduate { roll } => (roll.clone(), config.rolling_branch.clone()),
+        ops::Route::Promote => (config.rolling_branch.clone(), config.stable_branch.clone()),
+    };
+
+    // Graduation into rolling is deliberately out of scope: only the promotion
+    // route carries the bump requirement here.
+    if !matches!(route, ops::Route::Promote) {
+        return Ok(());
+    }
+    // Resolve the target the same way the merge will: local branch first, then
+    // `origin/<target>`. A repo that has never checked stable out locally still
+    // has a version to compare against, and skipping the check here would let
+    // the bump be missed and only resurface as a hard error later.
+    let Some(target_ref) = git::resolve_branch(&config.repo_root, &target) else {
+        // Genuinely missing on both sides — `ops::promote` raises the clearer
+        // "branch not found" error for this.
+        return Ok(());
+    };
+
+    let check = ops::version_check(config, &source, &target_ref)?;
+    if check.is_satisfied() {
+        return Ok(());
+    }
+
+    // A version *below* the target is never fixable by bumping one level, and
+    // silently jumping it would hide a bad merge. Always a hard error.
+    if check.status == VersionStatus::Lower {
+        return Err(ops::version_gate_error(&check, &source, &target));
+    }
+
+    let head = check
+        .head
+        .map(|v| v.to_string())
+        .unwrap_or_else(|| "<unreadable>".to_string());
+    println!("Version: {head} on '{source}' is unchanged from '{target}'; a bump is required");
+
+    if dry_run {
+        println!("Dry-run: not bumping the version");
+        return Ok(());
+    }
+
+    // The bump commit must land on the branch being merged from. `run_merge`
+    // returns us here afterwards, and `ensure_clean_state` already ran, but
+    // assert rather than trust it — a misplaced release commit is painful.
+    if current != source {
+        bail!(
+            "refusing to bump the version: expected to be on '{source}' but '{current}' is checked out"
+        );
+    }
+
+    let level = match bump {
+        Some(level) => Some(level),
+        None if yes => Some(BumpLevel::Patch),
+        None if std::io::stdin().is_terminal() => prompt_bump_level()?,
+        None => {
+            if forced {
+                None
+            } else {
+                return Err(ops::version_gate_error(&check, &source, &target));
+            }
+        }
+    };
+
+    let Some(level) = level else {
+        if forced {
+            eprintln!("warning: version not bumped, continuing under --force");
+        }
+        return Ok(());
+    };
+
+    let (from, to) = ops::apply_version_bump(config, level, &source)?;
+    println!("Bumped version {from} -> {to} (chore(release) commit on '{current}')");
+    Ok(())
+}
+
+/// Ask which field to raise. `None` means the user declined.
+fn prompt_bump_level() -> Result<Option<BumpLevel>> {
+    use std::io::Write;
+    print!("Bump version? [p]atch / [m]inor / [M]ajor / [n]o: ");
+    std::io::stdout().flush()?;
+    let mut line = String::new();
+    std::io::stdin().read_line(&mut line)?;
+    // Case-sensitive on purpose: `m` and `M` are different answers here, so
+    // this cannot reuse the lowercasing `prompt_yes`.
+    match line.trim() {
+        "p" | "patch" | "" => Ok(Some(BumpLevel::Patch)),
+        "m" | "minor" => Ok(Some(BumpLevel::Minor)),
+        "M" | "major" | "MAJOR" => Ok(Some(BumpLevel::Major)),
+        _ => Ok(None),
+    }
+}
+
+/// Render the version comparison line. Silent when the repo does not version
+/// through `Cargo.toml`, so unaffected repos see no new output.
+fn render_version_check(check: &VersionCheck, source: &str, target: &str) {
+    if check.status == VersionStatus::NotApplicable {
+        return;
+    }
+    let head = check
+        .head
+        .map(|v| v.to_string())
+        .unwrap_or_else(|| "<unreadable>".to_string());
+    let base = check
+        .base
+        .map(|v| v.to_string())
+        .unwrap_or_else(|| "none".to_string());
+    let verdict = match check.status {
+        VersionStatus::Ok => "OK",
+        VersionStatus::Unchanged => "UNCHANGED",
+        VersionStatus::Lower => "LOWER",
+        VersionStatus::Unreadable => "UNREADABLE",
+        VersionStatus::NotApplicable => return,
+    };
+    println!("Version: {head} on '{source}' (base '{target}' {base}) {verdict}");
+}
+
+/// Offer to push a freshly created release tag.
+///
+/// This is the one place outside `rf prune` that writes to the remote, so it is
+/// always gated on an explicit confirmation (or `--yes`) and never happens
+/// silently.
+fn offer_tag_push(config: &Config, tag: &str, yes: bool) -> Result<()> {
+    if !config.push_tag {
+        return Ok(());
+    }
+    let repo = &config.repo_root;
+    if !git::has_remote(repo, "origin") {
+        return Ok(());
+    }
+    let push = if yes {
+        true
+    } else if std::io::stdin().is_terminal() {
+        prompt_yes(&format!("Push tag {tag} to origin? [y/N] "))?
+    } else {
+        println!("note: tag {tag} was not pushed (run with --yes, or: git push origin {tag})");
+        return Ok(());
+    };
+    if push {
+        git::push_tag(repo, "origin", tag)
+            .with_context(|| format!("failed to push tag {tag} to origin"))?;
+        println!("Pushed tag {tag} to origin");
+    } else {
+        println!("note: tag {tag} kept local (push later with: git push origin {tag})");
+    }
     Ok(())
 }
 
@@ -344,7 +536,15 @@ fn cmd_graduate(dry_run: bool, force: bool, reason: Option<String>) -> Result<()
     Ok(())
 }
 
-fn cmd_promote(dry_run: bool, force: bool, reason: Option<String>) -> Result<()> {
+fn cmd_promote(
+    dry_run: bool,
+    force: bool,
+    reason: Option<String>,
+    bump: Option<BumpLevel>,
+    tag: bool,
+    yes: bool,
+) -> Result<()> {
+    let forced = force;
     let force = ops::ForceOpts::new(force, reason)?;
     let config = Config::load()?;
     ops::ensure_clean_state(&config)?;
@@ -359,7 +559,12 @@ fn cmd_promote(dry_run: bool, force: bool, reason: Option<String>) -> Result<()>
             print_graduate(&outcome);
         }
         Some(ops::Route::Promote) => {
-            let outcome = ops::promote(&config, dry_run, &force)?;
+            // Resolved before `ops::promote` so the bump commit is part of what
+            // gets merged, and so it precedes the `--locked` cargo gates.
+            resolve_version_gate(&config, bump, yes, forced, dry_run)?;
+
+            let outcome = ops::promote(&config, dry_run, &force, tag)?;
+            render_version_check(&outcome.version, &outcome.rolling, &outcome.stable);
             render_gate_notices(&outcome.gate_notices);
             render_gate_notices(&outcome.host_notices);
             render_host_results(&outcome.host_results);
@@ -370,6 +575,12 @@ fn cmd_promote(dry_run: bool, force: bool, reason: Option<String>) -> Result<()>
                 );
             } else {
                 println!("Promoted '{}' into '{}'", outcome.rolling, outcome.stable);
+            }
+            if let Some(line) = outcome.tag.describe() {
+                println!("{line}");
+            }
+            if let Some(tag) = outcome.tag.created_tag() {
+                offer_tag_push(&config, tag, yes)?;
             }
         }
         None => return Err(ops::not_promotable_error(&config, &current)),

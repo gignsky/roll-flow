@@ -93,6 +93,26 @@ unchanged version tags nothing). That pushed tag then triggers
 `.github/workflows/release-check.yml`, which re-checks the tag against
 `Cargo.toml` and confirms the lockfile is current.
 
+### `rf` enforces the same policy locally
+
+Promoting through a PR used to be the only way to get the bump verified and the
+tag created. `rf` now does both itself, so a local `rf promote` and a PR merge
+produce the same result:
+
+- `rf verify` and `rf promote` refuse to proceed when the version has not been
+  raised above the branch being merged into, and offer to bump it for you
+  (`--bump <patch|minor|major>` skips the prompt). The bump lands as its own
+  `chore(release):` commit, **before** the gates run — it rewrites `Cargo.lock`,
+  and `rolling_to_main_gates` includes `cargo update --workspace --locked`.
+- `rf promote` creates the annotated `vX.Y.Z` tag on the promotion merge commit
+  and offers to push it. Like the workflow, it skips an existing tag rather than
+  failing.
+
+The workflows stay in place as the backstop for anything that arrives by PR, and
+the two implementations are kept in agreement deliberately: `src/core/version.rs`
+documents which workflow each rule mirrors. `version_gate`, `tag_on_promote`, and
+`push_tag` in `.roll-flow.toml` can turn each piece off.
+
 ## What CI checks
 
 Every PR is gated by the `build · test · fmt · clippy` job defined in

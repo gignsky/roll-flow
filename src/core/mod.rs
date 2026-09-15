@@ -2,3 +2,4 @@ pub mod branches;
 pub mod config;
 pub mod git;
 pub mod ops;
+pub mod version;

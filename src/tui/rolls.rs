@@ -596,9 +596,15 @@ impl StatusApp {
             }
             Action::Promote => {
                 ops::ensure_clean_state(&self.config)?;
-                let o = ops::promote(&self.config, false, &force)?;
+                // Tagging is on; the version gate hard-fails here rather than
+                // prompting, since the TUI has no place to offer a bump — the
+                // error names the `rf promote --bump` fix.
+                let o = ops::promote(&self.config, false, &force, true)?;
                 push_gate_notices(&mut lines, &o.gate_notices);
                 lines.push(format!("Promoted '{}' into '{}'", o.rolling, o.stable));
+                if let Some(line) = o.tag.describe() {
+                    lines.push(line);
+                }
             }
             Action::Update => match ops::update(&self.config, false)? {
                 ops::UpdateOutcome::NoActiveRolls => {

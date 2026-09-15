@@ -213,6 +213,15 @@ Promote roll/N-theme to main
 Verified-On: all-hosts
 ```
 
+### Version gate and release tags (`core/version.rs`)
+
+When the repo has a `Cargo.toml`, `rf verify` and `rf promote` require the
+`[package]` version on the source branch to be strictly greater than the
+target's, and `rf promote` creates an annotated `vX.Y.Z` tag on the promotion
+merge commit (skipping an existing tag rather than erroring). Repos without a
+`Cargo.toml` — including the dotfiles repo — get `VersionStatus::NotApplicable`
+and skip all of it. Configurable via `version_gate`, `tag_on_promote`, `push_tag`.
+
 When a single promotion merge carries multiple graduated rolls, the subject is
 `Promote <rolling> to <stable>` and the body lists the rolls it includes:
 ```
@@ -253,8 +262,18 @@ cargo run -- list --no-tui
   so `rf prune` additionally requires the tip to be an ancestor of the stable branch
   or of `origin/<stable>`, and `--force` is the only override. Never delete the
   checked-out branch.
-- `rf prune` is the only command that writes to the remote (`git push --delete`) or
-  fetches. Everything else is local-only; keep it that way.
+- Only two commands write to the remote, and neither does it silently. `rf prune`
+  fetches and deletes branches (`git push --delete`). `rf promote` may push a
+  release tag, but only after an explicit y/N confirmation (or `--yes`), and only
+  when `push_tag` is enabled. Everything else is local-only; keep it that way.
+- The version gate and release tagging mirror the CI workflows exactly —
+  `version-bump-check.yml`, `tag-on-main.yml`, `release-check.yml`. When changing
+  one side, change the other. `src/core/version.rs` records which rule mirrors
+  which workflow.
+- A version bump must be committed **before** the configured gates run, never
+  after: it rewrites `Cargo.lock`, and `rolling_to_main_gates` contains
+  `cargo update --workspace --locked`, which fails on a stale lockfile. This is
+  why the bump is a CLI-level step in `main.rs` rather than part of `ops::promote`.
 
 ## Integration with dotfiles
 
