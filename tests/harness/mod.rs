@@ -182,12 +182,29 @@ impl Sandbox {
 
     /// Run `rf` against the sandbox, capturing stdout/stderr/exit code.
     pub fn rf(&self, args: &[&str]) -> RfOutput {
+        self.rf_at(args, &[])
+    }
+
+    /// `rf` with extra environment variables.
+    ///
+    /// Exists for `GIT_AUTHOR_DATE`/`GIT_COMMITTER_DATE`: a sandbox builds its
+    /// whole history inside one second, so commits are timestamp-tied and
+    /// `git log`'s reverse-chronological order degenerates to a tie-break that
+    /// happens to favour the mainline. Tests that care which of two commits
+    /// `git log` reports first have to set the dates explicitly, or they assert
+    /// nothing.
+    pub fn rf_with_env(&self, args: &[&str], env: &[(&str, &str)]) -> RfOutput {
+        self.rf_at(args, env)
+    }
+
+    fn rf_at(&self, args: &[&str], env: &[(&str, &str)]) -> RfOutput {
         let exe = std::env::var("CARGO_BIN_EXE_rf").expect("CARGO_BIN_EXE_rf");
-        let output = Command::new(exe)
-            .current_dir(self.path())
-            .args(args)
-            .output()
-            .expect("run rf");
+        let mut cmd = Command::new(exe);
+        cmd.current_dir(self.path()).args(args);
+        for (key, value) in env {
+            cmd.env(key, value);
+        }
+        let output = cmd.output().expect("run rf");
         RfOutput {
             success: output.status.success(),
             code: output.status.code(),
@@ -273,19 +290,64 @@ impl Sandbox {
     /// the existing line preserves its position ahead of the `[host_active]`
     /// table, so the key stays a root-level field.
     pub fn set_host_gates(&self, gates: &[&str]) {
+        self.set_gate_array("host_gates", gates);
+    }
+
+    /// Rewrite the `rolling_to_main_gates` array — the gates `rf promote` runs.
+    pub fn set_promote_gates(&self, gates: &[&str]) {
+        self.set_gate_array("rolling_to_main_gates", gates);
+    }
+
+    /// Replace a root-level array-of-strings key in the sandbox's
+    /// `.roll-flow.toml` (call after `rf init`). Each entry is emitted as a TOML
+    /// string, so `{host}` templates and shell snippets round-trip verbatim.
+    /// Replacing the existing line preserves its position ahead of the
+    /// `[host_active]` table, so the key stays a root-level field.
+    fn set_gate_array(&self, key: &str, values: &[&str]) {
         let path = self.path().join(".roll-flow.toml");
         let existing = fs::read_to_string(&path).expect("read config");
-        let rendered = gates
+        let rendered = values
             .iter()
             .map(|g| format!("{g:?}"))
             .collect::<Vec<_>>()
             .join(", ");
-        let new_line = format!("host_gates = [{rendered}]");
+        let new_line = format!("{key} = [{rendered}]");
         let mut replaced = false;
         let lines: Vec<String> = existing
             .lines()
             .map(|l| {
-                if l.trim_start().starts_with("host_gates") {
+                if l.trim_start().starts_with(key) {
+                    replaced = true;
+                    new_line.clone()
+                } else {
+                    l.to_string()
+                }
+            })
+            .collect();
+        assert!(replaced, "no {key} line to replace in config:\n{existing}");
+        let mut text = lines.join("\n");
+        text.push('\n');
+        fs::write(&path, text).expect("write config");
+    }
+
+    /// Rewrite the `clean_protect` array in the sandbox's `.roll-flow.toml`
+    /// in place (call after `rf init`). Replacing the existing line keeps the
+    /// key ahead of the `[host_active]` table, so it stays a root-level field
+    /// rather than becoming part of that table.
+    pub fn set_clean_protect(&self, branches: &[&str]) {
+        let path = self.path().join(".roll-flow.toml");
+        let existing = fs::read_to_string(&path).expect("read config");
+        let rendered = branches
+            .iter()
+            .map(|b| format!("{b:?}"))
+            .collect::<Vec<_>>()
+            .join(", ");
+        let new_line = format!("clean_protect = [{rendered}]");
+        let mut replaced = false;
+        let lines: Vec<String> = existing
+            .lines()
+            .map(|l| {
+                if l.trim_start().starts_with("clean_protect") {
                     replaced = true;
                     new_line.clone()
                 } else {
@@ -295,7 +357,7 @@ impl Sandbox {
             .collect();
         assert!(
             replaced,
-            "no host_gates line to replace in config:\n{existing}"
+            "no clean_protect line to replace in config:\n{existing}"
         );
         let mut text = lines.join("\n");
         text.push('\n');
@@ -308,6 +370,93 @@ impl Sandbox {
     pub fn push_branch(&self, branch: &str) {
         self.git(&["push", "origin", branch]);
         self.git(&["fetch", "origin"]);
+    }
+
+    /// Path to the bare repo backing `origin`. Panics for sandboxes built
+    /// without one.
+    pub fn origin_path(&self) -> String {
+        self.origin
+            .as_ref()
+            .expect("sandbox has no origin")
+            .path()
+            .to_str()
+            .expect("origin path")
+            .to_string()
+    }
+
+    /// Add a second bare remote named `name`, so multi-remote behavior is
+    /// testable. Returns its path.
+    pub fn add_remote(&self, name: &str) -> String {
+        let dir = tempfile::tempdir().expect("remote dir");
+        let path = dir.path().to_str().expect("remote path").to_string();
+        let ok = Command::new("git")
+            .args(["init", "--bare", "-b", "main", &path])
+            .output()
+            .expect("init bare remote")
+            .status
+            .success();
+        assert!(ok, "git init --bare failed for {path}");
+        self.git(&["remote", "add", name, &path]);
+        // Leak the TempDir: the remote must outlive this call, and the sandbox
+        // only holds a slot for `origin`.
+        std::mem::forget(dir);
+        path
+    }
+
+    /// Delete `branch` directly on the bare `origin`, modelling "another host
+    /// merged it and deleted the remote branch".
+    ///
+    /// Deliberately does *not* fetch afterwards, so the caller's repo is left
+    /// holding the stale remote-tracking ref this reproduces.
+    pub fn delete_on_origin(&self, branch: &str) {
+        let origin = self.origin_path();
+        let ok = Command::new("git")
+            .args(["-C", &origin, "branch", "-D", branch])
+            .output()
+            .expect("delete on origin")
+            .status
+            .success();
+        assert!(ok, "could not delete {branch} on origin");
+    }
+
+    /// Delete `branch` on an arbitrary bare remote at `path`.
+    pub fn delete_on_remote(&self, path: &str, branch: &str) {
+        let ok = Command::new("git")
+            .args(["-C", path, "branch", "-D", branch])
+            .output()
+            .expect("delete on remote")
+            .status
+            .success();
+        assert!(ok, "could not delete {branch} on {path}");
+    }
+
+    /// Check `branch` out in a second worktree, so the "checked out elsewhere"
+    /// guard has something to find. Returns the worktree path.
+    pub fn add_worktree(&self, branch: &str) -> String {
+        let dir = tempfile::tempdir().expect("worktree dir");
+        let path = dir.path().join("wt");
+        let path = path.to_str().expect("worktree path").to_string();
+        self.git(&["worktree", "add", &path, branch]);
+        std::mem::forget(dir);
+        path
+    }
+
+    /// True if a remote-tracking ref `<remote>/<name>` exists locally. This is
+    /// the cache lazygit reads, as opposed to what the remote actually carries.
+    pub fn tracking_ref_exists(&self, remote: &str, name: &str) -> bool {
+        self.git_try(&[
+            "rev-parse",
+            "--verify",
+            "--quiet",
+            &format!("refs/remotes/{remote}/{name}"),
+        ])
+        .0
+    }
+
+    /// True if an arbitrary bare remote at `path` carries `branch`.
+    pub fn branch_exists_on(&self, path: &str, branch: &str) -> bool {
+        let (ok, out, _) = self.git_try(&["ls-remote", "--heads", path, branch]);
+        ok && !out.trim().is_empty()
     }
 
     /// True if `origin` really carries a branch named `name`.

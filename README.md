@@ -46,162 +46,39 @@ rf integrate <branch>
 rf hotfix [<slug>] [--date MMDD] [--land] [--dry-run]
 rf verify [--dry-run] [--bump <patch|minor|major>] [--yes]
 rf graduate [--dry-run] [--force --reason <text>]
-rf promote [--dry-run] [--force --reason <text>] [--bump <patch|minor|major>] [--no-tag] [--yes]
-rf status [--no-tui] [--json]
+rf promote [--roll <branch>]... [--dry-run] [--force --reason <text>] [--bump <patch|minor|major>] [--no-tag] [--yes]
+rf status [--no-tui] [--no-deps] [--json]
 rf list [--no-tui] [--deps] [--json]
 rf update [--dry-run]
 rf prune [--dry-run] [--local | --remote] [--yes] [--force] [--no-fetch]
+rf delete <branch> [--dry-run] [--local | --remote] [--yes] [--force] [--no-fetch]
+rf clean [--dry-run] [--yes] [--force] [--with-remote] [--no-fetch]
 rf version
 ```
 
-### `init`
+Each command is documented in its own file under [`docs/commands/`](docs/commands):
 
-- Writes `.roll-flow.toml` at repository root
-- Detects branch defaults from repo (`rolling`/`develop`/`integration`, and `main`/`master`)
-- Ensures the rolling branch exists (creates it from stable branch when absent)
-- `--mode` selects `manage` (rf drives the workflow) or `assist` (a human drives;
-  rf reports and derives state). Preserved across re-init when omitted
-- `--force` overwrites the config even when it already matches, skipping the diff
-  prompt; `--yes` applies detected changes without prompting, for non-interactive use
-
-### `create`
-
-- Requires a clean working tree
-- Creates `roll/N-MMDD-slug` off the stable branch (so the roll starts from a clean
-  baseline; rolling and other rolls become dependencies only via `rf integrate`)
-- Computes `N` as next highest roll number
-- Supports `--dry-run`
-
-### `integrate`
-
-Merges a feature branch into the current roll branch, for work split finer than
-one roll.
-
-### `hotfix`
-
-Creates `hotfix/N-MMDD-slug` off the stable branch, for urgent fixes that cannot
-wait for the next promotion. `--land`, run from the hotfix branch, merges it into
-stable with `--no-ff` and then reintegrates stable into rolling so the two do not
-drift. `--date` and `--dry-run` behave as they do for `create`.
-
-### `verify`
-
-Checks graduation/promotion readiness for the current branch:
-
-- `roll/* -> rolling`
-- `rolling -> main`
-
-Validation includes:
-
-- clean tree
-- non-detached HEAD
-- mergeability (common history, something new to merge; divergence is fine and
-  only produces an informational note)
-- the version gate on the `rolling -> main` route (see
-  [Versioning and release tags](#versioning-and-release-tags)). When a bump is
-  needed, `verify` offers one; `--bump <level>` applies it without asking and
-  `--yes` accepts the default (patch) non-interactively
-- configured gate command execution
-
-### `graduate`
-
-Merges the current roll branch into rolling with `--no-ff` and a structured
-subject (`Graduate roll/N-slug into rolling`), then returns to the roll branch.
-Divergence between the roll and rolling is handled by the merge; a conflicting
-merge is aborted and the original branch restored, leaving the repo clean.
-
-`--force` proceeds past failing gates and requires `--reason <text>`, which is
-recorded as a `Force-Reason:` trailer in the merge commit so the bypass stays
-auditable in git history.
-
-### `promote`
-
-Merges rolling into the stable branch with `--no-ff` and a structured subject
-(`Promote roll/N-slug to main`, or `Promote rolling to main` with the included
-rolls listed in the body when several graduated rolls ride along). Run from a
-roll branch it redirects to graduation. Conflicts abort and restore, same as
-`graduate`, and `--force`/`--reason` behave the same way.
-
-Promotion also owns the release mechanics that previously only happened when you
-opened a PR — see [Versioning and release tags](#versioning-and-release-tags):
-
-- refuses to promote unless `Cargo.toml`'s version is above the stable branch's,
-  offering to bump it (`--bump <patch|minor|major>` to skip the prompt, `--yes`
-  to take the patch default non-interactively)
-- creates an annotated `vX.Y.Z` tag on the promotion merge commit, then offers to
-  push it to `origin`. `--no-tag` skips tagging entirely
-- `--force --reason "<why>"` overrides the version gate, recording it in the
-  merge commit alongside any other bypassed gate
-
-### `status`
-
-Shows current branch, tier, cleanliness, pending rolls, and promotion readiness.
-Runs as a full-screen TUI by default; `--no-tui` prints a plain table instead and
-`--json` emits machine-readable output.
-
-### `list`
-
-Lists roll branches and states, with the same `--no-tui`/`--json` options as
-`status`. `--deps` adds a dependency column to the table.
-
-### `update`
-
-Merges the stable branch into every active local roll branch, bringing them all
-up to the current baseline in one pass. Supports `--dry-run`.
-
-### `prune`
-
-Deletes roll branches that have already been promoted to the stable branch,
-removing both the local branch and its copy on `origin`. Reachable from the TUI
-with `[x]`.
-
-Being promoted is not by itself treated as permission to delete. Promotion is
-inferred from commit subjects on stable, which establishes that the roll landed
-but not that its branch tip has nothing left on it — a roll can take commits
-after its graduation merge. So each copy is additionally checked for containment:
-the tip must be an ancestor of the stable branch or of `origin/<stable>`.
-Anything failing that check is listed as skipped, with the reason, and is only
-deleted with `--force`. The checked-out branch is never deleted locally.
-
-Because `rf` is otherwise local-only, prune runs `git fetch --prune origin` first
-so it never acts on stale remote-tracking refs (`--no-fetch` opts out).
-
-- `--dry-run` — show the plan, delete nothing
-- `--local` / `--remote` — narrow to one side (default: both)
-- `--yes` — skip the confirmation prompt. Run unattended without it, prune
-  reports what it would do, deletes nothing, and exits 0
-- `--force` — also delete branches whose commits are not contained in stable.
-  This widens *what* may be deleted; it does not skip the prompt
-
-### `version`
-
-Prints the crate version — the same value `Cargo.toml` carries and the Nix
-package derives from.
+| Command | What it does |
+|---|---|
+| [`init`](docs/commands/init.md) | Write `.roll-flow.toml` and detect branch defaults |
+| [`create`](docs/commands/create.md) | Start `roll/N-MMDD-slug` off the stable branch |
+| [`integrate`](docs/commands/integrate.md) | Merge a feature branch into the current roll |
+| [`hotfix`](docs/commands/hotfix.md) | Branch off stable for urgent fixes, and land them |
+| [`verify`](docs/commands/verify.md) | Check readiness and run the configured gates |
+| [`graduate`](docs/commands/graduate.md) | Merge the current roll into rolling |
+| [`promote`](docs/commands/promote.md) | Merge rolling into the stable branch |
+| [`status`](docs/commands/status.md) | Current branch, tier, pending rolls, readiness |
+| [`list`](docs/commands/list.md) | All roll branches and their states |
+| [`update`](docs/commands/update.md) | Bring every roll up to the current baseline |
+| [`prune`](docs/commands/prune.md) | Delete rolls already promoted to stable |
+| [`delete`](docs/commands/delete.md) | Delete one named roll branch |
+| [`clean`](docs/commands/clean.md) | Repo-wide stale branch janitor; needs no config |
+| [`version`](docs/commands/version.md) | Print the crate version |
 
 ## Config
 
-`.roll-flow.toml` (repo-local):
-
-```toml
-config_version = 1
-repo_root = "/absolute/path/to/repo"
-rolling_branch = "rolling"
-stable_branch = "main"
-roll_prefix = "roll/"
-username = "gig"
-hosts = []
-version_gate = true
-tag_on_promote = true
-push_tag = true
-roll_to_rolling_gates = []
-rolling_to_main_gates = []
-```
-
-Gate entries are shell commands run in repo root. Any failure blocks verify/promote.
-
-`version_gate`, `tag_on_promote`, and `push_tag` control the release behavior
-described in [Versioning and release tags](#versioning-and-release-tags). All
-three default to `true` and are inert in repos without a `Cargo.toml`.
+See [docs/config.md](docs/config.md) for `.roll-flow.toml` and its gate and
+`clean_protect` settings.
 
 ## Versioning and release tags
 
@@ -223,13 +100,18 @@ equivalent:
   subject matches the one `.github/workflows/tag-on-main.yml` writes, and, like
   that workflow, an existing tag is left alone rather than treated as an error.
 - **Pushing the tag** — `rf promote` then asks before running
-  `git push origin <tag>`. This is the only write to the remote outside
-  `rf prune`; it never happens without confirmation or `--yes`.
+  `git push origin <tag>`. It never happens without confirmation or `--yes`.
+
+A `--roll` promotion is several merges, so it gates and tags each one as it is
+reached. Only the whole-branch route offers a bump, since only it merges a branch
+a bump commit could land on.
 
 Repos without a `Cargo.toml` — including the dotfiles repo roll-flow was built
-for — skip all of this silently.
+for — skip all of this silently. `version_gate`, `tag_on_promote`, and `push_tag`
+in [docs/config.md](docs/config.md) turn each piece off.
 
-See [CONTRIBUTING.md](CONTRIBUTING.md) for how this repo uses roll-flow on itself.
+See [CONTRIBUTING.md](CONTRIBUTING.md) for how this repo uses roll-flow on itself,
+and [CLAUDE.md](CLAUDE.md) for the internal domain model.
 
 ## Testing
 
@@ -239,9 +121,11 @@ cargo test
 
 ## Caveats
 
-- local-only behavior (no automatic fetch/push), except `rf prune`, which
-  fetches and deletes branches on `origin`, and the confirmed release-tag push
-  at the end of `rf promote`
+- local-only behavior (no automatic fetch/push), except `rf prune` and
+  `rf delete` (and the TUI's `[x]` and `[d]`), which fetch and delete branches
+  on `origin`; `rf clean`, which fetches from every remote and deletes there
+  only with `--with-remote`; and the confirmed release-tag push at the end of
+  `rf promote`
 - no daemon; `rf` only ever runs when invoked. The `status`/`list` TUI does drive
-  the workflow (`g` graduate, `p` promote, `u` update, `x` prune), but forced
-  operations stay CLI-only by design
+  the workflow (`g` graduate, `p` promote, `u` update, `x` prune, `d` delete),
+  but forced operations stay CLI-only by design

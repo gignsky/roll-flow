@@ -20,7 +20,7 @@ fn main() -> Result<()> {
     // `rf status` (issue #100). `--help`/`-h`/`--version` never reach here —
     // clap intercepts them during `parse()`.
     let Some(command) = cli.command else {
-        return cli::status::run(false);
+        return cli::status::run(false, true);
     };
 
     match command {
@@ -73,18 +73,23 @@ fn main() -> Result<()> {
             reason,
         } => cmd_graduate(dry_run, force, reason)?,
         Cmd::Promote {
+            roll,
             dry_run,
             force,
             reason,
             bump,
             no_tag,
             yes,
-        } => cmd_promote(dry_run, force, reason, bump, !no_tag, yes)?,
-        Cmd::Status { no_tui, json } => {
+        } => cmd_promote(roll, dry_run, force, reason, bump, !no_tag, yes)?,
+        Cmd::Status {
+            no_tui,
+            no_deps,
+            json,
+        } => {
             if json {
                 cmd_status_json()?;
             } else {
-                cli::status::run(no_tui)?;
+                cli::status::run(no_tui, !no_deps)?;
             }
         }
         Cmd::List { no_tui, deps, json } => {
@@ -103,6 +108,22 @@ fn main() -> Result<()> {
             force,
             no_fetch,
         } => cmd_prune(dry_run, local, remote, yes, force, no_fetch)?,
+        Cmd::Delete {
+            branch,
+            dry_run,
+            local,
+            remote,
+            yes,
+            force,
+            no_fetch,
+        } => cmd_delete(&branch, dry_run, local, remote, yes, force, no_fetch)?,
+        Cmd::Clean {
+            dry_run,
+            yes,
+            force,
+            with_remote,
+            no_fetch,
+        } => cli::clean::run(dry_run, yes, force, with_remote, no_fetch)?,
         Cmd::Version => println!("{}", env!("CARGO_PKG_VERSION")),
     }
 
@@ -178,7 +199,7 @@ fn cmd_init(
         let apply = if force || yes {
             true
         } else if std::io::stdin().is_terminal() {
-            prompt_yes("Apply these changes to .roll-flow.toml? [y/N] ")?
+            cli::prompt_yes("Apply these changes to .roll-flow.toml? [y/N] ")?
         } else {
             // Non-interactive without --yes/--force: default to keeping the
             // existing file. Nothing is written; exit 0.
@@ -218,18 +239,6 @@ fn config_diff(current: &str, detected: &str) -> String {
         }
     }
     out
-}
-
-/// Prompt on stdout and read a yes/no answer from stdin. `y`/`yes`
-/// (case-insensitive) is affirmative; anything else is negative.
-fn prompt_yes(msg: &str) -> Result<bool> {
-    use std::io::Write;
-    print!("{msg}");
-    std::io::stdout().flush()?;
-    let mut line = String::new();
-    std::io::stdin().read_line(&mut line)?;
-    let ans = line.trim().to_ascii_lowercase();
-    Ok(ans == "y" || ans == "yes")
 }
 
 fn cmd_create(slug: &str, date: Option<String>, dry_run: bool) -> Result<()> {
@@ -502,7 +511,7 @@ fn offer_tag_push(config: &Config, tag: &str, yes: bool) -> Result<()> {
     let push = if yes {
         true
     } else if std::io::stdin().is_terminal() {
-        prompt_yes(&format!("Push tag {tag} to origin? [y/N] "))?
+        cli::prompt_yes(&format!("Push tag {tag} to origin? [y/N] "))?
     } else {
         println!("note: tag {tag} was not pushed (run with --yes, or: git push origin {tag})");
         return Ok(());
@@ -537,6 +546,7 @@ fn cmd_graduate(dry_run: bool, force: bool, reason: Option<String>) -> Result<()
 }
 
 fn cmd_promote(
+    rolls: Vec<String>,
     dry_run: bool,
     force: bool,
     reason: Option<String>,
@@ -548,6 +558,33 @@ fn cmd_promote(
     let force = ops::ForceOpts::new(force, reason)?;
     let config = Config::load()?;
     ops::ensure_clean_state(&config)?;
+
+    // `--roll` names what to promote outright, so it needs no route inference —
+    // and deliberately works from any branch, rather than being redirected to
+    // graduate because HEAD happens to sit on a roll.
+    if !rolls.is_empty() {
+        // No version-bump prompt here: a per-roll promotion merges a commit that
+        // already exists on rolling, so there is no branch to land a bump on —
+        // the gate compares what that commit carries and says so if it is short.
+        // Say so rather than dropping the flag on the floor.
+        if bump.is_some() {
+            eprintln!(
+                "warning: --bump is ignored with --roll; a roll's version is whatever \
+                 its graduation commit already carries"
+            );
+        }
+        let outcome = ops::promote(
+            &config,
+            &ops::PromoteTarget::Rolls(rolls),
+            dry_run,
+            &force,
+            tag,
+        )?;
+        print_promote(&outcome);
+        offer_step_tag_pushes(&config, &outcome, yes)?;
+        return Ok(());
+    }
+
     let current = git::current_branch(&config.repo_root)?;
     match ops::infer_route(&config, &current) {
         Some(ops::Route::Graduate { roll }) => {
@@ -563,27 +600,53 @@ fn cmd_promote(
             // gets merged, and so it precedes the `--locked` cargo gates.
             resolve_version_gate(&config, bump, yes, forced, dry_run)?;
 
-            let outcome = ops::promote(&config, dry_run, &force, tag)?;
-            render_version_check(&outcome.version, &outcome.rolling, &outcome.stable);
-            render_gate_notices(&outcome.gate_notices);
-            render_gate_notices(&outcome.host_notices);
-            render_host_results(&outcome.host_results);
-            if outcome.dry_run {
-                println!(
-                    "Dry-run: would promote '{}' into '{}' (--no-ff)",
-                    outcome.rolling, outcome.stable
-                );
-            } else {
-                println!("Promoted '{}' into '{}'", outcome.rolling, outcome.stable);
-            }
-            if let Some(line) = outcome.tag.describe() {
-                println!("{line}");
-            }
-            if let Some(tag) = outcome.tag.created_tag() {
-                offer_tag_push(&config, tag, yes)?;
-            }
+            let outcome =
+                ops::promote(&config, &ops::PromoteTarget::Rolling, dry_run, &force, tag)?;
+            print_promote(&outcome);
+            offer_step_tag_pushes(&config, &outcome, yes)?;
         }
         None => return Err(ops::not_promotable_error(&config, &current)),
+    }
+    Ok(())
+}
+
+/// Render a promotion outcome: every step in the order it was applied, then the
+/// rolls that needed no work. A whole-rolling promotion is one step, so this
+/// prints exactly what it always did for that case.
+fn print_promote(outcome: &ops::PromoteOutcome) {
+    for step in &outcome.steps {
+        render_version_check(&step.version, &step.source, &outcome.stable);
+        render_gate_notices(&step.gate_notices);
+        render_gate_notices(&step.host_notices);
+        render_host_results(&step.host_results);
+        let what = step.roll.as_deref().unwrap_or(&outcome.rolling);
+        if outcome.dry_run {
+            // Naming the source matters for `--roll`: it shows the merge is of a
+            // graduation commit on rolling, not of the roll branch.
+            println!(
+                "Dry-run: would promote '{}' into '{}' by merging '{}' (--no-ff)",
+                what, outcome.stable, step.source
+            );
+        } else {
+            println!("Promoted '{}' into '{}'", what, outcome.stable);
+        }
+        if let Some(line) = step.tag.describe() {
+            println!("{line}");
+        }
+    }
+    for skip in &outcome.skipped {
+        println!("skipped '{}': {}", skip.roll, skip.reason);
+    }
+}
+
+/// Offer to push whatever release tags the promotion created. A whole-rolling
+/// promotion is one step and so asks once, exactly as it always did; a per-roll
+/// promotion asks per tag, since each step is its own release.
+fn offer_step_tag_pushes(config: &Config, outcome: &ops::PromoteOutcome, yes: bool) -> Result<()> {
+    for step in &outcome.steps {
+        if let Some(tag) = step.tag.created_tag() {
+            offer_tag_push(config, tag, yes)?;
+        }
     }
     Ok(())
 }
@@ -723,7 +786,7 @@ fn cmd_prune(
         return Ok(());
     }
 
-    render_prune_plan(&plan);
+    render_prune_plan(&plan, "Promoted roll branches to prune:");
     render_prune_skips(&plan.skipped);
 
     if dry_run {
@@ -732,29 +795,21 @@ fn cmd_prune(
     }
 
     // `--force` widens *what* may be deleted; only `--yes` skips the prompt.
-    // Non-interactive without `--yes` deletes nothing and exits 0, matching how
-    // `rf init` treats an unattended run.
-    let interactive = std::io::stdin().is_terminal();
-    let apply = if yes {
-        true
-    } else if interactive {
-        prompt_yes("\nDelete these branches? [y/N] ")?
-    } else {
-        false
-    };
-
-    if !apply {
-        if interactive {
+    match cli::confirm(yes, "\nDelete these branches? [y/N] ")? {
+        cli::Confirm::Yes => {}
+        cli::Confirm::Declined => {
             println!("Nothing deleted.");
-        } else {
-            println!("\nNothing deleted. Re-run with --yes to apply.");
+            return Ok(());
         }
-        return Ok(());
+        cli::Confirm::Unattended => {
+            println!("\nNothing deleted. Re-run with --yes to apply.");
+            return Ok(());
+        }
     }
 
     println!();
     let results = ops::prune_apply(&config, &plan)?;
-    let failures = render_prune_results(&results);
+    let failures = render_prune_results(&results, "Pruned");
     if failures > 0 {
         bail!(
             "{failures} branch{} could not be deleted",
@@ -764,8 +819,75 @@ fn cmd_prune(
     Ok(())
 }
 
+/// `rf delete <branch>` — delete one named roll branch, locally, on origin, or
+/// both.
+///
+/// The CLI twin of the TUI's `[d]elete`, and the reason the shared deletion
+/// rules in `ops` are testable end to end at all. Like `cmd_prune` it never
+/// moves `HEAD`, so a dirty working tree is irrelevant and `ensure_clean_state`
+/// is deliberately not called.
+#[allow(clippy::too_many_arguments)]
+fn cmd_delete(
+    branch: &str,
+    dry_run: bool,
+    local: bool,
+    remote: bool,
+    yes: bool,
+    force: bool,
+    no_fetch: bool,
+) -> Result<()> {
+    let config = Config::load()?;
+
+    // Neither flag means both copies; either one narrows to just that side.
+    let scope = ops::PruneScope {
+        local: local || !remote,
+        remote: remote || !local,
+        force,
+        fetch: !no_fetch,
+    };
+
+    let plan = ops::delete_branch_plan(&config, branch, &scope)?;
+
+    if plan.is_empty() {
+        println!("nothing to delete for '{branch}'");
+        render_prune_skips(&plan.skipped);
+        return Ok(());
+    }
+
+    render_prune_plan(&plan, "Branch to delete:");
+    render_prune_skips(&plan.skipped);
+
+    if dry_run {
+        println!("\nDry-run: nothing deleted");
+        return Ok(());
+    }
+
+    // Same split as `rf prune`: `--force` widens *what* may be deleted, only
+    // `--yes` skips the prompt, and an unattended run without `--yes` deletes
+    // nothing and exits 0.
+    match cli::confirm(yes, &format!("\nDelete '{branch}'? [y/N] "))? {
+        cli::Confirm::Yes => {}
+        cli::Confirm::Declined => {
+            println!("Nothing deleted.");
+            return Ok(());
+        }
+        cli::Confirm::Unattended => {
+            println!("\nNothing deleted. Re-run with --yes to apply.");
+            return Ok(());
+        }
+    }
+
+    println!();
+    let results = ops::prune_apply(&config, &plan)?;
+    let failures = render_prune_results(&results, "Deleted");
+    if failures > 0 {
+        bail!("'{branch}' could not be deleted");
+    }
+    Ok(())
+}
+
 /// Render the branches a prune would delete, and which copies of each.
-fn render_prune_plan(plan: &ops::PrunePlan) {
+fn render_prune_plan(plan: &ops::PrunePlan, title: &str) {
     let name_w = plan
         .candidates
         .iter()
@@ -774,7 +896,7 @@ fn render_prune_plan(plan: &ops::PrunePlan) {
         .unwrap_or(6)
         .max(6);
 
-    println!("Promoted roll branches to prune:");
+    println!("{title}");
     println!();
     println!(
         "  {num:>3}  {name:<nw$}  delete",
@@ -816,7 +938,7 @@ fn render_prune_skips(skipped: &[ops::PruneSkip]) {
 }
 
 /// Render what actually happened, returning the number of failed branches.
-fn render_prune_results(results: &[ops::PruneResult]) -> usize {
+fn render_prune_results(results: &[ops::PruneResult], verb: &str) -> usize {
     let mut failures = 0;
     for result in results {
         if result.errors.is_empty() {
@@ -837,7 +959,7 @@ fn render_prune_results(results: &[ops::PruneResult]) -> usize {
     }
     let deleted = results.len() - failures;
     println!(
-        "\nPruned {deleted} branch{}",
+        "\n{verb} {deleted} branch{}",
         if deleted == 1 { "" } else { "es" }
     );
     failures
@@ -865,13 +987,19 @@ fn cmd_list_text(no_tui: bool, deps: bool) -> Result<()> {
         .max(6);
     let state_w = "⛔ blocked".len();
 
+    let (dep_w, dependant_w) = dep_column_widths(&rolls);
+
     println!(
         "  {num:>3}  {name:<nw$}  {loc:<3}  {state:<sw$}{deps_hdr}",
         num = "#",
         name = "branch",
         loc = "loc",
         state = "state",
-        deps_hdr = if deps { "  deps" } else { "" },
+        deps_hdr = if deps {
+            format!("  {DEPS_HDR:<dep_w$}  {DEPENDANTS_HDR}")
+        } else {
+            String::new()
+        },
         nw = name_w,
         sw = state_w,
     );
@@ -879,19 +1007,20 @@ fn cmd_list_text(no_tui: bool, deps: bool) -> Result<()> {
         "  ───  {sep_e}  ───  {sep_s}{sep_d}",
         sep_e = "─".repeat(name_w),
         sep_s = "─".repeat(state_w),
-        sep_d = if deps { "  ────" } else { "" },
+        sep_d = if deps {
+            format!("  {}  {}", "─".repeat(dep_w), "─".repeat(dependant_w))
+        } else {
+            String::new()
+        },
     );
 
     for roll in &rolls {
         let cur = if roll.is_current { ">" } else { " " };
-        let deps_col = if deps && !roll.deps.is_empty() {
+        let deps_col = if deps {
             format!(
-                "  {}",
-                roll.deps
-                    .iter()
-                    .map(|n| n.to_string())
-                    .collect::<Vec<_>>()
-                    .join(",")
+                "  {:<dep_w$}  {}",
+                branches::format_roll_numbers(&roll.deps),
+                branches::format_roll_numbers(&roll.dependents),
             )
         } else {
             String::new()
@@ -908,6 +1037,30 @@ fn cmd_list_text(no_tui: bool, deps: bool) -> Result<()> {
     }
 
     Ok(())
+}
+
+/// Column headers for the dependency pair, shared by `rf list --no-tui --deps`
+/// and `rf status --no-tui` so the two tables read identically.
+pub(crate) const DEPS_HDR: &str = "deps";
+pub(crate) const DEPENDANTS_HDR: &str = "dependants";
+
+/// Widths for the `deps` / `dependants` columns: wide enough for the header and
+/// for the longest comma-joined number list in the table. Trailing whitespace on
+/// the last column is trimmed by the caller's format, so only `deps` needs a
+/// computed width — `dependants` is returned for the separator rule.
+pub(crate) fn dep_column_widths(rolls: &[branches::RollInfo]) -> (usize, usize) {
+    let widest = |pick: fn(&branches::RollInfo) -> &Vec<u32>, hdr: &str| {
+        rolls
+            .iter()
+            .map(|r| branches::format_roll_numbers(pick(r)).chars().count())
+            .max()
+            .unwrap_or(0)
+            .max(hdr.chars().count())
+    };
+    (
+        widest(|r| &r.deps, DEPS_HDR),
+        widest(|r| &r.dependents, DEPENDANTS_HDR),
+    )
 }
 
 #[derive(Serialize)]
@@ -934,6 +1087,10 @@ struct JsonRoll {
     state: String,
     location: String,
     is_current: bool,
+    /// Roll numbers this roll integrated, and the inverse. Emitted so scripted
+    /// consumers see the same dependency graph the TUI draws.
+    deps: Vec<u32>,
+    dependants: Vec<u32>,
 }
 
 fn rolls_for_json(rolls: Vec<branches::RollInfo>) -> Vec<JsonRoll> {
@@ -945,6 +1102,8 @@ fn rolls_for_json(rolls: Vec<branches::RollInfo>) -> Vec<JsonRoll> {
             state: r.state.label().to_string(),
             location: r.location.symbol().to_string(),
             is_current: r.is_current,
+            deps: r.deps,
+            dependants: r.dependents,
         })
         .collect()
 }

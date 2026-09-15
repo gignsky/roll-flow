@@ -1,7 +1,56 @@
+pub mod clean;
 pub mod status;
 
 use crate::core::version::BumpLevel;
+use std::io::IsTerminal;
+
 use clap::{Parser, Subcommand};
+
+// ── Interactive confirmation ──────────────────────────────────────────────────
+
+/// Prompt on stdout and read a yes/no answer from stdin. `y`/`yes`
+/// (case-insensitive) is affirmative; anything else is negative.
+pub(crate) fn prompt_yes(msg: &str) -> anyhow::Result<bool> {
+    use std::io::Write;
+    print!("{msg}");
+    std::io::stdout().flush()?;
+    let mut line = String::new();
+    std::io::stdin().read_line(&mut line)?;
+    let ans = line.trim().to_ascii_lowercase();
+    Ok(ans == "y" || ans == "yes")
+}
+
+/// How a destructive command's confirmation resolved.
+///
+/// [`Confirm::Declined`] and [`Confirm::Unattended`] both mean "do nothing", but
+/// they are distinct so the caller can explain *why*: a user who answered `n`
+/// knows what they did, whereas an unattended run needs to be told `--yes`
+/// exists.
+pub(crate) enum Confirm {
+    Yes,
+    Declined,
+    Unattended,
+}
+
+/// Resolve whether a destructive action may proceed.
+///
+/// `--yes` always wins; an interactive terminal is prompted; an unattended run
+/// without `--yes` declines. That last case is deliberately not an error — it
+/// exits 0 having changed nothing, so a command that lands in someone's CI
+/// reports rather than deletes.
+pub(crate) fn confirm(yes: bool, msg: &str) -> anyhow::Result<Confirm> {
+    if yes {
+        return Ok(Confirm::Yes);
+    }
+    if !std::io::stdin().is_terminal() {
+        return Ok(Confirm::Unattended);
+    }
+    if prompt_yes(msg)? {
+        Ok(Confirm::Yes)
+    } else {
+        Ok(Confirm::Declined)
+    }
+}
 
 #[derive(Parser)]
 #[command(
@@ -102,6 +151,11 @@ pub enum Cmd {
     /// Promote rolling into the stable branch (--no-ff merge). On a roll
     /// branch, redirects to graduate.
     Promote {
+        /// Promote only this graduated roll, by advancing stable to its
+        /// graduation commit on rolling. Repeatable; each roll is a separate
+        /// merge with its own gate run, applied in graduation order.
+        #[arg(long)]
+        roll: Vec<String>,
         #[arg(long)]
         dry_run: bool,
         /// Proceed past failing gates, recording the bypass in the merge commit.
@@ -128,6 +182,9 @@ pub enum Cmd {
     Status {
         #[arg(long)]
         no_tui: bool,
+        /// Hide the deps/dependants columns, which status shows by default.
+        #[arg(long)]
+        no_deps: bool,
         #[arg(long)]
         json: bool,
     },
@@ -168,6 +225,57 @@ pub enum Cmd {
         #[arg(long)]
         force: bool,
         /// Skip the `git fetch --prune origin` refresh that precedes planning.
+        #[arg(long)]
+        no_fetch: bool,
+    },
+
+    /// Delete a single roll branch locally, on origin, or both.
+    ///
+    /// Unlike `prune` this does not require the roll to be promoted — the
+    /// branch is named explicitly. Copies holding commits the stable branch
+    /// lacks still need `--force`, and the checked-out branch is never deleted.
+    Delete {
+        /// The roll branch to delete.
+        branch: String,
+        #[arg(long)]
+        dry_run: bool,
+        /// Delete only the local branch, leaving origin untouched.
+        #[arg(long, conflicts_with = "remote")]
+        local: bool,
+        /// Delete only the branch on origin, leaving the local one untouched.
+        #[arg(long, conflicts_with = "local")]
+        remote: bool,
+        /// Delete without prompting for confirmation.
+        #[arg(long)]
+        yes: bool,
+        /// Delete even when the branch has commits not contained in the stable
+        /// branch.
+        #[arg(long)]
+        force: bool,
+        /// Skip the `git fetch --prune origin` refresh that precedes planning.
+        #[arg(long)]
+        no_fetch: bool,
+    },
+
+    /// Delete stale branches: prune every remote, then remove local branches
+    /// whose upstream is gone, that are merged into the base branch, or — in a
+    /// roll-flow repo — whose roll is already promoted.
+    ///
+    /// Works in any git repository, with or without a `.roll-flow.toml`.
+    Clean {
+        #[arg(long)]
+        dry_run: bool,
+        /// Delete without prompting for confirmation.
+        #[arg(long)]
+        yes: bool,
+        /// Delete even when a branch holds commits the base branch lacks.
+        #[arg(long)]
+        force: bool,
+        /// Also delete the branches on their remote. Note this *extends* clean,
+        /// where `rf prune --remote` *narrows* prune to the remote side only.
+        #[arg(long)]
+        with_remote: bool,
+        /// Skip the `git fetch --prune` refresh that precedes planning.
         #[arg(long)]
         no_fetch: bool,
     },
