@@ -1,10 +1,16 @@
-//! Keeps `README.md` honest about the CLI surface.
+//! Keeps the command documentation honest about the CLI surface.
 //!
-//! README drift is this repo's recurring documentation failure: commands land,
-//! the README stays put, and the gap is only noticed when someone reads both.
-//! This test closes that loop mechanically — it asks the freshly built `rf`
-//! binary what its surface actually is (`--help`, then `<sub> --help`) and
-//! asserts the README documents all of it.
+//! Doc drift is this repo's recurring documentation failure: commands land, the
+//! docs stay put, and the gap is only noticed when someone reads both. This
+//! test closes that loop mechanically — it asks the freshly built `rf` binary
+//! what its surface actually is (`--help`, then `<sub> --help`) and asserts the
+//! documentation covers all of it.
+//!
+//! Two things are required per subcommand: a synopsis line in the `## Commands`
+//! block in `README.md` carrying every long flag, and a file of its own at
+//! `docs/commands/<sub>.md`. The per-command files are split out deliberately —
+//! when all the prose lived in `README.md`, every new command appended a section
+//! at the same spot and two rolls adding commands conflicted every time.
 //!
 //! It deliberately lives as a `cargo test` rather than a bespoke CI job:
 //! `cargo test --locked` is already a step in `.github/workflows/ci.yml` *and* a
@@ -112,10 +118,16 @@ fn readme_documents_every_subcommand_and_flag() {
             continue;
         };
 
-        if !readme.contains(&format!("### `{sub}`")) {
-            problems.push(format!(
-                "`rf {sub}` has no \"### `{sub}`\" section heading in README.md"
-            ));
+        let doc = std::path::Path::new(concat!(env!("CARGO_MANIFEST_DIR"), "/docs/commands"))
+            .join(format!("{sub}.md"));
+        match std::fs::read_to_string(&doc) {
+            Err(_) => problems.push(format!(
+                "`rf {sub}` has no documentation file at docs/commands/{sub}.md"
+            )),
+            Ok(body) if !body.contains(&format!("# `{sub}`")) => problems.push(format!(
+                "docs/commands/{sub}.md exists but is not headed \"# `{sub}`\""
+            )),
+            Ok(_) => {}
         }
 
         for flag in long_flags(&sb.rf(&[&sub, "--help"]).combined()) {
@@ -130,9 +142,9 @@ fn readme_documents_every_subcommand_and_flag() {
 
     assert!(
         problems.is_empty(),
-        "README.md is out of sync with the CLI ({} problem(s)):\n  - {}\n\n\
-         Update the `## Commands` block and the per-command `###` sections in \
-         README.md to match `rf --help`.",
+        "Command docs are out of sync with the CLI ({} problem(s)):\n  - {}\n\n\
+         Update the `## Commands` block in README.md and the per-command files \
+         in docs/commands/ to match `rf --help`.",
         problems.len(),
         problems.join("\n  - ")
     );
