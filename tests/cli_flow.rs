@@ -553,3 +553,214 @@ fn integrate_accepts_roll_number() {
         out.combined()
     );
 }
+
+// ── config file honesty (roll/18) ────────────────────────────────────────────
+
+#[test]
+fn init_keeps_hand_edited_gates_comments_and_flags() {
+    // The old `rf init --yes` regenerated the file from detection and so
+    // deleted every gate, every clean_protect entry and every comment. It now
+    // edits in place: detected keys refreshed, missing keys added, the rest
+    // left exactly as typed.
+    let sb = Sandbox::nixos();
+    sb.init();
+    let path = sb.path().join(".roll-flow.toml");
+    let mut text = std::fs::read_to_string(&path).expect("read");
+    text = text.replace(
+        "rolling_to_main_gates = []",
+        "# the release gate\nrolling_to_main_gates = [\"just test-all\"]",
+    );
+    text = text.replace("clean_protect = []", "clean_protect = [\"staging\"]");
+    text = text.replace("push_tag = true", "push_tag = false");
+    std::fs::write(&path, &text).expect("write");
+
+    let out = sb.rf(&["init", "--yes"]);
+    assert!(out.success, "{}", out.combined());
+    let after = std::fs::read_to_string(&path).expect("read");
+    assert!(
+        after.contains("# the release gate"),
+        "comment lost:\n{after}"
+    );
+    assert!(
+        after.contains("rolling_to_main_gates = [\"just test-all\"]"),
+        "{after}"
+    );
+    assert!(after.contains("clean_protect = [\"staging\"]"), "{after}");
+    assert!(after.contains("push_tag = false"), "{after}");
+    // And the detected hosts survived untouched.
+    assert!(after.contains("ganoslal = true"), "{after}");
+}
+
+#[test]
+fn init_adds_keys_a_newer_rf_knows_ahead_of_the_host_table() {
+    // A config from before `lazygit_command` existed. Init adds it — and puts
+    // it in the root table, not after `[host_active]` where it would become a
+    // host name.
+    let sb = Sandbox::nixos();
+    sb.init();
+    let path = sb.path().join(".roll-flow.toml");
+    let text = std::fs::read_to_string(&path).expect("read");
+    let stripped: String = text
+        .lines()
+        .filter(|l| !l.starts_with("lazygit_command"))
+        .map(|l| format!("{l}\n"))
+        .collect();
+    std::fs::write(&path, &stripped).expect("write");
+
+    let out = sb.rf(&["init", "--yes"]);
+    assert!(out.success, "{}", out.combined());
+    assert!(
+        out.combined().contains("+lazygit_command"),
+        "{}",
+        out.combined()
+    );
+    let after = std::fs::read_to_string(&path).expect("read");
+    let key_at = after.find("lazygit_command").expect("key added");
+    let table_at = after.find("[host_active]").expect("table present");
+    assert!(
+        key_at < table_at,
+        "key landed inside the host table:\n{after}"
+    );
+    // Loading it back reads the key, not a host called lazygit_command.
+    let out = sb.rf(&["status", "--no-tui"]);
+    assert!(out.success, "{}", out.combined());
+    assert!(!out.combined().contains("warning"), "{}", out.combined());
+}
+
+#[test]
+fn a_typo_in_the_config_is_warned_about_and_the_command_still_runs() {
+    let sb = Sandbox::nixos();
+    sb.init();
+    let path = sb.path().join(".roll-flow.toml");
+    let text = std::fs::read_to_string(&path).expect("read");
+    let text = text.replace("clean_protect = []", "clean_protct = [\"staging\"]");
+    std::fs::write(&path, &text).expect("write");
+
+    let out = sb.rf(&["status", "--no-tui"]);
+    assert!(
+        out.success,
+        "a typo must not break the command: {}",
+        out.combined()
+    );
+    assert!(
+        out.stderr.contains("warning: unknown key 'clean_protct'"),
+        "no warning:\n{}",
+        out.combined()
+    );
+}
+
+#[test]
+fn a_config_version_from_another_rf_warns_once_and_survives_init() {
+    let sb = Sandbox::nixos();
+    sb.init();
+    let path = sb.path().join(".roll-flow.toml");
+    let text = std::fs::read_to_string(&path).expect("read");
+    std::fs::write(
+        &path,
+        text.replace("config_version = 1", "config_version = 3"),
+    )
+    .expect("write");
+
+    let out = sb.rf(&["status", "--no-tui"]);
+    assert!(out.success, "{}", out.combined());
+    assert!(
+        out.stderr.contains("config_version is 3"),
+        "{}",
+        out.combined()
+    );
+
+    // Init reports nothing to change: the version is the file's statement
+    // about itself, not something detection knows better.
+    let out = sb.rf(&["init"]);
+    assert!(out.success, "{}", out.combined());
+    assert!(
+        out.combined().contains("already up to date"),
+        "{}",
+        out.combined()
+    );
+}
+
+#[test]
+fn a_missing_required_key_points_at_init() {
+    let sb = Sandbox::nixos();
+    sb.init();
+    let path = sb.path().join(".roll-flow.toml");
+    let text = std::fs::read_to_string(&path).expect("read");
+    let text: String = text
+        .lines()
+        .filter(|l| !l.starts_with("stable_branch"))
+        .map(|l| format!("{l}\n"))
+        .collect();
+    std::fs::write(&path, &text).expect("write");
+
+    let out = sb.rf(&["status", "--no-tui"]);
+    assert!(!out.success);
+    assert!(
+        out.combined().contains("stable_branch"),
+        "{}",
+        out.combined()
+    );
+    assert!(out.combined().contains("rf init"), "{}", out.combined());
+}
+
+#[test]
+fn init_detects_hosts_from_the_real_hosts_nix_shape() {
+    // The fixture is shaped like the dotfiles file: a bare attrset. Detection
+    // never worked on that shape before, which is why the dotfiles config has
+    // `hosts = []`.
+    let sb = Sandbox::nixos();
+    sb.init();
+    let text = std::fs::read_to_string(sb.path().join(".roll-flow.toml")).expect("read");
+    // Rendered multi-line by `toml`; what matters is all three, in file order.
+    let listed: Vec<&str> = text
+        .split("hosts = [")
+        .nth(1)
+        .and_then(|r| r.split(']').next())
+        .map(|b| b.split('"').skip(1).step_by(2).collect())
+        .unwrap_or_default();
+    assert_eq!(listed, vec!["ganoslal", "merlin", "wsl"], "{text}");
+    assert!(text.contains("username = \"gig\""), "{text}");
+    assert!(text.contains("[host_active]"), "{text}");
+    assert!(text.contains("wsl = false"), "{text}");
+}
+
+#[test]
+fn init_never_flips_a_host_the_file_already_names() {
+    // The file is where the user records what is true now; vars/hosts.nix only
+    // seeds it. A host flipped off by hand, with a comment saying why, must
+    // survive `rf init --yes` — and a host the seed newly mentions is added.
+    let sb = Sandbox::nixos();
+    sb.init();
+    let path = sb.path().join(".roll-flow.toml");
+    let text = std::fs::read_to_string(&path).expect("read");
+    let text = text.replace(
+        "[host_active]\nganoslal = true",
+        "[host_active]\n# ganoslal is being rebuilt; back on next week\nganoslal = false",
+    );
+    std::fs::write(&path, &text).expect("write");
+    // The seed grows a host the file has never heard of.
+    sb.write(
+        "vars/hosts.nix",
+        "{\n  ganoslal = true;\n  merlin = true;\n  wsl = false;\n  spacedock = true;\n}\n",
+    );
+
+    let out = sb.rf(&["init", "--yes"]);
+    assert!(out.success, "{}", out.combined());
+    let after = std::fs::read_to_string(&path).expect("read");
+    assert!(
+        after.contains("# ganoslal is being rebuilt"),
+        "comment lost:\n{after}"
+    );
+    assert!(
+        after.contains("ganoslal = false"),
+        "hand edit undone:\n{after}"
+    );
+    assert!(
+        after.contains("spacedock = true"),
+        "new host not added:\n{after}"
+    );
+    assert!(
+        after.contains("\"spacedock\""),
+        "new host not listed in hosts:\n{after}"
+    );
+}

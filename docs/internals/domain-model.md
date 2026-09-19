@@ -28,22 +28,24 @@ and follow the same verification/promotion gating as real rolls. Auto-generated 
 
 ## Config structure
 
+`<repo>/.roll-flow.toml`, every key of it, is documented in
+[`docs/config.md`](../config.md) and that table is enforced by
+`tests/config_docs_sync.rs`. The shape that matters here:
+
 ```toml
-repo_root = "/home/gig/.dotfiles"
 rolling_branch = "rolling"
 stable_branch = "main"
 roll_prefix = "roll/"
-username = "gig"
-hosts = ["ganoslal", "merlin", "wsl"]
+hosts = ["ganoslal", "merlin", "wsl"]   # order only; may be empty
 
-[host_active]
+[host_active]                            # the truth about who verifies
 ganoslal = true
 merlin = true
 wsl = false
 ```
 
-`host_active` is sourced from `vars/hosts.nix` in the dotfiles repo. Inactive hosts are
-excluded from verification requirements (used when a machine is offline or being rebuilt).
-
-Auto-generation reads `flake.nix` via `nix eval .#nixosConfigurations` and
-`.#homeConfigurations` to discover hosts and username.
+`host_active` is detected from `vars/hosts.nix` in the dotfiles repo, which is a
+bare `{ host = bool; }` attrset; inactive hosts are excluded from verification
+requirements (a machine offline or being rebuilt). The username comes from
+`vars/default.nix`, then `$USER`, then git. Detection is a text scan of those
+two files — `rf` never runs `nix eval`.
