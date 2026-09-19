@@ -65,6 +65,63 @@ false positives from shared ancestry. This is the method that gives
 merging roll N into roll M leaves exactly that subject in M's history, so M gains
 a dependency on N and stays `⛔ blocked` until N graduates.
 
+Subjects are read by `branches::extract_graduated_branch`, and it is deliberately
+lenient, because the subject is not always the one git wrote. A merge that
+conflicts opens an editor, and what comes back is whatever the user typed —
+`merge branch 'roll/8-0918-help-menu'`, lowercase and shorn of its `into` clause,
+is in this repo's own history. So matching ignores case, and a subject that still
+begins with `merge` but fits none of the known shapes falls back to "the first
+token containing a `/`".
+
+Two rules keep that leniency from doing damage:
+
+- **The ` into ` clause is cut before anything else looks at the subject.** It
+  names the merge *target*, never the source. Without the cut,
+  `Merge branch 'roll/8-x' into roll/7-y` could yield roll/7 — and on the rolling
+  branch that reads as "roll/7 graduated", which is far worse than missing a
+  dependency.
+- **The fallback only fires on a subject that announces itself as a merge**, so
+  `Revert "Merge branch 'roll/8-x'"` is not mistaken for a graduation.
+
+The token it returns is not validated against the roll prefix, and does not need
+to be: every caller either compares it to a real roll branch name or runs it
+through `parse_roll_number`, so a candidate that is not a roll matches nothing.
+
+**Outdated dependencies.** Each integrate merge also records *which tip* was
+merged: its second parent, `<merge>^2`. `list_rolls` compares that against the
+dependency's tip today, and when they differ diffs the two. A dependency counts
+as **moved** — and its dependant as `outdated` with respect to it — only if that
+diff touches something other than `version = …` lines in `Cargo.toml` and
+`Cargo.lock`. The dev-version marker `rf start` writes and an ordinary bump both
+change exactly those lines, and a dependant that integrated a roll before its
+mark has not fallen behind any work. The classifier is
+`branches::only_version_lines_changed`, line-based on purpose: it cannot tell a
+package version from a dependency's, and errs toward "outdated", which is the
+safe side.
+
+The check is cheap by construction: two SHA comparisons per integration, and a
+diff only for a dependency whose tip actually moved — `--name-only` first, and a
+`-U0` diff of the manifest and lockfile only when nothing else changed. Where a
+roll integrated the same dependency twice, the latest merge is the one that
+counts, since that is the tip it holds now. Re-integrating clears the mark.
+
+`outdated` is a field on `RollInfo`, not a `RollState`: it is orthogonal to the
+lifecycle — a `⛔ blocked` roll can be outdated too, and so can a graduated one
+— and folding it into the enum would force one of the two facts to win. The
+tables show it as a `⟳` prefix on the state cell; the detail view names the
+dependencies that moved and marks the link in the chain; `--json` carries it as
+its own `outdated` array beside `deps`.
+
+**Dependency chain.** The detail view (`[enter]`) walks `deps` transitively —
+roll 12 depends on 9, which depends on 8, which depends on 7 — through
+`tui::rolls::dep_chain`. Each level is exactly `dep_rows` of its parent, so there
+is one definition of a direct dependency row and the chain only adds depth. A
+roll reached a second time (a diamond, or a cycle if hand-written merge subjects
+ever produce one) is listed once more as `↑ shown above` and not descended into,
+so the walk is finite and every roll's own dependencies appear exactly once.
+The table's `deps` column stays direct-only; widening it for transitive counts
+would cost the `branch` column, which has nothing to spare.
+
 One consequence worth knowing, since `[i]` makes roll-into-roll merges cheap: the
 graduated scan below has a second pass *without* `--first-parent`, so once M
 graduates, N's integrate merge is reachable from rolling and N reports as

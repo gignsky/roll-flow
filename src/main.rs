@@ -1067,7 +1067,12 @@ fn cmd_list_text(no_tui: bool, deps: bool) -> Result<()> {
         .max()
         .unwrap_or(6)
         .max(6);
-    let state_w = "⛔ blocked".len();
+    let state_w = rolls
+        .iter()
+        .map(|r| r.state_display().chars().count())
+        .max()
+        .unwrap_or(0)
+        .max("⛔ blocked".len());
 
     let (dep_w, dependant_w) = dep_column_widths(&rolls);
 
@@ -1112,7 +1117,7 @@ fn cmd_list_text(no_tui: bool, deps: bool) -> Result<()> {
             num = roll.number,
             name = roll.branch,
             loc = roll.location.symbol(),
-            state = roll.state.label(),
+            state = roll.state_display(),
             nw = name_w,
             sw = state_w,
         );
@@ -1173,6 +1178,9 @@ struct JsonRoll {
     /// consumers see the same dependency graph the TUI draws.
     deps: Vec<u32>,
     dependants: Vec<u32>,
+    /// The subset of `deps` whose branch has changed — beyond a version line —
+    /// since this roll integrated it.
+    outdated: Vec<u32>,
 }
 
 fn rolls_for_json(rolls: Vec<branches::RollInfo>) -> Vec<JsonRoll> {
@@ -1186,6 +1194,7 @@ fn rolls_for_json(rolls: Vec<branches::RollInfo>) -> Vec<JsonRoll> {
             is_current: r.is_current,
             deps: r.deps,
             dependants: r.dependents,
+            outdated: r.outdated,
         })
         .collect()
 }

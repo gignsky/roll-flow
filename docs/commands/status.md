@@ -12,8 +12,16 @@ The table carries a `deps` column (roll numbers this roll integrated) and a
 `dependants` column (roll numbers that integrated it) — `--no-deps` hides both.
 They are shown whatever the roll's state, so a roll that has already graduated
 still reports what it depends on and what depends on it. Press `[enter]` on a
-roll for the detail overlay, which breaks the same two relationships out with
-per-dependency blocker markers.
+roll for the detail overlay, which follows the dependencies all the way down —
+roll 12 depends on 9, which depends on 8, which depends on 7 — one indented line
+per link, each with its state and a `⛔ blocker` / `✓ ok` marker. A roll reached
+twice (a diamond) is shown once more as `↑ shown above`.
+
+A `⟳` in front of a roll's state means a dependency has **changed since it was
+integrated** — real changes, not a version bump or the `-rollN` dev marker,
+which touch only version lines. The overlay names which dependencies moved and
+marks the link (`⟳ moved since integration`); `rf integrate` again to catch up,
+and the marker clears. `--json` reports the same list as `outdated`.
 
 The TUI table pins the stable and rolling branches above the rolls, so `[space]`
 switches to them the same way it switches to a roll. A base branch that exists
@@ -21,12 +29,59 @@ neither locally nor on `origin` is not listed.
 
 ## Keys
 
+The status bar carries the handful you need before you know the rest exist:
+
 ```text
-[q] quit   [j/k ↑/↓] nav   [space] switch   [enter] detail   [r]efresh
-[p] pull   [P] push   [f] fetch   [gg] lazygit   [esc] close output
-[c]reate   [i]ntegrate   [G]raduate   [m] promote   [u]pdate   [b]ump
-[d]elete   [x] prune   [t]idy   [PgUp/PgDn/End] scroll output
+ [j/k ↑/↓] nav   [space] switch   [enter] detail   [?] keys   [q] quit
 ```
+
+Everything else lives behind `?`, which opens a searchable list of every
+binding. Type to filter, `↑`/`↓` to move, `enter` to *run* the key under the
+cursor, `esc` to close:
+
+```text
+┌ keys ─────────────────────────────────────────────────────────────┐
+│> br_                                                              │
+│                                                                   │
+│▶ t      tidy local roll branches, leaving origin alone  branches  │
+│  p      pull the selected branch                        sync      │
+│  P      push the selected branch                        sync      │
+│  d      delete the selected branch                      branches  │
+│  x      prune promoted roll branches, local and origin  branches  │
+│                                                                   │
+│type to filter   [↑/↓] move   [enter] run   [esc] close            │
+└───────────────────────────────────────────────────────────────────┘
+```
+
+The search is fuzzy rather than a substring test, because the useful query is a
+half-remembered word against a label you never read: matched characters score
+higher when they run together (`prune`), when they land at the start of a word
+(so `pb` finds "push branch"), and when they turn up early. Keys, label and
+group are all searched, so `gg` finds lazygit by the key and `sync` lists the
+whole group.
+
+`enter` runs the binding by replaying its keystrokes through the ordinary key
+handler — `gg` really does hand the terminal to lazygit — so there is one
+dispatch path, not a second copy of the keymap that can drift.
+
+The full list:
+
+| key | does |
+|---|---|
+| `j`/`k`, `↑`/`↓` | move |
+| `space` | switch to the selected branch |
+| `enter` | roll detail: dependencies and divergence |
+| `r` | reload |
+| `?` | search every key |
+| `q` | quit |
+| `p` / `P` / `f` | pull / push / fetch the selected branch |
+| `gg` | lazygit |
+| `c` / `i` | create a roll / integrate one into the checked-out roll |
+| `G` / `m` / `u` | graduate / promote / update from stable |
+| `b` | bump the version |
+| `d` / `x` / `t` | delete / prune / tidy branches |
+| `esc` | close the output panel |
+| `PgUp` / `PgDn` / `End` | scroll the panel, or follow new output |
 
 The sync keys follow lazygit, which is why graduate is `[G]` and promote is `[m]`
 rather than the `[g]`/`[p]` they used to be — `[p]` and `[P]` are pull and push
