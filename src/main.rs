@@ -148,85 +148,197 @@ fn cmd_init(
     force: bool,
     yes: bool,
 ) -> Result<()> {
-    let mut config = Config::auto_detect()?;
-    config = config.with_overrides(rolling_branch, stable_branch, roll_prefix, username, hosts);
+    let detected = Config::auto_detect()?;
+    let overridden = detected.with_overrides(
+        rolling_branch.clone(),
+        stable_branch.clone(),
+        roll_prefix.clone(),
+        username.clone(),
+        hosts.clone(),
+    );
+    let mode = mode.map(|m| core::config::Mode::parse(&m)).transpose()?;
 
-    let cfg_path = Config::config_path(&config.repo_root);
-    if !git::ref_exists(&config.repo_root, &config.stable_branch) {
-        bail!("stable branch '{}' not found", config.stable_branch);
+    let cfg_path = Config::config_path(&overridden.repo_root);
+    if !git::ref_exists(&overridden.repo_root, &overridden.stable_branch) {
+        bail!("stable branch '{}' not found", overridden.stable_branch);
     }
-    if !git::ref_exists(&config.repo_root, &config.rolling_branch) {
+    if !git::ref_exists(&overridden.repo_root, &overridden.rolling_branch) {
         git::run_git(
-            &config.repo_root,
-            &["branch", &config.rolling_branch, &config.stable_branch],
+            &overridden.repo_root,
+            &[
+                "branch",
+                &overridden.rolling_branch,
+                &overridden.stable_branch,
+            ],
         )?;
     }
 
-    // Resolve the workflow mode (issue #18): an explicit `--mode` always wins;
-    // otherwise, if a config already exists, preserve its mode so a bare re-init
-    // never silently resets it (and stays idempotent). Absent both, the field's
-    // serde default (`manage`) applies via `auto_detect`.
-    if let Some(m) = mode {
-        config.mode = core::config::Mode::parse(&m)?;
-    } else if cfg_path.exists() {
-        if let Ok(existing) = std::fs::read_to_string(&cfg_path) {
-            if let Ok(existing_cfg) = toml::from_str::<Config>(&existing) {
-                config.mode = existing_cfg.mode;
-            }
-        }
-    }
-
-    // Re-running `rf init` is idempotent and non-destructive: it regenerates the
-    // config from the repo's actual detected state and only rewrites the file
-    // when the result differs. Serialize both sides through the same renderer
-    // (`to_toml_string`) so an unchanged re-run is a true no-op — no rewrite,
-    // and no `--force` required (issue #16).
-    let regenerated = config.to_toml_string()?;
-    if cfg_path.exists() {
-        let existing = std::fs::read_to_string(&cfg_path)
-            .with_context(|| format!("reading existing config at {}", cfg_path.display()))?;
-        if existing == regenerated {
-            if !force {
-                println!("roll-flow config already up to date (no changes)");
-                return Ok(());
-            }
-            // Identical content but `--force`: rewrite anyway, matching prior
-            // `--force` semantics.
-            config.save()?;
-            println!("Updated {} from detected state", cfg_path.display());
-            return Ok(());
-        }
-
-        // The regenerated config differs from what's on disk. Rather than
-        // silently overwriting, show the change and decide non-destructively
-        // (issue #17).
-        println!("Detected config changes for {}:", cfg_path.display());
-        print!("{}", config_diff(&existing, &regenerated));
-
-        let apply = if force || yes {
-            true
-        } else if std::io::stdin().is_terminal() {
-            cli::prompt_yes("Apply these changes to .roll-flow.toml? [y/N] ")?
-        } else {
-            // Non-interactive without --yes/--force: default to keeping the
-            // existing file. Nothing is written; exit 0.
-            false
-        };
-
-        if apply {
-            config.save()?;
-            println!("Updated {} from detected state", cfg_path.display());
-        } else {
-            if !std::io::stdin().is_terminal() {
-                println!("Changes detected but not applied. Run with --yes to apply, or --force.");
-            }
-            println!("Kept existing config at {}", cfg_path.display());
-        }
-    } else {
+    // A fresh file is the detected state rendered whole.
+    if !cfg_path.exists() {
+        let mut config = overridden;
+        config.mode = mode.unwrap_or_default();
         config.save()?;
         println!("Initialized roll-flow at {}", cfg_path.display());
+        return Ok(());
+    }
+
+    // An existing file is edited in place, never regenerated. Regenerating from
+    // the detected state was how `rf init --yes` used to delete every gate
+    // array, every `clean_protect` entry and every comment the user had written
+    // — detection knows nothing about those, so they came back empty. The rule
+    // now: detected keys are refreshed, missing keys are added with their
+    // defaults, and everything else is left exactly as it was typed.
+    let existing = std::fs::read_to_string(&cfg_path)
+        .with_context(|| format!("reading existing config at {}", cfg_path.display()))?;
+    let merged = merge_init(
+        &existing,
+        &overridden,
+        InitOverrides {
+            roll_prefix: roll_prefix.is_some(),
+            username: username.is_some(),
+            hosts: hosts.is_some(),
+            mode,
+        },
+    )?;
+
+    if existing == merged {
+        if !force {
+            println!("roll-flow config already up to date (no changes)");
+            return Ok(());
+        }
+        // Identical content but `--force`: rewrite anyway, matching prior
+        // `--force` semantics.
+        std::fs::write(&cfg_path, &merged)?;
+        println!("Updated {} from detected state", cfg_path.display());
+        return Ok(());
+    }
+
+    // The merged config differs from what's on disk. Rather than silently
+    // overwriting, show the change and decide non-destructively (issue #17).
+    println!("Detected config changes for {}:", cfg_path.display());
+    print!("{}", config_diff(&existing, &merged));
+
+    let apply = if force || yes {
+        true
+    } else if std::io::stdin().is_terminal() {
+        cli::prompt_yes("Apply these changes to .roll-flow.toml? [y/N] ")?
+    } else {
+        // Non-interactive without --yes/--force: default to keeping the
+        // existing file. Nothing is written; exit 0.
+        false
+    };
+
+    if apply {
+        std::fs::write(&cfg_path, &merged)?;
+        println!("Updated {} from detected state", cfg_path.display());
+    } else {
+        if !std::io::stdin().is_terminal() {
+            println!("Changes detected but not applied. Run with --yes to apply, or --force.");
+        }
+        println!("Kept existing config at {}", cfg_path.display());
     }
     Ok(())
+}
+
+/// Which `rf init` flags were given explicitly, so a flag beats the file where
+/// detection alone would not.
+struct InitOverrides {
+    roll_prefix: bool,
+    username: bool,
+    hosts: bool,
+    mode: Option<core::config::Mode>,
+}
+
+/// Fold the detected state into an existing config's text, preserving
+/// everything detection has no opinion on: comments, key order, gate arrays,
+/// `clean_protect`, the release flags, and `config_version`.
+///
+/// Edited as a `toml_edit` document rather than round-tripped through the
+/// struct, because the struct cannot carry comments and a re-render would
+/// reorder keys — and because new keys inserted into the root table are
+/// rendered ahead of `[host_active]` by construction, which is the one place a
+/// hand-appended key silently becomes a host name.
+fn merge_init(existing: &str, detected: &Config, overrides: InitOverrides) -> Result<String> {
+    use toml_edit::DocumentMut;
+
+    let mut doc: DocumentMut = existing
+        .parse()
+        .context("parsing the existing .roll-flow.toml")?;
+    let defaults: DocumentMut = detected
+        .to_toml_string()?
+        .parse()
+        .context("rendering the detected config")?;
+    let take = |key: &str| defaults[key].clone();
+
+    // Always refreshed: these are what init is for, and both are read from the
+    // repo itself rather than guessed.
+    doc["repo_root"] = take("repo_root");
+    doc["rolling_branch"] = take("rolling_branch");
+    doc["stable_branch"] = take("stable_branch");
+
+    // Hosts are *added*, never replaced. `vars/hosts.nix` seeds the table, but
+    // the file is where the user records what is true right now — the dotfiles
+    // config flips a host off with a comment saying why, and `rf init` refreshing
+    // that back to the seed would undo a deliberate edit every time it ran. So
+    // a host the table already names keeps its value and its comments; a host
+    // detection found that the table lacks is appended with its detected
+    // value. `--hosts` on the command line is the one thing that replaces.
+    if overrides.hosts {
+        doc["hosts"] = take("hosts");
+    } else if !detected.hosts.is_empty() {
+        let mut hosts = doc
+            .get("hosts")
+            .and_then(|h| h.as_array())
+            .cloned()
+            .unwrap_or_default();
+        let listed: Vec<String> = hosts
+            .iter()
+            .filter_map(|v| v.as_str().map(String::from))
+            .collect();
+        for host in &detected.hosts {
+            if !listed.contains(host) {
+                hosts.push(host.as_str());
+            }
+        }
+        doc["hosts"] = toml_edit::value(hosts);
+    }
+    if !detected.host_active.is_empty() {
+        if doc.get("host_active").is_none() {
+            doc["host_active"] = take("host_active");
+        } else if let Some(table) = doc["host_active"].as_table_like_mut() {
+            for (host, active) in &detected.host_active {
+                if table.get(host).is_none() {
+                    table.insert(host, toml_edit::value(*active));
+                }
+            }
+        }
+    }
+    if overrides.username || !detected.username.is_empty() {
+        doc["username"] = take("username");
+    }
+    if overrides.roll_prefix || doc.get("roll_prefix").is_none() {
+        doc["roll_prefix"] = take("roll_prefix");
+    }
+    if let Some(mode) = overrides.mode {
+        doc["mode"] = toml_edit::value(match mode {
+            core::config::Mode::Manage => "manage",
+            core::config::Mode::Assist => "assist",
+        });
+    }
+
+    // Everything else: present stays as written, absent gets its default —
+    // except `config_version`, which is the file's own statement about itself
+    // and is warned about on load rather than silently rewritten here.
+    for key in Config::KEYS {
+        if doc.get(key).is_none() && *key != "config_version" {
+            doc[key] = take(key);
+        }
+    }
+    if doc.get("config_version").is_none() {
+        doc["config_version"] = toml_edit::value(i64::from(core::config::CONFIG_VERSION));
+    }
+
+    Ok(doc.to_string())
 }
 
 /// A dependency-free, line-based diff of two config renderings: lines only in

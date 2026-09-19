@@ -1,9 +1,9 @@
 config_version = 1
-repo_root = "/home/user/roll-flow"
+repo_root = "/home/gig/local_repos/roll-flow"
 rolling_branch = "develop"
 stable_branch = "main"
 roll_prefix = "roll/"
-username = ""
+username = "gig"
 hosts = []
 roll_to_rolling_gates = [
     "cargo fmt --all --check",
@@ -17,5 +17,13 @@ rolling_to_main_gates = [
     "cargo build --locked",
     "cargo test --locked",
 ]
+version_gate = true
+tag_on_promote = true
+push_tag = true
+mode = "manage"
+host_gates = []
+clean_protect = []
+pull_mode = "ff-only"
+lazygit_command = "lazygit"
 
 [host_active]
