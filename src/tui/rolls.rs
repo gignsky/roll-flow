@@ -51,6 +51,9 @@ pub(crate) enum Action {
     Update,
     /// Delete every promoted roll branch, locally and on origin.
     Prune,
+    /// Delete the local copy of every graduated or promoted roll branch,
+    /// leaving `origin` untouched.
+    Tidy,
 }
 
 impl Action {
@@ -63,6 +66,7 @@ impl Action {
             Action::Promote => "promote",
             Action::Update => "update",
             Action::Prune => "prune",
+            Action::Tidy => "tidy",
         };
         match target {
             Some(t) => format!("rf {verb} {t}"),
@@ -508,6 +512,33 @@ pub(crate) fn prunable_count(rolls: &[RollInfo]) -> usize {
         .count()
 }
 
+/// The roll states `[t]` tidies, which are `rf tidy --state`'s default. The TUI
+/// has no way to type a state selection, so it takes that default rather than
+/// inventing a second one.
+pub(crate) const TIDY_STATES: [RollState; 2] = [RollState::Graduated, RollState::Promoted];
+
+/// Tidy is offered when at least one roll in [`TIDY_STATES`] still has a local
+/// branch. The local copy is the only thing tidy deletes, so a roll that exists
+/// only on `origin` is nothing for it to do.
+///
+/// As with [`can_prune`], whether a given branch is *safe* to delete is
+/// `ops::tidy_plan`'s call — it re-checks containment against stable, rolling
+/// and the branch's own `origin/<branch>`; this only answers whether the action
+/// is worth offering.
+pub(crate) fn can_tidy(rolls: &[RollInfo]) -> bool {
+    rolls.iter().any(is_tidy_candidate)
+}
+
+/// How many rolls the tidy action would consider — shown in the confirm modal.
+pub(crate) fn tidyable_count(rolls: &[RollInfo]) -> usize {
+    rolls.iter().filter(|r| is_tidy_candidate(r)).count()
+}
+
+fn is_tidy_candidate(roll: &RollInfo) -> bool {
+    TIDY_STATES.contains(&roll.state)
+        && matches!(roll.location, BranchLocation::Local | BranchLocation::Both)
+}
+
 /// Build the dependency rows to show in the detail view for `selected`.
 ///
 /// Each number in `selected.deps` is looked up in `all` to recover the
@@ -686,6 +717,13 @@ pub(crate) fn validate_action(
                 Ok(())
             } else {
                 Err("nothing to prune — no promoted roll branches".to_string())
+            }
+        }
+        Action::Tidy => {
+            if can_tidy(rolls) {
+                Ok(())
+            } else {
+                Err("nothing to tidy — no local graduated or promoted roll branches".to_string())
             }
         }
     }
@@ -1004,6 +1042,7 @@ impl StatusApp {
             KeyCode::Char('m') => self.request(Action::Promote),
             KeyCode::Char('u') => self.request(Action::Update),
             KeyCode::Char('x') => self.request(Action::Prune),
+            KeyCode::Char('t') => self.request(Action::Tidy),
             KeyCode::Char('d') => self.request_delete()?,
             KeyCode::Enter => {
                 if let Some(RowKind::Base(i)) = self.selected_row() {
@@ -1771,7 +1810,8 @@ impl StatusApp {
         // lifecycle first, then what removes things plus the panel's own keys.
         let roll_line =
             Line::from(" [c]reate   [i]ntegrate   [G]raduate   [m] promote   [u]pdate   [b]ump");
-        let extra_line = Line::from(" [d]elete   [x] prune   [PgUp/PgDn/End] scroll output");
+        let extra_line =
+            Line::from(" [d]elete   [x] prune   [t]idy   [PgUp/PgDn/End] scroll output");
         f.render_widget(
             Paragraph::new(vec![msg_line, nav_line, sync_line, roll_line, extra_line]),
             area,
@@ -1901,6 +1941,21 @@ fn run_op(config: &Config, action: Action, target: Option<&str>) -> Result<Vec<S
             let plan = ops::prune_plan(config, &ops::PruneScope::both())?;
             if plan.is_empty() {
                 lines.push("no promoted roll branches to prune".to_string());
+                push_prune_skips(&mut lines, &plan.skipped);
+            } else {
+                let results = ops::prune_apply(config, &plan)?;
+                lines.extend(render_prune_outcome(&plan, &results));
+            }
+        }
+        Action::Tidy => {
+            // Same shape as prune above, and the same refusal to force: a local
+            // branch holding commits found nowhere else is reported as skipped,
+            // and clearing it needs `rf tidy --force` from the CLI. `tidy(false)`
+            // also fixes `remote: false`, which is what keeps the TUI out of the
+            // three places allowed to delete a ref on origin.
+            let plan = ops::tidy_plan(config, &ops::PruneScope::tidy(false), &TIDY_STATES)?;
+            if plan.is_empty() {
+                lines.push("no local roll branches to tidy".to_string());
                 push_prune_skips(&mut lines, &plan.skipped);
             } else {
                 let results = ops::prune_apply(config, &plan)?;
@@ -2115,6 +2170,16 @@ fn render_modal(
             let n = prunable_count(rolls);
             format!(
                 "Delete {n} promoted roll branch{} (local + origin)?",
+                if n == 1 { "" } else { "es" }
+            )
+        }
+        // Says "local only" where prune says "local + origin": the two keys sit
+        // next to each other and differ in exactly that, so the prompt is where
+        // the difference has to be visible.
+        Action::Tidy => {
+            let n = tidyable_count(rolls);
+            format!(
+                "Delete {n} local graduated/promoted roll branch{} (local only)?",
                 if n == 1 { "" } else { "es" }
             )
         }
@@ -2609,6 +2674,37 @@ mod tests {
         assert_eq!(prunable_count(&with_promoted), 2);
         // Prune is repo-wide, so it validates with no selection.
         assert!(validate_action(Action::Prune, None, &with_promoted, "main", "roll/").is_ok());
+    }
+
+    #[test]
+    fn tidy_valid_only_for_local_graduated_or_promoted_rolls() {
+        // States tidy does not clear, whatever their location.
+        let wrong_state = vec![
+            roll_n(1, RollState::Active),
+            roll_n(2, RollState::Diverged),
+            roll_n(3, RollState::Blocked),
+        ];
+        assert!(!can_tidy(&wrong_state));
+        assert_eq!(tidyable_count(&wrong_state), 0);
+        assert!(validate_action(Action::Tidy, None, &wrong_state, "main", "roll/").is_err());
+
+        // Right state, but no local copy to delete — tidy never touches origin.
+        let remote_only = vec![RollInfo {
+            location: BranchLocation::Remote,
+            ..roll_n(4, RollState::Graduated)
+        }];
+        assert!(!can_tidy(&remote_only));
+
+        let mut tidyable = wrong_state.clone();
+        tidyable.push(roll_n(5, RollState::Graduated));
+        tidyable.push(RollInfo {
+            location: BranchLocation::Both,
+            ..roll_n(6, RollState::Promoted)
+        });
+        assert!(can_tidy(&tidyable));
+        assert_eq!(tidyable_count(&tidyable), 2);
+        // Repo-wide like prune, so it validates with no selection.
+        assert!(validate_action(Action::Tidy, None, &tidyable, "main", "roll/").is_ok());
     }
 
     #[test]
@@ -3702,6 +3798,30 @@ mod tests {
         assert!(
             out.contains("Integrate roll/1-0101-alpha into roll/2-0102-beta?"),
             "{out}"
+        );
+    }
+
+    #[test]
+    fn the_tidy_modal_says_local_only_where_prune_says_local_plus_origin() {
+        // `[x]` and `[t]` are adjacent keys whose only difference is whether
+        // origin is touched, so each prompt has to say which it is.
+        let cfg = config("main", "rolling");
+        let rolls = vec![
+            roll_n(1, RollState::Graduated),
+            roll_n(2, RollState::Promoted),
+        ];
+
+        let tidy = draw(|f, area| render_modal(f, area, &cfg, Action::Tidy, None, &rolls, "main"));
+        assert!(
+            tidy.contains("Delete 2 local graduated/promoted roll branches (local only)?"),
+            "{tidy}"
+        );
+
+        let prune =
+            draw(|f, area| render_modal(f, area, &cfg, Action::Prune, None, &rolls, "main"));
+        assert!(
+            prune.contains("Delete 1 promoted roll branch (local + origin)?"),
+            "{prune}"
         );
     }
 
