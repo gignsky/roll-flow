@@ -32,6 +32,7 @@ use crate::core::{
     git::{self, TrackState},
     ops,
     sync::{self, PullPlan, PushOutcome, SyncTarget},
+    version::{self, BumpLevel, Semver},
 };
 
 /// A workflow operation reachable from the view. Navigation, quit and refresh
@@ -90,6 +91,51 @@ pub(crate) enum ForcePushOutcome {
     Ignore,
     Cancel,
     Force,
+}
+
+/// What a keystroke in the bump modal asks for.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub(crate) enum BumpOutcome {
+    Ignore,
+    Cancel,
+    Level(BumpLevel),
+}
+
+/// Decide a keystroke in the bump modal.
+///
+/// Digits rather than initials, which is a break from the house style used by the
+/// delete modal (`l`/`r`/`b`). The three level names give `p`, `m` and `M` as
+/// initials, and distinguishing minor from major by the shift key alone — for
+/// choices an order of magnitude apart — is a mistake waiting to happen. Digits
+/// also carry the ordering, so `1`/`2`/`3` reads as least-to-most significant.
+pub(crate) fn bump_key(code: KeyCode) -> BumpOutcome {
+    match code {
+        KeyCode::Char('1') => BumpOutcome::Level(BumpLevel::Patch),
+        KeyCode::Char('2') => BumpOutcome::Level(BumpLevel::Minor),
+        KeyCode::Char('3') => BumpOutcome::Level(BumpLevel::Major),
+        KeyCode::Char('n') | KeyCode::Char('N') | KeyCode::Esc => BumpOutcome::Cancel,
+        _ => BumpOutcome::Ignore,
+    }
+}
+
+/// The three levels and what each would produce, in the order the modal lists
+/// them. Shared by the renderer and its tests so the preview can never disagree
+/// with what a keypress actually applies.
+pub(crate) fn bump_previews(current: Semver) -> [(BumpLevel, Semver); 3] {
+    [
+        (BumpLevel::Patch, current.bump(BumpLevel::Patch)),
+        (BumpLevel::Minor, current.bump(BumpLevel::Minor)),
+        (BumpLevel::Major, current.bump(BumpLevel::Major)),
+    ]
+}
+
+/// Whether `[b]` can do anything here, or why not.
+///
+/// A repo with no `Cargo.toml` has no version to raise — the same condition that
+/// makes the whole release path a no-op (`VersionStatus::NotApplicable`), so
+/// refusing here keeps the key honest rather than opening a modal over nothing.
+pub(crate) fn bump_gate(current: Option<Semver>) -> Result<Semver, String> {
+    current.ok_or_else(|| "no readable version in Cargo.toml — nothing to bump".to_string())
 }
 
 /// Decide a keystroke in the force-push confirmation.
@@ -174,6 +220,11 @@ enum Mode {
     /// produces a *scope* (which copies), neither of which `Action` can carry.
     Delete {
         preview: DeletePreview,
+    },
+    /// Pick a semver level to raise. Holds the version read when the modal
+    /// opened, so the previews it shows and the bump it applies agree.
+    Bump {
+        current: Semver,
     },
     /// A push was refused as non-fast-forward (or is already known to be behind
     /// its upstream). Asks whether to force it.
@@ -379,6 +430,10 @@ struct StatusApp {
     /// Upstream tracking state per local branch, refreshed on reload. Sourced in
     /// one `for-each-ref` rather than an `ahead_behind` call per row.
     tracking: HashMap<String, git::LocalBranch>,
+    /// The `[package]` version on the checked-out branch, refreshed on reload.
+    /// `None` in repos with no `Cargo.toml`, where the header omits it and `[b]`
+    /// refuses.
+    version: Option<Semver>,
     table: TableState,
     mode: Mode,
     /// Transient one-line feedback (e.g. why an action was rejected), cleared on
@@ -770,6 +825,7 @@ impl StatusApp {
         let mut table = TableState::default();
         table.select(initial_selection(&bases, &rolls));
         let tracking = load_tracking(&config);
+        let version = version::read_version(&config.repo_root).unwrap_or(None);
         Self {
             config,
             current_branch,
@@ -777,6 +833,7 @@ impl StatusApp {
             rolls,
             show_deps,
             tracking,
+            version,
             table,
             mode: Mode::Browsing,
             message: None,
@@ -802,6 +859,8 @@ impl StatusApp {
                         self.handle_confirm(key.code);
                     } else if matches!(self.mode, Mode::ForcePush { .. }) {
                         self.handle_force_push(key.code);
+                    } else if matches!(self.mode, Mode::Bump { .. }) {
+                        self.handle_bump(key.code);
                     } else if matches!(self.mode, Mode::Detail { .. }) {
                         self.handle_detail(key.code);
                     } else if matches!(self.mode, Mode::CreateInput { .. }) {
@@ -940,6 +999,7 @@ impl StatusApp {
             KeyCode::Char('f') => self.start_fetch(),
             KeyCode::Char('G') => self.request(Action::Graduate),
             KeyCode::Char('i') => self.request_integrate(),
+            KeyCode::Char('b') => self.request_bump(),
             KeyCode::Char('m') => self.request(Action::Promote),
             KeyCode::Char('u') => self.request(Action::Update),
             KeyCode::Char('x') => self.request(Action::Prune),
@@ -1094,6 +1154,48 @@ impl StatusApp {
             }
             Err(msg) => self.message = Some(msg),
         }
+    }
+
+    /// `[b]` — open the version-bump picker for the checked-out branch.
+    ///
+    /// Always the current branch, never the row under the cursor: a bump is a
+    /// commit, and it has to land where the merge that needs it will be made from.
+    fn request_bump(&mut self) {
+        if self.busy() {
+            return;
+        }
+        match bump_gate(self.version) {
+            Ok(current) => self.mode = Mode::Bump { current },
+            Err(msg) => self.message = Some(msg),
+        }
+    }
+
+    /// Handle a keypress while the bump picker is open.
+    fn handle_bump(&mut self, code: KeyCode) {
+        match bump_key(code) {
+            BumpOutcome::Ignore => {}
+            BumpOutcome::Cancel => self.mode = Mode::Browsing,
+            BumpOutcome::Level(level) => {
+                self.mode = Mode::Browsing;
+                self.execute_bump(level);
+            }
+        }
+    }
+
+    /// Write the bumped version, refresh the lockfile and commit, as a job.
+    fn execute_bump(&mut self, level: BumpLevel) {
+        let config = self.config.clone();
+        let branch = self.current_branch.clone();
+        self.start_job(format!("rf bump {level}"), move || {
+            // A bump is a commit, so anything else staged would be swept into it:
+            // `git::commit_paths` stages its two files and then commits the whole
+            // index. Graduate and promote take the same precaution.
+            ops::ensure_clean_state(&config)?;
+            let (from, to) = ops::apply_version_bump(&config, level, &branch)?;
+            Ok(JobDone::lines(vec![format!(
+                "Bumped {from} → {to} ({level}) on '{branch}'"
+            )]))
+        });
     }
 
     fn request_delete(&mut self) -> Result<()> {
@@ -1449,6 +1551,9 @@ impl StatusApp {
         });
         self.rolls = branches::list_rolls(&self.config)?;
         self.tracking = load_tracking(&self.config);
+        // Read from the worktree, so a bump — or a branch switch that changes it —
+        // shows in the header straight away.
+        self.version = version::read_version(&self.config.repo_root).unwrap_or(None);
         let len = self.row_count();
         if len == 0 {
             self.table.select(None);
@@ -1497,6 +1602,7 @@ impl StatusApp {
             }
             Mode::CreateInput { slug } => render_create_input(f, area, &self.config, slug),
             Mode::Delete { preview } => render_delete_modal(f, area, &self.config, preview),
+            Mode::Bump { current } => render_bump_modal(f, area, *current, &self.current_branch),
             Mode::ForcePush { branch, remote } => {
                 render_force_push_modal(f, area, branch, remote, self.tracking.get(branch))
             }
@@ -1505,7 +1611,7 @@ impl StatusApp {
     }
 
     fn render_header(&self, f: &mut Frame, area: Rect) {
-        let header_line = Line::from(vec![
+        let mut spans = vec![
             Span::styled("Branch: ", Style::default().add_modifier(Modifier::BOLD)),
             Span::raw(self.current_branch.as_str()),
             Span::raw("   Rolling: "),
@@ -1518,7 +1624,17 @@ impl StatusApp {
                 self.config.stable_branch.as_str(),
                 Style::default().fg(Color::Green),
             ),
-        ]);
+        ];
+        // Only when the repo has one. Without this, `[b]` would be a key whose
+        // whole effect is a line in a dismissable panel.
+        if let Some(v) = self.version {
+            spans.push(Span::raw("   Version: "));
+            spans.push(Span::styled(
+                v.to_string(),
+                Style::default().fg(Color::Magenta),
+            ));
+        }
+        let header_line = Line::from(spans);
         f.render_widget(
             Paragraph::new(header_line).block(Block::bordered().title(" roll-flow ")),
             area,
@@ -1652,7 +1768,8 @@ impl StatusApp {
         // Split across two lines because thirteen bindings do not fit on one at
         // 80 columns, and `Paragraph` truncates rather than wrapping — the roll
         // lifecycle first, then what removes things plus the panel's own keys.
-        let roll_line = Line::from(" [c]reate   [i]ntegrate   [G]raduate   [m] promote   [u]pdate");
+        let roll_line =
+            Line::from(" [c]reate   [i]ntegrate   [G]raduate   [m] promote   [u]pdate   [b]ump");
         let extra_line = Line::from(" [d]elete   [x] prune   [PgUp/PgDn/End] scroll output");
         f.render_widget(
             Paragraph::new(vec![msg_line, nav_line, sync_line, roll_line, extra_line]),
@@ -1827,6 +1944,60 @@ fn load_tracking(config: &Config) -> HashMap<String, git::LocalBranch> {
 /// "in sync".
 fn track_of(tracking: &HashMap<String, git::LocalBranch>, branch: &str) -> Option<TrackState> {
     tracking.get(branch).map(git::track_state)
+}
+
+/// Render the version-bump picker.
+///
+/// Every level shows the version it would produce, not just its name: "minor" is
+/// abstract, `0.2.0 → 0.3.0` is not, and seeing all three at once is what makes
+/// picking the right one obvious.
+fn render_bump_modal(f: &mut Frame, area: Rect, current: Semver, branch: &str) {
+    let mut lines = vec![
+        Line::from(vec![
+            Span::raw("Current: "),
+            Span::styled(
+                current.to_string(),
+                Style::default().add_modifier(Modifier::BOLD),
+            ),
+            Span::raw(format!("  on {branch}")),
+        ]),
+        Line::from(""),
+    ];
+    for (i, (level, next)) in bump_previews(current).into_iter().enumerate() {
+        lines.push(Line::from(vec![
+            Span::styled(format!("[{}] ", i + 1), Style::default().fg(Color::Yellow)),
+            // No padding needed for the arrows to line up: "patch", "minor" and
+            // "major" are all five characters. (A width spec would be ignored
+            // anyway — `BumpLevel`'s `Display` writes straight to the formatter
+            // rather than going through `pad`.)
+            Span::raw(format!("{level} → ")),
+            Span::styled(
+                next.to_string(),
+                Style::default().add_modifier(Modifier::BOLD),
+            ),
+        ]));
+    }
+    lines.push(Line::from(""));
+    lines.push(Line::from(Span::styled(
+        "[n] cancel",
+        Style::default().fg(Color::Yellow),
+    )));
+
+    let width = lines
+        .iter()
+        .map(|l| l.width())
+        .max()
+        .unwrap_or(32)
+        .clamp(28, 70) as u16;
+    let modal = centered_rect(area, width + 4, lines.len() as u16 + 2);
+    f.render_widget(Clear, modal);
+    f.render_widget(
+        Paragraph::new(lines).block(Block::bordered().title(Span::styled(
+            " bump version ",
+            Style::default().add_modifier(Modifier::BOLD),
+        ))),
+        modal,
+    );
 }
 
 /// Render the force-push confirmation.
@@ -3155,6 +3326,7 @@ mod tests {
             rolls,
             show_deps: false,
             tracking,
+            version: None,
             table: TableState::default(),
             mode: Mode::Browsing,
             message: None,
@@ -3196,6 +3368,7 @@ mod tests {
             rolls: vec![roll_n(1, RollState::Active)],
             show_deps: false,
             tracking: HashMap::new(),
+            version: None,
             table: TableState::default(),
             mode: Mode::Browsing,
             message: None,
@@ -3250,6 +3423,110 @@ mod tests {
     fn the_chevron_marks_only_the_checked_out_branch() {
         assert_eq!(current_marker(true), "›");
         assert_eq!(current_marker(false), "");
+    }
+
+    fn v(major: u64, minor: u64, patch: u64) -> Semver {
+        Semver {
+            major,
+            minor,
+            patch,
+        }
+    }
+
+    #[test]
+    fn the_bump_previews_cover_all_three_levels_in_ascending_order() {
+        assert_eq!(
+            bump_previews(v(0, 2, 0)),
+            [
+                (BumpLevel::Patch, v(0, 2, 1)),
+                (BumpLevel::Minor, v(0, 3, 0)),
+                (BumpLevel::Major, v(1, 0, 0)),
+            ]
+        );
+    }
+
+    #[test]
+    fn minor_and_major_bumps_reset_the_fields_below_them() {
+        let [(_, patch), (_, minor), (_, major)] = bump_previews(v(1, 4, 7));
+        assert_eq!(patch, v(1, 4, 8));
+        assert_eq!(minor, v(1, 5, 0), "minor must zero the patch");
+        assert_eq!(major, v(2, 0, 0), "major must zero minor and patch");
+    }
+
+    #[test]
+    fn the_bump_keys_are_digits_in_the_order_shown() {
+        // The modal numbers its rows from `bump_previews`, so key N must select
+        // preview N — a mismatch here would bump the wrong field silently.
+        let previews = bump_previews(v(0, 2, 0));
+        for (i, (level, _)) in previews.into_iter().enumerate() {
+            let key = KeyCode::Char(char::from_digit(i as u32 + 1, 10).unwrap());
+            assert_eq!(bump_key(key), BumpOutcome::Level(level), "row {}", i + 1);
+        }
+    }
+
+    #[test]
+    fn the_bump_modal_cancels_and_ignores_everything_else() {
+        for key in [KeyCode::Char('n'), KeyCode::Char('N'), KeyCode::Esc] {
+            assert_eq!(bump_key(key), BumpOutcome::Cancel, "{key:?}");
+        }
+        // No Enter and no initials: `m`/`M` for minor/major would differ only by
+        // the shift key, for choices an order of magnitude apart.
+        for key in [
+            KeyCode::Enter,
+            KeyCode::Char(' '),
+            KeyCode::Char('m'),
+            KeyCode::Char('M'),
+            KeyCode::Char('p'),
+            KeyCode::Char('0'),
+            KeyCode::Char('4'),
+        ] {
+            assert_eq!(bump_key(key), BumpOutcome::Ignore, "{key:?}");
+        }
+    }
+
+    #[test]
+    fn bump_is_refused_in_a_repo_with_no_version() {
+        let err = bump_gate(None).expect_err("a repo with no Cargo.toml has nothing to bump");
+        assert!(err.contains("Cargo.toml"), "{err}");
+        assert_eq!(bump_gate(Some(v(0, 1, 0))), Ok(v(0, 1, 0)));
+    }
+
+    #[test]
+    fn the_bump_modal_shows_every_resulting_version() {
+        // "minor" is abstract; `0.2.0 → 0.3.0` is not. All three have to be
+        // visible at once for the choice to be obvious.
+        let out = draw(|f, area| render_bump_modal(f, area, v(0, 2, 0), "roll/3-0918-x"));
+        assert!(out.contains("bump version"), "{out}");
+        assert!(out.contains("Current: 0.2.0"), "{out}");
+        assert!(
+            out.contains("roll/3-0918-x"),
+            "names the branch it lands on: {out}"
+        );
+        assert!(out.contains("[1] patch → 0.2.1"), "{out}");
+        assert!(out.contains("[2] minor → 0.3.0"), "{out}");
+        assert!(out.contains("[3] major → 1.0.0"), "{out}");
+        assert!(out.contains("[n] cancel"), "{out}");
+    }
+
+    #[test]
+    fn the_bump_modal_stays_readable_for_wide_versions() {
+        let out = draw(|f, area| render_bump_modal(f, area, v(12, 345, 6789), "roll/1-x"));
+        assert!(out.contains("[3] major → 13.0.0"), "{out}");
+        assert!(out.contains("[1] patch → 12.345.6790"), "{out}");
+    }
+
+    #[test]
+    fn the_header_shows_the_version_only_when_the_repo_has_one() {
+        let mut app = StatusApp::new(test_config(), "main".to_string(), Vec::new(), false);
+        app.version = Some(v(1, 2, 3));
+        let with = draw(|f, area| app.render_header(f, area));
+        assert!(with.contains("Version: 1.2.3"), "{with}");
+
+        app.version = None;
+        let without = draw(|f, area| app.render_header(f, area));
+        assert!(!without.contains("Version:"), "{without}");
+        // The rest of the header is unaffected either way.
+        assert!(without.contains("Branch: main"), "{without}");
     }
 
     #[test]
@@ -3465,6 +3742,7 @@ mod tests {
             rolls: vec![roll_n(1, RollState::Active)],
             show_deps: false,
             tracking: HashMap::new(),
+            version: None,
             table,
             mode: Mode::Browsing,
             message: None,
