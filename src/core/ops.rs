@@ -1217,6 +1217,14 @@ pub(crate) struct PromoteStep {
     /// dry-runs, where naming the commit is the only way to show that a per-roll
     /// promotion merges a point on rolling rather than the roll branch.
     pub source: String,
+    /// Rolls that graduated ahead of this step's roll and are not yet on stable,
+    /// so advancing stable to its graduation commit lands them too. Oldest
+    /// first. Always empty for a whole-rolling promotion, where every graduated
+    /// roll is the point. Disclosed before the merge by
+    /// [`preview_roll_promotion`] and reported after it, because a per-roll
+    /// promotion that silently lands other rolls is the one outcome a user
+    /// asking for one roll does not expect.
+    pub carried: Vec<String>,
     pub gate_notices: Vec<GateNotice>,
     /// Per-host verification results (empty when no host gates / no active hosts).
     pub host_results: Vec<HostResult>,
@@ -1226,6 +1234,11 @@ pub(crate) struct PromoteStep {
     pub version: VersionCheck,
     /// What happened to the `vX.Y.Z` release tag.
     pub tag: TagOutcome,
+    /// True when this step raised the version inside its own merge commit —
+    /// the per-roll route's only way to satisfy the gate. `version` then
+    /// reports the raised version as `Ok`, and `bumped_from` the one it was.
+    pub bumped: bool,
+    pub bumped_from: Option<Semver>,
 }
 
 /// Outcome of promoting into stable.
@@ -1238,6 +1251,10 @@ pub(crate) struct PromoteOutcome {
     /// Rolls that were named but needed no work, with the reason — already
     /// promoted, or already contained in stable via an earlier step.
     pub skipped: Vec<SkippedRoll>,
+    /// Set when a per-roll step carried a version bump inside its merge: stable
+    /// then holds a commit rolling does not, and stable was merged back into
+    /// rolling to close the gap. See [`promote`].
+    pub reintegrated: bool,
 }
 
 /// A named roll that needed no promotion, and why.
@@ -1252,12 +1269,27 @@ pub(crate) struct SkippedRoll {
 /// [`PromoteTarget::Rolls`] is one merge behind one gate run *per roll*, applied
 /// in graduation order, so each intermediate state of stable is verified rather
 /// than only the end state.
+/// Promote rolling, or named rolls, into stable.
+///
+/// `bump` is the level to raise the version by **inside a per-roll merge** whose
+/// graduation commit carries no bump of its own. It is ignored for the
+/// whole-rolling route, where the CLI has already committed the bump on rolling
+/// before calling here; a per-roll step has no such branch — it merges a commit
+/// that already exists on rolling — so the only place a bump can land is the
+/// promotion merge itself. That keeps the invariant that stable only ever
+/// receives merges: the bump is *in* the merge commit, not a commit beside it.
+///
+/// A step that did that leaves stable one commit ahead of rolling, and rolling's
+/// version below stable's — which would make the next whole-rolling promotion
+/// read as LOWER. So after the steps, stable is merged back into rolling (the
+/// same reintegration a landed hotfix does) and `reintegrated` records it.
 pub(crate) fn promote(
     config: &Config,
     target: &PromoteTarget,
     dry_run: bool,
     force: &ForceOpts,
     tag: bool,
+    bump: Option<BumpLevel>,
 ) -> Result<PromoteOutcome> {
     let rolling = &config.rolling_branch;
     let stable = &config.stable_branch;
@@ -1270,6 +1302,7 @@ pub(crate) fn promote(
         },
         PromoteTarget::Rolls(rolls) => plan_roll_steps(config, rolls, &stable_ref)?,
     };
+    let per_roll = matches!(target, PromoteTarget::Rolls(_));
 
     let mut steps = Vec::new();
     for step in plan.steps {
@@ -1280,7 +1313,17 @@ pub(crate) fn promote(
             dry_run,
             force,
             tag,
+            if per_roll { bump } else { None },
         )?);
+    }
+
+    let mut reintegrated = false;
+    if per_roll && !dry_run && steps.iter().any(|s| s.bumped) {
+        let subject = format!("Reintegrate {stable} into {rolling} (after per-roll promotion)");
+        run_merge(&config.repo_root, stable, rolling, &subject, None).with_context(|| {
+            format!("promoted, but merging '{stable}' back into '{rolling}' failed")
+        })?;
+        reintegrated = true;
     }
 
     Ok(PromoteOutcome {
@@ -1289,6 +1332,7 @@ pub(crate) fn promote(
         dry_run,
         steps,
         skipped: plan.skipped,
+        reintegrated,
     })
 }
 
@@ -1302,6 +1346,11 @@ struct PlannedStep {
     /// Captured at planning time, before any merge: afterwards these rolls read
     /// as promoted rather than graduated, so the list would come back empty.
     included: Vec<String>,
+    /// See [`PromoteStep::carried`]. Computed at planning time for the same
+    /// reason `included` is, and against the stable ref *as the earlier steps
+    /// of this plan will have advanced it*, so naming two rolls does not report
+    /// the first as carried by the second.
+    carried: Vec<String>,
 }
 
 /// The steps a promotion will perform, plus the rolls it found nothing to do
@@ -1339,6 +1388,7 @@ fn plan_rolling_step(config: &Config, stable_ref: &str) -> Result<PlannedStep> {
         subject,
         body,
         included,
+        carried: Vec::new(),
     })
 }
 
@@ -1401,15 +1451,111 @@ fn plan_roll_steps(config: &Config, rolls: &[String], stable_ref: &str) -> Resul
                 // name this step's own roll.
                 body: Some(format!("Rolls:\n  {name}\n")),
                 included: vec![name.clone()],
+                // Filled in below, once the steps are in graduation order:
+                // what a step carries depends on which step precedes it.
+                carried: Vec::new(),
             },
         ));
     }
 
     planned.sort_by_key(|(pos, _)| *pos);
-    Ok(PromotePlan {
-        steps: planned.into_iter().map(|(_, step)| step).collect(),
-        skipped,
+    let mut steps: Vec<PlannedStep> = planned.into_iter().map(|(_, step)| step).collect();
+    fill_carried_rolls(repo, &known, &order, &mut steps, stable_ref);
+    Ok(PromotePlan { steps, skipped })
+}
+
+/// Record, per step, the rolls its merge lands on stable besides its own.
+///
+/// A step merges its roll's graduation commit on rolling, so everything that
+/// graduated earlier and is not yet on stable comes with it — see
+/// [`PromoteTarget::Rolls`]. The baseline is the *previous* step's merge source
+/// rather than stable's current tip, because by the time a step runs, stable has
+/// been advanced by the steps ahead of it; without that, `--roll a --roll b`
+/// would report `a` as something `b` drags along behind the user's back.
+///
+/// Best-effort: an unreadable ancestry answer omits the roll rather than
+/// inventing one. Disclosure that under-reports is a worse bug than a missing
+/// line, so `promote` still never *relies* on this list — it only shows it.
+fn fill_carried_rolls(
+    repo: &Path,
+    known: &[branches::RollInfo],
+    order: &HashMap<String, usize>,
+    steps: &mut [PlannedStep],
+    stable_ref: &str,
+) {
+    for i in 0..steps.len() {
+        let baseline = if i == 0 {
+            stable_ref.to_string()
+        } else {
+            steps[i - 1].source.clone()
+        };
+        let source = steps[i].source.clone();
+        let own = steps[i].roll.clone();
+        let mut carried: Vec<(usize, String)> = known
+            .iter()
+            .filter(|r| own.as_deref() != Some(r.branch.as_str()))
+            .filter_map(|r| r.graduation_commit.as_deref().map(|g| (r, g)))
+            .filter(|(_, g)| {
+                git::is_ancestor(repo, g, &source).unwrap_or(false)
+                    && !git::is_ancestor(repo, g, &baseline).unwrap_or(true)
+            })
+            .map(|(r, g)| {
+                (
+                    order.get(g).copied().unwrap_or(usize::MAX),
+                    r.branch.clone(),
+                )
+            })
+            .collect();
+        carried.sort();
+        steps[i].carried = carried.into_iter().map(|(_, branch)| branch).collect();
+    }
+}
+
+/// What `rf promote --roll` would do, without doing any of it.
+///
+/// Exists so the CLI and the TUI can disclose the rolls a per-roll promotion
+/// carries and ask before merging, rather than reporting them afterwards. It is
+/// the same planner [`promote`] runs, so what is shown is what would happen;
+/// resolving stable read-only means a repo with no local stable branch previews
+/// instead of erroring here — [`promote`] still reports that.
+pub(crate) fn preview_roll_promotion(config: &Config, rolls: &[String]) -> Result<PromotePreview> {
+    let stable_ref = git::resolve_branch(&config.repo_root, &config.stable_branch)
+        .ok_or_else(|| anyhow!(target_missing_error(config, &config.stable_branch)))?;
+    let plan = plan_roll_steps(config, rolls, &stable_ref)?;
+    Ok(PromotePreview {
+        steps: plan
+            .steps
+            .into_iter()
+            .map(|step| PreviewStep {
+                roll: step.roll,
+                source: step.source,
+                carried: step.carried,
+            })
+            .collect(),
     })
+}
+
+/// The merges a per-roll promotion would make, in order.
+///
+/// Carries no `skipped` list: a roll already contained in stable simply has no
+/// step here, and [`promote`] reports the skip when it runs.
+pub(crate) struct PromotePreview {
+    pub steps: Vec<PreviewStep>,
+}
+
+/// One prospective merge: the roll asked for, the commit on rolling that would
+/// be merged, and the rolls that ride along with it.
+pub(crate) struct PreviewStep {
+    pub roll: Option<String>,
+    pub source: String,
+    pub carried: Vec<String>,
+}
+
+impl PromotePreview {
+    /// True when at least one step would land a roll the user did not name.
+    pub fn carries_extra(&self) -> bool {
+        self.steps.iter().any(|s| !s.carried.is_empty())
+    }
 }
 
 /// Map each commit reachable from rolling to its distance from the tip, so
@@ -1442,23 +1588,39 @@ fn run_promote_step(
     dry_run: bool,
     force: &ForceOpts,
     tag: bool,
+    bump: Option<BumpLevel>,
 ) -> Result<PromoteStep> {
     let repo = &config.repo_root;
     let stable = &config.stable_branch;
+    // The gate names the roll where it can; a graduation commit's bare hash is
+    // the last thing a user wants to see in "version X on '<sha>' is unchanged".
+    let label = step.roll.clone().unwrap_or_else(|| step.source.clone());
 
     // The version gate runs before the configured gates: it is nearly free, and
     // failing fast beats failing after a full build. The source is this step's
     // merge source, and the target is the *resolved* stable ref — which in
     // dry-run may be `origin/<stable>`, and which for a per-roll promotion has
     // already been advanced by the steps ahead of this one.
-    let version = version_check(config, &step.source, stable_ref)?;
+    let mut version = version_check(config, &step.source, stable_ref)?;
     let mut version_bypass = Vec::new();
-    if !version.is_satisfied() {
+
+    // An unchanged version with a bump level in hand is not a failure but a
+    // plan: raise it inside the merge. Only `Unchanged` qualifies — a version
+    // that is *lower* than stable is never one level away from right, and an
+    // unreadable one cannot be raised at all.
+    let in_merge_bump = match (version.status, version.head, bump) {
+        (VersionStatus::Unchanged, Some(head), Some(level)) if !dry_run => {
+            Some((head, head.bump(level)))
+        }
+        _ => None,
+    };
+
+    if !version.is_satisfied() && in_merge_bump.is_none() {
         // `--dry-run` previews rather than enforces, exactly as it does for the
         // configured gates (which are printed, not executed). The rendered
         // status line still reports that the version would block a real run.
         if !force.enabled && !dry_run {
-            return Err(version_gate_error(&version, &step.source, stable));
+            return Err(version_gate_error(&version, &label, stable));
         }
         // Under --force the gate is recorded in the merge trailer exactly like a
         // bypassed shell gate, so the override leaves the same audit trail.
@@ -1473,6 +1635,26 @@ fn run_promote_step(
     // Gates run against the staged merge result, so `report` is produced inside
     // `merge_gated`. In dry-run nothing is staged and nothing is merged.
     let run_checks = || -> Result<(GateReport, HostReport)> {
+        // The bump lands in the staged tree *before* the gates, so they check
+        // the manifest the merge commit will carry — and so `cargo update
+        // --locked` sees a lockfile that matches it. Staged, not left in the
+        // worktree: `merge_gated` refuses to commit unstaged tracked changes,
+        // precisely so a gate cannot smuggle edits past it, and this is not a
+        // gate's edit but part of what is being merged.
+        if let Some((_, next)) = in_merge_bump {
+            version::write_version(repo, next)?;
+            refresh_lockfile(repo);
+            // Only what exists: a manifest with no lockfile (fixture crates,
+            // libraries that do not commit one) must not fail the add.
+            let mut add = vec!["add"];
+            add.extend(
+                ["Cargo.toml", "Cargo.lock"]
+                    .into_iter()
+                    .filter(|f| repo.join(f).exists()),
+            );
+            git::run_git(repo, &add)
+                .context("failed to stage the version bump in the promotion merge")?;
+        }
         let report = run_gates(repo, &config.rolling_to_main_gates, dry_run, force)?;
 
         // Host gates block promotion when an active host fails (issue #106),
@@ -1500,11 +1682,14 @@ fn run_promote_step(
         return Ok(PromoteStep {
             roll: step.roll,
             source: step.source,
+            carried: step.carried,
             gate_notices: report.notices,
             host_results: host_report.results,
             host_notices: host_report.notices,
             version,
             tag: tag_outcome,
+            bumped: false,
+            bumped_from: None,
         });
     }
 
@@ -1527,6 +1712,17 @@ fn run_promote_step(
         append_commit_trailer(repo, stable_ref, &trailer)?;
     }
 
+    // Once merged, the version the tag must name is the raised one, and the
+    // check reports it as satisfied — which it now is.
+    let bumped_from = in_merge_bump.map(|(from, next)| {
+        version = VersionCheck {
+            head: Some(next),
+            base: version.base,
+            status: VersionStatus::Ok,
+        };
+        from
+    });
+
     // Tag last of all, so it points at the commit the trailer amend produced
     // rather than the one it replaced.
     let tag_outcome = tag_release(config, &version, tag, &step.included)?;
@@ -1534,11 +1730,14 @@ fn run_promote_step(
     Ok(PromoteStep {
         roll: step.roll,
         source: step.source,
+        carried: step.carried,
         gate_notices: report.notices,
         host_results: host_report.results,
         host_notices: host_report.notices,
         version,
         tag: tag_outcome,
+        bumped: bumped_from.is_some(),
+        bumped_from,
     })
 }
 

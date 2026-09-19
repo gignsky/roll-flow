@@ -414,3 +414,231 @@ fn promotion_merges_the_graduation_on_rolling_not_an_integration_merge_elsewhere
         Some("✓ graduated")
     );
 }
+
+// ── per-roll promotion and the version gate ─────────────────────────────────
+
+/// A cargo repo with one roll graduated and no bump anywhere, which is the
+/// shape the version gate used to dead-end on: UNCHANGED against stable, with
+/// `--bump` ignored for `--roll`.
+fn one_graduated_cargo_roll() -> (Sandbox, String) {
+    let sb = Sandbox::cargo();
+    sb.init();
+    let out = sb.create_roll("alpha", "0611");
+    assert!(out.success, "create alpha: {}", out.combined());
+    let alpha = sb.current_branch();
+    sb.commit_file("alpha.txt", "a\n", "alpha work");
+    assert!(sb.rf(&["graduate"]).success, "graduate alpha");
+    sb.git(&["checkout", "rolling"]);
+    (sb, alpha)
+}
+
+#[test]
+fn a_per_roll_promotion_bumps_inside_its_own_merge() {
+    let (sb, alpha) = one_graduated_cargo_roll();
+    assert_eq!(sb.cargo_version_at("main"), "0.0.1");
+
+    let out = sb.rf(&["promote", "--roll", &alpha, "--bump", "minor", "--yes"]);
+    assert!(out.success, "promote --roll failed: {}", out.combined());
+    assert!(
+        out.combined()
+            .contains("Bumped version 0.0.1 -> 0.1.0 inside the promotion merge"),
+        "{}",
+        out.combined()
+    );
+
+    // The bump is in the merge commit, not a commit beside it: main's tip is a
+    // merge, and stable still only ever receives merges.
+    assert_eq!(sb.cargo_version_at("main"), "0.1.0");
+    let parents = sb.git(&["rev-list", "--parents", "-1", "main"]);
+    assert_eq!(
+        parents.split_whitespace().count(),
+        3,
+        "main's tip is not a merge: {parents}"
+    );
+    assert!(sb.tag_exists("v0.1.0"), "tag missing: {}", sb.git(&["tag"]));
+
+    // Rolling would otherwise sit *below* stable and fail the next promotion as
+    // LOWER, so stable was merged back into it.
+    assert!(
+        out.combined()
+            .contains("Reintegrated 'main' into 'rolling'"),
+        "{}",
+        out.combined()
+    );
+    assert_eq!(sb.cargo_version_at("rolling"), "0.1.0");
+    assert!(
+        sb.is_ancestor("main", "rolling"),
+        "main not reintegrated into rolling"
+    );
+}
+
+#[test]
+fn yes_takes_the_patch_default_for_a_per_roll_promotion() {
+    let (sb, alpha) = one_graduated_cargo_roll();
+    let out = sb.rf(&["promote", "--roll", &alpha, "--yes"]);
+    assert!(out.success, "{}", out.combined());
+    assert_eq!(sb.cargo_version_at("main"), "0.0.2");
+}
+
+#[test]
+fn an_unattended_per_roll_promotion_names_the_roll_not_a_sha() {
+    // No --bump, no --yes, no terminal: refused — but the refusal must name
+    // the roll and a fix that actually works.
+    let (sb, alpha) = one_graduated_cargo_roll();
+    let out = sb.rf(&["promote", "--roll", &alpha]);
+    assert!(!out.success, "should refuse: {}", out.combined());
+    assert!(
+        out.combined().contains(&alpha),
+        "roll not named:\n{}",
+        out.combined()
+    );
+    assert!(out.combined().contains("--bump"), "{}", out.combined());
+    assert_eq!(
+        sb.cargo_version_at("main"),
+        "0.0.1",
+        "nothing should have moved"
+    );
+}
+
+#[test]
+fn a_graduation_that_already_bumped_is_not_bumped_again() {
+    let sb = Sandbox::cargo();
+    sb.init();
+    let out = sb.create_roll("alpha", "0611");
+    assert!(out.success, "{}", out.combined());
+    let alpha = sb.current_branch();
+    sb.write_cargo_version("0.5.0");
+    sb.git(&["add", "Cargo.toml"]);
+    sb.git(&["commit", "-m", "bump on the roll"]);
+    assert!(sb.rf(&["graduate"]).success);
+    sb.git(&["checkout", "rolling"]);
+
+    let out = sb.rf(&["promote", "--roll", &alpha, "--bump", "major", "--yes"]);
+    assert!(out.success, "{}", out.combined());
+    // The gate was already satisfied, so the level in hand is not applied.
+    assert_eq!(sb.cargo_version_at("main"), "0.5.0");
+    assert!(
+        !out.combined().contains("inside the promotion merge"),
+        "{}",
+        out.combined()
+    );
+}
+
+#[test]
+fn after_a_per_roll_promotion_yes_updates_the_active_rolls() {
+    let (sb, alpha) = one_graduated_cargo_roll();
+    // An active roll that will trail what lands on main.
+    let out = sb.create_roll("beta", "0612");
+    assert!(out.success, "{}", out.combined());
+    let beta = sb.current_branch();
+    sb.commit_file("beta.txt", "b\n", "beta work");
+    sb.git(&["checkout", "rolling"]);
+
+    let out = sb.rf(&["promote", "--roll", &alpha, "--yes"]);
+    assert!(out.success, "{}", out.combined());
+    assert!(
+        out.combined()
+            .contains(&format!("updated '{beta}' with 'main'")),
+        "{}",
+        out.combined()
+    );
+    assert!(
+        sb.is_ancestor("main", &beta),
+        "beta was not updated from main"
+    );
+}
+
+// ── disclosing the rolls a step carries ─────────────────────────────────────
+//
+// Advancing stable to a roll's graduation commit lands everything that
+// graduated ahead of it. That is inherent to the route, so the fix is
+// disclosure: say which rolls come along, and get an answer before merging.
+
+#[test]
+fn promoting_a_later_roll_alone_refuses_unattended_and_names_what_it_would_carry() {
+    let sb = two_graduated_rolls();
+
+    let out = sb.rf(&["promote", "--roll", "roll/2-0612-beta"]);
+    assert!(
+        !out.success,
+        "landing alpha unasked must not happen silently: {}",
+        out.combined()
+    );
+    assert!(
+        out.combined().contains("roll/1-0611-alpha"),
+        "the carried roll should be named: {}",
+        out.combined()
+    );
+    assert_eq!(
+        sb.roll_state("roll/1-0611-alpha").as_deref(),
+        Some("✓ graduated"),
+        "nothing should have been promoted"
+    );
+    assert_eq!(
+        sb.roll_state("roll/2-0612-beta").as_deref(),
+        Some("✓ graduated")
+    );
+}
+
+#[test]
+fn yes_accepts_the_carried_rolls_and_reports_them() {
+    let sb = two_graduated_rolls();
+
+    let out = sb.rf(&["promote", "--roll", "roll/2-0612-beta", "--yes"]);
+    assert!(out.success, "promote beta: {}", out.combined());
+    assert!(
+        out.combined().contains("also landed: roll/1-0611-alpha"),
+        "the carried roll should be reported: {}",
+        out.combined()
+    );
+    // Both are on main — which is the point of the disclosure, not a bug: the
+    // merge source is beta's graduation, and alpha's is its ancestor.
+    assert_eq!(
+        sb.roll_state("roll/1-0611-alpha").as_deref(),
+        Some("✓ promoted")
+    );
+    assert_eq!(
+        sb.roll_state("roll/2-0612-beta").as_deref(),
+        Some("✓ promoted")
+    );
+}
+
+#[test]
+fn a_dry_run_lists_the_carried_rolls_instead_of_asking() {
+    let sb = two_graduated_rolls();
+
+    let out = sb.rf(&["promote", "--roll", "roll/2-0612-beta", "--dry-run"]);
+    assert!(
+        out.success,
+        "a dry-run previews rather than refusing: {}",
+        out.combined()
+    );
+    assert!(
+        out.combined()
+            .contains("would also land: roll/1-0611-alpha"),
+        "{}",
+        out.combined()
+    );
+}
+
+#[test]
+fn naming_both_rolls_carries_neither_behind_the_users_back() {
+    // Alpha is promoted by its own step, so beta's step must not report it as
+    // something it dragged along — the baseline is the previous step's source,
+    // not stable's tip when the command started.
+    let sb = two_graduated_rolls();
+
+    let out = sb.rf(&[
+        "promote",
+        "--roll",
+        "roll/1-0611-alpha",
+        "--roll",
+        "roll/2-0612-beta",
+    ]);
+    assert!(out.success, "promote both: {}", out.combined());
+    assert!(
+        !out.combined().contains("also landed"),
+        "nothing was carried unasked: {}",
+        out.combined()
+    );
+}
