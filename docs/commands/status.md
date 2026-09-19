@@ -81,7 +81,18 @@ reports a stale lease, fetch with `[f]` and try again.
 `[b]` raises the `[package]` version in `Cargo.toml` on the **checked-out**
 branch — not the row under the cursor, because a bump is a commit and has to land
 on the branch the merge will be made from. The header carries the current version
-so the effect is visible without opening anything.
+in its top-right corner as `v0.2.3`, so the effect is visible without opening
+anything — and it sits in the border rather than on the branch line, which a long
+roll name would otherwise crowd out.
+
+```text
+┌ roll-flow ──────────────────────────────────────────── v0.2.3 ┐
+│Branch: roll/4-0918-x   Rolling: rolling   Stable: main        │
+└───────────────────────────────────────────────────────────────┘
+```
+
+Repos with no `Cargo.toml` show nothing there, the same rule that makes `[b]`
+refuse in them.
 
 ```text
 ┌ bump version ────────────────────────┐
