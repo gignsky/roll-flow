@@ -38,6 +38,25 @@ long list — that keeps two rolls adding rules in different areas from collidin
   it from commit subjects. Every other rule is unchanged: an uncontained copy still
   needs `force`, and in the TUI that means a second, separate confirmation stating how
   many commits would be lost. That confirmation is the only thing that sets `force`.
+- What counts as "safe to delete" is a *policy*, `ops::Containment`, not a second
+  code path. `rf prune` and `rf delete` carry `Stable`; `rf tidy` carries
+  `Recoverable`, which also accepts the rolling branch and the branch's own
+  `origin/<branch>` copy — because tidy deletes only the local copy, so commits
+  still on the remote can be fetched back. `decide_copies` takes the *answers*,
+  never the policy: which refs were consulted is `local_survives`'s business, and
+  keeping that split is what lets one safety table serve all three commands. A new
+  command that deletes branches adds a policy, not a path.
+- `Recoverable` must always fetch before planning, even though it deletes nothing
+  on the remote. It reads `origin/<branch>` as proof the commits survive, and a
+  stale ref there names a branch that may already be deleted upstream — certifying
+  as recoverable exactly the branches whose only remaining copy is the local one.
+  `Stable` does not need this: a stale `origin/<stable>` is only ever *older*, so
+  it under-reports containment and errs toward keeping branches.
+- A local copy checked out in *any* worktree is never deleted — the current branch
+  and another worktree are two separate refusals with two separate messages, and
+  both sit ahead of the force check. git refuses either delete regardless; the
+  guards exist so the user is told which worktree to clear rather than shown git's
+  error once per branch.
 - All *roll branch* deletion goes through `ops::decide_copies` → `plan_branch_deletion`
   → `prune_apply`. There is deliberately one implementation of those safety rules and
   one path to the remote; do not add a second way to delete a roll branch. `rf clean`
@@ -54,7 +73,9 @@ long list — that keeps two rolls adding rules in different areas from collidin
   `rf clean --with-remote`. All of them `git fetch --prune` before planning a
   remote delete, so containment is never judged against a stale ref — a stale one
   names an old tip, and deleting against it would destroy commits the check never
-  saw. Do not add a fourth.
+  saw. Do not add a fourth. `rf tidy` in particular is not one and must never
+  become one: its whole safety argument is that a branch still on `origin` is
+  recoverable, which stops being true the moment it can delete the remote copy.
 - *Advancing* a ref on the remote happens in one place: the TUI's `[P]`, via
   `core::sync::run_push`. It is a different act from a delete and is governed by
   different rules, which is why it is a separate bullet rather than a fourth

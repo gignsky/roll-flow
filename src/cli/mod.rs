@@ -1,10 +1,11 @@
 pub mod clean;
 pub mod status;
 
+use crate::core::branches::RollState;
 use crate::core::version::BumpLevel;
 use std::io::IsTerminal;
 
-use clap::{Parser, Subcommand};
+use clap::{Parser, Subcommand, ValueEnum};
 
 // ── Interactive confirmation ──────────────────────────────────────────────────
 
@@ -257,6 +258,37 @@ pub enum Cmd {
         no_fetch: bool,
     },
 
+    /// Delete local roll branches whose commits survive elsewhere, leaving
+    /// `origin` untouched.
+    ///
+    /// The disk-cleanup counterpart to `prune`: where prune retires work that
+    /// reached stable on both sides, tidy clears local clutter a `git fetch`
+    /// could bring back. A branch is only deleted when its tip is contained in
+    /// the stable branch, the rolling branch, or its own copy on `origin`.
+    Tidy {
+        /// Roll states to clear local branches for. Repeat or comma-separate.
+        #[arg(
+            long = "state",
+            value_enum,
+            value_delimiter = ',',
+            default_value = "graduated,promoted"
+        )]
+        state: Vec<TidyState>,
+        #[arg(long)]
+        dry_run: bool,
+        /// Delete without prompting for confirmation.
+        #[arg(long)]
+        yes: bool,
+        /// Delete even when the local tip holds commits found nowhere else —
+        /// including commits that were never pushed.
+        #[arg(long)]
+        force: bool,
+        /// Skip the `git fetch --prune origin` refresh that precedes planning.
+        /// Containment is then judged against cached remote-tracking refs.
+        #[arg(long)]
+        no_fetch: bool,
+    },
+
     /// Delete stale branches: prune every remote, then remove local branches
     /// whose upstream is gone, that are merged into the base branch, or — in a
     /// roll-flow repo — whose roll is already promoted.
@@ -282,4 +314,59 @@ pub enum Cmd {
 
     /// Print program version.
     Version,
+}
+
+/// The roll states `rf tidy --state` accepts.
+///
+/// A CLI-level vocabulary rather than `branches::RollState` itself: the states
+/// are a user-facing menu here, and `all` is a selection, not a state a roll can
+/// be in. [`TidyState::expand`] is the one place the two are related.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
+pub enum TidyState {
+    /// Not yet merged to rolling.
+    Active,
+    /// Active, but waiting on an ungraduated dependency.
+    Blocked,
+    /// Graduated, then took further commits.
+    Diverged,
+    /// Merged to rolling.
+    Graduated,
+    /// Merged to the stable branch.
+    Promoted,
+    /// Every state above.
+    All,
+}
+
+impl TidyState {
+    /// Expand a `--state` selection into the roll states it covers,
+    /// deduplicated and order-independent.
+    pub fn expand(selected: &[TidyState]) -> Vec<RollState> {
+        let mut states = Vec::new();
+        let mut push = |state: RollState| {
+            if !states.contains(&state) {
+                states.push(state);
+            }
+        };
+        for choice in selected {
+            match choice {
+                TidyState::Active => push(RollState::Active),
+                TidyState::Blocked => push(RollState::Blocked),
+                TidyState::Diverged => push(RollState::Diverged),
+                TidyState::Graduated => push(RollState::Graduated),
+                TidyState::Promoted => push(RollState::Promoted),
+                TidyState::All => {
+                    for state in [
+                        RollState::Active,
+                        RollState::Blocked,
+                        RollState::Diverged,
+                        RollState::Graduated,
+                        RollState::Promoted,
+                    ] {
+                        push(state);
+                    }
+                }
+            }
+        }
+        states
+    }
 }

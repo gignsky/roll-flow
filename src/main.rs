@@ -117,6 +117,13 @@ fn main() -> Result<()> {
             force,
             no_fetch,
         } => cmd_delete(&branch, dry_run, local, remote, yes, force, no_fetch)?,
+        Cmd::Tidy {
+            state,
+            dry_run,
+            yes,
+            force,
+            no_fetch,
+        } => cmd_tidy(&state, dry_run, yes, force, no_fetch)?,
         Cmd::Clean {
             dry_run,
             yes,
@@ -776,6 +783,7 @@ fn cmd_prune(
         remote: remote || !local,
         force,
         fetch: !no_fetch,
+        ..ops::PruneScope::both()
     };
 
     let plan = ops::prune_plan(&config, &scope)?;
@@ -819,6 +827,79 @@ fn cmd_prune(
     Ok(())
 }
 
+/// `rf tidy` — delete local roll branches whose commits survive elsewhere.
+///
+/// The disk-cleanup half of prune. Prune asks "has this landed?" and answers it
+/// on both sides; tidy asks the weaker question "could I get this back?" and
+/// only ever touches the local copy, so the honest answer for a branch still on
+/// `origin` is yes. That is why it is a command of its own rather than a flag:
+/// there is no `--remote` here to reach for by accident.
+///
+/// Like `cmd_prune` it never moves `HEAD` and never merges, so a dirty working
+/// tree is irrelevant and `ops::ensure_clean_state` is deliberately not called.
+fn cmd_tidy(
+    state: &[cli::TidyState],
+    dry_run: bool,
+    yes: bool,
+    force: bool,
+    no_fetch: bool,
+) -> Result<()> {
+    let config = Config::load()?;
+
+    let states = cli::TidyState::expand(state);
+    let scope = ops::PruneScope {
+        fetch: !no_fetch,
+        ..ops::PruneScope::tidy(force)
+    };
+
+    let plan = ops::tidy_plan(&config, &scope, &states)?;
+    let wanted = states
+        .iter()
+        .map(|s| s.label().trim_start_matches(['✓', '⚠', '⛔', ' ']))
+        .collect::<Vec<_>>()
+        .join(", ");
+
+    if plan.is_empty() {
+        println!("no local roll branches to tidy ({wanted})");
+        render_prune_skips(&plan.skipped);
+        return Ok(());
+    }
+
+    render_prune_plan(&plan, &format!("Local roll branches to tidy ({wanted}):"));
+    render_prune_skips(&plan.skipped);
+
+    if dry_run {
+        println!("\nDry-run: nothing deleted");
+        return Ok(());
+    }
+
+    // The same split as everywhere else: `--force` widens *what* may be
+    // deleted, only `--yes` skips the prompt, and an unattended run without
+    // `--yes` deletes nothing and exits 0.
+    match cli::confirm(yes, "\nDelete these local branches? [y/N] ")? {
+        cli::Confirm::Yes => {}
+        cli::Confirm::Declined => {
+            println!("Nothing deleted.");
+            return Ok(());
+        }
+        cli::Confirm::Unattended => {
+            println!("\nNothing deleted. Re-run with --yes to apply.");
+            return Ok(());
+        }
+    }
+
+    println!();
+    let results = ops::prune_apply(&config, &plan)?;
+    let failures = render_prune_results(&results, "Tidied");
+    if failures > 0 {
+        bail!(
+            "{failures} branch{} could not be deleted",
+            if failures == 1 { "" } else { "es" }
+        );
+    }
+    Ok(())
+}
+
 /// `rf delete <branch>` — delete one named roll branch, locally, on origin, or
 /// both.
 ///
@@ -844,6 +925,7 @@ fn cmd_delete(
         remote: remote || !local,
         force,
         fetch: !no_fetch,
+        ..ops::PruneScope::both()
     };
 
     let plan = ops::delete_branch_plan(&config, branch, &scope)?;

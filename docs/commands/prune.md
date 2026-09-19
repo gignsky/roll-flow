@@ -28,3 +28,6 @@ so it never acts on stale remote-tracking refs (`--no-fetch` opts out).
 
 To delete a branch that has *not* been promoted, name it with
 [`delete`](delete.md). To clear stale branches repo-wide, see [`clean`](clean.md).
+To clear local branches without touching `origin` — including graduated rolls
+prune will not consider — see [`tidy`](tidy.md), which judges safety by whether
+the commits could be fetched back rather than by whether they reached stable.
