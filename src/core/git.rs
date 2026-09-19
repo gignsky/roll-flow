@@ -1099,19 +1099,32 @@ mod tests {
 
     #[test]
     fn show_files_at_refs_reads_the_manifest_at_several_refs_at_once() {
-        // Against this very repo: HEAD has a Cargo.toml, a bogus ref does not,
-        // and one subprocess answers for both.
-        let repo = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+        // A throwaway repo, not `CARGO_MANIFEST_DIR`: under `nix build` the
+        // source is copied into the sandbox without its `.git`, and a test that
+        // reaches for the real checkout fails there and nowhere else.
+        let dir = tempfile::tempdir().expect("temp dir");
+        let repo = dir.path();
+        git(repo, &["init", "-b", "main"]);
+        git(repo, &["config", "user.email", "t@t"]);
+        git(repo, &["config", "user.name", "t"]);
+        std::fs::write(repo.join("Cargo.toml"), "[package]\nversion = \"1.2.3\"\n")
+            .expect("write manifest");
+        git(repo, &["add", "Cargo.toml"]);
+        git(repo, &["commit", "-m", "manifest"]);
+        git(repo, &["branch", "bare"]);
+        git(repo, &["rm", "-q", "Cargo.toml"]);
+        git(repo, &["commit", "-m", "drop manifest"]);
+
+        // One subprocess answers for a ref that has the file, one that does
+        // not, and a path that never existed.
         let specs = vec![
-            "HEAD:Cargo.toml".to_string(),
-            "HEAD:definitely-not-here.toml".to_string(),
+            "bare:Cargo.toml".to_string(),
+            "main:Cargo.toml".to_string(),
+            "main:definitely-not-here.toml".to_string(),
         ];
         let found = show_files_at_refs(repo, &specs).expect("batch read");
-        assert!(
-            found["HEAD:Cargo.toml"].contains("[package]"),
-            "{:?}",
-            found.get("HEAD:Cargo.toml")
-        );
-        assert!(!found.contains_key("HEAD:definitely-not-here.toml"));
+        assert!(found["bare:Cargo.toml"].contains("1.2.3"), "{found:?}");
+        assert!(!found.contains_key("main:Cargo.toml"));
+        assert!(!found.contains_key("main:definitely-not-here.toml"));
     }
 }
