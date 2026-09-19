@@ -203,6 +203,12 @@ enum Mode {
         /// The roll branch an action targets (graduate); `None` for repo-wide
         /// ops (promote / update).
         target: Option<String>,
+        /// For `[m]` on a roll row: the rolls that graduated ahead of it and
+        /// would land on stable with it. Read once when the modal opens — it
+        /// costs git calls, and a draw must not — and empty for every other
+        /// action. The modal states them because advancing stable to one roll's
+        /// graduation commit is not what "promote this roll" sounds like.
+        carried: Vec<String>,
     },
     /// Read-only drill-down for a single roll: its identity plus its dependency
     /// rows (issue #61). A snapshot of the selected roll is captured on open so
@@ -1103,7 +1109,7 @@ impl StatusApp {
     fn handle_confirm(&mut self, code: KeyCode) {
         match code {
             KeyCode::Char('y') | KeyCode::Char('Y') => {
-                if let Mode::Confirm { action, target } =
+                if let Mode::Confirm { action, target, .. } =
                     std::mem::replace(&mut self.mode, Mode::Browsing)
                 {
                     self.execute(action, target);
@@ -1155,8 +1161,18 @@ impl StatusApp {
             Action::Promote => promote_target_for(selected, &self.rolls).unwrap_or(None),
             _ => None,
         };
+        let carried = match (action, &target) {
+            (Action::Promote, Some(roll)) => carried_by_promoting(&self.config, roll),
+            _ => Vec::new(),
+        };
         match validation {
-            Ok(()) => self.mode = Mode::Confirm { action, target },
+            Ok(()) => {
+                self.mode = Mode::Confirm {
+                    action,
+                    target,
+                    carried,
+                }
+            }
             Err(msg) => self.message = Some(msg),
         }
     }
@@ -1190,6 +1206,7 @@ impl StatusApp {
                 self.mode = Mode::Confirm {
                     action: Action::Integrate,
                     target: Some(branch),
+                    carried: Vec::new(),
                 }
             }
             Err(msg) => self.message = Some(msg),
@@ -1626,15 +1643,22 @@ impl StatusApp {
         }
 
         match &self.mode {
-            Mode::Confirm { action, target } => {
+            Mode::Confirm {
+                action,
+                target,
+                carried,
+            } => {
                 render_modal(
                     f,
                     area,
                     &self.config,
-                    *action,
-                    target.as_deref(),
-                    &self.rolls,
-                    &self.current_branch,
+                    &ConfirmModal {
+                        action: *action,
+                        target: target.as_deref(),
+                        carried,
+                        rolls: &self.rolls,
+                        current_branch: &self.current_branch,
+                    },
                 );
             }
             Mode::Detail { roll, ahead_behind } => {
@@ -1903,6 +1927,9 @@ fn run_op(config: &Config, action: Action, target: Option<&str>) -> Result<Vec<S
                 push_host_results(&mut lines, &step.host_results);
                 let what = step.roll.as_deref().unwrap_or(&o.rolling);
                 lines.push(format!("Promoted '{}' into '{}'", what, o.stable));
+                for carried in &step.carried {
+                    lines.push(format!("  also landed: {carried}"));
+                }
                 if let Some(line) = step.tag.describe() {
                     lines.push(line);
                 }
@@ -2131,16 +2158,31 @@ fn plural(n: u32) -> &'static str {
     }
 }
 
-/// Render the centered confirmation popup for a pending action.
-fn render_modal(
-    f: &mut Frame,
-    area: Rect,
-    config: &Config,
+/// Everything the confirm modal reads, gathered so the renderer takes one
+/// parameter per *thing* rather than one per field.
+struct ConfirmModal<'a> {
     action: Action,
-    target: Option<&str>,
-    rolls: &[RollInfo],
-    current_branch: &str,
-) {
+    /// The roll a roll-scoped action targets; `None` for the repo-wide shapes.
+    target: Option<&'a str>,
+    /// See [`Mode::Confirm`]'s field of the same name.
+    carried: &'a [String],
+    rolls: &'a [RollInfo],
+    current_branch: &'a str,
+}
+
+/// Render the centered confirmation popup for a pending action.
+///
+/// `carried` is non-empty only for `[m]` on a roll row, and the modal then grows
+/// to list those rolls: the merge lands them on stable too, and the confirmation
+/// is the last place the user can see that before it happens.
+fn render_modal(f: &mut Frame, area: Rect, config: &Config, modal: &ConfirmModal) {
+    let ConfirmModal {
+        action,
+        target,
+        carried,
+        rolls,
+        current_branch,
+    } = *modal;
     let prompt = match action {
         Action::Graduate => format!(
             "Graduate {} into {}?",
@@ -2186,14 +2228,45 @@ fn render_modal(
     };
     let hint = "[y] confirm    [n] cancel";
 
-    let width = (prompt.chars().count().max(hint.len()) as u16) + 4;
-    let modal = centered_rect(area, width, 4);
+    let mut lines = vec![Line::from(prompt)];
+    if !carried.is_empty() {
+        let yellow = Style::default().fg(Color::Yellow);
+        lines.push(Line::from(Span::styled(
+            "also lands, in graduation order:",
+            yellow,
+        )));
+        for roll in carried {
+            lines.push(Line::from(Span::styled(roll.clone(), yellow)));
+        }
+    }
+    lines.push(Line::from(hint));
+
+    let width = lines.iter().map(|l| l.width()).max().unwrap_or(20) as u16 + 4;
+    let modal = centered_rect(area, width, lines.len() as u16 + 2);
 
     f.render_widget(Clear, modal);
-    let body = Paragraph::new(vec![Line::from(prompt), Line::from(hint)])
+    let body = Paragraph::new(lines)
         .alignment(Alignment::Center)
         .block(Block::bordered().title(" confirm "));
     f.render_widget(body, modal);
+}
+
+/// The rolls that `[m]` on `roll` would land on stable besides `roll` itself.
+///
+/// Best-effort: a planning failure yields an empty list rather than an error.
+/// The keypress opens a confirmation, and `ops::promote` reports the real
+/// problem a moment later if there is one — refusing to draw the modal because
+/// the disclosure could not be computed would be the worse trade.
+fn carried_by_promoting(config: &Config, roll: &str) -> Vec<String> {
+    ops::preview_roll_promotion(config, &[roll.to_string()])
+        .map(|preview| {
+            preview
+                .steps
+                .into_iter()
+                .flat_map(|step| step.carried)
+                .collect()
+        })
+        .unwrap_or_default()
 }
 
 /// Render the centered delete popup. Its shape follows `preview.prompt`, and
@@ -3789,16 +3862,53 @@ mod tests {
                 f,
                 area,
                 &cfg,
-                Action::Integrate,
-                Some("roll/1-0101-alpha"),
-                &[],
-                "roll/2-0102-beta",
+                &ConfirmModal {
+                    action: Action::Integrate,
+                    target: Some("roll/1-0101-alpha"),
+                    carried: &[],
+                    rolls: &[],
+                    current_branch: "roll/2-0102-beta",
+                },
             )
         });
         assert!(
             out.contains("Integrate roll/1-0101-alpha into roll/2-0102-beta?"),
             "{out}"
         );
+    }
+
+    #[test]
+    fn the_promote_modal_lists_the_rolls_a_roll_promotion_would_carry() {
+        // `[m]` on one roll advances stable to that roll's graduation commit, so
+        // earlier graduations land too. The modal is the last place the user can
+        // see that before the merge, so it has to name them.
+        let cfg = config("main", "rolling");
+        let carried = vec![
+            "roll/4-0918-version-corner".to_string(),
+            "roll/7-0918-verify-button".to_string(),
+        ];
+        let out = draw(|f, area| {
+            render_modal(
+                f,
+                area,
+                &cfg,
+                &ConfirmModal {
+                    action: Action::Promote,
+                    target: Some("roll/8-0918-help-menu"),
+                    carried: &carried,
+                    rolls: &[],
+                    current_branch: "rolling",
+                },
+            )
+        });
+        assert!(
+            out.contains("Promote roll/8-0918-help-menu into main?"),
+            "{out}"
+        );
+        assert!(out.contains("also lands"), "{out}");
+        for roll in &carried {
+            assert!(out.contains(roll.as_str()), "{roll} missing from:\n{out}");
+        }
     }
 
     #[test]
@@ -3811,14 +3921,39 @@ mod tests {
             roll_n(2, RollState::Promoted),
         ];
 
-        let tidy = draw(|f, area| render_modal(f, area, &cfg, Action::Tidy, None, &rolls, "main"));
+        let tidy = draw(|f, area| {
+            render_modal(
+                f,
+                area,
+                &cfg,
+                &ConfirmModal {
+                    action: Action::Tidy,
+                    target: None,
+                    carried: &[],
+                    rolls: &rolls,
+                    current_branch: "main",
+                },
+            )
+        });
         assert!(
             tidy.contains("Delete 2 local graduated/promoted roll branches (local only)?"),
             "{tidy}"
         );
 
-        let prune =
-            draw(|f, area| render_modal(f, area, &cfg, Action::Prune, None, &rolls, "main"));
+        let prune = draw(|f, area| {
+            render_modal(
+                f,
+                area,
+                &cfg,
+                &ConfirmModal {
+                    action: Action::Prune,
+                    target: None,
+                    carried: &[],
+                    rolls: &rolls,
+                    current_branch: "main",
+                },
+            )
+        });
         assert!(
             prune.contains("Delete 1 promoted roll branch (local + origin)?"),
             "{prune}"

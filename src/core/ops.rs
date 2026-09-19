@@ -1217,6 +1217,14 @@ pub(crate) struct PromoteStep {
     /// dry-runs, where naming the commit is the only way to show that a per-roll
     /// promotion merges a point on rolling rather than the roll branch.
     pub source: String,
+    /// Rolls that graduated ahead of this step's roll and are not yet on stable,
+    /// so advancing stable to its graduation commit lands them too. Oldest
+    /// first. Always empty for a whole-rolling promotion, where every graduated
+    /// roll is the point. Disclosed before the merge by
+    /// [`preview_roll_promotion`] and reported after it, because a per-roll
+    /// promotion that silently lands other rolls is the one outcome a user
+    /// asking for one roll does not expect.
+    pub carried: Vec<String>,
     pub gate_notices: Vec<GateNotice>,
     /// Per-host verification results (empty when no host gates / no active hosts).
     pub host_results: Vec<HostResult>,
@@ -1338,6 +1346,11 @@ struct PlannedStep {
     /// Captured at planning time, before any merge: afterwards these rolls read
     /// as promoted rather than graduated, so the list would come back empty.
     included: Vec<String>,
+    /// See [`PromoteStep::carried`]. Computed at planning time for the same
+    /// reason `included` is, and against the stable ref *as the earlier steps
+    /// of this plan will have advanced it*, so naming two rolls does not report
+    /// the first as carried by the second.
+    carried: Vec<String>,
 }
 
 /// The steps a promotion will perform, plus the rolls it found nothing to do
@@ -1375,6 +1388,7 @@ fn plan_rolling_step(config: &Config, stable_ref: &str) -> Result<PlannedStep> {
         subject,
         body,
         included,
+        carried: Vec::new(),
     })
 }
 
@@ -1437,15 +1451,111 @@ fn plan_roll_steps(config: &Config, rolls: &[String], stable_ref: &str) -> Resul
                 // name this step's own roll.
                 body: Some(format!("Rolls:\n  {name}\n")),
                 included: vec![name.clone()],
+                // Filled in below, once the steps are in graduation order:
+                // what a step carries depends on which step precedes it.
+                carried: Vec::new(),
             },
         ));
     }
 
     planned.sort_by_key(|(pos, _)| *pos);
-    Ok(PromotePlan {
-        steps: planned.into_iter().map(|(_, step)| step).collect(),
-        skipped,
+    let mut steps: Vec<PlannedStep> = planned.into_iter().map(|(_, step)| step).collect();
+    fill_carried_rolls(repo, &known, &order, &mut steps, stable_ref);
+    Ok(PromotePlan { steps, skipped })
+}
+
+/// Record, per step, the rolls its merge lands on stable besides its own.
+///
+/// A step merges its roll's graduation commit on rolling, so everything that
+/// graduated earlier and is not yet on stable comes with it — see
+/// [`PromoteTarget::Rolls`]. The baseline is the *previous* step's merge source
+/// rather than stable's current tip, because by the time a step runs, stable has
+/// been advanced by the steps ahead of it; without that, `--roll a --roll b`
+/// would report `a` as something `b` drags along behind the user's back.
+///
+/// Best-effort: an unreadable ancestry answer omits the roll rather than
+/// inventing one. Disclosure that under-reports is a worse bug than a missing
+/// line, so `promote` still never *relies* on this list — it only shows it.
+fn fill_carried_rolls(
+    repo: &Path,
+    known: &[branches::RollInfo],
+    order: &HashMap<String, usize>,
+    steps: &mut [PlannedStep],
+    stable_ref: &str,
+) {
+    for i in 0..steps.len() {
+        let baseline = if i == 0 {
+            stable_ref.to_string()
+        } else {
+            steps[i - 1].source.clone()
+        };
+        let source = steps[i].source.clone();
+        let own = steps[i].roll.clone();
+        let mut carried: Vec<(usize, String)> = known
+            .iter()
+            .filter(|r| own.as_deref() != Some(r.branch.as_str()))
+            .filter_map(|r| r.graduation_commit.as_deref().map(|g| (r, g)))
+            .filter(|(_, g)| {
+                git::is_ancestor(repo, g, &source).unwrap_or(false)
+                    && !git::is_ancestor(repo, g, &baseline).unwrap_or(true)
+            })
+            .map(|(r, g)| {
+                (
+                    order.get(g).copied().unwrap_or(usize::MAX),
+                    r.branch.clone(),
+                )
+            })
+            .collect();
+        carried.sort();
+        steps[i].carried = carried.into_iter().map(|(_, branch)| branch).collect();
+    }
+}
+
+/// What `rf promote --roll` would do, without doing any of it.
+///
+/// Exists so the CLI and the TUI can disclose the rolls a per-roll promotion
+/// carries and ask before merging, rather than reporting them afterwards. It is
+/// the same planner [`promote`] runs, so what is shown is what would happen;
+/// resolving stable read-only means a repo with no local stable branch previews
+/// instead of erroring here — [`promote`] still reports that.
+pub(crate) fn preview_roll_promotion(config: &Config, rolls: &[String]) -> Result<PromotePreview> {
+    let stable_ref = git::resolve_branch(&config.repo_root, &config.stable_branch)
+        .ok_or_else(|| anyhow!(target_missing_error(config, &config.stable_branch)))?;
+    let plan = plan_roll_steps(config, rolls, &stable_ref)?;
+    Ok(PromotePreview {
+        steps: plan
+            .steps
+            .into_iter()
+            .map(|step| PreviewStep {
+                roll: step.roll,
+                source: step.source,
+                carried: step.carried,
+            })
+            .collect(),
     })
+}
+
+/// The merges a per-roll promotion would make, in order.
+///
+/// Carries no `skipped` list: a roll already contained in stable simply has no
+/// step here, and [`promote`] reports the skip when it runs.
+pub(crate) struct PromotePreview {
+    pub steps: Vec<PreviewStep>,
+}
+
+/// One prospective merge: the roll asked for, the commit on rolling that would
+/// be merged, and the rolls that ride along with it.
+pub(crate) struct PreviewStep {
+    pub roll: Option<String>,
+    pub source: String,
+    pub carried: Vec<String>,
+}
+
+impl PromotePreview {
+    /// True when at least one step would land a roll the user did not name.
+    pub fn carries_extra(&self) -> bool {
+        self.steps.iter().any(|s| !s.carried.is_empty())
+    }
 }
 
 /// Map each commit reachable from rolling to its distance from the tip, so
@@ -1572,6 +1682,7 @@ fn run_promote_step(
         return Ok(PromoteStep {
             roll: step.roll,
             source: step.source,
+            carried: step.carried,
             gate_notices: report.notices,
             host_results: host_report.results,
             host_notices: host_report.notices,
@@ -1619,6 +1730,7 @@ fn run_promote_step(
     Ok(PromoteStep {
         roll: step.roll,
         source: step.source,
+        carried: step.carried,
         gate_notices: report.notices,
         host_results: host_report.results,
         host_notices: host_report.notices,

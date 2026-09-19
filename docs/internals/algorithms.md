@@ -167,6 +167,17 @@ dependencies are satisfied for free.
 Each `--roll` is a separate merge behind a separate gate run; promoting the whole
 rolling branch is a single merge behind a single gate run.
 
+Carrying earlier graduations is therefore structural, not a bug — but it is not
+what "promote this roll" sounds like, so it is *disclosed*: `plan_roll_steps`
+fills each step's `carried` list (via `fill_carried_rolls`), and
+`ops::preview_roll_promotion` hands that plan to the CLI and the TUI so the
+confirmation can state it before any merge happens. The baseline for a step is
+the **previous step's merge source**, not stable's tip when the command started
+— otherwise `--roll a --roll b` would report `a` as something `b` dragged along,
+when `a` had its own step. `carried` is disclosure only: nothing decides what to
+merge from it, so a git call that cannot answer omits a line rather than
+changing the promotion.
+
 Promotion gates run against the **staged merge result**, not the pre-merge
 worktree: `merge_gated` stages `git merge --no-ff --no-commit`, runs the gates,
 and commits only if they pass. This is why a gate that rewrites tracked files

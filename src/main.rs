@@ -570,6 +570,15 @@ fn cmd_promote(
     // and deliberately works from any branch, rather than being redirected to
     // graduate because HEAD happens to sit on a roll.
     if !rolls.is_empty() {
+        // Advancing stable to a roll's graduation commit lands whatever
+        // graduated ahead of it too (see `ops::PromoteTarget::Rolls`). That is
+        // how the route keeps stable a prefix of rolling, but it is not what
+        // someone naming one roll assumes — so it is disclosed and confirmed
+        // before any merge, never reported afterwards.
+        if !confirm_carried_rolls(&config, &rolls, dry_run, yes)? {
+            return Ok(());
+        }
+
         // A per-roll promotion merges a commit that already exists on rolling,
         // so there is no branch to land a bump commit on ahead of the merge —
         // which used to make the version gate a dead end here: it reported
@@ -638,6 +647,57 @@ fn cmd_promote(
     Ok(())
 }
 
+/// Show the rolls a per-roll promotion would carry besides the ones named, and
+/// ask whether to proceed. Returns false when the user declined and nothing
+/// should be promoted.
+///
+/// Silent when the named rolls are all there is to land, so the common case is
+/// unchanged. A dry-run asks nothing — it renders the same list through
+/// [`print_promote`] instead. An unattended run with extra rolls in the plan
+/// fails rather than proceeding: a script that expected one roll should not land
+/// three because nobody was there to read the prompt, and `--yes` says it may.
+fn confirm_carried_rolls(
+    config: &Config,
+    rolls: &[String],
+    dry_run: bool,
+    yes: bool,
+) -> Result<bool> {
+    let preview = ops::preview_roll_promotion(config, rolls)?;
+    if dry_run || !preview.carries_extra() {
+        return Ok(true);
+    }
+
+    for step in &preview.steps {
+        if step.carried.is_empty() {
+            continue;
+        }
+        let roll = step.roll.as_deref().unwrap_or(&step.source);
+        println!(
+            "Promoting '{}' to '{}' also lands, in graduation order:",
+            roll, config.stable_branch
+        );
+        for carried in &step.carried {
+            println!("  {carried}");
+        }
+        println!(
+            "(stable is advanced to {}'s graduation commit on '{}', which those are part of)",
+            roll, config.rolling_branch
+        );
+    }
+
+    match cli::confirm(yes, "\nProceed? [y/N] ")? {
+        cli::Confirm::Yes => Ok(true),
+        cli::Confirm::Declined => {
+            println!("Aborted; nothing was promoted.");
+            Ok(false)
+        }
+        cli::Confirm::Unattended => bail!(
+            "promoting these rolls would also land rolls that graduated earlier; \
+             re-run with --yes to accept, or name them explicitly"
+        ),
+    }
+}
+
 /// Whether any of the named rolls' graduation commits carries a version equal
 /// to stable's — the case a per-roll promotion can only pass by bumping inside
 /// its merge. A cheap read ahead of the prompt so the user is only asked when
@@ -702,6 +762,16 @@ fn print_promote(outcome: &ops::PromoteOutcome) {
             );
         } else {
             println!("Promoted '{}' into '{}'", what, outcome.stable);
+        }
+        // Named in dry-runs as well, which is the whole disclosure there —
+        // `--dry-run` previews rather than prompts.
+        let verb = if outcome.dry_run {
+            "would also land"
+        } else {
+            "also landed"
+        };
+        for carried in &step.carried {
+            println!("  {verb}: {carried}");
         }
         if let (Some(from), Some(to)) = (step.bumped_from, step.version.head) {
             println!("Bumped version {from} -> {to} inside the promotion merge");

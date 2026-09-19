@@ -24,6 +24,26 @@ graduation, so promoting a roll necessarily carries whatever graduated ahead of
 it; a roll already contained in stable is reported as skipped rather than
 failing.
 
+Because of that, a `--roll` promotion that would land rolls you did not name
+says so before merging anything, and asks:
+
+```text
+Promoting 'roll/8-0919-help-menu' to 'main' also lands, in graduation order:
+  roll/4-0918-version-corner
+  roll/7-0918-verify-button
+(stable is advanced to roll/8-0919-help-menu's graduation commit on 'develop',
+which those are part of)
+
+Proceed? [y/N]
+```
+
+`--yes` answers it; an unattended run without `--yes` **fails** rather than
+landing rolls nobody agreed to. Naming every roll yourself carries nothing
+unasked — each is promoted by its own step, so no step drags another along. A
+`--dry-run` prints the same list as `would also land:` lines instead of asking,
+and a real promotion reports what it landed as `also landed:`. The TUI's `[m]`
+on a roll row shows the same list inside its confirmation modal.
+
 Each `--roll` is its own merge behind its own gate run, so a two-roll promotion
 runs the gates twice and verifies both intermediate states of stable. Promoting
 the whole branch is a single merge, so one gate run covers it. If a later step's

@@ -547,3 +547,98 @@ fn after_a_per_roll_promotion_yes_updates_the_active_rolls() {
         "beta was not updated from main"
     );
 }
+
+// ── disclosing the rolls a step carries ─────────────────────────────────────
+//
+// Advancing stable to a roll's graduation commit lands everything that
+// graduated ahead of it. That is inherent to the route, so the fix is
+// disclosure: say which rolls come along, and get an answer before merging.
+
+#[test]
+fn promoting_a_later_roll_alone_refuses_unattended_and_names_what_it_would_carry() {
+    let sb = two_graduated_rolls();
+
+    let out = sb.rf(&["promote", "--roll", "roll/2-0612-beta"]);
+    assert!(
+        !out.success,
+        "landing alpha unasked must not happen silently: {}",
+        out.combined()
+    );
+    assert!(
+        out.combined().contains("roll/1-0611-alpha"),
+        "the carried roll should be named: {}",
+        out.combined()
+    );
+    assert_eq!(
+        sb.roll_state("roll/1-0611-alpha").as_deref(),
+        Some("✓ graduated"),
+        "nothing should have been promoted"
+    );
+    assert_eq!(
+        sb.roll_state("roll/2-0612-beta").as_deref(),
+        Some("✓ graduated")
+    );
+}
+
+#[test]
+fn yes_accepts_the_carried_rolls_and_reports_them() {
+    let sb = two_graduated_rolls();
+
+    let out = sb.rf(&["promote", "--roll", "roll/2-0612-beta", "--yes"]);
+    assert!(out.success, "promote beta: {}", out.combined());
+    assert!(
+        out.combined().contains("also landed: roll/1-0611-alpha"),
+        "the carried roll should be reported: {}",
+        out.combined()
+    );
+    // Both are on main — which is the point of the disclosure, not a bug: the
+    // merge source is beta's graduation, and alpha's is its ancestor.
+    assert_eq!(
+        sb.roll_state("roll/1-0611-alpha").as_deref(),
+        Some("✓ promoted")
+    );
+    assert_eq!(
+        sb.roll_state("roll/2-0612-beta").as_deref(),
+        Some("✓ promoted")
+    );
+}
+
+#[test]
+fn a_dry_run_lists_the_carried_rolls_instead_of_asking() {
+    let sb = two_graduated_rolls();
+
+    let out = sb.rf(&["promote", "--roll", "roll/2-0612-beta", "--dry-run"]);
+    assert!(
+        out.success,
+        "a dry-run previews rather than refusing: {}",
+        out.combined()
+    );
+    assert!(
+        out.combined()
+            .contains("would also land: roll/1-0611-alpha"),
+        "{}",
+        out.combined()
+    );
+}
+
+#[test]
+fn naming_both_rolls_carries_neither_behind_the_users_back() {
+    // Alpha is promoted by its own step, so beta's step must not report it as
+    // something it dragged along — the baseline is the previous step's source,
+    // not stable's tip when the command started.
+    let sb = two_graduated_rolls();
+
+    let out = sb.rf(&[
+        "promote",
+        "--roll",
+        "roll/1-0611-alpha",
+        "--roll",
+        "roll/2-0612-beta",
+    ]);
+    assert!(out.success, "promote both: {}", out.combined());
+    assert!(
+        !out.combined().contains("also landed"),
+        "nothing was carried unasked: {}",
+        out.combined()
+    );
+}
