@@ -80,6 +80,7 @@ The full list:
 | `c` / `i` | create a roll / integrate one into the checked-out roll |
 | `G` / `m` / `u` | graduate / promote / update from stable |
 | `b` | bump the version |
+| `h` / `H` | create a hotfix off stable / land the checked-out hotfix |
 | `d` / `x` / `t` | delete / prune / tidy branches |
 | `esc` | close the output panel |
 | `PgUp` / `PgDn` / `End` | scroll the panel, or follow new output |
@@ -154,6 +155,17 @@ The one thing it will not do is bump the version. `rf verify` offers one; here a
 failed version gate points at `[b]` instead, which is the key that already writes
 that commit. A failed host or an unsatisfied gate marks the panel as failed
 rather than passing quietly.
+
+## Hotfixes
+
+`[h]` opens the same slug modal as `[c]reate` and runs `rf hotfix <slug>`,
+branching `hotfix/N-MMDD-slug` off stable and selecting it. `[H]` runs
+`rf hotfix --land` on the **checked-out** hotfix — the merge comes from HEAD, so
+the cursor cannot pick a different one; on a hotfix row that is not checked out
+it says to `[space]` onto it first. The confirmation names both merges, because
+landing writes to stable *and* then reintegrates stable into rolling. Gates run
+as they do from the CLI and are never forced from a keypress. `[d]elete` works
+on a hotfix row with the same shapes and the same safety rules as a roll.
 
 ## Bumping the version
 

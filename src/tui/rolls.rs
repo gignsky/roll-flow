@@ -54,6 +54,10 @@ pub(crate) enum Action {
     /// Delete the local copy of every graduated or promoted roll branch,
     /// leaving `origin` untouched.
     Tidy,
+    /// Land the *checked-out* hotfix into stable, then reintegrate stable into
+    /// rolling. Reads HEAD like `[v]` and `[b]` do: `ops::hotfix_land` merges
+    /// from the branch that is checked out, so the cursor cannot pick another.
+    LandHotfix,
 }
 
 impl Action {
@@ -67,6 +71,7 @@ impl Action {
             Action::Update => "update",
             Action::Prune => "prune",
             Action::Tidy => "tidy",
+            Action::LandHotfix => "hotfix --land",
         };
         match target {
             Some(t) => format!("rf {verb} {t}"),
@@ -213,11 +218,12 @@ enum Mode {
         roll: RollInfo,
         ahead_behind: Option<(u32, u32)>,
     },
-    /// Slug-input modal for creating a new roll (issue #79). Holds the
-    /// in-progress text buffer; on Enter it runs `ops::create` through the same
-    /// suspend/resume path as the other actions.
+    /// Slug-input modal for creating a new roll (issue #79) or a hotfix. Holds
+    /// the in-progress text buffer; on Enter it runs `ops::create` or
+    /// `ops::hotfix_create` through the same job path as the other actions.
     CreateInput {
         slug: String,
+        kind: CreateKind,
     },
     /// Destructive per-row branch deletion. Deliberately not a `Confirm`: the
     /// prompt shape depends on where the branch exists, and the decision
@@ -247,6 +253,24 @@ enum Mode {
         branch: String,
         remote: String,
     },
+}
+
+/// What the slug-input modal creates. One modal for both, because the input
+/// is identical — a slug — and only the op it feeds and the words on the box
+/// differ.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub(crate) enum CreateKind {
+    Roll,
+    Hotfix,
+}
+
+impl CreateKind {
+    fn noun(self) -> &'static str {
+        match self {
+            CreateKind::Roll => "roll",
+            CreateKind::Hotfix => "hotfix",
+        }
+    }
 }
 
 /// Which copies of a roll branch a `[d]elete` targets.
@@ -727,8 +751,22 @@ pub(crate) const BINDINGS: &[Binding] = &[
         replay: &[KeyCode::Char('b')],
     },
     Binding {
+        keys: "h",
+        label: "create a hotfix off stable",
+        group: "hotfix",
+        hint: None,
+        replay: &[KeyCode::Char('h')],
+    },
+    Binding {
+        keys: "H",
+        label: "land the checked-out hotfix into stable and rolling",
+        group: "hotfix",
+        hint: None,
+        replay: &[KeyCode::Char('H')],
+    },
+    Binding {
         keys: "d",
-        label: "delete the selected branch",
+        label: "delete the selected roll or hotfix branch",
         group: "branches",
         hint: None,
         replay: &[KeyCode::Char('d')],
@@ -1143,6 +1181,15 @@ pub(crate) fn validate_action(
                 Err("nothing to tidy — no local graduated or promoted roll branches".to_string())
             }
         }
+        Action::LandHotfix => {
+            if current_branch.starts_with(branches::HOTFIX_PREFIX) {
+                Ok(())
+            } else {
+                Err(format!(
+                    "'{current_branch}' is not a hotfix — [space] onto one to land it"
+                ))
+            }
+        }
     }
 }
 
@@ -1180,12 +1227,15 @@ pub(crate) fn is_submittable_slug(buffer: &str) -> bool {
 /// checked-out branch's local copy is never deletable, so a both-location
 /// current roll degrades to a remote-only y/N and a local-only current roll is
 /// refused. `Neither` is refused too — the row is stale, there is nothing there.
-pub(crate) fn delete_prompt(roll: &RollInfo) -> Result<DeletePrompt, String> {
-    match (&roll.location, roll.is_current) {
-        (BranchLocation::Neither, _) => Err(format!("{} no longer exists", roll.branch)),
+pub(crate) fn delete_prompt(
+    branch: &str,
+    location: &BranchLocation,
+    is_current: bool,
+) -> Result<DeletePrompt, String> {
+    match (location, is_current) {
+        (BranchLocation::Neither, _) => Err(format!("{branch} no longer exists")),
         (BranchLocation::Local, true) => Err(format!(
-            "{} is checked out — switch away before deleting it",
-            roll.branch
+            "{branch} is checked out — switch away before deleting it"
         )),
         (BranchLocation::Local, false) => Ok(DeletePrompt::Single(DeleteScope::Local)),
         (BranchLocation::Remote, _) => Ok(DeletePrompt::Single(DeleteScope::Remote)),
@@ -1443,8 +1493,19 @@ impl StatusApp {
                 }
                 self.mode = Mode::CreateInput {
                     slug: String::new(),
+                    kind: CreateKind::Roll,
                 }
             }
+            KeyCode::Char('h') => {
+                if self.busy() {
+                    return Ok(false);
+                }
+                self.mode = Mode::CreateInput {
+                    slug: String::new(),
+                    kind: CreateKind::Hotfix,
+                }
+            }
+            KeyCode::Char('H') => self.request_land_hotfix(),
             KeyCode::Char(' ') => {
                 if self.busy() {
                     return Ok(false);
@@ -1525,7 +1586,7 @@ impl StatusApp {
     /// cancel back to browsing, or submit. Submitting an empty buffer surfaces a
     /// message instead of invoking `ops::create`.
     fn handle_create_input(&mut self, code: KeyCode) {
-        let outcome = if let Mode::CreateInput { slug } = &mut self.mode {
+        let outcome = if let Mode::CreateInput { slug, .. } = &mut self.mode {
             handle_create_key(slug, code)
         } else {
             return;
@@ -1534,12 +1595,12 @@ impl StatusApp {
             InputOutcome::Continue => {}
             InputOutcome::Cancel => self.mode = Mode::Browsing,
             InputOutcome::Submit => {
-                let slug = match std::mem::replace(&mut self.mode, Mode::Browsing) {
-                    Mode::CreateInput { slug } => slug,
-                    _ => String::new(),
+                let (slug, kind) = match std::mem::replace(&mut self.mode, Mode::Browsing) {
+                    Mode::CreateInput { slug, kind } => (slug, kind),
+                    _ => (String::new(), CreateKind::Roll),
                 };
                 if is_submittable_slug(&slug) {
-                    self.execute_create(slug);
+                    self.execute_create(slug, kind);
                 } else {
                     self.message = Some("slug cannot be empty".to_string());
                 }
@@ -1725,13 +1786,26 @@ impl StatusApp {
     }
 
     fn request_delete(&mut self) -> Result<()> {
-        let Some(roll) = self.selected_roll() else {
-            self.message = Some("no roll selected".to_string());
-            return Ok(());
+        // Rolls and hotfixes alike: `delete_branch_plan` takes any branch that
+        // is not stable or rolling, and the safety rules downstream are the
+        // same. Only a base row is refused, and `selected_roll` already treats
+        // it as no selection.
+        let (branch, location, is_current) = match self.selected_row() {
+            Some(RowKind::Roll(i)) => {
+                let r = &self.rolls[i];
+                (r.branch.clone(), r.location.clone(), r.is_current)
+            }
+            Some(RowKind::Hotfix(i)) => {
+                let h = &self.hotfixes[i];
+                (h.branch.clone(), h.location.clone(), h.is_current)
+            }
+            _ => {
+                self.message = Some("no roll or hotfix selected".to_string());
+                return Ok(());
+            }
         };
-        let roll = roll.clone();
 
-        let prompt = match delete_prompt(&roll) {
+        let prompt = match delete_prompt(&branch, &location, is_current) {
             Ok(prompt) => prompt,
             Err(msg) => {
                 self.message = Some(msg);
@@ -1739,17 +1813,15 @@ impl StatusApp {
             }
         };
 
-        let (local_unmerged, remote_unmerged) =
-            ops::unmerged_commit_counts(&self.config, &roll.branch);
+        let (local_unmerged, remote_unmerged) = ops::unmerged_commit_counts(&self.config, &branch);
 
         self.mode = Mode::Delete {
             preview: DeletePreview {
-                branch: roll.branch,
+                branch,
                 prompt,
                 local_unmerged,
                 remote_unmerged,
-                local_is_checked_out: roll.is_current
-                    && matches!(roll.location, BranchLocation::Both),
+                local_is_checked_out: is_current && matches!(location, BranchLocation::Both),
             },
         };
         Ok(())
@@ -1824,15 +1896,43 @@ impl StatusApp {
     /// Create a roll from `slug`, selecting it once the reload turns it up. An
     /// `ops::create` error (e.g. an invalid slug) lands in the panel like any
     /// other failure and never aborts the TUI.
-    fn execute_create(&mut self, slug: String) {
+    fn execute_create(&mut self, slug: String, kind: CreateKind) {
         let config = self.config.clone();
-        self.start_job("rf create", move || {
-            let outcome = ops::create(&config, &slug, None, false)?;
+        let title = match kind {
+            CreateKind::Roll => "rf create",
+            CreateKind::Hotfix => "rf hotfix",
+        };
+        self.start_job(title, move || {
+            let outcome = match kind {
+                CreateKind::Roll => ops::create(&config, &slug, None, false)?,
+                CreateKind::Hotfix => ops::hotfix_create(&config, &slug, None, false)?,
+            };
             Ok(JobDone::with_next(
                 vec![format!("Created {}", outcome.branch)],
                 Followup::SelectBranch(outcome.branch),
             ))
         });
+    }
+
+    /// `[H]` — land the checked-out hotfix. The cursor is consulted only to
+    /// explain a refusal: a hotfix row that is not checked out gets told how to
+    /// become so, since `ops::hotfix_land` can only merge from HEAD.
+    fn request_land_hotfix(&mut self) {
+        if let Some(RowKind::Hotfix(i)) = self.selected_row() {
+            let hotfix = &self.hotfixes[i];
+            if !hotfix.is_current {
+                self.message = Some(format!(
+                    "[space] onto '{}' first — landing merges from the checked-out branch",
+                    hotfix.branch
+                ));
+                return;
+            }
+            if hotfix.state == HotfixState::Landed {
+                self.message = Some(format!("'{}' is already landed", hotfix.branch));
+                return;
+            }
+        }
+        self.request(Action::LandHotfix);
     }
 
     /// Switch the working tree to `branch` (issue #99). Git natively carries
@@ -2157,7 +2257,9 @@ impl StatusApp {
             Mode::Detail { roll, ahead_behind } => {
                 render_detail(f, area, roll, *ahead_behind, &self.rolls)
             }
-            Mode::CreateInput { slug } => render_create_input(f, area, &self.config, slug),
+            Mode::CreateInput { slug, kind } => {
+                render_create_input(f, area, &self.config, slug, *kind)
+            }
             Mode::Delete { preview } => render_delete_modal(f, area, &self.config, preview),
             Mode::Bump { current } => render_bump_modal(f, area, *current, &self.current_branch),
             Mode::ForcePush { branch, remote } => {
@@ -2554,6 +2656,16 @@ fn run_op(config: &Config, action: Action, target: Option<&str>) -> Result<Vec<S
                 lines.extend(render_prune_outcome(&plan, &results));
             }
         }
+        Action::LandHotfix => {
+            // The same op `rf hotfix --land` runs, gates and all; never dry,
+            // never forced — a hotfix that fails its gates is fixed on the
+            // branch, not pushed past them from a keypress.
+            ops::ensure_clean_state(config)?;
+            let o = ops::hotfix_land(config, false)?;
+            push_gate_notices(&mut lines, &o.gate_notices);
+            lines.push(format!("Landed '{}' into '{}'", o.current, o.stable));
+            lines.push(format!("Reintegrated '{}' into '{}'", o.stable, o.rolling));
+        }
     }
     Ok(lines)
 }
@@ -2775,6 +2887,12 @@ fn render_modal(
                 if n == 1 { "" } else { "es" }
             )
         }
+        // Both merges named, because the second is the one people forget:
+        // landing writes to stable *and* to rolling.
+        Action::LandHotfix => format!(
+            "Land {} into {}, then reintegrate into {}?",
+            current_branch, config.stable_branch, config.rolling_branch
+        ),
     };
     let hint = "[y] confirm    [n] cancel";
 
@@ -2985,8 +3103,12 @@ fn column_width<'a>(values: impl Iterator<Item = &'a str>) -> usize {
 
 /// Render the centered slug-input popup for creating a new roll. Shows the
 /// prompt, the current buffer with a trailing caret, and the key hints.
-fn render_create_input(f: &mut Frame, area: Rect, config: &Config, buffer: &str) {
-    let prompt = format!("New roll slug (branched from {}):", config.stable_branch);
+fn render_create_input(f: &mut Frame, area: Rect, config: &Config, buffer: &str, kind: CreateKind) {
+    let prompt = format!(
+        "New {} slug (branched from {}):",
+        kind.noun(),
+        config.stable_branch
+    );
     let input_line = format!("{buffer}_");
     let hint = "[enter] create    [esc] cancel";
 
@@ -3007,7 +3129,7 @@ fn render_create_input(f: &mut Frame, area: Rect, config: &Config, buffer: &str)
         Line::from(Span::styled(hint, Style::default().fg(Color::DarkGray))),
     ])
     .alignment(Alignment::Center)
-    .block(Block::bordered().title(" create roll "));
+    .block(Block::bordered().title(format!(" create {} ", kind.noun())));
     f.render_widget(body, modal);
 }
 
@@ -3930,9 +4052,13 @@ mod tests {
         }
     }
 
+    fn delete_prompt_of(roll: &RollInfo) -> Result<DeletePrompt, String> {
+        delete_prompt(&roll.branch, &roll.location, roll.is_current)
+    }
+
     #[test]
     fn delete_prompt_shape_follows_location() {
-        let single = |loc| delete_prompt(&roll(RollState::Active, loc));
+        let single = |loc| delete_prompt_of(&roll(RollState::Active, loc));
         assert_eq!(
             single(BranchLocation::Local),
             Ok(DeletePrompt::Single(DeleteScope::Local))
@@ -3959,7 +4085,7 @@ mod tests {
             RollState::Blocked,
         ] {
             assert_eq!(
-                delete_prompt(&roll(state.clone(), BranchLocation::Local)),
+                delete_prompt_of(&roll(state.clone(), BranchLocation::Local)),
                 Ok(DeletePrompt::Single(DeleteScope::Local)),
                 "{state:?} should still be deletable"
             );
@@ -3970,14 +4096,14 @@ mod tests {
     fn delete_prompt_never_offers_the_checked_out_local_copy() {
         let mut local = roll(RollState::Active, BranchLocation::Local);
         local.is_current = true;
-        let err = delete_prompt(&local).expect_err("checked-out local-only roll");
+        let err = delete_prompt_of(&local).expect_err("checked-out local-only roll");
         assert!(err.contains("checked out"), "should explain itself: {err}");
 
         // The origin copy of a checked-out roll is still fair game.
         let mut both = roll(RollState::Active, BranchLocation::Both);
         both.is_current = true;
         assert_eq!(
-            delete_prompt(&both),
+            delete_prompt_of(&both),
             Ok(DeletePrompt::Single(DeleteScope::Remote)),
             "a checked-out both-location roll degrades to origin-only"
         );
@@ -4255,6 +4381,81 @@ mod tests {
             app.render_status_bar(f, chunks[0])
         });
         assert!(out.contains("[q] quit"), "hint line clipped:\n{out}");
+    }
+
+    #[test]
+    fn the_hotfix_keys_are_in_the_keymap_and_found_by_the_search() {
+        let hits: Vec<&str> = filter_bindings("hotfix")
+            .into_iter()
+            .map(|i| BINDINGS[i].keys)
+            .collect();
+        assert!(hits.contains(&"h"), "{hits:?}");
+        assert!(hits.contains(&"H"), "{hits:?}");
+        // Neither belongs on the slim bar.
+        for b in BINDINGS.iter().filter(|b| b.keys == "h" || b.keys == "H") {
+            assert!(b.hint.is_none(), "{} on the status bar", b.keys);
+        }
+    }
+
+    #[test]
+    fn landing_a_hotfix_needs_one_checked_out() {
+        let rolls = vec![roll_n(1, RollState::Active)];
+        assert!(validate_action(
+            Action::LandHotfix,
+            None,
+            &rolls,
+            "hotfix/1-0720-urgent",
+            "roll/"
+        )
+        .is_ok());
+        let err = validate_action(Action::LandHotfix, None, &rolls, "main", "roll/")
+            .expect_err("main is not a hotfix");
+        assert!(err.contains("[space]"), "{err}");
+    }
+
+    #[test]
+    fn the_land_modal_names_both_merges() {
+        let cfg = config("main", "develop");
+        let out = draw(|f, area| {
+            render_modal(
+                f,
+                area,
+                &cfg,
+                Action::LandHotfix,
+                None,
+                &[],
+                "hotfix/1-0720-urgent",
+            )
+        });
+        assert!(
+            out.contains("Land hotfix/1-0720-urgent into main, then reintegrate into develop?"),
+            "{out}"
+        );
+    }
+
+    #[test]
+    fn the_create_modal_says_which_tier_it_creates() {
+        let cfg = config("main", "develop");
+        let roll = draw(|f, area| render_create_input(f, area, &cfg, "", CreateKind::Roll));
+        assert!(roll.contains("New roll slug"), "{roll}");
+        assert!(roll.contains(" create roll "), "{roll}");
+        let hot = draw(|f, area| render_create_input(f, area, &cfg, "urg", CreateKind::Hotfix));
+        assert!(
+            hot.contains("New hotfix slug (branched from main)"),
+            "{hot}"
+        );
+        assert!(hot.contains("urg_"), "{hot}");
+    }
+
+    #[test]
+    fn a_hotfix_row_gets_the_same_delete_shapes_as_a_roll() {
+        assert_eq!(
+            delete_prompt("hotfix/1-0720-x", &BranchLocation::Both, false),
+            Ok(DeletePrompt::Choice)
+        );
+        let err = delete_prompt("hotfix/1-0720-x", &BranchLocation::Local, true)
+            .expect_err("checked out");
+        assert!(err.contains("checked out"), "{err}");
     }
 
     #[test]

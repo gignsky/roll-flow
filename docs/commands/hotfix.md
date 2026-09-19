@@ -15,3 +15,6 @@ into <stable>` merge is on the stable branch. A hotfix merged by hand with a
 plain `Merge branch 'hotfix/…'` counts too — landing is read from the merge
 subject's *source*, never its target, so the reintegration merge that follows a
 landing (`Reintegrate <stable> into <rolling> …`) is never mistaken for one.
+
+From the TUI, `[h]` creates one and `[H]` lands the checked-out one — see
+[`status`](status.md#hotfixes).
