@@ -2,10 +2,17 @@
 //!
 //! Beyond navigation this drives workflow operations on the selected roll
 //! (issues #20/#21): action keys open a confirmation modal, and on confirm the
-//! op runs through [`crate::core::ops`] with the terminal suspended so git's
-//! own output is visible, then the roll list reloads in place.
+//! op runs on a worker thread whose child output streams into a floating
+//! [`super::output::Panel`], then the roll list reloads in place. The view stays
+//! drawn and navigable throughout — an op no longer tears the screen down and
+//! waits for a keypress to give it back.
+//!
+//! It also carries lazygit's sync keys: `[p]` pull, `[P]` push, `[f]` fetch, and
+//! `gg` to hand the terminal to lazygit itself. The keymap is deliberately
+//! lazygit's rather than one of our own — `[G]raduate` and `[m] promote` moved
+//! aside to make room for it.
 
-use std::io::{self, Write};
+use std::collections::HashMap;
 use std::time::Duration;
 
 use anyhow::{anyhow, Result};
@@ -18,10 +25,13 @@ use ratatui::{
     Frame,
 };
 
+use super::output::{self, Followup, JobDone, JobProgress};
 use crate::core::{
     branches::{self, BranchLocation, RollInfo, RollState},
     config::Config,
-    git, ops,
+    git::{self, TrackState},
+    ops,
+    sync::{self, PullPlan, PushOutcome, SyncTarget},
 };
 
 /// A workflow operation reachable from the view. Navigation, quit and refresh
@@ -30,12 +40,109 @@ use crate::core::{
 pub(crate) enum Action {
     /// Graduate the selected roll into the rolling branch.
     Graduate,
+    /// Merge the *selected* roll into the *checked-out* one. The only action here
+    /// whose subject and object are different rows: everything else acts on the
+    /// row under the cursor, this one acts on HEAD using that row as the source.
+    Integrate,
     /// Promote the rolling branch into stable.
     Promote,
     /// Update all active local rolls from stable.
     Update,
     /// Delete every promoted roll branch, locally and on origin.
     Prune,
+}
+
+impl Action {
+    /// Panel title for this action, naming the roll when one is targeted so two
+    /// consecutive graduations are distinguishable in the log.
+    fn job_title(&self, target: Option<&str>) -> String {
+        let verb = match self {
+            Action::Graduate => "graduate",
+            Action::Integrate => "integrate",
+            Action::Promote => "promote",
+            Action::Update => "update",
+            Action::Prune => "prune",
+        };
+        match target {
+            Some(t) => format!("rf {verb} {t}"),
+            None => format!("rf {verb}"),
+        }
+    }
+}
+
+/// How far `PageUp`/`PageDown` move the output panel. A fixed step rather than a
+/// page: the panel's height is a render-time detail the key handler does not see,
+/// and a step that overshoots a short panel reads as a jump to the start.
+const PANEL_SCROLL_STEP: usize = 5;
+
+/// Which way a scroll key moves the output panel.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum PanelScroll {
+    Up,
+    Down,
+    End,
+}
+
+/// What a keystroke in the force-push confirmation asks for.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub(crate) enum ForcePushOutcome {
+    /// Unbound here — stay open, change nothing.
+    Ignore,
+    Cancel,
+    Force,
+}
+
+/// Decide a keystroke in the force-push confirmation.
+///
+/// Deliberately narrow: only an explicit `y` forces. `Enter` is *not* bound,
+/// because this modal can open unprompted the moment `[P]` lands on a branch
+/// that is behind, and a stray Enter must never overwrite a remote.
+pub(crate) fn force_push_key(code: KeyCode) -> ForcePushOutcome {
+    match code {
+        KeyCode::Char('y') | KeyCode::Char('Y') => ForcePushOutcome::Force,
+        KeyCode::Char('n') | KeyCode::Char('N') | KeyCode::Esc => ForcePushOutcome::Cancel,
+        _ => ForcePushOutcome::Ignore,
+    }
+}
+
+/// Turn a [`sync::SyncFailure`] into an `anyhow` error carrying git's own text
+/// and, when we have one, a line of advice on what to do about it.
+fn sync_error(err: sync::SyncFailure) -> anyhow::Error {
+    match &err.hint {
+        Some(hint) => anyhow!("{}\n{hint}", err.failure),
+        None => anyhow!("{}", err.failure),
+    }
+}
+
+/// The `sync` column's glyph and colour for one branch.
+///
+/// `track` is `None` when the branch has no local copy, which is not the same as
+/// having no upstream — a remote-only roll has nothing to compare, so it shows a
+/// dash rather than claiming to be in sync. Pure, so the whole table is testable
+/// without a terminal.
+pub(crate) fn sync_cell(track: Option<TrackState>) -> (String, Color) {
+    match track {
+        None | Some(TrackState::NoUpstream) => ("—".to_string(), Color::DarkGray),
+        Some(TrackState::Gone) => ("gone".to_string(), Color::Red),
+        Some(TrackState::InSync) => ("✓".to_string(), Color::Green),
+        Some(TrackState::Ahead(n)) => (format!("↑{n}"), Color::Yellow),
+        Some(TrackState::Behind(n)) => (format!("↓{n}"), Color::Yellow),
+        Some(TrackState::Diverged { ahead, behind }) => {
+            (format!("↑{ahead}↓{behind}"), Color::Yellow)
+        }
+    }
+}
+
+/// The marker shown against the checked-out branch.
+///
+/// Distinct from the table's selection cursor (`▶`), which follows the keyboard:
+/// these answer different questions and both have to be readable at once.
+pub(crate) fn current_marker(is_current: bool) -> &'static str {
+    if is_current {
+        "›"
+    } else {
+        ""
+    }
 }
 
 /// App state driving the event loop and the optional modal overlay.
@@ -67,6 +174,16 @@ enum Mode {
     /// produces a *scope* (which copies), neither of which `Action` can carry.
     Delete {
         preview: DeletePreview,
+    },
+    /// A push was refused as non-fast-forward (or is already known to be behind
+    /// its upstream). Asks whether to force it.
+    ///
+    /// Its own variant rather than a `Confirm` action: the answer carries the
+    /// branch and remote to retry against, and forcing is destructive enough
+    /// that it should not share a code path with the routine confirmations.
+    ForcePush {
+        branch: String,
+        remote: String,
     },
 }
 
@@ -259,11 +376,22 @@ struct StatusApp {
     bases: Vec<BaseBranch>,
     rolls: Vec<RollInfo>,
     show_deps: bool,
+    /// Upstream tracking state per local branch, refreshed on reload. Sourced in
+    /// one `for-each-ref` rather than an `ahead_behind` call per row.
+    tracking: HashMap<String, git::LocalBranch>,
     table: TableState,
     mode: Mode,
     /// Transient one-line feedback (e.g. why an action was rejected), cleared on
     /// the next browsing keypress.
     message: Option<String>,
+    /// The command currently running, if any. Mutating keys are refused while
+    /// this is set; navigation is not.
+    job: Option<output::Job>,
+    /// The output log. Outlives its job so a result stays readable until `esc`.
+    panel: Option<output::Panel>,
+    /// True after a bare `g`, waiting to see whether the next key makes it `gg`.
+    /// `g` has no action of its own, so this needs no timeout.
+    pending_g: bool,
 }
 
 /// Entry point. Takes ownership of the data so the app can rebuild it after an
@@ -431,12 +559,48 @@ pub(crate) fn promote_target_for(
     }
 }
 
+/// The roll `[i]` would merge into the current branch, or the reason it cannot.
+///
+/// Unlike every other action, integration reads *two* rows: the source is the one
+/// under the cursor and the destination is whatever is checked out. That is why
+/// this needs `current_branch` when the other gates do not, and why "no roll
+/// selected" is only one of several ways it can be refused.
+pub(crate) fn integrate_target_for(
+    current_branch: &str,
+    roll_prefix: &str,
+    selected: Option<&RollInfo>,
+) -> Result<String, String> {
+    // Mirrors the check inside `ops::integrate`, so the key is never offered for
+    // something the core would refuse anyway.
+    if !current_branch.starts_with(roll_prefix) {
+        return Err(format!(
+            "'{current_branch}' is not a roll branch — integrate merges into a roll"
+        ));
+    }
+    let sel = selected.ok_or_else(|| "no roll selected".to_string())?;
+    if sel.branch == current_branch {
+        return Err(format!("'{}' is already the current branch", sel.branch));
+    }
+    // `ops::integrate` resolves the source with a bare `ref_exists`, so a
+    // remote-only roll would fail there as "branch not found" — a confusing way to
+    // say "fetch it first".
+    if !matches!(sel.location, BranchLocation::Local | BranchLocation::Both) {
+        return Err(format!(
+            "'{}' exists only on origin — press [space] or [p] to get it locally first",
+            sel.branch
+        ));
+    }
+    Ok(sel.branch.clone())
+}
+
 /// Validate an action against the current selection/list. `Ok(())` means the
 /// confirm modal may open; `Err(msg)` is a brief reason to surface instead.
 pub(crate) fn validate_action(
     action: Action,
     selected: Option<&RollInfo>,
     rolls: &[RollInfo],
+    current_branch: &str,
+    roll_prefix: &str,
 ) -> Result<(), String> {
     match action {
         Action::Graduate => {
@@ -450,6 +614,9 @@ pub(crate) fn validate_action(
                     sel.state.label()
                 ))
             }
+        }
+        Action::Integrate => {
+            integrate_target_for(current_branch, roll_prefix, selected).map(|_| ())
         }
         Action::Promote => promote_target_for(selected, rolls).map(|_| ()),
         Action::Update => {
@@ -602,21 +769,29 @@ impl StatusApp {
         });
         let mut table = TableState::default();
         table.select(initial_selection(&bases, &rolls));
+        let tracking = load_tracking(&config);
         Self {
             config,
             current_branch,
             bases,
             rolls,
             show_deps,
+            tracking,
             table,
             mode: Mode::Browsing,
             message: None,
+            job: None,
+            panel: None,
+            pending_g: false,
         }
     }
 
     fn run_loop(&mut self, terminal: &mut super::Tui) -> Result<()> {
         loop {
             terminal.draw(|f| self.render(f))?;
+            // Before reading input, so a job that finished during the poll is
+            // reflected in this frame rather than the next one.
+            self.poll_job()?;
 
             if event::poll(Duration::from_millis(50))? {
                 if let Event::Key(key) = event::read()? {
@@ -624,13 +799,15 @@ impl StatusApp {
                         continue;
                     }
                     if matches!(self.mode, Mode::Confirm { .. }) {
-                        self.handle_confirm(terminal, key.code)?;
+                        self.handle_confirm(key.code);
+                    } else if matches!(self.mode, Mode::ForcePush { .. }) {
+                        self.handle_force_push(key.code);
                     } else if matches!(self.mode, Mode::Detail { .. }) {
                         self.handle_detail(key.code);
                     } else if matches!(self.mode, Mode::CreateInput { .. }) {
-                        self.handle_create_input(terminal, key.code)?;
+                        self.handle_create_input(key.code);
                     } else if matches!(self.mode, Mode::Delete { .. }) {
-                        self.handle_delete(terminal, key.code)?;
+                        self.handle_delete(key.code);
                     } else if self.handle_browsing(terminal, key.code)? {
                         break;
                     }
@@ -640,35 +817,130 @@ impl StatusApp {
         Ok(())
     }
 
+    /// Move a running job's output into the panel, and act on its result once it
+    /// finishes.
+    fn poll_job(&mut self) -> Result<()> {
+        // Split field borrows: the job writes into the panel, and both live on
+        // `self`.
+        let progress = match (&mut self.job, &mut self.panel) {
+            (Some(job), Some(panel)) => job.drain(panel),
+            _ => return Ok(()),
+        };
+        if let Some(panel) = self.panel.as_mut() {
+            panel.tick();
+        }
+        let JobProgress::Finished(next) = progress else {
+            return Ok(());
+        };
+        self.job = None;
+        // Reload regardless of outcome: a failed op may still have changed the
+        // repo, and a stale table is worse than a redundant refresh.
+        self.reload()?;
+        match next {
+            Some(Followup::SelectBranch(branch)) => {
+                if let Some(idx) = self.rolls.iter().position(|r| r.branch == branch) {
+                    self.table.select(Some(self.bases.len() + idx));
+                }
+            }
+            Some(Followup::OfferForcePush { branch, remote }) => {
+                self.mode = Mode::ForcePush { branch, remote };
+            }
+            None => {}
+        }
+        Ok(())
+    }
+
+    /// Start a background job, replacing any previous panel.
+    ///
+    /// Replacing rather than appending keeps one panel to one operation, so its
+    /// border colour means something: a green panel is *this* command's success,
+    /// not the last one's.
+    fn start_job(
+        &mut self,
+        title: impl Into<String>,
+        body: impl FnOnce() -> Result<JobDone> + Send + 'static,
+    ) {
+        self.panel = Some(output::Panel::new(title));
+        self.job = Some(output::Job::spawn(body));
+    }
+
+    /// Refuse a mutating key while a job is in flight, so two commands cannot
+    /// race on the same repo. Returns true when the caller should stop.
+    fn busy(&mut self) -> bool {
+        if self.job.is_some() {
+            self.message = Some("a git command is already running".to_string());
+            return true;
+        }
+        false
+    }
+
     /// Handle a keypress while browsing. Returns `Ok(true)` to quit.
     fn handle_browsing(&mut self, terminal: &mut super::Tui, code: KeyCode) -> Result<bool> {
         self.message = None;
+
+        // `gg` opens lazygit. `g` alone does nothing, so a pending `g` needs no
+        // timeout: any other key clears it and is then handled normally.
+        if std::mem::take(&mut self.pending_g) {
+            if code == KeyCode::Char('g') {
+                self.launch_lazygit(terminal)?;
+                return Ok(false);
+            }
+        } else if code == KeyCode::Char('g') {
+            self.pending_g = true;
+            return Ok(false);
+        }
+
         match code {
-            KeyCode::Char('q') | KeyCode::Esc => return Ok(true),
+            KeyCode::Char('q') => return Ok(true),
+            // `esc` dismisses the output panel when one is up, and only quits
+            // when there is nothing left to dismiss.
+            KeyCode::Esc => {
+                if self.panel.is_some() && self.job.is_none() {
+                    self.panel = None;
+                } else if self.panel.is_none() {
+                    return Ok(true);
+                }
+            }
             KeyCode::Down | KeyCode::Char('j') => self.select_next(),
             KeyCode::Up | KeyCode::Char('k') => self.select_prev(),
+            // Scrollback in the panel, which stays readable while a job runs.
+            KeyCode::PageUp => self.scroll_panel(PanelScroll::Up),
+            KeyCode::PageDown => self.scroll_panel(PanelScroll::Down),
+            KeyCode::End => self.scroll_panel(PanelScroll::End),
             KeyCode::Char('r') => {
                 self.reload()?;
                 self.message = Some("refreshed".to_string());
             }
             KeyCode::Char('c') => {
+                if self.busy() {
+                    return Ok(false);
+                }
                 self.mode = Mode::CreateInput {
                     slug: String::new(),
                 }
             }
-            KeyCode::Char(' ') => match self.selected_row() {
-                Some(RowKind::Roll(i)) => {
-                    let roll = self.rolls[i].clone();
-                    self.execute_switch(terminal, roll.branch, roll.location)?;
+            KeyCode::Char(' ') => {
+                if self.busy() {
+                    return Ok(false);
                 }
-                Some(RowKind::Base(i)) => {
-                    let base = self.bases[i].clone();
-                    self.execute_switch(terminal, base.branch, base.location)?;
+                match self.selected_row() {
+                    Some(RowKind::Roll(i)) => {
+                        let roll = self.rolls[i].clone();
+                        self.execute_switch(roll.branch, roll.location);
+                    }
+                    Some(RowKind::Base(i)) => {
+                        let base = self.bases[i].clone();
+                        self.execute_switch(base.branch, base.location);
+                    }
+                    None => self.message = Some("no branch selected".to_string()),
                 }
-                None => self.message = Some("no branch selected".to_string()),
-            },
-            KeyCode::Char('g') => self.request(Action::Graduate),
-            KeyCode::Char('p') => self.request(Action::Promote),
+            }
+            KeyCode::Char('p') => self.start_pull(),
+            KeyCode::Char('P') => self.start_push(),
+            KeyCode::Char('f') => self.start_fetch(),
+            KeyCode::Char('G') => self.request(Action::Graduate),
+            KeyCode::Char('i') => self.request_integrate(),
+            KeyCode::Char('m') => self.request(Action::Promote),
             KeyCode::Char('u') => self.request(Action::Update),
             KeyCode::Char('x') => self.request(Action::Prune),
             KeyCode::Char('d') => self.request_delete()?,
@@ -704,11 +976,11 @@ impl StatusApp {
     /// Handle a keypress while the create-input modal is open: edit the buffer,
     /// cancel back to browsing, or submit. Submitting an empty buffer surfaces a
     /// message instead of invoking `ops::create`.
-    fn handle_create_input(&mut self, terminal: &mut super::Tui, code: KeyCode) -> Result<()> {
+    fn handle_create_input(&mut self, code: KeyCode) {
         let outcome = if let Mode::CreateInput { slug } = &mut self.mode {
             handle_create_key(slug, code)
         } else {
-            return Ok(());
+            return;
         };
         match outcome {
             InputOutcome::Continue => {}
@@ -719,23 +991,22 @@ impl StatusApp {
                     _ => String::new(),
                 };
                 if is_submittable_slug(&slug) {
-                    self.execute_create(terminal, slug)?;
+                    self.execute_create(slug);
                 } else {
                     self.message = Some("slug cannot be empty".to_string());
                 }
             }
         }
-        Ok(())
     }
 
     /// Handle a keypress while the confirm modal is open.
-    fn handle_confirm(&mut self, terminal: &mut super::Tui, code: KeyCode) -> Result<()> {
+    fn handle_confirm(&mut self, code: KeyCode) {
         match code {
             KeyCode::Char('y') | KeyCode::Char('Y') => {
                 if let Mode::Confirm { action, target } =
                     std::mem::replace(&mut self.mode, Mode::Browsing)
                 {
-                    self.execute(terminal, action, target)?;
+                    self.execute(action, target);
                 }
             }
             KeyCode::Char('n') | KeyCode::Char('N') | KeyCode::Esc => {
@@ -743,7 +1014,6 @@ impl StatusApp {
             }
             _ => {}
         }
-        Ok(())
     }
 
     /// Total number of table rows: the pinned base branches plus the rolls.
@@ -769,9 +1039,18 @@ impl StatusApp {
     /// Validate an action and either open the confirm modal or set a message.
     fn request(&mut self, action: Action) {
         let selected = self.selected_roll();
-        let validation = validate_action(action, selected, &self.rolls);
+        let validation = validate_action(
+            action,
+            selected,
+            &self.rolls,
+            &self.current_branch,
+            &self.config.roll_prefix,
+        );
         let target = match action {
             Action::Graduate => selected.map(|r| r.branch.clone()),
+            Action::Integrate => {
+                integrate_target_for(&self.current_branch, &self.config.roll_prefix, selected).ok()
+            }
             // `None` here means "the whole rolling branch", not "no target".
             Action::Promote => promote_target_for(selected, &self.rolls).unwrap_or(None),
             _ => None,
@@ -785,6 +1064,38 @@ impl StatusApp {
     /// Open the delete modal for the selected roll, or say why it cannot be
     /// deleted. The per-copy unmerged counts are taken here, once, so the modal
     /// can state what a delete would cost without re-shelling out on every draw.
+    /// `[i]` — merge the roll under the cursor into the checked-out branch.
+    ///
+    /// Not routed through [`Self::request`] because the row under the cursor is
+    /// the *source* here, and because a base row needs its own answer: `main` and
+    /// `rolling` are selectable, but merging them into a roll is a different
+    /// operation with its own key.
+    fn request_integrate(&mut self) {
+        if self.busy() {
+            return;
+        }
+        if let Some(RowKind::Base(i)) = self.selected_row() {
+            self.message = Some(format!(
+                "'{}' is a base branch — [u]pdate brings stable into your rolls",
+                self.bases[i].branch
+            ));
+            return;
+        }
+        match integrate_target_for(
+            &self.current_branch,
+            &self.config.roll_prefix,
+            self.selected_roll(),
+        ) {
+            Ok(branch) => {
+                self.mode = Mode::Confirm {
+                    action: Action::Integrate,
+                    target: Some(branch),
+                }
+            }
+            Err(msg) => self.message = Some(msg),
+        }
+    }
+
     fn request_delete(&mut self) -> Result<()> {
         let Some(roll) = self.selected_roll() else {
             self.message = Some("no roll selected".to_string());
@@ -822,9 +1133,9 @@ impl StatusApp {
     /// *not* delete: it advances the modal to [`DeletePrompt::ForceConfirm`],
     /// which states the cost and demands a fresh `y`. That second `y` is the
     /// only thing that ever sets `force`.
-    fn handle_delete(&mut self, terminal: &mut super::Tui, code: KeyCode) -> Result<()> {
+    fn handle_delete(&mut self, code: KeyCode) {
         let Mode::Delete { preview } = &self.mode else {
-            return Ok(());
+            return;
         };
         let prompt = preview.prompt;
 
@@ -837,16 +1148,15 @@ impl StatusApp {
                     if let Mode::Delete { preview } = &mut self.mode {
                         preview.prompt = DeletePrompt::ForceConfirm(scope);
                     }
-                    return Ok(());
+                    return;
                 }
                 let Mode::Delete { preview } = std::mem::replace(&mut self.mode, Mode::Browsing)
                 else {
-                    return Ok(());
+                    return;
                 };
-                self.execute_delete(terminal, preview.branch, scope, already_forced)?;
+                self.execute_delete(preview.branch, scope, already_forced);
             }
         }
-        Ok(())
     }
 
     fn select_next(&mut self) {
@@ -874,225 +1184,260 @@ impl StatusApp {
         self.table.select(Some(prev));
     }
 
-    /// Suspend the TUI, run the op, surface its outcome (or error) on the normal
-    /// terminal, wait for a keypress, resume, and reload the list.
-    fn execute(
-        &mut self,
-        terminal: &mut super::Tui,
-        action: Action,
-        target: Option<String>,
-    ) -> Result<()> {
-        self.with_suspended(terminal, |app| {
-            Ok((app.run_op(action, target.as_deref())?, ()))
-        })?;
-        Ok(())
+    /// Run a workflow op as a background job.
+    fn execute(&mut self, action: Action, target: Option<String>) {
+        let config = self.config.clone();
+        let title = action.job_title(target.as_deref());
+        self.start_job(title, move || {
+            Ok(JobDone::lines(run_op(&config, action, target.as_deref())?))
+        });
     }
 
-    /// Create a roll from `slug` through the same suspended execution path as the
-    /// other actions, then reload and select the freshly created roll if it is
-    /// present. An `ops::create` error (e.g. an invalid slug) is shown like any
-    /// other action error and never aborts the TUI.
-    fn execute_create(&mut self, terminal: &mut super::Tui, slug: String) -> Result<()> {
-        let created = self.with_suspended(terminal, |app| {
-            let outcome = ops::create(&app.config, &slug, None, false)?;
-            Ok((vec![format!("Created {}", outcome.branch)], outcome.branch))
-        })?;
-        if let Some(branch) = created {
-            if let Some(idx) = self.rolls.iter().position(|r| r.branch == branch) {
-                self.table.select(Some(idx));
-            }
-        }
-        Ok(())
+    /// Create a roll from `slug`, selecting it once the reload turns it up. An
+    /// `ops::create` error (e.g. an invalid slug) lands in the panel like any
+    /// other failure and never aborts the TUI.
+    fn execute_create(&mut self, slug: String) {
+        let config = self.config.clone();
+        self.start_job("rf create", move || {
+            let outcome = ops::create(&config, &slug, None, false)?;
+            Ok(JobDone::with_next(
+                vec![format!("Created {}", outcome.branch)],
+                Followup::SelectBranch(outcome.branch),
+            ))
+        });
     }
 
-    /// Switch the working tree to `branch` (issue #99), through the same
-    /// suspended path as the other actions so git's own output — including a
-    /// conflict refusal — is visible, then reload so the dashboard reflects the
-    /// new current branch. Git natively carries clean uncommitted changes forward
-    /// and refuses (non-zero) when they would conflict; either way the TUI never
-    /// crashes and the error is surfaced. Serves both roll rows and the pinned
-    /// base-branch rows.
-    fn execute_switch(
-        &mut self,
-        terminal: &mut super::Tui,
-        branch: String,
-        location: BranchLocation,
-    ) -> Result<()> {
-        self.with_suspended(terminal, |app| {
-            Ok((app.run_switch(&branch, &location)?, ()))
-        })?;
-        Ok(())
+    /// Switch the working tree to `branch` (issue #99). Git natively carries
+    /// clean uncommitted changes forward and refuses (non-zero) when they would
+    /// conflict; either way the refusal shows in the panel and the TUI survives.
+    /// Serves both roll rows and the pinned base-branch rows.
+    fn execute_switch(&mut self, branch: String, location: BranchLocation) {
+        let config = self.config.clone();
+        let current = self.current_branch.clone();
+        self.start_job(format!("git switch {branch}"), move || {
+            Ok(JobDone::lines(run_switch(
+                &config, &current, &branch, &location,
+            )?))
+        });
     }
 
-    /// Perform the branch switch, returning printable status lines. A
-    /// remote-only branch is fetched first so `git switch` can DWIM-create a
-    /// local tracking branch from `origin/<branch>`.
-    fn run_switch(&self, branch: &str, location: &BranchLocation) -> Result<Vec<String>> {
-        let repo = &self.config.repo_root;
-        if branch == self.current_branch {
-            return Ok(vec![format!("Already on '{branch}'")]);
-        }
-        let mut lines = Vec::new();
-        if matches!(location, BranchLocation::Remote) {
-            git::run_git(repo, &["fetch", "origin", branch])?;
-            lines.push(format!("Fetched origin/{branch}"));
-        }
-        git::run_git(repo, &["switch", branch])?;
-        lines.push(format!("Switched to '{branch}'"));
-        Ok(lines)
+    /// Delete `branch`, so git's own failures are visible and the list reloads
+    /// after.
+    fn execute_delete(&mut self, branch: String, scope: DeleteScope, force: bool) {
+        let config = self.config.clone();
+        self.start_job(format!("rf delete {branch}"), move || {
+            Ok(JobDone::lines(run_delete(&config, &branch, scope, force)?))
+        });
     }
 
-    /// Delete `branch` through the same suspended execution path as the other
-    /// actions, so git's own failures are visible and the list reloads after.
-    fn execute_delete(
-        &mut self,
-        terminal: &mut super::Tui,
-        branch: String,
-        scope: DeleteScope,
-        force: bool,
-    ) -> Result<()> {
-        self.with_suspended(terminal, |app| {
-            Ok((app.run_delete(&branch, scope, force)?, ()))
-        })?;
-        Ok(())
-    }
+    // ── Sync (lazygit's p / P / f) ──────────────────────────────────────────
 
-    /// Plan and apply the deletion of one branch, returning printable lines.
-    ///
-    /// The plan is recomputed here rather than carried over from the modal: the
-    /// preview's commit counts are UI, and the authority to delete has to come
-    /// from the repo as it is *now*. If it changed underneath the modal, the
-    /// core refuses and says so.
-    fn run_delete(&self, branch: &str, scope: DeleteScope, force: bool) -> Result<Vec<String>> {
-        let plan = ops::delete_branch_plan(&self.config, branch, &prune_scope_for(scope, force))?;
-        if plan.is_empty() {
-            let mut lines = vec![format!("nothing to delete for '{branch}'")];
-            push_prune_skips(&mut lines, &plan.skipped);
-            return Ok(lines);
-        }
-        let results = ops::prune_apply(&self.config, &plan)?;
-        Ok(render_prune_outcome(&plan, &results))
-    }
-
-    /// Shared suspend → run → show → resume → reload wrapper. Runs `body` with the
-    /// TUI suspended so git's own output shows on the normal terminal, prints the
-    /// resulting lines (or the error chain) exactly like the actions do, waits for
-    /// a keypress, resumes, and reloads the list regardless of success. Returns
-    /// the value `body` produced on success, or `None` if it errored.
-    fn with_suspended<T>(
-        &mut self,
-        terminal: &mut super::Tui,
-        body: impl FnOnce(&Self) -> Result<(Vec<String>, T)>,
-    ) -> Result<Option<T>> {
-        super::suspend(terminal)?;
-
-        let outcome = body(self);
-        println!();
-        let value = match outcome {
-            Ok((lines, value)) => {
-                for line in &lines {
-                    println!("{line}");
-                }
-                Some(value)
-            }
-            Err(err) => {
-                eprintln!("Error: {err}");
-                for cause in err.chain().skip(1) {
-                    eprintln!("  caused by: {cause}");
-                }
-                None
-            }
+    /// Build a [`SyncTarget`] for the selected row, or `None` when nothing is
+    /// selected. Serves roll rows and the pinned base rows alike — `main` and
+    /// `rolling` are branches like any other as far as syncing goes.
+    fn sync_target(&self) -> Option<SyncTarget> {
+        let (branch, location) = match self.selected_row()? {
+            RowKind::Roll(i) => (self.rolls[i].branch.clone(), self.rolls[i].location.clone()),
+            RowKind::Base(i) => (self.bases[i].branch.clone(), self.bases[i].location.clone()),
         };
-        println!();
-        print!("Press any key to continue...");
-        let _ = io::stdout().flush();
-
-        let waited = super::wait_for_key();
-        super::resume(terminal)?;
-        waited?;
-
-        // Reflect the new repo state in place regardless of op success/failure.
-        self.reload()?;
-        Ok(value)
+        Some(SyncTarget::resolve(
+            &branch,
+            &self.current_branch,
+            location,
+            self.tracking.get(&branch),
+        ))
     }
 
-    /// Drive the actual operation through `core::ops`, rendering its structured
-    /// outcome into printable lines. Never runs dry and never forces.
-    fn run_op(&self, action: Action, target: Option<&str>) -> Result<Vec<String>> {
-        let force = ops::ForceOpts::new(false, None)?;
-        let mut lines = Vec::new();
-        match action {
-            Action::Graduate => {
-                let roll = target.ok_or_else(|| anyhow!("no roll selected"))?;
-                ops::ensure_clean_state(&self.config)?;
-                let o = ops::graduate(&self.config, roll, false, &force)?;
-                push_gate_notices(&mut lines, &o.gate_notices);
-                lines.push(format!("Graduated '{}' into '{}'", o.roll, o.rolling));
+    /// `[p]` — pull the selected branch. What that means depends on whether it is
+    /// checked out; see [`sync::pull_plan`].
+    fn start_pull(&mut self) {
+        if self.busy() {
+            return;
+        }
+        let Some(target) = self.sync_target() else {
+            self.message = Some("no branch selected".to_string());
+            return;
+        };
+        let repo = self.config.repo_root.clone();
+        let (args, title) = match sync::pull_plan(&target, self.config.pull_mode) {
+            PullPlan::Refused { reason } => {
+                self.message = Some(reason);
+                return;
             }
-            Action::Promote => {
-                ops::ensure_clean_state(&self.config)?;
-                let promote_target = match target {
-                    Some(roll) => ops::PromoteTarget::Rolls(vec![roll.to_string()]),
-                    None => ops::PromoteTarget::Rolling,
-                };
-                // Tagging is on; the version gate hard-fails here rather than
-                // prompting, since the TUI has no place to offer a bump — the
-                // error names the `rf promote --bump` fix.
-                let o = ops::promote(&self.config, &promote_target, false, &force, true)?;
-                for step in &o.steps {
-                    push_gate_notices(&mut lines, &step.gate_notices);
-                    push_gate_notices(&mut lines, &step.host_notices);
-                    push_host_results(&mut lines, &step.host_results);
-                    let what = step.roll.as_deref().unwrap_or(&o.rolling);
-                    lines.push(format!("Promoted '{}' into '{}'", what, o.stable));
-                    if let Some(line) = step.tag.describe() {
-                        lines.push(line);
-                    }
-                }
-                for skip in &o.skipped {
-                    lines.push(format!("skipped '{}': {}", skip.roll, skip.reason));
-                }
+            PullPlan::Pull { args } => (args, format!("git pull {}", target.branch)),
+            PullPlan::FastForward { args } => (args, format!("fast-forward {}", target.branch)),
+            PullPlan::FetchRemote { args } => (args, format!("git fetch {}", target.branch)),
+        };
+        self.start_job(title, move || {
+            sync::run_pull(&repo, &args).map_err(sync_error)?;
+            Ok(JobDone::lines(vec!["up to date".to_string()]))
+        });
+    }
+
+    /// `[P]` — push the selected branch, offering a force when git refuses.
+    ///
+    /// A branch already known to be behind skips the doomed plain attempt and
+    /// goes straight to the confirmation, which is what lazygit does: there is no
+    /// point spending a round-trip to be told what the tracking ref already says.
+    fn start_push(&mut self) {
+        if self.busy() {
+            return;
+        }
+        let Some(target) = self.sync_target() else {
+            self.message = Some("no branch selected".to_string());
+            return;
+        };
+        if !matches!(
+            target.location,
+            BranchLocation::Local | BranchLocation::Both
+        ) {
+            self.message = Some(format!(
+                "'{}' exists only on origin — nothing local to push",
+                target.branch
+            ));
+            return;
+        }
+        if sync::needs_force_prompt(&target) {
+            self.mode = Mode::ForcePush {
+                branch: target.branch.clone(),
+                remote: target.remote.clone(),
+            };
+            return;
+        }
+        self.push_job(target, false);
+    }
+
+    /// Run one push attempt. On a non-fast-forward refusal the job finishes
+    /// *successfully* carrying a [`Followup::OfferForcePush`] — the refusal is an
+    /// expected answer to be acted on, not an error to report and stop at.
+    fn push_job(&mut self, target: SyncTarget, force: bool) {
+        let repo = self.config.repo_root.clone();
+        let title = if force {
+            format!("git push --force-with-lease {}", target.branch)
+        } else {
+            format!("git push {}", target.branch)
+        };
+        self.start_job(title, move || {
+            match sync::run_push(&repo, &target, force).map_err(sync_error)? {
+                PushOutcome::Pushed => Ok(JobDone::lines(vec![format!(
+                    "Pushed '{}' to {}",
+                    target.branch, target.remote
+                )])),
+                PushOutcome::Rejected { .. } => Ok(JobDone::with_next(
+                    vec![format!(
+                        "'{}' was rejected by {}",
+                        target.branch, target.remote
+                    )],
+                    Followup::OfferForcePush {
+                        branch: target.branch.clone(),
+                        remote: target.remote.clone(),
+                    },
+                )),
             }
-            Action::Update => match ops::update(&self.config, false)? {
-                ops::UpdateOutcome::NoActiveRolls => {
-                    lines.push("no active local rolls to update".to_string());
-                }
-                ops::UpdateOutcome::Ran { stable, items } => {
-                    for item in items {
-                        match item {
-                            ops::UpdateItem::AlreadyUpToDate { roll } => {
-                                lines.push(format!(
-                                    "'{roll}' is already up to date with '{stable}'"
-                                ));
-                            }
-                            ops::UpdateItem::WouldMerge { roll, behind } => {
-                                lines.push(format!(
-                                    "would merge '{stable}' into '{roll}' ({behind} ahead)"
-                                ));
-                            }
-                            ops::UpdateItem::Updated { roll } => {
-                                lines.push(format!("updated '{roll}' with '{stable}'"));
-                            }
-                        }
-                    }
-                }
-            },
-            Action::Prune => {
-                // The modal was the confirmation, so plan and apply run back to
-                // back here. `PruneScope::both` never forces: a branch holding
-                // commits stable lacks is reported as skipped, and clearing it
-                // needs `rf prune --force` from the CLI, deliberately.
-                let plan = ops::prune_plan(&self.config, &ops::PruneScope::both())?;
-                if plan.is_empty() {
-                    lines.push("no promoted roll branches to prune".to_string());
-                    push_prune_skips(&mut lines, &plan.skipped);
-                } else {
-                    let results = ops::prune_apply(&self.config, &plan)?;
-                    lines.extend(render_prune_outcome(&plan, &results));
-                }
+        });
+    }
+
+    /// `[f]` — refresh every remote-tracking ref and drop the ones whose upstream
+    /// is gone, so the sync column and every containment check that follows are
+    /// judged against current data.
+    fn start_fetch(&mut self) {
+        if self.busy() {
+            return;
+        }
+        let repo = self.config.repo_root.clone();
+        self.start_job("git fetch --prune", move || {
+            sync::run_fetch(&repo, "origin").map_err(sync_error)?;
+            Ok(JobDone::lines(vec!["fetched origin".to_string()]))
+        });
+    }
+
+    /// `gg` — hand the terminal to lazygit, then take it back.
+    ///
+    /// The one action that still suspends: lazygit is a full-screen application
+    /// and owns the terminal outright, so there is nothing to stream into a
+    /// panel. The list reloads afterwards because anything at all may have
+    /// happened inside it.
+    fn launch_lazygit(&mut self, terminal: &mut super::Tui) -> Result<()> {
+        if self.busy() {
+            return Ok(());
+        }
+        super::suspend(terminal)?;
+        let spawned = std::process::Command::new(&self.config.lazygit_command)
+            .arg("-p")
+            .arg(&self.config.repo_root)
+            .status();
+        super::resume(terminal)?;
+
+        match spawned {
+            Ok(status) if status.success() => self.message = None,
+            Ok(status) => {
+                self.message = Some(format!(
+                    "{} exited with {status}",
+                    self.config.lazygit_command
+                ))
+            }
+            // A missing binary is the common case and deserves the actionable
+            // message rather than a raw io error.
+            Err(err) => {
+                let mut panel = output::Panel::new(self.config.lazygit_command.clone());
+                panel.fail(vec![
+                    format!("could not run '{}': {err}", self.config.lazygit_command),
+                    "set lazygit_command in .roll-flow.toml to override".to_string(),
+                ]);
+                self.panel = Some(panel);
             }
         }
-        Ok(lines)
+        self.reload()
+    }
+
+    /// Move the output panel's scrollback, if one is up.
+    fn scroll_panel(&mut self, how: PanelScroll) {
+        let Some(panel) = self.panel.as_mut() else {
+            return;
+        };
+        match how {
+            PanelScroll::Up => panel.scroll_up(PANEL_SCROLL_STEP),
+            PanelScroll::Down => panel.scroll_down(PANEL_SCROLL_STEP),
+            PanelScroll::End => panel.scroll_to_end(),
+        }
+    }
+
+    /// Handle a keypress while the force-push confirmation is open.
+    fn handle_force_push(&mut self, code: KeyCode) {
+        match force_push_key(code) {
+            ForcePushOutcome::Ignore => {}
+            ForcePushOutcome::Cancel => self.mode = Mode::Browsing,
+            ForcePushOutcome::Force => {
+                let Mode::ForcePush { branch, .. } =
+                    std::mem::replace(&mut self.mode, Mode::Browsing)
+                else {
+                    return;
+                };
+                // Re-resolve rather than reusing the target captured when the
+                // modal opened: the tracking data may have moved underneath it,
+                // and a force push is the last place to act on a stale view.
+                let location = self.location_of(&branch);
+                let target = SyncTarget::resolve(
+                    &branch,
+                    &self.current_branch,
+                    location,
+                    self.tracking.get(&branch),
+                );
+                self.push_job(target, true);
+            }
+        }
+    }
+
+    /// Where `branch` currently exists, for a branch named by an open modal
+    /// rather than by the selection.
+    fn location_of(&self, branch: &str) -> BranchLocation {
+        if let Some(roll) = self.rolls.iter().find(|r| r.branch == branch) {
+            return roll.location.clone();
+        }
+        if let Some(base) = self.bases.iter().find(|b| b.branch == branch) {
+            return base.location.clone();
+        }
+        BranchLocation::Local
     }
 
     /// Rebuild the roll list and current-branch after an action, keeping the
@@ -1103,6 +1448,7 @@ impl StatusApp {
             git::ref_exists(&self.config.repo_root, refspec)
         });
         self.rolls = branches::list_rolls(&self.config)?;
+        self.tracking = load_tracking(&self.config);
         let len = self.row_count();
         if len == 0 {
             self.table.select(None);
@@ -1119,14 +1465,20 @@ impl StatusApp {
         let chunks = Layout::vertical([
             Constraint::Length(3),
             Constraint::Min(3),
-            // One message line plus two hint lines.
-            Constraint::Length(3),
+            // One message line plus four hint lines.
+            Constraint::Length(5),
         ])
         .split(area);
 
         self.render_header(f, chunks[0]);
         self.render_table(f, chunks[1]);
         self.render_status_bar(f, chunks[2]);
+
+        // Over the table, never over the hints: the panel is passed the table's
+        // area so the keymap stays readable while a job runs.
+        if let Some(panel) = &self.panel {
+            output::render(f, chunks[1], panel);
+        }
 
         match &self.mode {
             Mode::Confirm { action, target } => {
@@ -1137,6 +1489,7 @@ impl StatusApp {
                     *action,
                     target.as_deref(),
                     &self.rolls,
+                    &self.current_branch,
                 );
             }
             Mode::Detail { roll, ahead_behind } => {
@@ -1144,6 +1497,9 @@ impl StatusApp {
             }
             Mode::CreateInput { slug } => render_create_input(f, area, &self.config, slug),
             Mode::Delete { preview } => render_delete_modal(f, area, &self.config, preview),
+            Mode::ForcePush { branch, remote } => {
+                render_force_push_modal(f, area, branch, remote, self.tracking.get(branch))
+            }
             Mode::Browsing => {}
         }
     }
@@ -1171,9 +1527,14 @@ impl StatusApp {
 
     fn render_table(&mut self, f: &mut Frame, area: Rect) {
         let mut col_constraints = vec![
+            // The current-branch chevron, narrow and always present so the
+            // columns after it do not shift as HEAD moves.
+            Constraint::Length(1),
             Constraint::Length(4),
             Constraint::Fill(1),
             Constraint::Length(3),
+            // `↑12↓12` at its widest.
+            Constraint::Length(7),
             Constraint::Length(13),
         ];
         if self.show_deps {
@@ -1183,11 +1544,14 @@ impl StatusApp {
             col_constraints.push(Constraint::Length(10));
         }
 
+        let bold = Style::default().add_modifier(Modifier::BOLD);
         let mut header_cells = vec![
-            Cell::from("#").style(Style::default().add_modifier(Modifier::BOLD)),
-            Cell::from("branch").style(Style::default().add_modifier(Modifier::BOLD)),
-            Cell::from("loc").style(Style::default().add_modifier(Modifier::BOLD)),
-            Cell::from("state").style(Style::default().add_modifier(Modifier::BOLD)),
+            Cell::from(""),
+            Cell::from("#").style(bold),
+            Cell::from("branch").style(bold),
+            Cell::from("loc").style(bold),
+            Cell::from("sync").style(bold),
+            Cell::from("state").style(bold),
         ];
         if self.show_deps {
             header_cells
@@ -1201,6 +1565,7 @@ impl StatusApp {
             .height(1);
 
         let show_deps = self.show_deps;
+        let tracking = &self.tracking;
         // Base branches are pinned above the rolls: no number and no state, the
         // `state` column carrying their role instead.
         let mut rows: Vec<Row> = self
@@ -1212,10 +1577,17 @@ impl StatusApp {
                 } else {
                     Style::default()
                 };
+                let (sync_text, sync_color) = sync_cell(track_of(tracking, &base.branch));
                 let mut cells = vec![
+                    Cell::from(current_marker(base.is_current)).style(
+                        Style::default()
+                            .fg(Color::Green)
+                            .add_modifier(Modifier::BOLD),
+                    ),
                     Cell::from(""),
                     Cell::from(base.branch.clone()).style(base_style.fg(base.role.color())),
                     Cell::from(base.location.symbol()).style(base_style),
+                    Cell::from(sync_text).style(Style::default().fg(sync_color)),
                     Cell::from(base.role.label()).style(Style::default().fg(base.role.color())),
                 ];
                 if show_deps {
@@ -1232,10 +1604,17 @@ impl StatusApp {
             } else {
                 Style::default()
             };
+            let (sync_text, sync_color) = sync_cell(track_of(tracking, &roll.branch));
             let mut cells = vec![
+                Cell::from(current_marker(roll.is_current)).style(
+                    Style::default()
+                        .fg(Color::Green)
+                        .add_modifier(Modifier::BOLD),
+                ),
                 Cell::from(roll.number.to_string()).style(base_style),
                 Cell::from(roll.branch.clone()).style(base_style),
                 Cell::from(roll.location.symbol()).style(base_style),
+                Cell::from(sync_text).style(Style::default().fg(sync_color)),
                 Cell::from(roll.state.label()).style(Style::default().fg(row_state_color)),
             ];
             if show_deps {
@@ -1268,9 +1647,260 @@ impl StatusApp {
         // dynamic line count would overflow whatever fixed height is picked.
         let nav_line =
             Line::from(" [q] quit   [j/k ↑/↓] nav   [space] switch   [enter] detail   [r]efresh");
-        let action_line =
-            Line::from(" [c]reate   [g]raduate   [p]romote   [u]pdate   [d]elete   [x] prune");
-        f.render_widget(Paragraph::new(vec![msg_line, nav_line, action_line]), area);
+        let sync_line =
+            Line::from(" [p] pull   [P] push   [f] fetch   [gg] lazygit   [esc] close output");
+        // Split across two lines because thirteen bindings do not fit on one at
+        // 80 columns, and `Paragraph` truncates rather than wrapping — the roll
+        // lifecycle first, then what removes things plus the panel's own keys.
+        let roll_line = Line::from(" [c]reate   [i]ntegrate   [G]raduate   [m] promote   [u]pdate");
+        let extra_line = Line::from(" [d]elete   [x] prune   [PgUp/PgDn/End] scroll output");
+        f.render_widget(
+            Paragraph::new(vec![msg_line, nav_line, sync_line, roll_line, extra_line]),
+            area,
+        );
+    }
+}
+
+/// Perform the branch switch, returning printable status lines. A remote-only
+/// branch is fetched first so `git switch` can DWIM-create a local tracking
+/// branch from `origin/<branch>`.
+fn run_switch(
+    config: &Config,
+    current_branch: &str,
+    branch: &str,
+    location: &BranchLocation,
+) -> Result<Vec<String>> {
+    let repo = &config.repo_root;
+    if branch == current_branch {
+        return Ok(vec![format!("Already on '{branch}'")]);
+    }
+    let mut lines = Vec::new();
+    if matches!(location, BranchLocation::Remote) {
+        git::run_git(repo, &["fetch", "origin", branch])?;
+        lines.push(format!("Fetched origin/{branch}"));
+    }
+    git::run_git(repo, &["switch", branch])?;
+    lines.push(format!("Switched to '{branch}'"));
+    Ok(lines)
+}
+
+/// Plan and apply the deletion of one branch, returning printable lines.
+///
+/// The plan is recomputed here rather than carried over from the modal: the
+/// preview's commit counts are UI, and the authority to delete has to come from
+/// the repo as it is *now*. If it changed underneath the modal, the core refuses
+/// and says so.
+fn run_delete(
+    config: &Config,
+    branch: &str,
+    scope: DeleteScope,
+    force: bool,
+) -> Result<Vec<String>> {
+    let plan = ops::delete_branch_plan(config, branch, &prune_scope_for(scope, force))?;
+    if plan.is_empty() {
+        let mut lines = vec![format!("nothing to delete for '{branch}'")];
+        push_prune_skips(&mut lines, &plan.skipped);
+        return Ok(lines);
+    }
+    let results = ops::prune_apply(config, &plan)?;
+    Ok(render_prune_outcome(&plan, &results))
+}
+
+/// Drive a workflow operation through `core::ops`, rendering its structured
+/// outcome into printable lines. Never runs dry and never forces.
+fn run_op(config: &Config, action: Action, target: Option<&str>) -> Result<Vec<String>> {
+    let force = ops::ForceOpts::new(false, None)?;
+    let mut lines = Vec::new();
+    match action {
+        Action::Graduate => {
+            let roll = target.ok_or_else(|| anyhow!("no roll selected"))?;
+            ops::ensure_clean_state(config)?;
+            let o = ops::graduate(config, roll, false, &force)?;
+            push_gate_notices(&mut lines, &o.gate_notices);
+            lines.push(format!("Graduated '{}' into '{}'", o.roll, o.rolling));
+        }
+        Action::Integrate => {
+            let roll = target.ok_or_else(|| anyhow!("no roll selected"))?;
+            // Deliberately no `ensure_clean_state`: this is the same operation as
+            // `rf integrate`, and git already refuses a merge that would clobber
+            // local changes while carrying harmless ones through. A conflict is a
+            // legitimate outcome to go and resolve, not a reason to refuse up
+            // front.
+            let o = ops::integrate(config, roll).map_err(|err| integrate_error(config, err))?;
+            lines.push(format!("Integrated '{}' into '{}'", o.branch, o.current));
+        }
+        Action::Promote => {
+            ops::ensure_clean_state(config)?;
+            let promote_target = match target {
+                Some(roll) => ops::PromoteTarget::Rolls(vec![roll.to_string()]),
+                None => ops::PromoteTarget::Rolling,
+            };
+            // Tagging is on; the version gate hard-fails here rather than
+            // prompting, since the TUI has no place to offer a bump — the
+            // error names the `rf promote --bump` fix.
+            let o = ops::promote(config, &promote_target, false, &force, true)?;
+            for step in &o.steps {
+                push_gate_notices(&mut lines, &step.gate_notices);
+                push_gate_notices(&mut lines, &step.host_notices);
+                push_host_results(&mut lines, &step.host_results);
+                let what = step.roll.as_deref().unwrap_or(&o.rolling);
+                lines.push(format!("Promoted '{}' into '{}'", what, o.stable));
+                if let Some(line) = step.tag.describe() {
+                    lines.push(line);
+                }
+            }
+            for skip in &o.skipped {
+                lines.push(format!("skipped '{}': {}", skip.roll, skip.reason));
+            }
+        }
+        Action::Update => match ops::update(config, false)? {
+            ops::UpdateOutcome::NoActiveRolls => {
+                lines.push("no active local rolls to update".to_string());
+            }
+            ops::UpdateOutcome::Ran { stable, items } => {
+                for item in items {
+                    match item {
+                        ops::UpdateItem::AlreadyUpToDate { roll } => {
+                            lines.push(format!("'{roll}' is already up to date with '{stable}'"));
+                        }
+                        ops::UpdateItem::WouldMerge { roll, behind } => {
+                            lines.push(format!(
+                                "would merge '{stable}' into '{roll}' ({behind} ahead)"
+                            ));
+                        }
+                        ops::UpdateItem::Updated { roll } => {
+                            lines.push(format!("updated '{roll}' with '{stable}'"));
+                        }
+                    }
+                }
+            }
+        },
+        Action::Prune => {
+            // The modal was the confirmation, so plan and apply run back to
+            // back here. `PruneScope::both` never forces: a branch holding
+            // commits stable lacks is reported as skipped, and clearing it
+            // needs `rf prune --force` from the CLI, deliberately.
+            let plan = ops::prune_plan(config, &ops::PruneScope::both())?;
+            if plan.is_empty() {
+                lines.push("no promoted roll branches to prune".to_string());
+                push_prune_skips(&mut lines, &plan.skipped);
+            } else {
+                let results = ops::prune_apply(config, &plan)?;
+                lines.extend(render_prune_outcome(&plan, &results));
+            }
+        }
+    }
+    Ok(lines)
+}
+
+/// Add a recovery hint to a failed integrate when it left a merge in progress.
+///
+/// A conflicted merge is the common failure, and the raw
+/// ``  `git merge --no-ff X` exited with exit status: 1`` says nothing about the
+/// worktree now being mid-merge — which is the only fact the user needs next.
+/// `MERGE_HEAD` exists exactly while a merge is unresolved, so `ref_exists`
+/// answers this without a new git helper.
+fn integrate_error(config: &Config, err: anyhow::Error) -> anyhow::Error {
+    if git::ref_exists(&config.repo_root, "MERGE_HEAD") {
+        return anyhow!(
+            "{err}\nmerge left conflicts — resolve them and commit,\n\
+             press gg for lazygit, or run `git merge --abort`"
+        );
+    }
+    err
+}
+
+/// Read every local branch's upstream tracking state, keyed by branch name.
+///
+/// One `for-each-ref` for the whole repo, not one `ahead_behind` per row: the
+/// sync column needs an answer for every visible branch on every reload. A
+/// failure here degrades the column to `—` rather than failing the reload —
+/// divergence is decoration, and losing it must not cost the user their table.
+fn load_tracking(config: &Config) -> HashMap<String, git::LocalBranch> {
+    git::local_branch_details(&config.repo_root)
+        .map(|branches| branches.into_iter().map(|b| (b.name.clone(), b)).collect())
+        .unwrap_or_default()
+}
+
+/// The tracking state to show for `branch`, or `None` when it has no local copy
+/// in the batch — which the `sync` column renders as a dash rather than as
+/// "in sync".
+fn track_of(tracking: &HashMap<String, git::LocalBranch>, branch: &str) -> Option<TrackState> {
+    tracking.get(branch).map(git::track_state)
+}
+
+/// Render the force-push confirmation.
+///
+/// Red-bordered and stating the divergence in commits, because this is the one
+/// key in the view that can destroy commits on the remote. The counts come from
+/// the tracking batch, so the prompt says what would actually be overwritten
+/// rather than asking in the abstract.
+fn render_force_push_modal(
+    f: &mut Frame,
+    area: Rect,
+    branch: &str,
+    remote: &str,
+    details: Option<&git::LocalBranch>,
+) {
+    let divergence = match details.map(git::track_state) {
+        Some(TrackState::Diverged { ahead, behind }) => format!(
+            "{remote}/{branch} has {behind} commit{} you don't; you have {ahead}.",
+            plural(behind)
+        ),
+        Some(TrackState::Behind(behind)) => format!(
+            "{remote}/{branch} has {behind} commit{} you don't.",
+            plural(behind)
+        ),
+        // Reached when git refused a push we could not predict — say so plainly
+        // rather than inventing a count.
+        _ => format!("{remote}/{branch} has commits you don't."),
+    };
+
+    let lines = vec![
+        Line::from(Span::styled(
+            format!("Force-push {branch}?"),
+            Style::default().add_modifier(Modifier::BOLD),
+        )),
+        Line::from(""),
+        Line::from(divergence),
+        Line::from(Span::styled(
+            "Uses --force-with-lease: refused if origin moved since your last fetch.",
+            Style::default().fg(Color::DarkGray),
+        )),
+        Line::from(""),
+        Line::from(Span::styled(
+            "[y] force    [n] cancel",
+            Style::default().fg(Color::Yellow),
+        )),
+    ];
+
+    let width = lines
+        .iter()
+        .map(|l| l.width())
+        .max()
+        .unwrap_or(40)
+        .clamp(32, 78) as u16;
+    let modal = centered_rect(area, width + 4, lines.len() as u16 + 2);
+    f.render_widget(Clear, modal);
+    f.render_widget(
+        Paragraph::new(lines).block(
+            Block::bordered()
+                .title(Span::styled(
+                    " force push ",
+                    Style::default().fg(Color::Red).add_modifier(Modifier::BOLD),
+                ))
+                .border_style(Style::default().fg(Color::Red)),
+        ),
+        modal,
+    );
+}
+
+/// `"s"` unless `n` is 1 — used so the force prompt reads as prose.
+fn plural(n: u32) -> &'static str {
+    if n == 1 {
+        ""
+    } else {
+        "s"
     }
 }
 
@@ -1282,12 +1912,18 @@ fn render_modal(
     action: Action,
     target: Option<&str>,
     rolls: &[RollInfo],
+    current_branch: &str,
 ) {
     let prompt = match action {
         Action::Graduate => format!(
             "Graduate {} into {}?",
             target.unwrap_or("(selected roll)"),
             config.rolling_branch
+        ),
+        Action::Integrate => format!(
+            "Integrate {} into {}?",
+            target.unwrap_or("(selected roll)"),
+            current_branch
         ),
         // `target` is the selected roll when `[p]` was pressed on one, and
         // `None` for a whole-branch promotion — the prompt must say which,
@@ -1670,6 +2306,8 @@ mod tests {
             rolling_to_main_gates: Vec::new(),
             host_gates: Vec::new(),
             clean_protect: Vec::new(),
+            pull_mode: Default::default(),
+            lazygit_command: "lazygit".to_string(),
         }
     }
 
@@ -1790,7 +2428,7 @@ mod tests {
         ];
         assert!(!can_prune(&unpromoted));
         assert_eq!(prunable_count(&unpromoted), 0);
-        assert!(validate_action(Action::Prune, None, &unpromoted).is_err());
+        assert!(validate_action(Action::Prune, None, &unpromoted, "main", "roll/").is_err());
 
         let mut with_promoted = unpromoted.clone();
         with_promoted.push(roll_n(5, RollState::Promoted));
@@ -1798,7 +2436,7 @@ mod tests {
         assert!(can_prune(&with_promoted));
         assert_eq!(prunable_count(&with_promoted), 2);
         // Prune is repo-wide, so it validates with no selection.
-        assert!(validate_action(Action::Prune, None, &with_promoted).is_ok());
+        assert!(validate_action(Action::Prune, None, &with_promoted, "main", "roll/").is_ok());
     }
 
     #[test]
@@ -1841,17 +2479,26 @@ mod tests {
         let graduated = vec![roll(RollState::Graduated, BranchLocation::Both)];
 
         // Graduate needs a valid selection.
-        assert!(validate_action(Action::Graduate, None, &active).is_err());
-        assert!(validate_action(Action::Graduate, Some(&active[0]), &active).is_ok());
-        assert!(validate_action(Action::Graduate, Some(&graduated[0]), &graduated).is_err());
+        assert!(validate_action(Action::Graduate, None, &active, "main", "roll/").is_err());
+        assert!(
+            validate_action(Action::Graduate, Some(&active[0]), &active, "main", "roll/").is_ok()
+        );
+        assert!(validate_action(
+            Action::Graduate,
+            Some(&graduated[0]),
+            &graduated,
+            "main",
+            "roll/"
+        )
+        .is_err());
 
         // Promote needs a graduated roll on rolling.
-        assert!(validate_action(Action::Promote, None, &active).is_err());
-        assert!(validate_action(Action::Promote, None, &graduated).is_ok());
+        assert!(validate_action(Action::Promote, None, &active, "main", "roll/").is_err());
+        assert!(validate_action(Action::Promote, None, &graduated, "main", "roll/").is_ok());
 
         // Update needs a local active roll.
-        assert!(validate_action(Action::Update, None, &active).is_ok());
-        assert!(validate_action(Action::Update, None, &graduated).is_err());
+        assert!(validate_action(Action::Update, None, &active, "main", "roll/").is_ok());
+        assert!(validate_action(Action::Update, None, &graduated, "main", "roll/").is_err());
     }
 
     #[test]
@@ -1950,7 +2597,9 @@ mod tests {
             roll_n(2, RollState::Active),
         ];
         assert!(promote_target_for(Some(&rolls[1]), &rolls).is_err());
-        assert!(validate_action(Action::Promote, Some(&rolls[1]), &rolls).is_err());
+        assert!(
+            validate_action(Action::Promote, Some(&rolls[1]), &rolls, "main", "roll/").is_err()
+        );
     }
 
     #[test]
@@ -2359,6 +3008,8 @@ mod tests {
             rolling_to_main_gates: Vec::new(),
             host_gates: Vec::new(),
             clean_protect: Vec::new(),
+            pull_mode: Default::default(),
+            lazygit_command: "lazygit".to_string(),
         }
     }
 
@@ -2426,12 +3077,374 @@ mod tests {
     #[test]
     fn status_bar_hints_fit_an_80_column_terminal() {
         // The single-line footer this replaced was ~126 columns and silently
-        // truncated, hiding the last several bindings. Both lines must fit whole.
+        // truncated, hiding the last several bindings. `Paragraph` does not wrap
+        // unless asked, so every line has to fit whole on its own.
         let app = StatusApp::new(test_config(), "main".to_string(), Vec::new(), false);
         let out = draw(|f, area| app.render_status_bar(f, area));
-        for key in ["[q] quit", "[r]efresh", "[c]reate", "[d]elete", "[x] prune"] {
+        for key in [
+            "[q] quit",
+            "[r]efresh",
+            "[p] pull",
+            "[P] push",
+            "[f] fetch",
+            "[gg] lazygit",
+            "[esc] close output",
+            "[c]reate",
+            "[i]ntegrate",
+            "[G]raduate",
+            "[m] promote",
+            "[u]pdate",
+            "[d]elete",
+            "[x] prune",
+            "scroll output",
+        ] {
             assert!(out.contains(key), "{key} truncated away:\n{out}");
         }
+    }
+
+    #[test]
+    fn the_status_bar_reserves_a_row_for_every_hint_line_it_writes() {
+        // The layout hands `render_status_bar` a fixed height; one hint line more
+        // than that and the last binding silently disappears.
+        let app = StatusApp::new(test_config(), "main".to_string(), Vec::new(), false);
+        let out = draw(|f, area| {
+            let chunks = Layout::vertical([Constraint::Length(5)]).split(area);
+            app.render_status_bar(f, chunks[0])
+        });
+        assert!(
+            out.contains("scroll output"),
+            "last hint line clipped:\n{out}"
+        );
+    }
+
+    #[test]
+    fn the_table_shows_the_chevron_and_the_sync_glyph_on_the_right_rows() {
+        let cfg = config("main", "rolling");
+        let mut rolls = vec![roll_n(1, RollState::Active), roll_n(2, RollState::Active)];
+        rolls[0].branch = "roll/1-0101-ahead".to_string();
+        rolls[0].is_current = true;
+        rolls[1].branch = "roll/2-0102-diverged".to_string();
+        rolls[1].is_current = false;
+
+        let mut tracking = HashMap::new();
+        tracking.insert(
+            "roll/1-0101-ahead".to_string(),
+            git::LocalBranch {
+                name: "roll/1-0101-ahead".to_string(),
+                upstream: "origin/roll/1-0101-ahead".to_string(),
+                remote_name: "origin".to_string(),
+                track: "ahead 2".to_string(),
+                worktree: String::new(),
+            },
+        );
+        tracking.insert(
+            "roll/2-0102-diverged".to_string(),
+            git::LocalBranch {
+                name: "roll/2-0102-diverged".to_string(),
+                upstream: "origin/roll/2-0102-diverged".to_string(),
+                remote_name: "origin".to_string(),
+                track: "ahead 1, behind 3".to_string(),
+                worktree: String::new(),
+            },
+        );
+
+        let mut app = StatusApp {
+            config: cfg,
+            current_branch: "roll/1-0101-ahead".to_string(),
+            bases: Vec::new(),
+            rolls,
+            show_deps: false,
+            tracking,
+            table: TableState::default(),
+            mode: Mode::Browsing,
+            message: None,
+            job: None,
+            panel: None,
+            pending_g: false,
+        };
+
+        let out = draw(|f, area| app.render_table(f, area));
+        let ahead = out
+            .lines()
+            .find(|l| l.contains("roll/1-0101-ahead"))
+            .expect("roll 1 row");
+        let diverged = out
+            .lines()
+            .find(|l| l.contains("roll/2-0102-diverged"))
+            .expect("roll 2 row");
+
+        assert!(ahead.contains('›'), "chevron missing on HEAD: {ahead}");
+        assert!(ahead.contains("↑2"), "{ahead}");
+        // The chevron marks HEAD only — a second row must not claim it.
+        assert!(
+            !diverged.contains('›'),
+            "chevron on a non-HEAD row: {diverged}"
+        );
+        assert!(diverged.contains("↑1↓3"), "{diverged}");
+        assert!(out.contains("sync"), "the sync header is missing:\n{out}");
+    }
+
+    #[test]
+    fn a_branch_with_no_tracking_data_renders_a_dash_in_the_table() {
+        // `load_tracking` degrades to an empty map when git fails, and the table
+        // still has to draw. Every row shows a dash rather than a false ✓.
+        let cfg = config("main", "rolling");
+        let mut app = StatusApp {
+            config: cfg,
+            current_branch: "main".to_string(),
+            bases: Vec::new(),
+            rolls: vec![roll_n(1, RollState::Active)],
+            show_deps: false,
+            tracking: HashMap::new(),
+            table: TableState::default(),
+            mode: Mode::Browsing,
+            message: None,
+            job: None,
+            panel: None,
+            pending_g: false,
+        };
+        let out = draw(|f, area| app.render_table(f, area));
+        let row = out
+            .lines()
+            .find(|l| l.contains("roll/1-0101-x"))
+            .expect("roll row");
+        assert!(row.contains('—'), "{row}");
+        assert!(!row.contains('✓'), "{row}");
+    }
+
+    #[test]
+    fn the_sync_column_maps_each_tracking_state_to_a_glyph() {
+        assert_eq!(sync_cell(Some(TrackState::InSync)).0, "✓");
+        assert_eq!(sync_cell(Some(TrackState::Ahead(2))).0, "↑2");
+        assert_eq!(sync_cell(Some(TrackState::Behind(3))).0, "↓3");
+        assert_eq!(
+            sync_cell(Some(TrackState::Diverged {
+                ahead: 2,
+                behind: 1
+            }))
+            .0,
+            "↑2↓1"
+        );
+        assert_eq!(sync_cell(Some(TrackState::Gone)).0, "gone");
+    }
+
+    #[test]
+    fn a_branch_with_nothing_to_compare_shows_a_dash_not_a_tick() {
+        // A remote-only roll has no local copy, and a local branch may have no
+        // upstream at all. Neither is "in sync", and rendering ✓ would say the
+        // opposite of the truth.
+        assert_eq!(sync_cell(None).0, "—");
+        assert_eq!(sync_cell(Some(TrackState::NoUpstream)).0, "—");
+    }
+
+    #[test]
+    fn the_sync_column_is_green_in_sync_yellow_diverged_and_red_when_gone() {
+        assert_eq!(sync_cell(Some(TrackState::InSync)).1, Color::Green);
+        assert_eq!(sync_cell(Some(TrackState::Ahead(1))).1, Color::Yellow);
+        assert_eq!(sync_cell(Some(TrackState::Behind(1))).1, Color::Yellow);
+        assert_eq!(sync_cell(Some(TrackState::Gone)).1, Color::Red);
+        assert_eq!(sync_cell(None).1, Color::DarkGray);
+    }
+
+    #[test]
+    fn the_chevron_marks_only_the_checked_out_branch() {
+        assert_eq!(current_marker(true), "›");
+        assert_eq!(current_marker(false), "");
+    }
+
+    #[test]
+    fn only_an_explicit_y_forces_a_push() {
+        assert_eq!(force_push_key(KeyCode::Char('y')), ForcePushOutcome::Force);
+        assert_eq!(force_push_key(KeyCode::Char('Y')), ForcePushOutcome::Force);
+        for key in [KeyCode::Char('n'), KeyCode::Char('N'), KeyCode::Esc] {
+            assert_eq!(force_push_key(key), ForcePushOutcome::Cancel, "{key:?}");
+        }
+        // Enter is deliberately unbound: this modal can open the instant `[P]`
+        // lands on a branch that is behind, so a stray Enter must not overwrite a
+        // remote.
+        for key in [
+            KeyCode::Enter,
+            KeyCode::Char(' '),
+            KeyCode::Char('P'),
+            KeyCode::Char('f'),
+        ] {
+            assert_eq!(force_push_key(key), ForcePushOutcome::Ignore, "{key:?}");
+        }
+    }
+
+    #[test]
+    fn the_force_push_modal_states_the_divergence_and_the_lease() {
+        let details = git::LocalBranch {
+            name: "roll/1-0101-x".to_string(),
+            upstream: "origin/roll/1-0101-x".to_string(),
+            remote_name: "origin".to_string(),
+            track: "ahead 1, behind 2".to_string(),
+            worktree: String::new(),
+        };
+        let out = draw(|f, area| {
+            render_force_push_modal(f, area, "roll/1-0101-x", "origin", Some(&details))
+        });
+        assert!(out.contains("force push"), "{out}");
+        assert!(out.contains("2 commits you don't"), "{out}");
+        assert!(out.contains("--force-with-lease"), "{out}");
+        assert!(out.contains("[y] force"), "{out}");
+    }
+
+    #[test]
+    fn the_force_push_modal_says_something_sensible_without_counts() {
+        // Reached when git refused a push we could not predict from the tracking
+        // ref; inventing a number there would be worse than omitting one.
+        let out = draw(|f, area| render_force_push_modal(f, area, "roll/1", "origin", None));
+        assert!(out.contains("has commits you don't"), "{out}");
+        assert!(!out.contains("0 commits"), "{out}");
+    }
+
+    #[test]
+    fn a_single_commit_reads_as_singular_in_the_force_prompt() {
+        let details = git::LocalBranch {
+            name: "roll/1".to_string(),
+            upstream: "origin/roll/1".to_string(),
+            remote_name: "origin".to_string(),
+            track: "behind 1".to_string(),
+            worktree: String::new(),
+        };
+        let out =
+            draw(|f, area| render_force_push_modal(f, area, "roll/1", "origin", Some(&details)));
+        assert!(out.contains("1 commit you don't"), "{out}");
+        assert!(!out.contains("1 commits"), "{out}");
+    }
+
+    #[test]
+    fn integrate_merges_the_hovered_roll_into_the_checked_out_one() {
+        let mut other = roll_n(1, RollState::Active);
+        other.branch = "roll/1-0101-alpha".to_string();
+        other.location = BranchLocation::Both;
+        assert_eq!(
+            integrate_target_for("roll/2-0102-beta", "roll/", Some(&other)),
+            Ok("roll/1-0101-alpha".to_string())
+        );
+    }
+
+    #[test]
+    fn integrate_needs_a_roll_branch_checked_out() {
+        // `ops::integrate` refuses this too; catching it here means the message
+        // names the branch instead of surfacing a core error after the modal.
+        let other = roll_n(1, RollState::Active);
+        for head in ["main", "rolling", "feature/x"] {
+            let err = integrate_target_for(head, "roll/", Some(&other))
+                .expect_err("{head} should be refused");
+            assert!(err.contains("not a roll branch"), "{head}: {err}");
+        }
+    }
+
+    #[test]
+    fn integrate_refuses_a_roll_into_itself() {
+        let mut same = roll_n(1, RollState::Active);
+        same.branch = "roll/1-0101-alpha".to_string();
+        let err = integrate_target_for("roll/1-0101-alpha", "roll/", Some(&same))
+            .expect_err("self-merge should be refused");
+        assert!(err.contains("already the current branch"), "{err}");
+    }
+
+    #[test]
+    fn integrate_refuses_a_remote_only_roll_with_advice() {
+        // `ops::integrate` resolves the source with a bare `ref_exists`, so
+        // without this the user would get "branch not found" for a roll plainly
+        // listed on screen.
+        let mut remote = roll_n(1, RollState::Active);
+        remote.branch = "roll/1-0101-alpha".to_string();
+        remote.location = BranchLocation::Remote;
+        let err = integrate_target_for("roll/2-0102-beta", "roll/", Some(&remote))
+            .expect_err("a remote-only roll should be refused");
+        assert!(err.contains("only on origin"), "{err}");
+    }
+
+    #[test]
+    fn integrate_needs_something_selected() {
+        let err = integrate_target_for("roll/2-0102-beta", "roll/", None)
+            .expect_err("nothing selected should be refused");
+        assert!(err.contains("no roll selected"), "{err}");
+    }
+
+    #[test]
+    fn integrate_accepts_an_already_graduated_roll() {
+        // Merging a graduated roll into yours is legitimate — you want its code —
+        // and the dependency it records is simply already satisfied.
+        let mut graduated = roll_n(1, RollState::Graduated);
+        graduated.branch = "roll/1-0101-alpha".to_string();
+        graduated.location = BranchLocation::Local;
+        assert!(integrate_target_for("roll/2-0102-beta", "roll/", Some(&graduated)).is_ok());
+    }
+
+    #[test]
+    fn integrate_honours_a_non_default_roll_prefix() {
+        let mut other = roll_n(1, RollState::Active);
+        other.branch = "batch/1-0101-alpha".to_string();
+        other.location = BranchLocation::Local;
+        assert!(integrate_target_for("batch/2-0102-beta", "batch/", Some(&other)).is_ok());
+        assert!(integrate_target_for("batch/2-0102-beta", "roll/", Some(&other)).is_err());
+    }
+
+    #[test]
+    fn validate_action_gates_integrate_the_same_way() {
+        // The single validation entry point must agree with the helper, or the
+        // key and the modal could disagree about what is allowed.
+        let mut rolls = vec![roll_n(1, RollState::Active)];
+        rolls[0].branch = "roll/1-0101-alpha".to_string();
+        rolls[0].location = BranchLocation::Both;
+        assert!(validate_action(
+            Action::Integrate,
+            Some(&rolls[0]),
+            &rolls,
+            "roll/2-0102-beta",
+            "roll/"
+        )
+        .is_ok());
+        assert!(
+            validate_action(Action::Integrate, Some(&rolls[0]), &rolls, "main", "roll/").is_err()
+        );
+    }
+
+    #[test]
+    fn the_integrate_modal_names_both_the_source_and_the_destination() {
+        // The direction is the whole point and the easiest thing to get backwards,
+        // so the prompt has to spell it out.
+        let cfg = config("main", "rolling");
+        let out = draw(|f, area| {
+            render_modal(
+                f,
+                area,
+                &cfg,
+                Action::Integrate,
+                Some("roll/1-0101-alpha"),
+                &[],
+                "roll/2-0102-beta",
+            )
+        });
+        assert!(
+            out.contains("Integrate roll/1-0101-alpha into roll/2-0102-beta?"),
+            "{out}"
+        );
+    }
+
+    #[test]
+    fn a_job_title_names_the_roll_it_targets() {
+        assert_eq!(
+            Action::Graduate.job_title(Some("roll/1-0101-x")),
+            "rf graduate roll/1-0101-x"
+        );
+        assert_eq!(Action::Promote.job_title(None), "rf promote");
+    }
+
+    #[test]
+    fn a_sync_failure_carries_gits_text_and_the_hint_together() {
+        let failure = sync::SyncFailure::from(git::GitFailure {
+            stderr: " ! [rejected] main -> main (stale info)".to_string(),
+            message: "`git push` exited with 1".to_string(),
+        });
+        let rendered = sync_error(failure).to_string();
+        assert!(rendered.contains("stale info"), "{rendered}");
+        assert!(rendered.contains("press f to fetch"), "{rendered}");
     }
 
     /// The pinned base rows render above the rolls, with the role in the
@@ -2451,15 +3464,21 @@ mod tests {
             bases,
             rolls: vec![roll_n(1, RollState::Active)],
             show_deps: false,
+            tracking: HashMap::new(),
             table,
             mode: Mode::Browsing,
             message: None,
+            job: None,
+            panel: None,
+            pending_g: false,
         };
 
-        let mut term = Terminal::new(TestBackend::new(60, 12)).unwrap();
+        // Tall enough for the header, three table rows and the four-line status
+        // bar, and wide enough for the sync column.
+        let mut term = Terminal::new(TestBackend::new(80, 14)).unwrap();
         term.draw(|f| app.render(f)).unwrap();
         let line = |row: u16| -> String {
-            (0..60)
+            (0..80)
                 .map(|x| term.backend().buffer()[(x, row)].symbol().to_string())
                 .collect::<String>()
                 .trim_end()
