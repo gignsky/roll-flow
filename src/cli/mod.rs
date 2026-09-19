@@ -147,6 +147,11 @@ pub enum Cmd {
         /// Justification recorded as `Force-Reason:` in the merge commit.
         #[arg(long)]
         reason: Option<String>,
+        /// Graduate ungraduated dependencies first without asking. Without it
+        /// a multi-roll plan is shown and confirmed; unattended, it is shown
+        /// and nothing is merged.
+        #[arg(long)]
+        yes: bool,
     },
 
     /// Promote rolling into the stable branch (--no-ff merge). On a roll

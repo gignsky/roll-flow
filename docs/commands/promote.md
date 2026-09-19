@@ -24,6 +24,24 @@ graduation, so promoting a roll necessarily carries whatever graduated ahead of
 it; a roll already contained in stable is reported as skipped rather than
 failing.
 
+A `--roll` that depends on rolls which have graduated but not yet promoted
+promotes those first, each as its own step, and says so before asking:
+
+```text
+  roll/7-0918-verify-button  (dependency of 8, ✓ graduated)
+(dependencies added ahead of what was named)
+
+Promote these in order? [y/N]
+```
+
+`--yes` confirms; unattended, the plan is printed and nothing is merged. Since a
+per-roll promotion advances stable to a graduation commit that already carries
+everything graduated before it, the dependency step often reports
+`already contained` once the first merge lands — that is correct, and the point
+of ordering them. A dependency that has not graduated is refused outright: there
+is nothing on rolling to advance stable to. `[m]` on a roll row in the TUI
+performs the same expansion and lists it in its confirm modal.
+
 Each `--roll` is its own merge behind its own gate run, so a two-roll promotion
 runs the gates twice and verifies both intermediate states of stable. Promoting
 the whole branch is a single merge, so one gate run covers it. If a later step's

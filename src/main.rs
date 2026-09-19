@@ -71,7 +71,8 @@ fn main() -> Result<()> {
             dry_run,
             force,
             reason,
-        } => cmd_graduate(dry_run, force, reason)?,
+            yes,
+        } => cmd_graduate(dry_run, force, reason, yes)?,
         Cmd::Promote {
             roll,
             dry_run,
@@ -533,7 +534,7 @@ fn offer_tag_push(config: &Config, tag: &str, yes: bool) -> Result<()> {
     Ok(())
 }
 
-fn cmd_graduate(dry_run: bool, force: bool, reason: Option<String>) -> Result<()> {
+fn cmd_graduate(dry_run: bool, force: bool, reason: Option<String>, yes: bool) -> Result<()> {
     let force = ops::ForceOpts::new(force, reason)?;
     let config = Config::load()?;
     ops::ensure_clean_state(&config)?;
@@ -547,9 +548,79 @@ fn cmd_graduate(dry_run: bool, force: bool, reason: Option<String>) -> Result<()
             config.stable_branch
         );
     }
-    let outcome = ops::graduate(&config, &current, dry_run, &force)?;
-    print_graduate(&outcome);
+    graduate_with_deps(&config, &current, dry_run, &force, yes)
+}
+
+/// Graduate `roll`, after any ungraduated roll it depends on.
+///
+/// A roll alone is what `rf graduate` always did, and runs without a word. A
+/// chain is shown first and confirmed, because it merges more than the branch
+/// the user is standing on; `--yes` takes it as read, and an unattended run
+/// prints the plan and merges nothing, the same shape every other confirmation
+/// here has. `--dry-run` prints the plan and previews each step.
+fn graduate_with_deps(
+    config: &Config,
+    roll: &str,
+    dry_run: bool,
+    force: &ops::ForceOpts,
+    yes: bool,
+) -> Result<()> {
+    let rolls = branches::list_rolls(config)?;
+    let chain = ops::dependency_chain(&rolls, roll, ops::ChainKind::Graduate)?;
+
+    if chain.len() > 1 {
+        println!(
+            "'{}' depends on {} ungraduated roll{}; graduating in order:",
+            roll,
+            chain.len() - 1,
+            if chain.len() == 2 { "" } else { "s" }
+        );
+        for (i, step) in chain.iter().enumerate() {
+            println!("  {}. {}", i + 1, step.describe());
+        }
+        if !dry_run {
+            match cli::confirm(yes, "\nGraduate these in order? [y/N] ")? {
+                cli::Confirm::Yes => {}
+                cli::Confirm::Declined => {
+                    println!("Nothing graduated.");
+                    return Ok(());
+                }
+                cli::Confirm::Unattended => {
+                    println!("\nNothing graduated. Re-run with --yes to graduate them in order.");
+                    return Ok(());
+                }
+            }
+        }
+        println!();
+    }
+
+    for outcome in ops::graduate_chain(config, &chain, dry_run, force)? {
+        print_graduate(&outcome);
+    }
     Ok(())
+}
+
+/// Expand each `--roll` into itself plus any graduated-but-unpromoted roll it
+/// depends on, dependencies first, so a per-roll promotion is never asked to
+/// land a roll ahead of what it integrated. Duplicates across the named rolls
+/// collapse to one step. Returns the ordered branch list and whether it grew.
+fn promote_rolls_with_deps(config: &Config, named: &[String]) -> Result<(Vec<String>, bool)> {
+    let rolls = branches::list_rolls(config)?;
+    let mut ordered: Vec<String> = Vec::new();
+    let mut grew = false;
+    for name in named {
+        for step in ops::dependency_chain(&rolls, name, ops::ChainKind::Promote)? {
+            if ordered.contains(&step.branch) {
+                continue;
+            }
+            if step.reason != ops::ChainReason::Requested && !named.contains(&step.branch) {
+                println!("  {}", step.describe());
+                grew = true;
+            }
+            ordered.push(step.branch);
+        }
+    }
+    Ok((ordered, grew))
 }
 
 fn cmd_promote(
@@ -580,6 +651,27 @@ fn cmd_promote(
                  its graduation commit already carries"
             );
         }
+        // Dependencies that have graduated but not promoted come first, each
+        // its own step. The expansion is printed as it is found so the plan
+        // reads top to bottom, then confirmed — it merges more than was named.
+        let (rolls, grew) = promote_rolls_with_deps(&config, &rolls)?;
+        if grew {
+            println!("(dependencies added ahead of what was named)");
+            if !dry_run {
+                match cli::confirm(yes, "\nPromote these in order? [y/N] ")? {
+                    cli::Confirm::Yes => {}
+                    cli::Confirm::Declined => {
+                        println!("Nothing promoted.");
+                        return Ok(());
+                    }
+                    cli::Confirm::Unattended => {
+                        println!("\nNothing promoted. Re-run with --yes to promote them in order.");
+                        return Ok(());
+                    }
+                }
+            }
+            println!();
+        }
         let outcome = ops::promote(
             &config,
             &ops::PromoteTarget::Rolls(rolls),
@@ -599,8 +691,7 @@ fn cmd_promote(
                 "note: '{}' is a roll branch; graduating into '{}' — use rf graduate directly next time",
                 roll, config.rolling_branch
             );
-            let outcome = ops::graduate(&config, &roll, dry_run, &force)?;
-            print_graduate(&outcome);
+            graduate_with_deps(&config, &roll, dry_run, &force, yes)?;
         }
         Some(ops::Route::Promote) => {
             // Resolved before `ops::promote` so the bump commit is part of what
