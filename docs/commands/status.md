@@ -25,7 +25,7 @@ neither locally nor on `origin` is not listed.
 [q] quit   [j/k ↑/↓] nav   [space] switch   [enter] detail   [r]efresh
 [p] pull   [P] push   [PP] push all   [f] fetch   [gg] lazygit
 [c]reate   [i]ntegrate   [G]raduate   [m] promote   [u]pdate   [b]ump
-[d]elete   [x] prune   [esc] close output   [PgUp/PgDn/End] scroll
+[d]elete   [x] prune   [t]idy   [esc] close output   [PgUp/PgDn/End] scroll
 ```
 
 The sync keys follow lazygit, which is why graduate is `[G]` and promote is `[m]`

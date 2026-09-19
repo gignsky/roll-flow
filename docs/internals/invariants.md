@@ -76,6 +76,9 @@ long list — that keeps two rolls adding rules in different areas from collidin
   saw. Do not add a fourth. `rf tidy` in particular is not one and must never
   become one: its whole safety argument is that a branch still on `origin` is
   recoverable, which stops being true the moment it can delete the remote copy.
+  The TUI's `[t]` is the same command and inherits the same rule — it builds its
+  scope with `PruneScope::tidy`, whose `remote: false` is the thing that keeps it
+  out of this list.
 - *Advancing* a ref on the remote happens through one function,
   `core::sync::run_push`, reached from the TUI's `[P]` and `PP`. It is a
   different act from a delete and is governed by different rules, which is why it
