@@ -15,7 +15,7 @@
 use std::collections::HashMap;
 use std::time::Duration;
 
-use anyhow::{anyhow, Result};
+use anyhow::{anyhow, bail, Result};
 use crossterm::event::{self, Event, KeyCode, KeyEventKind};
 use ratatui::{
     layout::{Alignment, Constraint, Layout, Rect},
@@ -32,7 +32,7 @@ use crate::core::{
     git::{self, TrackState},
     ops,
     sync::{self, PullPlan, PushOutcome, SyncTarget},
-    version::{self, BumpLevel, Semver},
+    version::{self, BumpLevel, Semver, VersionCheck, VersionStatus},
 };
 
 /// A workflow operation reachable from the view. Navigation, quit and refresh
@@ -229,6 +229,13 @@ enum Mode {
     /// opened, so the previews it shows and the bump it applies agree.
     Bump {
         current: Semver,
+    },
+    /// `?`: the searchable keymap. Holds the filter text and the cursor's
+    /// position in the *filtered* list, which is why editing the query resets
+    /// it — see [`handle_help_key`].
+    Help {
+        query: String,
+        cursor: usize,
     },
     /// A push was refused as non-fast-forward (or is already known to be behind
     /// its upstream). Asks whether to force it.
@@ -537,6 +544,387 @@ pub(crate) fn tidyable_count(rolls: &[RollInfo]) -> usize {
 fn is_tidy_candidate(roll: &RollInfo) -> bool {
     TIDY_STATES.contains(&roll.state)
         && matches!(roll.location, BranchLocation::Local | BranchLocation::Both)
+}
+
+// ── Keymap ──────────────────────────────────────────────────────────────────
+
+/// One entry in the keymap.
+///
+/// The table below is the single source of truth for what keys exist: the status
+/// bar renders the `basic` ones, `?` lists all of them, and `replay` is what
+/// pressing enter in that list feeds back through the browsing handler. Adding a
+/// key means adding a row here and an arm in [`StatusApp::handle_browsing`] —
+/// nothing else, and in particular no hand-written hint string to fall out of
+/// date. Before this the bindings were spelled out in four footer lines that
+/// each had to be re-measured against an 80-column terminal every time one was
+/// added.
+pub(crate) struct Binding {
+    /// As shown to the user: `"P"`, `"gg"`, `"j / ↓"`.
+    pub keys: &'static str,
+    pub label: &'static str,
+    /// Coarse grouping, shown dim and searchable — typing `sync` finds them all.
+    pub group: &'static str,
+    /// The status bar's fragment for this key — `Some("[q] quit")` — when it is
+    /// one of the basics someone needs before they know `?` exists. `None`
+    /// keeps the key to the `?` list. It is a whole fragment rather than a word
+    /// so one row can stand for a pair: `j` carries `[j/k ↑/↓] nav` and `k`
+    /// carries nothing, instead of the bar saying "nav" twice.
+    pub hint: Option<&'static str>,
+    /// Keystrokes `?` replays to run this binding, in order. Two entries for a
+    /// chord: replaying `g` then `g` arms and completes it exactly as typing it
+    /// would, so there is no second dispatch path to keep in step. Empty means
+    /// there is nothing to run and enter merely closes the list.
+    pub replay: &'static [KeyCode],
+}
+
+/// Every key the browsing view answers to.
+pub(crate) const BINDINGS: &[Binding] = &[
+    Binding {
+        keys: "j / ↓",
+        label: "move down",
+        group: "navigate",
+        hint: Some("[j/k ↑/↓] nav"),
+        replay: &[KeyCode::Char('j')],
+    },
+    Binding {
+        keys: "k / ↑",
+        label: "move up",
+        group: "navigate",
+        hint: None,
+        replay: &[KeyCode::Char('k')],
+    },
+    Binding {
+        keys: "space",
+        label: "switch to the selected branch",
+        group: "navigate",
+        hint: Some("[space] switch"),
+        replay: &[KeyCode::Char(' ')],
+    },
+    Binding {
+        keys: "enter",
+        label: "roll detail: dependencies and divergence",
+        group: "navigate",
+        hint: Some("[enter] detail"),
+        replay: &[KeyCode::Enter],
+    },
+    Binding {
+        keys: "r",
+        label: "reload the roll list",
+        group: "navigate",
+        hint: None,
+        replay: &[KeyCode::Char('r')],
+    },
+    Binding {
+        keys: "?",
+        label: "search every key",
+        group: "navigate",
+        hint: Some("[?] keys"),
+        // Nothing to replay: enter here would only reopen the list it is in.
+        replay: &[],
+    },
+    Binding {
+        keys: "q",
+        label: "quit",
+        group: "navigate",
+        hint: Some("[q] quit"),
+        replay: &[KeyCode::Char('q')],
+    },
+    Binding {
+        keys: "p",
+        label: "pull the selected branch",
+        group: "sync",
+        hint: None,
+        replay: &[KeyCode::Char('p')],
+    },
+    Binding {
+        keys: "P",
+        label: "push the selected branch",
+        group: "sync",
+        hint: None,
+        replay: &[KeyCode::Char('P')],
+    },
+    Binding {
+        keys: "f",
+        label: "fetch and prune remote-tracking refs",
+        group: "sync",
+        hint: None,
+        replay: &[KeyCode::Char('f')],
+    },
+    Binding {
+        keys: "gg",
+        label: "hand the terminal to lazygit",
+        group: "sync",
+        hint: None,
+        replay: &[KeyCode::Char('g'), KeyCode::Char('g')],
+    },
+    Binding {
+        keys: "c",
+        label: "create a new roll",
+        group: "roll",
+        hint: None,
+        replay: &[KeyCode::Char('c')],
+    },
+    Binding {
+        keys: "i",
+        label: "integrate the selected roll into this one",
+        group: "roll",
+        hint: None,
+        replay: &[KeyCode::Char('i')],
+    },
+    Binding {
+        keys: "v",
+        label: "verify the checked-out branch",
+        group: "roll",
+        hint: None,
+        replay: &[KeyCode::Char('v')],
+    },
+    Binding {
+        keys: "G",
+        label: "graduate the selected roll into rolling",
+        group: "roll",
+        hint: None,
+        replay: &[KeyCode::Char('G')],
+    },
+    Binding {
+        keys: "m",
+        label: "promote to stable",
+        group: "roll",
+        hint: None,
+        replay: &[KeyCode::Char('m')],
+    },
+    Binding {
+        keys: "u",
+        label: "update active rolls from stable",
+        group: "roll",
+        hint: None,
+        replay: &[KeyCode::Char('u')],
+    },
+    Binding {
+        keys: "b",
+        label: "bump the version on the checked-out branch",
+        group: "roll",
+        hint: None,
+        replay: &[KeyCode::Char('b')],
+    },
+    Binding {
+        keys: "d",
+        label: "delete the selected branch",
+        group: "branches",
+        hint: None,
+        replay: &[KeyCode::Char('d')],
+    },
+    Binding {
+        keys: "x",
+        label: "prune promoted roll branches, local and origin",
+        group: "branches",
+        hint: None,
+        replay: &[KeyCode::Char('x')],
+    },
+    Binding {
+        keys: "t",
+        label: "tidy local roll branches, leaving origin alone",
+        group: "branches",
+        hint: None,
+        replay: &[KeyCode::Char('t')],
+    },
+    Binding {
+        keys: "esc",
+        label: "close the output panel",
+        group: "output",
+        hint: None,
+        replay: &[KeyCode::Esc],
+    },
+    Binding {
+        keys: "PgUp",
+        label: "scroll the output panel up",
+        group: "output",
+        hint: None,
+        replay: &[KeyCode::PageUp],
+    },
+    Binding {
+        keys: "PgDn",
+        label: "scroll the output panel down",
+        group: "output",
+        hint: None,
+        replay: &[KeyCode::PageDown],
+    },
+    Binding {
+        keys: "End",
+        label: "follow new output again",
+        group: "output",
+        hint: None,
+        replay: &[KeyCode::End],
+    },
+];
+
+/// Score `needle` against `haystack` as a fuzzy subsequence match, `None` when
+/// it does not match at all. Higher is better; an empty needle matches
+/// everything at zero.
+///
+/// Deliberately fzf-shaped rather than a substring test: the useful query here
+/// is a half-remembered word (`push`, `del`, `ver`) against a label the user
+/// never read, and the ranking is what makes the first row the right one. Three
+/// signals, in the order they matter:
+///
+/// - a **run bonus** for characters matched adjacently, so `prune` scores far
+///   above the same five letters scattered across a sentence;
+/// - a **word-start bonus**, so the acronym `pb` finds "push branch";
+/// - a **gap penalty** per break in the match, which prefers the tighter of two
+///   otherwise equal matches.
+///
+/// The gap penalty is charged once per gap rather than per character skipped,
+/// and that is what makes acronyms work: `pb` against "push branch" skips four
+/// characters to reach the second word, and a per-character cost would make
+/// that lose to any contiguous `pb` buried mid-word.
+pub(crate) fn fuzzy_score(haystack: &str, needle: &str) -> Option<i32> {
+    let hay: Vec<char> = haystack.to_lowercase().chars().collect();
+    let pat: Vec<char> = needle.to_lowercase().chars().collect();
+    if pat.is_empty() {
+        return Some(0);
+    }
+    let mut score = 0;
+    let mut at = 0usize;
+    let mut last: Option<usize> = None;
+    let mut first: Option<usize> = None;
+    for want in pat {
+        if want.is_whitespace() {
+            continue;
+        }
+        let found = hay[at..].iter().position(|&c| c == want)? + at;
+        if last == Some(found.wrapping_sub(1)) {
+            score += 8;
+        } else {
+            score -= 1;
+        }
+        if found == 0 || !hay[found - 1].is_alphanumeric() {
+            score += 6;
+        }
+        first.get_or_insert(found);
+        last = Some(found);
+        at = found + 1;
+    }
+    // Break a tie toward the match that starts earlier. Two labels can both
+    // contain the typed word outright — "prune promoted roll branches" and
+    // "fetch and prune remote-tracking refs" both do — and the one that leads
+    // with it is the one that is about it. Divided down so it only ever settles
+    // ties and never outweighs a run.
+    score -= first.unwrap_or(0) as i32 / 4;
+    Some(score)
+}
+
+/// The bindings matching `query`, best first, as indices into [`BINDINGS`].
+///
+/// Keys, label and group are matched as one string, so `sync` lists a whole
+/// group and `gg` finds lazygit by the key nobody remembers the name of. Sorting
+/// is stable, so an empty query — every score zero — leaves the table's own
+/// order, which is grouped the way the old status bar was.
+pub(crate) fn filter_bindings(query: &str) -> Vec<usize> {
+    let mut scored: Vec<(usize, i32)> = BINDINGS
+        .iter()
+        .enumerate()
+        .filter_map(|(i, b)| {
+            let hay = format!("{} {} {}", b.keys, b.label, b.group);
+            fuzzy_score(&hay, query).map(|score| (i, score))
+        })
+        .collect();
+    scored.sort_by_key(|&(_, score)| std::cmp::Reverse(score));
+    scored.into_iter().map(|(i, _)| i).collect()
+}
+
+/// What a keypress in the `?` list does.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum HelpOutcome {
+    /// Query or cursor changed (or the key meant nothing); keep the list open.
+    Continue,
+    Close,
+    /// Run this [`BINDINGS`] entry and close.
+    Run(usize),
+}
+
+/// Apply one keystroke to the `?` list, mutating the query and cursor in place.
+///
+/// fzf's shape, because that is what the list is: printable characters type into
+/// the filter rather than navigating, so movement is the arrow keys. Editing the
+/// query resets the cursor to the top — the row under it is about to be a
+/// different row, and leaving the cursor at index 3 of a list that just changed
+/// means enter runs something the user never looked at.
+///
+/// Pure (mutates only its arguments), so the whole interaction is testable
+/// without a terminal.
+pub(crate) fn handle_help_key(
+    query: &mut String,
+    cursor: &mut usize,
+    code: KeyCode,
+) -> HelpOutcome {
+    match code {
+        KeyCode::Esc => HelpOutcome::Close,
+        KeyCode::Enter => match filter_bindings(query).get(*cursor) {
+            Some(&index) => HelpOutcome::Run(index),
+            // Enter on "no match" closes rather than doing nothing, so the list
+            // is never a trap.
+            None => HelpOutcome::Close,
+        },
+        KeyCode::Down => {
+            let len = filter_bindings(query).len();
+            *cursor = (*cursor + 1).min(len.saturating_sub(1));
+            HelpOutcome::Continue
+        }
+        KeyCode::Up => {
+            *cursor = cursor.saturating_sub(1);
+            HelpOutcome::Continue
+        }
+        KeyCode::Backspace => {
+            query.pop();
+            *cursor = 0;
+            HelpOutcome::Continue
+        }
+        KeyCode::Char(c) if !c.is_control() => {
+            query.push(c);
+            *cursor = 0;
+            HelpOutcome::Continue
+        }
+        _ => HelpOutcome::Continue,
+    }
+}
+
+/// The route `[v]` would check, as `(source, target)`, or `None` when the
+/// checked-out branch is not on one.
+///
+/// Verify reads HEAD rather than the row under the cursor, for the same reason
+/// `[b]` does: the gates run in the working tree, so the branch they judge is
+/// the checked-out one whatever the cursor is on. Deferring to
+/// [`ops::infer_route`] keeps the TUI and `rf verify` agreeing on what a branch
+/// tier means — there is one definition of the route, not two.
+pub(crate) fn verify_route_for(config: &Config, current_branch: &str) -> Option<(String, String)> {
+    match ops::infer_route(config, current_branch)? {
+        ops::Route::Graduate { roll } => Some((roll, config.rolling_branch.clone())),
+        ops::Route::Promote => Some((config.rolling_branch.clone(), config.stable_branch.clone())),
+    }
+}
+
+/// Render a version check the way `main.rs` prints it, so the TUI and the CLI
+/// report the same comparison in the same words.
+fn push_version_check(lines: &mut Vec<String>, check: &VersionCheck, source: &str, target: &str) {
+    let verdict = match check.status {
+        VersionStatus::Ok => "OK",
+        VersionStatus::Unchanged => "UNCHANGED",
+        VersionStatus::Lower => "LOWER",
+        VersionStatus::Unreadable => "UNREADABLE",
+        // Repos with no `Cargo.toml`, and repos with the gate switched off, have
+        // nothing to say here — the same silence `rf verify` keeps.
+        VersionStatus::NotApplicable => return,
+    };
+    let head = check
+        .head
+        .map(|v| v.to_string())
+        .unwrap_or_else(|| "<unreadable>".to_string());
+    let base = check
+        .base
+        .map(|v| v.to_string())
+        .unwrap_or_else(|| "none".to_string());
+    lines.push(format!(
+        "Version: {head} on '{source}' (base '{target}' {base}) {verdict}"
+    ));
 }
 
 /// Build the dependency rows to show in the detail view for `selected`.
@@ -906,6 +1294,12 @@ impl StatusApp {
                         self.handle_create_input(key.code);
                     } else if matches!(self.mode, Mode::Delete { .. }) {
                         self.handle_delete(key.code);
+                    } else if matches!(self.mode, Mode::Help { .. }) {
+                        // Takes the terminal because a replayed `gg` hands it to
+                        // lazygit, exactly as typing `gg` would.
+                        if self.handle_help(terminal, key.code)? {
+                            break;
+                        }
                     } else if self.handle_browsing(terminal, key.code)? {
                         break;
                     }
@@ -1036,6 +1430,7 @@ impl StatusApp {
             KeyCode::Char('p') => self.start_pull(),
             KeyCode::Char('P') => self.start_push(),
             KeyCode::Char('f') => self.start_fetch(),
+            KeyCode::Char('v') => self.start_verify(),
             KeyCode::Char('G') => self.request(Action::Graduate),
             KeyCode::Char('i') => self.request_integrate(),
             KeyCode::Char('b') => self.request_bump(),
@@ -1044,6 +1439,14 @@ impl StatusApp {
             KeyCode::Char('x') => self.request(Action::Prune),
             KeyCode::Char('t') => self.request(Action::Tidy),
             KeyCode::Char('d') => self.request_delete()?,
+            // No busy guard: the list changes nothing, and every binding it can
+            // run carries its own.
+            KeyCode::Char('?') => {
+                self.mode = Mode::Help {
+                    query: String::new(),
+                    cursor: 0,
+                }
+            }
             KeyCode::Enter => {
                 if let Some(RowKind::Base(i)) = self.selected_row() {
                     // Base branches have no roll detail to drill into.
@@ -1113,6 +1516,32 @@ impl StatusApp {
                 self.mode = Mode::Browsing;
             }
             _ => {}
+        }
+    }
+
+    /// Drive the `?` list. Returns `Ok(true)` to quit, since a replayed `q`
+    /// means exactly what typing it would.
+    fn handle_help(&mut self, terminal: &mut super::Tui, code: KeyCode) -> Result<bool> {
+        let Mode::Help { query, cursor } = &mut self.mode else {
+            return Ok(false);
+        };
+        match handle_help_key(query, cursor, code) {
+            HelpOutcome::Continue => Ok(false),
+            HelpOutcome::Close => {
+                self.mode = Mode::Browsing;
+                Ok(false)
+            }
+            HelpOutcome::Run(index) => {
+                // Closed *before* replaying, so the binding sees the browsing
+                // view it expects — one that can open a modal of its own.
+                self.mode = Mode::Browsing;
+                for code in BINDINGS[index].replay {
+                    if self.handle_browsing(terminal, *code)? {
+                        return Ok(true);
+                    }
+                }
+                Ok(false)
+            }
         }
     }
 
@@ -1493,6 +1922,32 @@ impl StatusApp {
         });
     }
 
+    /// `[v]` — check whether the checked-out branch could graduate or promote,
+    /// running the configured gates.
+    ///
+    /// Not an [`Action`] and deliberately not behind the confirm modal: that
+    /// modal exists for the ops that mutate the repo, and verify is the one key
+    /// whose entire output is a verdict. The route is resolved here rather than
+    /// inside the job so the panel title names it before the gates start — on a
+    /// repo with `cargo test` gates that is the difference between a title the
+    /// user can trust and several silent minutes.
+    fn start_verify(&mut self) {
+        if self.busy() {
+            return;
+        }
+        let Some((source, target)) = verify_route_for(&self.config, &self.current_branch) else {
+            self.message = Some(format!(
+                "'{}' is not promotable — check out {} or a {}branch to verify",
+                self.current_branch, self.config.rolling_branch, self.config.roll_prefix
+            ));
+            return;
+        };
+        let config = self.config.clone();
+        self.start_job(format!("rf verify {source} → {target}"), move || {
+            Ok(JobDone::lines(run_verify(&config)?))
+        });
+    }
+
     /// `gg` — hand the terminal to lazygit, then take it back.
     ///
     /// The one action that still suspends: lazygit is a full-screen application
@@ -1610,8 +2065,8 @@ impl StatusApp {
         let chunks = Layout::vertical([
             Constraint::Length(3),
             Constraint::Min(3),
-            // One message line plus four hint lines.
-            Constraint::Length(5),
+            // One message line plus the single hint line.
+            Constraint::Length(2),
         ])
         .split(area);
 
@@ -1646,6 +2101,7 @@ impl StatusApp {
             Mode::ForcePush { branch, remote } => {
                 render_force_push_modal(f, area, branch, remote, self.tracking.get(branch))
             }
+            Mode::Help { query, cursor } => render_help(f, area, query, *cursor),
             Mode::Browsing => {}
         }
     }
@@ -1797,23 +2253,13 @@ impl StatusApp {
             )),
             None => Line::from(""),
         };
-        // Two lines, not one: the single-line form was already ~126 columns and
-        // silently truncated on an 80-column terminal, hiding the last few
-        // bindings entirely. `Paragraph` does not wrap unless asked, and a
-        // dynamic line count would overflow whatever fixed height is picked.
-        let nav_line =
-            Line::from(" [q] quit   [j/k ↑/↓] nav   [space] switch   [enter] detail   [r]efresh");
-        let sync_line =
-            Line::from(" [p] pull   [P] push   [f] fetch   [gg] lazygit   [esc] close output");
-        // Split across two lines because thirteen bindings do not fit on one at
-        // 80 columns, and `Paragraph` truncates rather than wrapping — the roll
-        // lifecycle first, then what removes things plus the panel's own keys.
-        let roll_line =
-            Line::from(" [c]reate   [i]ntegrate   [G]raduate   [m] promote   [u]pdate   [b]ump");
-        let extra_line =
-            Line::from(" [d]elete   [x] prune   [t]idy   [PgUp/PgDn/End] scroll output");
+        // One line, built from the keymap rather than written out. Four hand-kept
+        // lines listing twenty bindings crowded the bottom of the screen and had
+        // to be re-measured against an 80-column terminal every time a key was
+        // added; the rest now lives behind `?`, which can hold any number of
+        // them and is searchable besides.
         f.render_widget(
-            Paragraph::new(vec![msg_line, nav_line, sync_line, roll_line, extra_line]),
+            Paragraph::new(vec![msg_line, Line::from(basic_hints())]),
             area,
         );
     }
@@ -1862,6 +2308,62 @@ fn run_delete(
     }
     let results = ops::prune_apply(config, &plan)?;
     Ok(render_prune_outcome(&plan, &results))
+}
+
+/// Run `ops::verify` and render its outcome, mirroring `main.rs`'s `cmd_verify`
+/// line for line — the same checks in the same order, so a verdict in the panel
+/// and a verdict in the terminal never disagree.
+///
+/// Two deliberate differences, both because this is the TUI:
+///
+/// - no version *bump*. `cmd_verify` offers one before the gates run; here the
+///   gate failure points at `[b]`, which is the key that already does it and the
+///   only place a bump commit is written from.
+/// - nothing is forced and nothing is dry-run. `[v]` has no flags to carry.
+///
+/// A failed host or an unsatisfied version gate is an `Err`, not a line: the
+/// panel marks a failed job, and a verdict that reads as "done" when it is
+/// really "blocked" is the one outcome worth being loud about. Everything the
+/// gates printed is already in the panel either way, streamed as they ran.
+fn run_verify(config: &Config) -> Result<Vec<String>> {
+    ops::ensure_clean_state(config)?;
+    let outcome = ops::verify(config, false)?;
+
+    let mut lines = Vec::new();
+    if outcome.diverged_note {
+        lines.push(format!(
+            "note: '{}' has commits not in '{}'; graduation/promotion will create a --no-ff merge",
+            outcome.target, outcome.source
+        ));
+    }
+    push_version_check(
+        &mut lines,
+        &outcome.version,
+        &outcome.source,
+        &outcome.target,
+    );
+    push_gate_notices(&mut lines, &outcome.gate_notices);
+    push_gate_notices(&mut lines, &outcome.host_notices);
+    push_host_results(&mut lines, &outcome.host_results);
+
+    if !outcome.failed_hosts.is_empty() {
+        bail!(
+            "host verification failed: {}",
+            outcome.failed_hosts.join(", ")
+        );
+    }
+    if !outcome.version.is_satisfied() {
+        return Err(anyhow!(
+            "{}\npress [b] to bump the version on '{}'",
+            ops::version_gate_error(&outcome.version, &outcome.source, &outcome.target),
+            outcome.source
+        ));
+    }
+    lines.push(format!(
+        "Verification passed: {} -> {}",
+        outcome.source, outcome.target
+    ));
+    Ok(lines)
 }
 
 /// Drive a workflow operation through `core::ops`, rendering its structured
@@ -2288,6 +2790,109 @@ fn scope_label(scope: DeleteScope) -> &'static str {
     }
 }
 
+/// The status bar's one hint line, built from the `basic` bindings so it cannot
+/// drift from what the keys actually are.
+pub(crate) fn basic_hints() -> String {
+    let mut line = String::new();
+    for hint in BINDINGS.iter().filter_map(|b| b.hint) {
+        // One leading space to clear the edge, three between fragments.
+        line.push_str(if line.is_empty() { " " } else { "   " });
+        line.push_str(hint);
+    }
+    line
+}
+
+/// Render the `?` keymap: a filter line, the matching bindings, and the keys
+/// that drive it.
+///
+/// Sized to the terminal rather than to the list — twenty-odd bindings do not
+/// fit an 80×24 screen, and the window scrolls to keep the cursor in view. The
+/// selected row is marked *and* styled, so it stays visible on terminals that
+/// drop the background colour.
+fn render_help(f: &mut Frame, area: Rect, query: &str, cursor: usize) {
+    let matches = filter_bindings(query);
+    let dim = Style::default().fg(Color::DarkGray);
+
+    // Both columns are sized from the whole table, not from what is showing, so
+    // the box keeps its shape as the query narrows it. A modal that resizes on
+    // every keystroke is unreadable to type into.
+    let key_width = column_width(BINDINGS.iter().map(|b| b.keys));
+    let label_width = column_width(BINDINGS.iter().map(|b| b.label));
+
+    // Rows the list itself gets: the frame is two borders, the query line, a
+    // blank, the overflow line, a blank and the hint. Budgeting for the
+    // overflow line whether or not it appears keeps the box one height.
+    let visible = (area.height.saturating_sub(8) as usize).max(1);
+    let rows = matches.len().min(visible);
+    // Scroll only once the cursor leaves the window, so a short list never jumps
+    // around under the eye.
+    let first = cursor.saturating_sub(rows.saturating_sub(1));
+
+    let mut lines = vec![
+        Line::from(vec![
+            Span::styled("> ", Style::default().fg(Color::Cyan)),
+            Span::raw(query.to_string()),
+            Span::styled("_", Style::default().fg(Color::Cyan)),
+        ]),
+        Line::from(""),
+    ];
+
+    if matches.is_empty() {
+        lines.push(Line::from(Span::styled("no key matches", dim)));
+    }
+    for (row, &index) in matches.iter().enumerate().skip(first).take(rows) {
+        let binding = &BINDINGS[index];
+        let selected = row == cursor;
+        let label_style = if selected {
+            Style::default().add_modifier(Modifier::REVERSED)
+        } else {
+            Style::default()
+        };
+        lines.push(Line::from(vec![
+            // Marked as well as styled: the cursor has to survive a terminal
+            // that drops the reverse attribute.
+            Span::raw(if selected { "▶ " } else { "  " }),
+            Span::styled(
+                format!("{:<key_width$}", binding.keys),
+                Style::default()
+                    .fg(Color::Yellow)
+                    .add_modifier(Modifier::BOLD),
+            ),
+            Span::raw("  "),
+            Span::styled(format!("{:<label_width$}", binding.label), label_style),
+            Span::raw("  "),
+            Span::styled(binding.group, dim),
+        ]));
+    }
+    if matches.len() > rows {
+        lines.push(Line::from(Span::styled(
+            format!("… {} more, keep typing", matches.len() - rows),
+            dim,
+        )));
+    }
+
+    lines.push(Line::from(""));
+    lines.push(Line::from(Span::styled(
+        "type to filter   [↑/↓] move   [enter] run   [esc] close",
+        dim,
+    )));
+
+    let width = lines.iter().map(|l| l.width()).max().unwrap_or(40) as u16 + 4;
+    let height = lines.len() as u16 + 2;
+    let modal = centered_rect(area, width.max(52), height);
+
+    f.render_widget(Clear, modal);
+    f.render_widget(
+        Paragraph::new(lines).block(Block::bordered().title(" keys ")),
+        modal,
+    );
+}
+
+/// The display width of the widest of `values`, for padding a column to it.
+fn column_width<'a>(values: impl Iterator<Item = &'a str>) -> usize {
+    values.map(|v| v.chars().count()).max().unwrap_or(0)
+}
+
 /// Render the centered slug-input popup for creating a new roll. Shows the
 /// prompt, the current buffer with a trailing caret, and the key hints.
 fn render_create_input(f: &mut Frame, area: Rect, config: &Config, buffer: &str) {
@@ -2705,6 +3310,196 @@ mod tests {
         assert_eq!(tidyable_count(&tidyable), 2);
         // Repo-wide like prune, so it validates with no selection.
         assert!(validate_action(Action::Tidy, None, &tidyable, "main", "roll/").is_ok());
+    }
+
+    /// The keys of the bindings `query` matches, best first.
+    fn matched_keys(query: &str) -> Vec<&'static str> {
+        filter_bindings(query)
+            .into_iter()
+            .map(|i| BINDINGS[i].keys)
+            .collect()
+    }
+
+    #[test]
+    fn the_search_ranks_the_key_you_meant_first() {
+        // The point of fuzzy over substring: a half-remembered word against a
+        // label nobody read, with the right row at the top.
+        assert_eq!(matched_keys("prune")[0], "x");
+        assert_eq!(matched_keys("lazygit")[0], "gg");
+        assert_eq!(matched_keys("bump")[0], "b");
+        // By the key itself, which is the other way people search.
+        assert_eq!(matched_keys("gg")[0], "gg");
+        // A group name lists the whole group, and nothing outside it.
+        let sync = matched_keys("sync");
+        assert!(sync.len() >= 4, "{sync:?}");
+        for keys in ["p", "P", "f", "gg"] {
+            assert!(sync.contains(&keys), "{keys} missing from {sync:?}");
+        }
+        // An empty query is everything, in table order.
+        assert_eq!(matched_keys("").len(), BINDINGS.len());
+        assert_eq!(matched_keys("")[0], BINDINGS[0].keys);
+        // And a query that matches nothing says so rather than falling back to
+        // showing everything.
+        assert!(matched_keys("zzzz").is_empty());
+    }
+
+    #[test]
+    fn fuzzy_scoring_prefers_runs_and_word_starts() {
+        // A contiguous run beats the same letters scattered.
+        let run = fuzzy_score("prune branches", "prune").unwrap();
+        let scattered = fuzzy_score("push remote under new entry", "prune").unwrap();
+        assert!(run > scattered, "run {run} !> scattered {scattered}");
+
+        // Matching at the start of a word beats matching mid-word.
+        let word_start = fuzzy_score("push branch", "pb").unwrap();
+        let mid_word = fuzzy_score("supbar", "pb").unwrap();
+        assert!(word_start > mid_word, "{word_start} !> {mid_word}");
+
+        // Order is required — it is a subsequence match, not a bag of letters.
+        assert!(fuzzy_score("push", "hsup").is_none());
+        assert_eq!(fuzzy_score("anything", ""), Some(0));
+    }
+
+    #[test]
+    fn typing_in_the_list_filters_and_enter_runs_what_is_under_the_cursor() {
+        let mut query = String::new();
+        let mut cursor = 0;
+
+        for c in "prune".chars() {
+            assert_eq!(
+                handle_help_key(&mut query, &mut cursor, KeyCode::Char(c)),
+                HelpOutcome::Continue
+            );
+        }
+        assert_eq!(query, "prune");
+
+        let expected = filter_bindings("prune")[0];
+        assert_eq!(
+            handle_help_key(&mut query, &mut cursor, KeyCode::Enter),
+            HelpOutcome::Run(expected)
+        );
+        assert_eq!(BINDINGS[expected].keys, "x");
+    }
+
+    #[test]
+    fn editing_the_query_puts_the_cursor_back_on_the_top_row() {
+        // Otherwise enter runs whatever happens to be at index 3 of a list the
+        // user has just changed out from under it.
+        let mut query = "s".to_string();
+        let mut cursor = 0;
+        handle_help_key(&mut query, &mut cursor, KeyCode::Down);
+        handle_help_key(&mut query, &mut cursor, KeyCode::Down);
+        assert_eq!(cursor, 2);
+
+        handle_help_key(&mut query, &mut cursor, KeyCode::Char('y'));
+        assert_eq!(cursor, 0);
+
+        handle_help_key(&mut query, &mut cursor, KeyCode::Down);
+        handle_help_key(&mut query, &mut cursor, KeyCode::Backspace);
+        assert_eq!(cursor, 0);
+        assert_eq!(query, "s");
+    }
+
+    #[test]
+    fn the_cursor_cannot_leave_the_filtered_list() {
+        let mut query = "lazygit".to_string();
+        let mut cursor = 0;
+        assert_eq!(filter_bindings(&query).len(), 1);
+
+        // Past the end clamps to the last row rather than selecting nothing...
+        for _ in 0..5 {
+            handle_help_key(&mut query, &mut cursor, KeyCode::Down);
+        }
+        assert_eq!(cursor, 0);
+        // ...and past the top clamps to the first.
+        handle_help_key(&mut query, &mut cursor, KeyCode::Up);
+        assert_eq!(cursor, 0);
+
+        // Enter on a query that matches nothing closes rather than trapping.
+        let mut empty = "zzzz".to_string();
+        let mut at = 0;
+        assert_eq!(
+            handle_help_key(&mut empty, &mut at, KeyCode::Enter),
+            HelpOutcome::Close
+        );
+    }
+
+    #[test]
+    fn esc_closes_the_list_and_stray_keys_leave_it_open() {
+        let mut query = String::new();
+        let mut cursor = 0;
+        assert_eq!(
+            handle_help_key(&mut query, &mut cursor, KeyCode::Esc),
+            HelpOutcome::Close
+        );
+        // A key the list has no use for must not close it — the query survives.
+        query.push_str("push");
+        assert_eq!(
+            handle_help_key(&mut query, &mut cursor, KeyCode::Tab),
+            HelpOutcome::Continue
+        );
+        assert_eq!(query, "push");
+    }
+
+    #[test]
+    fn the_list_shows_the_matches_and_the_keys_that_drive_it() {
+        let out = draw(|f, area| render_help(f, area, "prune", 0));
+        assert!(out.contains("> prune"), "{out}");
+        assert!(out.contains("prune promoted roll branches"), "{out}");
+        assert!(out.contains("[enter] run"), "{out}");
+        assert!(out.contains("[esc] close"), "{out}");
+
+        // A query with no match says so rather than rendering an empty box.
+        let none = draw(|f, area| render_help(f, area, "zzzz", 0));
+        assert!(none.contains("no key matches"), "{none}");
+    }
+
+    #[test]
+    fn verify_reads_head_and_resolves_the_route_from_its_tier() {
+        let cfg = config("main", "rolling");
+
+        // A roll branch checks its graduation into rolling...
+        assert_eq!(
+            verify_route_for(&cfg, "roll/4-0918-x"),
+            Some(("roll/4-0918-x".to_string(), "rolling".to_string()))
+        );
+        // ...and rolling checks its promotion to stable.
+        assert_eq!(
+            verify_route_for(&cfg, "rolling"),
+            Some(("rolling".to_string(), "main".to_string()))
+        );
+        // Stable itself has nowhere to go, and neither does anything off the
+        // tiers — `[v]` says so rather than guessing a route.
+        assert_eq!(verify_route_for(&cfg, "main"), None);
+        assert_eq!(verify_route_for(&cfg, "feature/whatever"), None);
+    }
+
+    #[test]
+    fn the_version_line_matches_the_one_the_cli_prints() {
+        let check = |status, head: Option<Semver>, base: Option<Semver>| {
+            let mut lines = Vec::new();
+            push_version_check(
+                &mut lines,
+                &VersionCheck { head, base, status },
+                "rolling",
+                "main",
+            );
+            lines
+        };
+
+        assert_eq!(
+            check(VersionStatus::Unchanged, Some(v(0, 2, 3)), Some(v(0, 2, 3))),
+            vec!["Version: 0.2.3 on 'rolling' (base 'main' 0.2.3) UNCHANGED"]
+        );
+        // A repo with no `Cargo.toml` says nothing at all, rather than reporting
+        // a comparison it did not make.
+        assert!(check(VersionStatus::NotApplicable, None, None).is_empty());
+        // And an unreadable version still reports both sides, naming which one
+        // could not be read.
+        assert_eq!(
+            check(VersionStatus::Unreadable, None, Some(v(1, 0, 0))),
+            vec!["Version: <unreadable> on 'rolling' (base 'main' 1.0.0) UNREADABLE"]
+        );
     }
 
     #[test]
@@ -3343,46 +4138,58 @@ mod tests {
     }
 
     #[test]
-    fn status_bar_hints_fit_an_80_column_terminal() {
-        // The single-line footer this replaced was ~126 columns and silently
-        // truncated, hiding the last several bindings. `Paragraph` does not wrap
-        // unless asked, so every line has to fit whole on its own.
+    fn the_status_bar_carries_only_the_basics_and_points_at_the_rest() {
+        // The bar this replaced spelled out twenty bindings across four lines;
+        // its whole failure mode was silently truncating the last one at 80
+        // columns. One line now, and the way to everything else has to be on it.
         let app = StatusApp::new(test_config(), "main".to_string(), Vec::new(), false);
         let out = draw(|f, area| app.render_status_bar(f, area));
-        for key in [
-            "[q] quit",
-            "[r]efresh",
-            "[p] pull",
-            "[P] push",
-            "[f] fetch",
-            "[gg] lazygit",
-            "[esc] close output",
-            "[c]reate",
-            "[i]ntegrate",
-            "[G]raduate",
-            "[m] promote",
-            "[u]pdate",
-            "[d]elete",
-            "[x] prune",
-            "scroll output",
-        ] {
-            assert!(out.contains(key), "{key} truncated away:\n{out}");
+
+        assert!(out.contains("[?] keys"), "no way to reach the rest:\n{out}");
+        assert!(basic_hints().chars().count() < 80, "{}", basic_hints());
+        // A hint per basic binding and not one more: the bar is built from the
+        // keymap, so an over-eager `hint` on a new row shows up here.
+        assert_eq!(BINDINGS.iter().filter(|b| b.hint.is_some()).count(), 5);
+        for absent in ["[x] prune", "[G]raduate", "[gg] lazygit"] {
+            assert!(!out.contains(absent), "{absent} still on the bar:\n{out}");
         }
     }
 
     #[test]
     fn the_status_bar_reserves_a_row_for_every_hint_line_it_writes() {
-        // The layout hands `render_status_bar` a fixed height; one hint line more
-        // than that and the last binding silently disappears.
+        // The layout hands `render_status_bar` a fixed height; one hint line
+        // more than that and the last binding silently disappears.
         let app = StatusApp::new(test_config(), "main".to_string(), Vec::new(), false);
         let out = draw(|f, area| {
-            let chunks = Layout::vertical([Constraint::Length(5)]).split(area);
+            let chunks = Layout::vertical([Constraint::Length(2)]).split(area);
             app.render_status_bar(f, chunks[0])
         });
-        assert!(
-            out.contains("scroll output"),
-            "last hint line clipped:\n{out}"
-        );
+        assert!(out.contains("[q] quit"), "hint line clipped:\n{out}");
+    }
+
+    #[test]
+    fn every_binding_is_declared_once_and_can_be_run() {
+        // The table is the only place keys are declared, so this is where a
+        // doubled-up or unlabelled binding has to be caught.
+        let mut seen = Vec::new();
+        for binding in BINDINGS {
+            assert!(!binding.keys.is_empty(), "a binding with no keys");
+            assert!(!binding.label.is_empty(), "{} has no label", binding.keys);
+            assert!(
+                !seen.contains(&binding.keys),
+                "{} declared twice",
+                binding.keys
+            );
+            seen.push(binding.keys);
+        }
+        // `?` is the one entry with nothing to replay — enter on it would only
+        // reopen the list it is in.
+        let unrunnable: Vec<_> = BINDINGS
+            .iter()
+            .filter(|b| b.replay.is_empty())
+            .map(|b| b.keys)
+            .collect();
+        assert_eq!(unrunnable, vec!["?"]);
     }
 
     #[test]

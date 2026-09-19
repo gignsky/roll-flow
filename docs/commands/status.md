@@ -21,12 +21,59 @@ neither locally nor on `origin` is not listed.
 
 ## Keys
 
+The status bar carries the handful you need before you know the rest exist:
+
 ```text
-[q] quit   [j/k ↑/↓] nav   [space] switch   [enter] detail   [r]efresh
-[p] pull   [P] push   [f] fetch   [gg] lazygit   [esc] close output
-[c]reate   [i]ntegrate   [G]raduate   [m] promote   [u]pdate   [b]ump
-[d]elete   [x] prune   [t]idy   [PgUp/PgDn/End] scroll output
+ [j/k ↑/↓] nav   [space] switch   [enter] detail   [?] keys   [q] quit
 ```
+
+Everything else lives behind `?`, which opens a searchable list of every
+binding. Type to filter, `↑`/`↓` to move, `enter` to *run* the key under the
+cursor, `esc` to close:
+
+```text
+┌ keys ─────────────────────────────────────────────────────────────┐
+│> br_                                                              │
+│                                                                   │
+│▶ t      tidy local roll branches, leaving origin alone  branches  │
+│  p      pull the selected branch                        sync      │
+│  P      push the selected branch                        sync      │
+│  d      delete the selected branch                      branches  │
+│  x      prune promoted roll branches, local and origin  branches  │
+│                                                                   │
+│type to filter   [↑/↓] move   [enter] run   [esc] close            │
+└───────────────────────────────────────────────────────────────────┘
+```
+
+The search is fuzzy rather than a substring test, because the useful query is a
+half-remembered word against a label you never read: matched characters score
+higher when they run together (`prune`), when they land at the start of a word
+(so `pb` finds "push branch"), and when they turn up early. Keys, label and
+group are all searched, so `gg` finds lazygit by the key and `sync` lists the
+whole group.
+
+`enter` runs the binding by replaying its keystrokes through the ordinary key
+handler — `gg` really does hand the terminal to lazygit — so there is one
+dispatch path, not a second copy of the keymap that can drift.
+
+The full list:
+
+| key | does |
+|---|---|
+| `j`/`k`, `↑`/`↓` | move |
+| `space` | switch to the selected branch |
+| `enter` | roll detail: dependencies and divergence |
+| `r` | reload |
+| `?` | search every key |
+| `q` | quit |
+| `p` / `P` / `f` | pull / push / fetch the selected branch |
+| `gg` | lazygit |
+| `c` / `i` | create a roll / integrate one into the checked-out roll |
+| `G` / `m` / `u` | graduate / promote / update from stable |
+| `b` | bump the version |
+| `d` / `x` / `t` | delete / prune / tidy branches |
+| `esc` | close the output panel |
+| `PgUp` / `PgDn` / `End` | scroll the panel, or follow new output |
 
 The sync keys follow lazygit, which is why graduate is `[G]` and promote is `[m]`
 rather than the `[g]`/`[p]` they used to be — `[p]` and `[P]` are pull and push
@@ -75,6 +122,29 @@ git refuses the push — a red confirmation states how many commits would be
 overwritten and asks. Only `y` proceeds, and it uses `--force-with-lease`, so a
 push someone else landed in the meantime is refused rather than clobbered. If git
 reports a stale lease, fetch with `[f]` and try again.
+
+## Verifying
+
+`[v]` runs [`verify`](verify.md) on the **checked-out** branch — not the row
+under the cursor, because the gates run in the working tree, so the branch they
+judge is whichever one is checked out. The route comes from that branch's tier
+and is named in the panel title before the gates start:
+
+| checked out | `[v]` checks |
+|---|---|
+| a `roll/*` branch | `roll/N-… → rolling` |
+| the rolling branch | `rolling → main` |
+| anything else | nothing — it says to check out a roll or rolling first |
+
+It is the one action key with no confirmation modal, because it is the one that
+changes nothing: the modal is for the ops that write to the repo. It reports the
+same checks as `rf verify`, in the same words — divergence note, version
+comparison, gate notices, per-host results, verdict.
+
+The one thing it will not do is bump the version. `rf verify` offers one; here a
+failed version gate points at `[b]` instead, which is the key that already writes
+that commit. A failed host or an unsatisfied gate marks the panel as failed
+rather than passing quietly.
 
 ## Bumping the version
 
