@@ -22,7 +22,7 @@ use crate::core::{branches, config::Config, git, proc, version};
 /// Prefix for the hotfix tier. Parallel to `roll_prefix`, but fixed rather than
 /// configurable — hotfixes are a rarely-used sanctioned exception with their own
 /// independent numbering.
-pub(crate) const HOTFIX_PREFIX: &str = "hotfix/";
+pub(crate) use crate::core::branches::HOTFIX_PREFIX;
 
 // ── Clean-state / working-tree guards ───────────────────────────────────────
 
@@ -685,20 +685,6 @@ fn next_hotfix_number(config: &Config) -> Result<u32> {
     Ok(max + 1)
 }
 
-/// Short reference form used in hotfix merge subjects: the branch
-/// `hotfix/N-MMDD-slug` renders as `hotfix/N-slug` (date dropped).
-fn hotfix_short_name(branch: &str) -> Option<String> {
-    let rest = branch.strip_prefix(HOTFIX_PREFIX)?;
-    let mut parts = rest.splitn(3, '-');
-    let number = parts.next()?;
-    let _mmdd = parts.next()?;
-    let slug = parts.next()?;
-    if number.is_empty() || slug.is_empty() {
-        return None;
-    }
-    Some(format!("{HOTFIX_PREFIX}{number}-{slug}"))
-}
-
 /// Create a hotfix branch off the stable branch: `hotfix/N-MMDD-slug`.
 ///
 /// Mirrors [`create`] but over the `hotfix/` tier, which carries its own
@@ -765,7 +751,7 @@ pub(crate) fn hotfix_land(config: &Config, dry_run: bool) -> Result<HotfixLandOu
             current
         );
     }
-    let short = hotfix_short_name(&current)
+    let short = branches::hotfix_short_name(&current)
         .ok_or_else(|| anyhow!("could not parse hotfix branch name '{current}'"))?;
     let stable = config.stable_branch.clone();
     let rolling = config.rolling_branch.clone();

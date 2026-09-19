@@ -27,7 +27,7 @@ use ratatui::{
 
 use super::output::{self, Followup, JobDone, JobProgress};
 use crate::core::{
-    branches::{self, BranchLocation, RollInfo, RollState},
+    branches::{self, BranchLocation, HotfixInfo, HotfixState, RollInfo, RollState},
     config::Config,
     git::{self, TrackState},
     ops,
@@ -349,15 +349,24 @@ pub(crate) struct BaseBranch {
 pub(crate) enum RowKind {
     Base(usize),
     Roll(usize),
+    /// A `hotfix/N-…` row, listed below the rolls.
+    Hotfix(usize),
 }
 
-/// Map a flat table index onto the base-then-roll row layout. `None` when the
-/// index is past the last row.
-pub(crate) fn row_at(index: usize, base_count: usize, roll_count: usize) -> Option<RowKind> {
+/// Map a flat table index onto the base-then-roll-then-hotfix row layout.
+/// `None` when the index is past the last row.
+pub(crate) fn row_at(
+    index: usize,
+    base_count: usize,
+    roll_count: usize,
+    hotfix_count: usize,
+) -> Option<RowKind> {
     if index < base_count {
         Some(RowKind::Base(index))
     } else if index - base_count < roll_count {
         Some(RowKind::Roll(index - base_count))
+    } else if index - base_count - roll_count < hotfix_count {
+        Some(RowKind::Hotfix(index - base_count - roll_count))
     } else {
         None
     }
@@ -399,8 +408,12 @@ pub(crate) fn base_branches(
 /// Initial table selection: the row for the current branch when it is on
 /// screen (a base branch or one of the rolls), else the first row. `None` only
 /// when there is nothing to select at all.
-pub(crate) fn initial_selection(bases: &[BaseBranch], rolls: &[RollInfo]) -> Option<usize> {
-    if bases.is_empty() && rolls.is_empty() {
+pub(crate) fn initial_selection(
+    bases: &[BaseBranch],
+    rolls: &[RollInfo],
+    hotfixes: &[HotfixInfo],
+) -> Option<usize> {
+    if bases.is_empty() && rolls.is_empty() && hotfixes.is_empty() {
         return None;
     }
     if let Some(i) = bases.iter().position(|b| b.is_current) {
@@ -408,6 +421,9 @@ pub(crate) fn initial_selection(bases: &[BaseBranch], rolls: &[RollInfo]) -> Opt
     }
     if let Some(i) = rolls.iter().position(|r| r.is_current) {
         return Some(bases.len() + i);
+    }
+    if let Some(i) = hotfixes.iter().position(|h| h.is_current) {
+        return Some(bases.len() + rolls.len() + i);
     }
     Some(0)
 }
@@ -430,6 +446,10 @@ struct StatusApp {
     /// so `is_current` tracks the branch actually checked out.
     bases: Vec<BaseBranch>,
     rolls: Vec<RollInfo>,
+    /// `hotfix/*` rows shown below the rolls; recomputed on reload like the
+    /// rolls are. Kept apart from `rolls` because they carry no dependencies
+    /// and number independently — see `branches::HotfixInfo`.
+    hotfixes: Vec<HotfixInfo>,
     show_deps: bool,
     /// Upstream tracking state per local branch, refreshed on reload. Sourced in
     /// one `for-each-ref` rather than an `ahead_behind` call per row.
@@ -608,6 +628,15 @@ fn state_color(state: &RollState) -> Color {
         RollState::Diverged => Color::Red,
         RollState::Promoted => Color::DarkGray,
         RollState::Blocked => Color::Magenta,
+    }
+}
+
+/// Hotfix rows in their own colour, distinct from every roll state, so a
+/// glance separates the two tiers even when their labels are both a tick.
+fn hotfix_color(state: HotfixState) -> Color {
+    match state {
+        HotfixState::Open => Color::LightRed,
+        HotfixState::Landed => Color::DarkGray,
     }
 }
 
@@ -861,8 +890,12 @@ impl StatusApp {
         let bases = base_branches(&config, &current_branch, |refspec| {
             git::ref_exists(&config.repo_root, refspec)
         });
+        // Loaded here rather than passed in: the CLI's plain table loads its
+        // own, and a load failure degrades to "no hotfix rows" instead of
+        // refusing to open the view.
+        let hotfixes = branches::list_hotfixes(&config).unwrap_or_default();
         let mut table = TableState::default();
-        table.select(initial_selection(&bases, &rolls));
+        table.select(initial_selection(&bases, &rolls, &hotfixes));
         let tracking = load_tracking(&config);
         let version = version::read_version(&config.repo_root).unwrap_or(None);
         Self {
@@ -870,6 +903,7 @@ impl StatusApp {
             current_branch,
             bases,
             rolls,
+            hotfixes,
             show_deps,
             tracking,
             version,
@@ -1030,6 +1064,10 @@ impl StatusApp {
                         let base = self.bases[i].clone();
                         self.execute_switch(base.branch, base.location);
                     }
+                    Some(RowKind::Hotfix(i)) => {
+                        let hotfix = self.hotfixes[i].clone();
+                        self.execute_switch(hotfix.branch, hotfix.location);
+                    }
                     None => self.message = Some("no branch selected".to_string()),
                 }
             }
@@ -1048,6 +1086,13 @@ impl StatusApp {
                 if let Some(RowKind::Base(i)) = self.selected_row() {
                     // Base branches have no roll detail to drill into.
                     self.message = Some(format!("'{}' is a base branch", self.bases[i].branch));
+                } else if let Some(RowKind::Hotfix(i)) = self.selected_row() {
+                    // Nor do hotfixes: no dependencies, nothing to break out.
+                    self.message = Some(format!(
+                        "'{}' is a hotfix branch — {}",
+                        self.hotfixes[i].branch,
+                        self.hotfixes[i].state.label()
+                    ));
                 } else if let Some(roll) = self.selected_roll() {
                     let roll = roll.clone();
                     // Capture the branch's divergence from origin for the overlay
@@ -1118,13 +1163,18 @@ impl StatusApp {
 
     /// Total number of table rows: the pinned base branches plus the rolls.
     fn row_count(&self) -> usize {
-        self.bases.len() + self.rolls.len()
+        self.bases.len() + self.rolls.len() + self.hotfixes.len()
     }
 
     /// Which row the cursor is on, or `None` when the table is empty.
     fn selected_row(&self) -> Option<RowKind> {
         let index = self.table.selected()?;
-        row_at(index, self.bases.len(), self.rolls.len())
+        row_at(
+            index,
+            self.bases.len(),
+            self.rolls.len(),
+            self.hotfixes.len(),
+        )
     }
 
     /// The selected roll, or `None` when the cursor is on a base-branch row —
@@ -1132,7 +1182,7 @@ impl StatusApp {
     fn selected_roll(&self) -> Option<&RollInfo> {
         match self.selected_row()? {
             RowKind::Roll(i) => self.rolls.get(i),
-            RowKind::Base(_) => None,
+            RowKind::Base(_) | RowKind::Hotfix(_) => None,
         }
     }
 
@@ -1178,6 +1228,13 @@ impl StatusApp {
             self.message = Some(format!(
                 "'{}' is a base branch — [u]pdate brings stable into your rolls",
                 self.bases[i].branch
+            ));
+            return;
+        }
+        if let Some(RowKind::Hotfix(i)) = self.selected_row() {
+            self.message = Some(format!(
+                "'{}' is a hotfix — it lands on stable, not into a roll",
+                self.hotfixes[i].branch
             ));
             return;
         }
@@ -1381,6 +1438,10 @@ impl StatusApp {
         let (branch, location) = match self.selected_row()? {
             RowKind::Roll(i) => (self.rolls[i].branch.clone(), self.rolls[i].location.clone()),
             RowKind::Base(i) => (self.bases[i].branch.clone(), self.bases[i].location.clone()),
+            RowKind::Hotfix(i) => (
+                self.hotfixes[i].branch.clone(),
+                self.hotfixes[i].location.clone(),
+            ),
         };
         Some(SyncTarget::resolve(
             &branch,
@@ -1590,6 +1651,7 @@ impl StatusApp {
             git::ref_exists(&self.config.repo_root, refspec)
         });
         self.rolls = branches::list_rolls(&self.config)?;
+        self.hotfixes = branches::list_hotfixes(&self.config).unwrap_or_default();
         self.tracking = load_tracking(&self.config);
         // Read from the worktree, so a bump — or a branch switch that changes it —
         // shows in the header straight away.
@@ -1776,6 +1838,34 @@ impl StatusApp {
             if show_deps {
                 cells.push(Cell::from(branches::format_roll_numbers(&roll.deps)));
                 cells.push(Cell::from(branches::format_roll_numbers(&roll.dependents)));
+            }
+            Row::new(cells)
+        }));
+        // Hotfixes last, numbered `h<N>` so their independent numbering is never
+        // read as a roll's. Same columns, so the sync keys work unchanged.
+        rows.extend(self.hotfixes.iter().map(|hotfix| {
+            let base_style = if hotfix.is_current {
+                Style::default().add_modifier(Modifier::BOLD)
+            } else {
+                Style::default()
+            };
+            let (sync_text, sync_color) = sync_cell(track_of(tracking, &hotfix.branch));
+            let color = hotfix_color(hotfix.state);
+            let mut cells = vec![
+                Cell::from(current_marker(hotfix.is_current)).style(
+                    Style::default()
+                        .fg(Color::Green)
+                        .add_modifier(Modifier::BOLD),
+                ),
+                Cell::from(format!("h{}", hotfix.number)).style(base_style.fg(color)),
+                Cell::from(hotfix.branch.clone()).style(base_style.fg(color)),
+                Cell::from(hotfix.location.symbol()).style(base_style),
+                Cell::from(sync_text).style(Style::default().fg(sync_color)),
+                Cell::from(hotfix.state.label()).style(Style::default().fg(color)),
+            ];
+            if show_deps {
+                cells.push(Cell::from(""));
+                cells.push(Cell::from(""));
             }
             Row::new(cells)
         }));
@@ -2596,16 +2686,16 @@ mod tests {
 
     #[test]
     fn row_at_maps_indices_over_bases_then_rolls() {
-        assert_eq!(row_at(0, 2, 3), Some(RowKind::Base(0)));
-        assert_eq!(row_at(1, 2, 3), Some(RowKind::Base(1)));
-        assert_eq!(row_at(2, 2, 3), Some(RowKind::Roll(0)));
-        assert_eq!(row_at(4, 2, 3), Some(RowKind::Roll(2)));
+        assert_eq!(row_at(0, 2, 3, 0), Some(RowKind::Base(0)));
+        assert_eq!(row_at(1, 2, 3, 0), Some(RowKind::Base(1)));
+        assert_eq!(row_at(2, 2, 3, 0), Some(RowKind::Roll(0)));
+        assert_eq!(row_at(4, 2, 3, 0), Some(RowKind::Roll(2)));
         // Past the last row.
-        assert_eq!(row_at(5, 2, 3), None);
+        assert_eq!(row_at(5, 2, 3, 0), None);
         // No bases → rolls start at 0; no rolls → only bases.
-        assert_eq!(row_at(0, 0, 1), Some(RowKind::Roll(0)));
-        assert_eq!(row_at(1, 1, 0), None);
-        assert_eq!(row_at(0, 0, 0), None);
+        assert_eq!(row_at(0, 0, 1, 0), Some(RowKind::Roll(0)));
+        assert_eq!(row_at(1, 1, 0, 0), None);
+        assert_eq!(row_at(0, 0, 0, 0), None);
     }
 
     #[test]
@@ -2615,22 +2705,22 @@ mod tests {
         let mut rolls = vec![roll_n(1, RollState::Active), roll_n(2, RollState::Active)];
 
         // Current branch is the rolling base → its own row.
-        assert_eq!(initial_selection(&bases, &rolls), Some(1));
+        assert_eq!(initial_selection(&bases, &rolls, &[]), Some(1));
 
         // Current branch is a roll → offset past the bases.
         let off_bases = base_branches(&cfg, "roll/2-0101-x", |_| true);
         rolls[1].is_current = true;
-        assert_eq!(initial_selection(&off_bases, &rolls), Some(3));
+        assert_eq!(initial_selection(&off_bases, &rolls, &[]), Some(3));
 
         // Nothing current → first row.
         rolls[1].is_current = false;
-        assert_eq!(initial_selection(&off_bases, &rolls), Some(0));
+        assert_eq!(initial_selection(&off_bases, &rolls, &[]), Some(0));
 
         // Rolls but no bases still selects the first roll.
-        assert_eq!(initial_selection(&[], &rolls), Some(0));
+        assert_eq!(initial_selection(&[], &rolls, &[]), Some(0));
 
         // Nothing at all → no selection.
-        assert_eq!(initial_selection(&[], &[]), None);
+        assert_eq!(initial_selection(&[], &[], &[]), None);
     }
 
     fn roll_n(number: u32, state: RollState) -> RollInfo {
@@ -3421,6 +3511,7 @@ mod tests {
             current_branch: "roll/1-0101-ahead".to_string(),
             bases: Vec::new(),
             rolls,
+            hotfixes: Vec::new(),
             show_deps: false,
             tracking,
             version: None,
@@ -3463,6 +3554,7 @@ mod tests {
             current_branch: "main".to_string(),
             bases: Vec::new(),
             rolls: vec![roll_n(1, RollState::Active)],
+            hotfixes: Vec::new(),
             show_deps: false,
             tracking: HashMap::new(),
             version: None,
@@ -3849,18 +3941,90 @@ mod tests {
     /// `state` column and no roll number, and the cursor starts on the checked
     /// out base branch.
     #[test]
+    fn row_at_maps_hotfixes_after_the_rolls() {
+        assert_eq!(row_at(5, 2, 3, 2), Some(RowKind::Hotfix(0)));
+        assert_eq!(row_at(6, 2, 3, 2), Some(RowKind::Hotfix(1)));
+        assert_eq!(row_at(7, 2, 3, 2), None);
+        // No rolls at all: hotfixes follow the bases directly.
+        assert_eq!(row_at(2, 2, 0, 1), Some(RowKind::Hotfix(0)));
+    }
+
+    #[test]
+    fn a_hotfix_row_renders_below_the_rolls_with_its_own_number() {
+        let hotfixes = vec![
+            HotfixInfo {
+                branch: "hotfix/1-0720-urgent".to_string(),
+                number: 1,
+                state: HotfixState::Open,
+                location: BranchLocation::Local,
+                is_current: false,
+            },
+            HotfixInfo {
+                branch: "hotfix/2-0721-landed-one".to_string(),
+                number: 2,
+                state: HotfixState::Landed,
+                location: BranchLocation::Both,
+                is_current: false,
+            },
+        ];
+        let mut table = TableState::default();
+        table.select(initial_selection(&[], &[], &hotfixes));
+        let mut app = StatusApp {
+            config: test_config(),
+            current_branch: "main".to_string(),
+            bases: Vec::new(),
+            rolls: vec![roll_n(1, RollState::Active)],
+            hotfixes,
+            show_deps: false,
+            tracking: HashMap::new(),
+            version: None,
+            table,
+            mode: Mode::Browsing,
+            message: None,
+            job: None,
+            panel: None,
+            pending_g: false,
+        };
+        let out = draw(|f, area| app.render_table(f, area));
+        let lines: Vec<&str> = out.lines().collect();
+        let roll_line = lines
+            .iter()
+            .position(|l| l.contains("roll/1-0101-x"))
+            .unwrap();
+        let hotfix_line = lines
+            .iter()
+            .position(|l| l.contains("hotfix/1-0720-urgent"))
+            .unwrap();
+        assert!(hotfix_line > roll_line, "hotfix above the roll:\n{out}");
+        // `h1`, not a bare `1`: hotfix numbering is independent of rolls, and
+        // this row sits under a roll that is also number 1.
+        assert!(lines[hotfix_line].contains("h1"), "{}", lines[hotfix_line]);
+        assert!(
+            lines[hotfix_line].contains("hotfix"),
+            "{}",
+            lines[hotfix_line]
+        );
+        assert!(out.contains("✓ landed"), "{out}");
+        // The current-branch hunt reaches hotfix rows too.
+        let mut current = app.hotfixes.clone();
+        current[1].is_current = true;
+        assert_eq!(initial_selection(&[], &app.rolls, &current), Some(2));
+    }
+
+    #[test]
     fn base_rows_render_above_the_rolls() {
         use ratatui::{backend::TestBackend, Terminal};
 
         let cfg = config("main", "develop");
         let bases = base_branches(&cfg, "develop", |_| true);
         let mut table = TableState::default();
-        table.select(initial_selection(&bases, &[]));
+        table.select(initial_selection(&bases, &[], &[]));
         let mut app = StatusApp {
             config: cfg,
             current_branch: "develop".to_string(),
             bases,
             rolls: vec![roll_n(1, RollState::Active)],
+            hotfixes: Vec::new(),
             show_deps: false,
             tracking: HashMap::new(),
             version: None,

@@ -19,6 +19,15 @@ The TUI table pins the stable and rolling branches above the rolls, so `[space]`
 switches to them the same way it switches to a roll. A base branch that exists
 neither locally nor on `origin` is not listed.
 
+Hotfix branches (`hotfix/N-MMDD-slug`, see [`hotfix`](hotfix.md)) are listed
+below the rolls, numbered `h1`, `h2`, … because they number independently of
+rolls and a bare `1` under a roll `1` would read as a duplicate. Their `state`
+column reads `hotfix` while open and `✓ landed` once the landing merge is on
+stable — detected from merge subjects exactly the way promotion is. They have no
+dependencies and no detail overlay, but `[space]`, `[p]`/`[P]`/`[f]` and
+`[d]elete` work on them as on any other row. `--json` carries them as their own
+`hotfixes` array rather than mixed into the roll list.
+
 ## Keys
 
 ```text

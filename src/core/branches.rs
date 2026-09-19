@@ -79,6 +79,46 @@ pub struct RollInfo {
     pub graduation_commit: Option<String>,
 }
 
+/// Prefix of the hotfix tier, which carries its own numbering independent of
+/// rolls. Lives here rather than in `ops` because listing hotfixes is a
+/// branch-level concern the tables need, not only the landing op.
+pub const HOTFIX_PREFIX: &str = "hotfix/";
+
+/// Where a hotfix is in its short life: branched off stable, or landed on it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum HotfixState {
+    /// Exists, not yet merged into the stable branch.
+    Open,
+    /// Its landing merge is on the stable branch.
+    Landed,
+}
+
+impl HotfixState {
+    pub fn label(&self) -> &'static str {
+        match self {
+            HotfixState::Open => "hotfix",
+            HotfixState::Landed => "✓ landed",
+        }
+    }
+}
+
+/// A `hotfix/N-MMDD-slug` branch as the tables show it.
+///
+/// Its own type rather than a [`RollInfo`] with a kind flag: a hotfix has no
+/// dependencies, no graduation commit and no place in the roll numbering (a
+/// `hotfix/1` and a `roll/1` coexist), so sharing `RollInfo` would either carry
+/// three meaningless fields or force every dependency scan in [`list_rolls`] to
+/// filter by kind. Keeping the roll list purely rolls is what keeps those scans
+/// simple.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct HotfixInfo {
+    pub branch: String,
+    pub number: u32,
+    pub state: HotfixState,
+    pub location: BranchLocation,
+    pub is_current: bool,
+}
+
 // ── Public API ────────────────────────────────────────────────────────────────
 
 /// Render a roll-number list for the `deps` / `dependants` table columns:
@@ -352,6 +392,103 @@ fn scan_graduated(repo: &Path, rolling_ref: &str) -> HashMap<String, String> {
     graduated
 }
 
+/// Short reference form used in hotfix merge subjects: the branch
+/// `hotfix/N-MMDD-slug` renders as `hotfix/N-slug` (date dropped).
+pub fn hotfix_short_name(branch: &str) -> Option<String> {
+    let rest = branch.strip_prefix(HOTFIX_PREFIX)?;
+    let mut parts = rest.splitn(3, '-');
+    let number = parts.next()?;
+    let _mmdd = parts.next()?;
+    let slug = parts.next()?;
+    if number.is_empty() || slug.is_empty() {
+        return None;
+    }
+    Some(format!("{HOTFIX_PREFIX}{number}-{slug}"))
+}
+
+/// Collect every hotfix branch (local + remote, deduplicated) with its state,
+/// sorted ascending by number. A hotfix is landed once its merge is on the
+/// stable branch — read from merge subjects exactly as promotion is.
+pub fn list_hotfixes(config: &Config) -> Result<Vec<HotfixInfo>, RfError> {
+    let repo = &config.repo_root;
+    let current = git::current_branch(repo).unwrap_or_default();
+    let pattern = format!("{HOTFIX_PREFIX}*");
+
+    let mut names = git::local_branches(repo, &pattern)?;
+    names.extend(git::remote_branches(repo, &pattern)?);
+    names.sort();
+    names.dedup();
+
+    let landed = scan_landed_hotfixes(repo, &config.stable_branch);
+
+    let mut hotfixes = Vec::new();
+    for branch in names {
+        let Some(number) = parse_roll_number(&branch, HOTFIX_PREFIX) else {
+            continue;
+        };
+        let location = match (
+            git::ref_exists(repo, &branch),
+            git::ref_exists(repo, &format!("origin/{branch}")),
+        ) {
+            (true, true) => BranchLocation::Both,
+            (true, false) => BranchLocation::Local,
+            (false, true) => BranchLocation::Remote,
+            _ => BranchLocation::Neither,
+        };
+        // The landing subject names the *short* form; a hand-made
+        // `Merge branch 'hotfix/…'` names the full one. Either counts.
+        let is_landed = landed.contains(&branch)
+            || hotfix_short_name(&branch)
+                .map(|short| landed.contains(&short))
+                .unwrap_or(false);
+        hotfixes.push(HotfixInfo {
+            is_current: branch == current,
+            branch,
+            number,
+            state: if is_landed {
+                HotfixState::Landed
+            } else {
+                HotfixState::Open
+            },
+            location,
+        });
+    }
+    hotfixes.sort_by_key(|h| h.number);
+    Ok(hotfixes)
+}
+
+/// Names (short or full) of hotfixes whose landing merge is reachable from
+/// `stable_ref`. One log pass, like [`scan_promoted`].
+fn scan_landed_hotfixes(repo: &Path, stable_ref: &str) -> HashSet<String> {
+    let Some(stable) = git::resolve_branch(repo, stable_ref) else {
+        return HashSet::new();
+    };
+    let subjects = git::log_subjects(repo, &["--merges", &stable]).unwrap_or_default();
+    subjects
+        .iter()
+        .filter_map(|s| extract_landed_hotfix(s).or_else(|| extract_graduated_branch(s)))
+        .filter(|name| name.starts_with(HOTFIX_PREFIX))
+        .collect()
+}
+
+/// Extract the hotfix named as the *source* of a landing subject:
+/// `Hotfix hotfix/N-slug into main` yields `hotfix/N-slug`.
+///
+/// A small parallel to [`extract_graduated_branch`] rather than a new arm in
+/// it, because that function answers "which roll graduated" and this answers a
+/// different question with a different vocabulary. It keeps the same rule,
+/// though: the ` into ` clause names the target and is cut first, so a subject
+/// can never be read as landing the branch it landed *on*.
+fn extract_landed_hotfix(subject: &str) -> Option<String> {
+    let head = match subject.find(" into ") {
+        Some(at) => &subject[..at],
+        None => subject,
+    };
+    let rest = head.strip_prefix("Hotfix ")?;
+    let name = rest.split_whitespace().next()?;
+    name.starts_with(HOTFIX_PREFIX).then(|| name.to_string())
+}
+
 /// Scan stable log once, returning the set of branch names that have been
 /// promoted. Three sources over a single log pass:
 /// 1. `Promote <roll> …` subjects (single-roll promotions),
@@ -489,7 +626,40 @@ fn find_graduation_commit(repo: &Path, roll_branch: &str, rolling_ref: &str) -> 
 
 #[cfg(test)]
 mod tests {
-    use super::{extract_graduated_branch, parse_roll_number};
+    use super::{
+        extract_graduated_branch, extract_landed_hotfix, hotfix_short_name, parse_roll_number,
+        HOTFIX_PREFIX,
+    };
+
+    #[test]
+    fn hotfix_names_parse_and_shorten() {
+        assert_eq!(
+            parse_roll_number("hotfix/3-0720-urgent", HOTFIX_PREFIX),
+            Some(3)
+        );
+        assert_eq!(
+            hotfix_short_name("hotfix/3-0720-urgent-fix").as_deref(),
+            Some("hotfix/3-urgent-fix")
+        );
+        assert_eq!(hotfix_short_name("hotfix/3-0720"), None);
+        assert_eq!(hotfix_short_name("roll/3-0720-x"), None);
+    }
+
+    #[test]
+    fn a_landing_subject_names_its_source_never_its_target() {
+        assert_eq!(
+            extract_landed_hotfix("Hotfix hotfix/1-urgent into main").as_deref(),
+            Some("hotfix/1-urgent")
+        );
+        // The reintegration merge that follows a landing names stable as its
+        // source and must not read as a landed hotfix.
+        assert_eq!(
+            extract_landed_hotfix("Reintegrate main into rolling (hotfix hotfix/1-urgent)"),
+            None
+        );
+        assert_eq!(extract_landed_hotfix("Hotfix roll/1-x into main"), None);
+        assert_eq!(extract_landed_hotfix("chore: bump"), None);
+    }
 
     #[test]
     fn parses_roll_number() {
