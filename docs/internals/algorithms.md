@@ -143,10 +143,16 @@ and skip all of it. Configurable via `version_gate`, `tag_on_promote`, `push_tag
 
 The gate and the tag are per promotion *step*, not per invocation: a per-roll
 promotion compares each roll's graduation commit against stable as that step is
-reached, and tags each merge it makes. Only the whole-rolling route offers a
-bump, because only it merges a branch a bump commit could land on — a per-roll
-step merges a commit that already exists on rolling, so a short version there is
-reported, not fixed.
+reached, and tags each merge it makes. The two routes land a needed bump in
+different places, because only one of them has a branch to put it on. The
+whole-rolling route commits the bump on rolling *before* merging, so it rides in
+with everything else. A per-roll step merges a commit that already exists on
+rolling, so its bump is written into the **staged merge tree** ahead of the
+gates and committed as part of the promotion merge (`run_promote_step`'s
+`in_merge_bump`) — stable still only receives merge commits. Because that leaves
+stable one commit ahead of rolling with a higher version, `ops::promote` then
+merges stable back into rolling, exactly as a landed hotfix does; otherwise the
+next whole-rolling promotion would read as LOWER.
 
 ## Per-roll promotion
 

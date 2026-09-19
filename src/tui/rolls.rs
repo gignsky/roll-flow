@@ -1896,7 +1896,7 @@ fn run_op(config: &Config, action: Action, target: Option<&str>) -> Result<Vec<S
             // Tagging is on; the version gate hard-fails here rather than
             // prompting, since the TUI has no place to offer a bump — the
             // error names the `rf promote --bump` fix.
-            let o = ops::promote(config, &promote_target, false, &force, true)?;
+            let o = ops::promote(config, &promote_target, false, &force, true, None)?;
             for step in &o.steps {
                 push_gate_notices(&mut lines, &step.gate_notices);
                 push_gate_notices(&mut lines, &step.host_notices);

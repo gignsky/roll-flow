@@ -36,8 +36,18 @@ opened a PR — see
 - refuses to promote unless `Cargo.toml`'s version is above the stable branch's,
   offering to bump it (`--bump <patch|minor|major>` to skip the prompt, `--yes`
   to take the patch default non-interactively). A `--roll` promotion merges a
-  commit that already exists on rolling, so it reports a short version rather
-  than offering a bump there is nowhere to put
+  commit that already exists on rolling, so there is no branch to land a bump
+  commit on ahead of the merge — instead the bump lands **inside the promotion
+  merge itself**: the manifest is raised in the staged tree before the gates
+  run, so what they check is what lands, and the one `--no-ff` merge commit
+  carries it. Stable then holds a commit rolling does not, so stable is merged
+  back into rolling afterwards (`Reintegrate main into develop (after per-roll
+  promotion)`) — without that, rolling's version would sit *below* stable's and
+  the next promotion would fail as LOWER. A graduation that already carried its
+  own bump is not bumped again
+- after a `--roll` promotion, offers to merge stable into the active local rolls
+  (`rf update`), since they now trail what landed; `--yes` accepts, and an
+  unattended run is told the command instead
 - creates an annotated `vX.Y.Z` tag on each promotion merge commit, then offers to
   push it to `origin`. `--no-tag` skips tagging entirely
 - `--force --reason "<why>"` overrides the version gate, recording it in the
