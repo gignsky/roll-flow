@@ -15,7 +15,7 @@
 use std::collections::HashMap;
 use std::time::Duration;
 
-use anyhow::{anyhow, Result};
+use anyhow::{anyhow, bail, Result};
 use crossterm::event::{self, Event, KeyCode, KeyEventKind};
 use ratatui::{
     layout::{Alignment, Constraint, Layout, Rect},
@@ -32,7 +32,7 @@ use crate::core::{
     git::{self, TrackState},
     ops,
     sync::{self, PullPlan, PushOutcome, SyncTarget},
-    version::{self, BumpLevel, Semver},
+    version::{self, BumpLevel, Semver, VersionCheck, VersionStatus},
 };
 
 /// A workflow operation reachable from the view. Navigation, quit and refresh
@@ -672,6 +672,13 @@ pub(crate) const BINDINGS: &[Binding] = &[
         replay: &[KeyCode::Char('i')],
     },
     Binding {
+        keys: "v",
+        label: "verify the checked-out branch",
+        group: "roll",
+        hint: None,
+        replay: &[KeyCode::Char('v')],
+    },
+    Binding {
         keys: "G",
         label: "graduate the selected roll into rolling",
         group: "roll",
@@ -878,6 +885,46 @@ pub(crate) fn handle_help_key(
         }
         _ => HelpOutcome::Continue,
     }
+}
+
+/// The route `[v]` would check, as `(source, target)`, or `None` when the
+/// checked-out branch is not on one.
+///
+/// Verify reads HEAD rather than the row under the cursor, for the same reason
+/// `[b]` does: the gates run in the working tree, so the branch they judge is
+/// the checked-out one whatever the cursor is on. Deferring to
+/// [`ops::infer_route`] keeps the TUI and `rf verify` agreeing on what a branch
+/// tier means — there is one definition of the route, not two.
+pub(crate) fn verify_route_for(config: &Config, current_branch: &str) -> Option<(String, String)> {
+    match ops::infer_route(config, current_branch)? {
+        ops::Route::Graduate { roll } => Some((roll, config.rolling_branch.clone())),
+        ops::Route::Promote => Some((config.rolling_branch.clone(), config.stable_branch.clone())),
+    }
+}
+
+/// Render a version check the way `main.rs` prints it, so the TUI and the CLI
+/// report the same comparison in the same words.
+fn push_version_check(lines: &mut Vec<String>, check: &VersionCheck, source: &str, target: &str) {
+    let verdict = match check.status {
+        VersionStatus::Ok => "OK",
+        VersionStatus::Unchanged => "UNCHANGED",
+        VersionStatus::Lower => "LOWER",
+        VersionStatus::Unreadable => "UNREADABLE",
+        // Repos with no `Cargo.toml`, and repos with the gate switched off, have
+        // nothing to say here — the same silence `rf verify` keeps.
+        VersionStatus::NotApplicable => return,
+    };
+    let head = check
+        .head
+        .map(|v| v.to_string())
+        .unwrap_or_else(|| "<unreadable>".to_string());
+    let base = check
+        .base
+        .map(|v| v.to_string())
+        .unwrap_or_else(|| "none".to_string());
+    lines.push(format!(
+        "Version: {head} on '{source}' (base '{target}' {base}) {verdict}"
+    ));
 }
 
 /// Build the dependency rows to show in the detail view for `selected`.
@@ -1383,6 +1430,7 @@ impl StatusApp {
             KeyCode::Char('p') => self.start_pull(),
             KeyCode::Char('P') => self.start_push(),
             KeyCode::Char('f') => self.start_fetch(),
+            KeyCode::Char('v') => self.start_verify(),
             KeyCode::Char('G') => self.request(Action::Graduate),
             KeyCode::Char('i') => self.request_integrate(),
             KeyCode::Char('b') => self.request_bump(),
@@ -1874,6 +1922,32 @@ impl StatusApp {
         });
     }
 
+    /// `[v]` — check whether the checked-out branch could graduate or promote,
+    /// running the configured gates.
+    ///
+    /// Not an [`Action`] and deliberately not behind the confirm modal: that
+    /// modal exists for the ops that mutate the repo, and verify is the one key
+    /// whose entire output is a verdict. The route is resolved here rather than
+    /// inside the job so the panel title names it before the gates start — on a
+    /// repo with `cargo test` gates that is the difference between a title the
+    /// user can trust and several silent minutes.
+    fn start_verify(&mut self) {
+        if self.busy() {
+            return;
+        }
+        let Some((source, target)) = verify_route_for(&self.config, &self.current_branch) else {
+            self.message = Some(format!(
+                "'{}' is not promotable — check out {} or a {}branch to verify",
+                self.current_branch, self.config.rolling_branch, self.config.roll_prefix
+            ));
+            return;
+        };
+        let config = self.config.clone();
+        self.start_job(format!("rf verify {source} → {target}"), move || {
+            Ok(JobDone::lines(run_verify(&config)?))
+        });
+    }
+
     /// `gg` — hand the terminal to lazygit, then take it back.
     ///
     /// The one action that still suspends: lazygit is a full-screen application
@@ -2234,6 +2308,62 @@ fn run_delete(
     }
     let results = ops::prune_apply(config, &plan)?;
     Ok(render_prune_outcome(&plan, &results))
+}
+
+/// Run `ops::verify` and render its outcome, mirroring `main.rs`'s `cmd_verify`
+/// line for line — the same checks in the same order, so a verdict in the panel
+/// and a verdict in the terminal never disagree.
+///
+/// Two deliberate differences, both because this is the TUI:
+///
+/// - no version *bump*. `cmd_verify` offers one before the gates run; here the
+///   gate failure points at `[b]`, which is the key that already does it and the
+///   only place a bump commit is written from.
+/// - nothing is forced and nothing is dry-run. `[v]` has no flags to carry.
+///
+/// A failed host or an unsatisfied version gate is an `Err`, not a line: the
+/// panel marks a failed job, and a verdict that reads as "done" when it is
+/// really "blocked" is the one outcome worth being loud about. Everything the
+/// gates printed is already in the panel either way, streamed as they ran.
+fn run_verify(config: &Config) -> Result<Vec<String>> {
+    ops::ensure_clean_state(config)?;
+    let outcome = ops::verify(config, false)?;
+
+    let mut lines = Vec::new();
+    if outcome.diverged_note {
+        lines.push(format!(
+            "note: '{}' has commits not in '{}'; graduation/promotion will create a --no-ff merge",
+            outcome.target, outcome.source
+        ));
+    }
+    push_version_check(
+        &mut lines,
+        &outcome.version,
+        &outcome.source,
+        &outcome.target,
+    );
+    push_gate_notices(&mut lines, &outcome.gate_notices);
+    push_gate_notices(&mut lines, &outcome.host_notices);
+    push_host_results(&mut lines, &outcome.host_results);
+
+    if !outcome.failed_hosts.is_empty() {
+        bail!(
+            "host verification failed: {}",
+            outcome.failed_hosts.join(", ")
+        );
+    }
+    if !outcome.version.is_satisfied() {
+        return Err(anyhow!(
+            "{}\npress [b] to bump the version on '{}'",
+            ops::version_gate_error(&outcome.version, &outcome.source, &outcome.target),
+            outcome.source
+        ));
+    }
+    lines.push(format!(
+        "Verification passed: {} -> {}",
+        outcome.source, outcome.target
+    ));
+    Ok(lines)
 }
 
 /// Drive a workflow operation through `core::ops`, rendering its structured
@@ -3322,6 +3452,54 @@ mod tests {
         // A query with no match says so rather than rendering an empty box.
         let none = draw(|f, area| render_help(f, area, "zzzz", 0));
         assert!(none.contains("no key matches"), "{none}");
+    }
+
+    #[test]
+    fn verify_reads_head_and_resolves_the_route_from_its_tier() {
+        let cfg = config("main", "rolling");
+
+        // A roll branch checks its graduation into rolling...
+        assert_eq!(
+            verify_route_for(&cfg, "roll/4-0918-x"),
+            Some(("roll/4-0918-x".to_string(), "rolling".to_string()))
+        );
+        // ...and rolling checks its promotion to stable.
+        assert_eq!(
+            verify_route_for(&cfg, "rolling"),
+            Some(("rolling".to_string(), "main".to_string()))
+        );
+        // Stable itself has nowhere to go, and neither does anything off the
+        // tiers — `[v]` says so rather than guessing a route.
+        assert_eq!(verify_route_for(&cfg, "main"), None);
+        assert_eq!(verify_route_for(&cfg, "feature/whatever"), None);
+    }
+
+    #[test]
+    fn the_version_line_matches_the_one_the_cli_prints() {
+        let check = |status, head: Option<Semver>, base: Option<Semver>| {
+            let mut lines = Vec::new();
+            push_version_check(
+                &mut lines,
+                &VersionCheck { head, base, status },
+                "rolling",
+                "main",
+            );
+            lines
+        };
+
+        assert_eq!(
+            check(VersionStatus::Unchanged, Some(v(0, 2, 3)), Some(v(0, 2, 3))),
+            vec!["Version: 0.2.3 on 'rolling' (base 'main' 0.2.3) UNCHANGED"]
+        );
+        // A repo with no `Cargo.toml` says nothing at all, rather than reporting
+        // a comparison it did not make.
+        assert!(check(VersionStatus::NotApplicable, None, None).is_empty());
+        // And an unreadable version still reports both sides, naming which one
+        // could not be read.
+        assert_eq!(
+            check(VersionStatus::Unreadable, None, Some(v(1, 0, 0))),
+            vec!["Version: <unreadable> on 'rolling' (base 'main' 1.0.0) UNREADABLE"]
+        );
     }
 
     #[test]

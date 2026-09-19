@@ -123,6 +123,29 @@ overwritten and asks. Only `y` proceeds, and it uses `--force-with-lease`, so a
 push someone else landed in the meantime is refused rather than clobbered. If git
 reports a stale lease, fetch with `[f]` and try again.
 
+## Verifying
+
+`[v]` runs [`verify`](verify.md) on the **checked-out** branch — not the row
+under the cursor, because the gates run in the working tree, so the branch they
+judge is whichever one is checked out. The route comes from that branch's tier
+and is named in the panel title before the gates start:
+
+| checked out | `[v]` checks |
+|---|---|
+| a `roll/*` branch | `roll/N-… → rolling` |
+| the rolling branch | `rolling → main` |
+| anything else | nothing — it says to check out a roll or rolling first |
+
+It is the one action key with no confirmation modal, because it is the one that
+changes nothing: the modal is for the ops that write to the repo. It reports the
+same checks as `rf verify`, in the same words — divergence note, version
+comparison, gate notices, per-host results, verdict.
+
+The one thing it will not do is bump the version. `rf verify` offers one; here a
+failed version gate points at `[b]` instead, which is the key that already writes
+that commit. A failed host or an unsatisfied gate marks the panel as failed
+rather than passing quietly.
+
 ## Bumping the version
 
 `[b]` raises the `[package]` version in `Cargo.toml` on the **checked-out**
