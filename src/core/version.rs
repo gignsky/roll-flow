@@ -18,6 +18,7 @@
 //! `Cargo.toml` (the dotfiles repo roll-flow was built for) yield
 //! `VersionStatus::NotApplicable` and every caller silently skips.
 
+use std::collections::HashMap;
 use std::fmt;
 use std::path::Path;
 
@@ -257,6 +258,28 @@ pub fn read_version(repo: &Path) -> Result<Option<Semver>, RfError> {
     }
     let text = std::fs::read_to_string(&path)?;
     Ok(parse_version(&text))
+}
+
+/// Read the crate version at each of `refs`, keyed by ref.
+///
+/// One `git cat-file --batch` for the whole set, because the caller is a table
+/// that wants a version per row on every reload. Refs without a `Cargo.toml`,
+/// or whose manifest carries a version this crate will not parse, are simply
+/// absent from the map — the column renders those as a dash, and a repo with no
+/// manifest at all yields an empty map rather than an error. Losing a version is
+/// never worth failing a reload over.
+pub fn versions_at(repo: &Path, refs: &[String]) -> HashMap<String, Semver> {
+    let specs: Vec<String> = refs.iter().map(|r| format!("{r}:{VERSION_FILE}")).collect();
+    let Ok(blobs) = git::show_files_at_refs(repo, &specs) else {
+        return HashMap::new();
+    };
+    refs.iter()
+        .zip(specs.iter())
+        .filter_map(|(r, spec)| {
+            let version = parse_version(blobs.get(spec)?)?;
+            Some((r.clone(), version))
+        })
+        .collect()
 }
 
 /// Compare the version on `source_ref` to the one on `target_ref`, the same

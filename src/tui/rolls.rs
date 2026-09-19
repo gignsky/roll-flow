@@ -441,6 +441,10 @@ struct StatusApp {
     /// Upstream tracking state per local branch, refreshed on reload. Sourced in
     /// one `for-each-ref` rather than an `ahead_behind` call per row.
     tracking: HashMap<String, git::LocalBranch>,
+    /// The `[package]` version at each visible branch's tip, refreshed on
+    /// reload. Sourced in one `cat-file --batch` rather than a `git show` per
+    /// row, the same reason `tracking` is one `for-each-ref`.
+    versions: HashMap<String, Semver>,
     /// The `[package]` version on the checked-out branch, refreshed on reload.
     /// `None` in repos with no `Cargo.toml`, where the header omits it and `[b]`
     /// refuses.
@@ -1205,6 +1209,7 @@ impl StatusApp {
         let mut table = TableState::default();
         table.select(initial_selection(&bases, &rolls));
         let tracking = load_tracking(&config);
+        let versions = load_versions(&config, &bases, &rolls);
         let version = version::read_version(&config.repo_root).unwrap_or(None);
         Self {
             config,
@@ -1213,6 +1218,7 @@ impl StatusApp {
             rolls,
             show_deps,
             tracking,
+            versions,
             version,
             table,
             mode: Mode::Browsing,
@@ -1972,6 +1978,7 @@ impl StatusApp {
         });
         self.rolls = branches::list_rolls(&self.config)?;
         self.tracking = load_tracking(&self.config);
+        self.versions = load_versions(&self.config, &self.bases, &self.rolls);
         // Read from the worktree, so a bump — or a branch switch that changes it —
         // shows in the header straight away.
         self.version = version::read_version(&self.config.repo_root).unwrap_or(None);
@@ -2075,6 +2082,14 @@ impl StatusApp {
             Constraint::Length(7),
             Constraint::Length(13),
         ];
+        // Present only in repos that have a `Cargo.toml`, the same rule the
+        // header version follows — so a dotfiles repo pays nothing for it. Wide
+        // enough for `12.34.5`; `branch` is the Fill column that pays for it,
+        // which is why the cell shows the numbers alone.
+        let show_versions = !self.versions.is_empty();
+        if show_versions {
+            col_constraints.push(Constraint::Length(7));
+        }
         if self.show_deps {
             col_constraints.push(Constraint::Length(8));
             // Exactly the header width: the values are short comma lists, and
@@ -2091,6 +2106,9 @@ impl StatusApp {
             Cell::from("sync").style(bold),
             Cell::from("state").style(bold),
         ];
+        if show_versions {
+            header_cells.push(Cell::from("version").style(bold));
+        }
         if self.show_deps {
             header_cells
                 .push(Cell::from("deps").style(Style::default().add_modifier(Modifier::BOLD)));
@@ -2104,6 +2122,7 @@ impl StatusApp {
 
         let show_deps = self.show_deps;
         let tracking = &self.tracking;
+        let versions = &self.versions;
         // Base branches are pinned above the rolls: no number and no state, the
         // `state` column carrying their role instead.
         let mut rows: Vec<Row> = self
@@ -2128,6 +2147,12 @@ impl StatusApp {
                     Cell::from(sync_text).style(Style::default().fg(sync_color)),
                     Cell::from(base.role.label()).style(Style::default().fg(base.role.color())),
                 ];
+                if show_versions {
+                    cells.push(
+                        Cell::from(version_cell(versions.get(&base.branch).copied()))
+                            .style(base_style),
+                    );
+                }
                 if show_deps {
                     cells.push(Cell::from(""));
                     cells.push(Cell::from(""));
@@ -2155,6 +2180,11 @@ impl StatusApp {
                 Cell::from(sync_text).style(Style::default().fg(sync_color)),
                 Cell::from(roll.state.label()).style(Style::default().fg(row_state_color)),
             ];
+            if show_versions {
+                cells.push(
+                    Cell::from(version_cell(versions.get(&roll.branch).copied())).style(base_style),
+                );
+            }
             if show_deps {
                 cells.push(Cell::from(branches::format_roll_numbers(&roll.deps)));
                 cells.push(Cell::from(branches::format_roll_numbers(&roll.dependents)));
@@ -2365,6 +2395,52 @@ fn load_tracking(config: &Config) -> HashMap<String, git::LocalBranch> {
     git::local_branch_details(&config.repo_root)
         .map(|branches| branches.into_iter().map(|b| (b.name.clone(), b)).collect())
         .unwrap_or_default()
+}
+
+/// Read the crate version at every branch on screen, keyed by branch name.
+///
+/// The refspec per row follows the same local-first order as
+/// `git::resolve_branch`: a branch with a local copy is read at its own tip, a
+/// remote-only one at `origin/<branch>`. One `cat-file --batch` covers the lot.
+///
+/// Degrades to an empty map rather than failing the reload — a missing version
+/// renders as a dash, and no repo should lose its table over a decoration. That
+/// also covers the ordinary case of a repo with no `Cargo.toml` at all, where
+/// the column simply never appears.
+fn load_versions(
+    config: &Config,
+    bases: &[BaseBranch],
+    rolls: &[RollInfo],
+) -> HashMap<String, Semver> {
+    let rows = bases
+        .iter()
+        .map(|b| (&b.branch, &b.location))
+        .chain(rolls.iter().map(|r| (&r.branch, &r.location)));
+    let refs: Vec<String> = rows
+        .map(|(branch, location)| branches::content_ref(branch, location))
+        .collect();
+
+    let by_ref = version::versions_at(&config.repo_root, &refs);
+    bases
+        .iter()
+        .map(|b| &b.branch)
+        .chain(rolls.iter().map(|r| &r.branch))
+        .zip(refs.iter())
+        .filter_map(|(branch, refspec)| Some((branch.clone(), *by_ref.get(refspec)?)))
+        .collect()
+}
+
+/// The version cell for `branch`: the three numbers, or a dash.
+///
+/// Deliberately formatted from the fields rather than through `Semver`'s
+/// `Display`. The table already carries a `#` column, so a `-rollN` dev suffix
+/// would be repeating what the row next door says — and it would cost four more
+/// columns out of `branch`, which is the one column with nothing to spare.
+pub(crate) fn version_cell(version: Option<Semver>) -> String {
+    match version {
+        Some(v) => format!("{}.{}.{}", v.major, v.minor, v.patch),
+        None => "—".to_string(),
+    }
 }
 
 /// The tracking state to show for `branch`, or `None` when it has no local copy
@@ -4054,6 +4130,7 @@ mod tests {
             rolls,
             show_deps: false,
             tracking,
+            versions: HashMap::new(),
             version: None,
             table: TableState::default(),
             mode: Mode::Browsing,
@@ -4085,6 +4162,73 @@ mod tests {
     }
 
     #[test]
+    fn the_version_column_shows_the_numbers_and_a_dash_when_absent() {
+        let mut rolls = vec![roll_n(1, RollState::Active), roll_n(2, RollState::Active)];
+        rolls[0].branch = "roll/1-0101-versioned".to_string();
+        rolls[1].branch = "roll/2-0102-bare".to_string();
+
+        let mut versions = HashMap::new();
+        versions.insert("roll/1-0101-versioned".to_string(), v(0, 12, 34));
+
+        let mut app = StatusApp {
+            config: test_config(),
+            current_branch: "main".to_string(),
+            bases: Vec::new(),
+            rolls,
+            show_deps: false,
+            tracking: HashMap::new(),
+            versions,
+            version: None,
+            table: TableState::default(),
+            mode: Mode::Browsing,
+            message: None,
+            job: None,
+            panel: None,
+            pending_g: false,
+        };
+        let out = draw(|f, area| app.render_table(f, area));
+
+        assert!(out.contains("version"), "no header:\n{out}");
+        assert!(out.contains("0.12.34"), "{out}");
+        // A branch whose ref carries no readable manifest gets a dash, the same
+        // vocabulary the sync column uses for "nothing to say".
+        assert!(out.contains("—"), "{out}");
+    }
+
+    #[test]
+    fn the_version_column_is_absent_in_a_repo_with_no_manifest() {
+        // The whole opt-in rule: no `Cargo.toml` anywhere, no column, no cost to
+        // the `branch` column. This is every dotfiles repo.
+        let mut app = StatusApp {
+            config: test_config(),
+            current_branch: "main".to_string(),
+            bases: Vec::new(),
+            rolls: vec![roll_n(1, RollState::Active)],
+            show_deps: false,
+            tracking: HashMap::new(),
+            versions: HashMap::new(),
+            version: None,
+            table: TableState::default(),
+            mode: Mode::Browsing,
+            message: None,
+            job: None,
+            panel: None,
+            pending_g: false,
+        };
+        let out = draw(|f, area| app.render_table(f, area));
+        assert!(!out.contains("version"), "column shown anyway:\n{out}");
+    }
+
+    #[test]
+    fn a_version_cell_drops_any_dev_suffix() {
+        // Formatted from the fields, never through `Display`. The `#` column
+        // already says which roll this is, so a `-rollN` suffix would repeat it
+        // and cost four columns out of `branch`.
+        assert_eq!(version_cell(Some(v(0, 2, 4))), "0.2.4");
+        assert_eq!(version_cell(None), "—");
+    }
+
+    #[test]
     fn a_branch_with_no_tracking_data_renders_a_dash_in_the_table() {
         // `load_tracking` degrades to an empty map when git fails, and the table
         // still has to draw. Every row shows a dash rather than a false ✓.
@@ -4096,6 +4240,7 @@ mod tests {
             rolls: vec![roll_n(1, RollState::Active)],
             show_deps: false,
             tracking: HashMap::new(),
+            versions: HashMap::new(),
             version: None,
             table: TableState::default(),
             mode: Mode::Browsing,
@@ -4495,6 +4640,7 @@ mod tests {
             rolls: vec![roll_n(1, RollState::Active)],
             show_deps: false,
             tracking: HashMap::new(),
+            versions: HashMap::new(),
             version: None,
             table,
             mode: Mode::Browsing,

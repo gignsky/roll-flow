@@ -1,5 +1,7 @@
+use std::collections::HashMap;
+use std::io::Write;
 use std::path::{Path, PathBuf};
-use std::process::Command;
+use std::process::{Command, Stdio};
 
 use crate::core::proc;
 use crate::error::RfError;
@@ -579,6 +581,95 @@ pub fn parse_ahead_behind(out: &str) -> Option<(u32, u32)> {
 
 // ── Blob reads ────────────────────────────────────────────────────────────────
 
+/// Read one `path` at many refs in a single `git cat-file --batch`.
+///
+/// Returns a map from the `<refspec>:<path>` spec that was asked for to the
+/// file's contents, omitting the specs where the path does not exist.
+///
+/// One subprocess for the whole batch rather than a [`show_file_at_ref`] per
+/// ref, for the same reason [`local_branch_details`] is one `for-each-ref`: the
+/// caller wants an answer for every branch on screen, on every reload, and N
+/// forks a keypress is a cost the user feels. `--batch` takes the specs on
+/// stdin and answers each with an `<oid> <type> <size>` header followed by the
+/// bytes, or `<spec> missing` — so "this branch has no Cargo.toml" arrives as
+/// data rather than as an error, exactly as it does from `show_file_at_ref`.
+pub fn show_files_at_refs(
+    repo: &Path,
+    specs: &[String],
+) -> Result<HashMap<String, String>, RfError> {
+    if specs.is_empty() {
+        return Ok(HashMap::new());
+    }
+    let mut child = Command::new("git")
+        .arg("-C")
+        .arg(repo)
+        .args(["cat-file", "--batch"])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()?;
+
+    // Written and dropped before the output is read: `--batch` streams answers
+    // as it goes, and holding stdin open while draining a pipe that git is
+    // still filling is how this would deadlock on a large batch.
+    {
+        let stdin = child
+            .stdin
+            .as_mut()
+            .ok_or_else(|| RfError::Git("cat-file --batch: no stdin".to_string()))?;
+        for spec in specs {
+            writeln!(stdin, "{spec}")?;
+        }
+    }
+    drop(child.stdin.take());
+
+    let output = child.wait_with_output()?;
+    if !output.status.success() {
+        return Err(RfError::Git("`git cat-file --batch` failed".to_string()));
+    }
+    Ok(parse_cat_file_batch(&output.stdout, specs))
+}
+
+/// Split `cat-file --batch` output into one entry per spec that resolved.
+///
+/// The stream is bytes, not lines: a header names a byte count and exactly that
+/// many bytes of content follow, then a newline. Walking it by that count —
+/// rather than splitting on newlines — is what keeps a file containing a line
+/// that looks like a header from derailing the parse. Specs are consumed in
+/// order, which is how each answer is matched back to what was asked: git
+/// echoes the *spec* only on a miss, and an oid on a hit.
+fn parse_cat_file_batch(stdout: &[u8], specs: &[String]) -> HashMap<String, String> {
+    let mut found = HashMap::new();
+    let mut at = 0usize;
+    let mut spec_iter = specs.iter();
+
+    while at < stdout.len() {
+        let Some(end) = stdout[at..].iter().position(|&b| b == b'\n') else {
+            break;
+        };
+        let header = String::from_utf8_lossy(&stdout[at..at + end]).to_string();
+        at += end + 1;
+        let Some(spec) = spec_iter.next() else { break };
+
+        // `<oid> <type> <size>` on a hit; anything else (`<spec> missing`,
+        // `<spec> ambiguous`) means there is no content to step over.
+        let size = header
+            .rsplit_once(' ')
+            .and_then(|(rest, size)| size.parse::<usize>().ok().filter(|_| rest.contains(' ')));
+        let Some(size) = size else { continue };
+        if at + size > stdout.len() {
+            break;
+        }
+        found.insert(
+            spec.clone(),
+            String::from_utf8_lossy(&stdout[at..at + size]).to_string(),
+        );
+        // The content is followed by a newline that belongs to neither.
+        at += size + 1;
+    }
+    found
+}
+
 /// Read `path` as it exists at `refspec` (`git show <ref>:<path>`).
 ///
 /// Returns `Ok(None)` when the path does not exist at that ref — the common
@@ -653,8 +744,9 @@ pub fn commit_paths(repo: &Path, paths: &[&str], message: &str) -> Result<(), Rf
 #[cfg(test)]
 mod tests {
     use super::{
-        ahead_behind, local_branch_details, parse_ahead_behind, parse_local_branch_line,
-        remote_head_branch, remote_tracking_refs, remotes, track_state, LocalBranch, TrackState,
+        ahead_behind, local_branch_details, parse_ahead_behind, parse_cat_file_batch,
+        parse_local_branch_line, remote_head_branch, remote_tracking_refs, remotes,
+        show_files_at_refs, track_state, LocalBranch, TrackState,
     };
     use std::path::Path;
     use std::process::Command;
@@ -970,5 +1062,56 @@ mod tests {
             "track was {:?}",
             main.track
         );
+    }
+
+    #[test]
+    fn cat_file_batch_walks_by_byte_count_not_by_lines() {
+        // The parse has to step over content by the size the header declares.
+        // This blob deliberately contains a line that looks like a `missing`
+        // answer — split the stream on newlines instead and that line is read
+        // as an answer to the next spec.
+        let content = "version = \"0.2.4\"\nb:Cargo.toml missing\n";
+        let mut stdout = Vec::new();
+        stdout.extend_from_slice(format!("abc123 blob {}\n", content.len()).as_bytes());
+        stdout.extend_from_slice(content.as_bytes());
+        stdout.push(b'\n');
+        stdout.extend_from_slice(b"b:Cargo.toml missing\n");
+
+        let specs = vec!["a:Cargo.toml".to_string(), "b:Cargo.toml".to_string()];
+        let found = parse_cat_file_batch(&stdout, &specs);
+
+        assert_eq!(found.get("a:Cargo.toml").map(String::as_str), Some(content));
+        // The ref that genuinely has no manifest is absent, not empty.
+        assert!(!found.contains_key("b:Cargo.toml"));
+    }
+
+    #[test]
+    fn cat_file_batch_reports_a_miss_as_absence() {
+        let specs = vec!["nope:Cargo.toml".to_string()];
+        let found = parse_cat_file_batch(b"nope:Cargo.toml missing\n", &specs);
+        assert!(found.is_empty());
+
+        // A truncated stream (git killed mid-write) yields what was complete
+        // rather than a panic on an out-of-range slice.
+        let truncated = b"abc123 blob 99\nshort";
+        assert!(parse_cat_file_batch(truncated, &specs).is_empty());
+    }
+
+    #[test]
+    fn show_files_at_refs_reads_the_manifest_at_several_refs_at_once() {
+        // Against this very repo: HEAD has a Cargo.toml, a bogus ref does not,
+        // and one subprocess answers for both.
+        let repo = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+        let specs = vec![
+            "HEAD:Cargo.toml".to_string(),
+            "HEAD:definitely-not-here.toml".to_string(),
+        ];
+        let found = show_files_at_refs(repo, &specs).expect("batch read");
+        assert!(
+            found["HEAD:Cargo.toml"].contains("[package]"),
+            "{:?}",
+            found.get("HEAD:Cargo.toml")
+        );
+        assert!(!found.contains_key("HEAD:definitely-not-here.toml"));
     }
 }
