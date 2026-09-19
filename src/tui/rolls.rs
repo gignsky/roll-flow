@@ -3014,6 +3014,7 @@ mod tests {
             version_gate: true,
             tag_on_promote: true,
             push_tag: true,
+            dev_versions: true,
             roll_to_rolling_gates: Vec::new(),
             rolling_to_main_gates: Vec::new(),
             host_gates: Vec::new(),
@@ -3889,6 +3890,7 @@ mod tests {
             version_gate: true,
             tag_on_promote: true,
             push_tag: true,
+            dev_versions: true,
             roll_to_rolling_gates: Vec::new(),
             rolling_to_main_gates: Vec::new(),
             host_gates: Vec::new(),
@@ -4156,6 +4158,7 @@ mod tests {
             major,
             minor,
             patch,
+            dev_roll: None,
         }
     }
 

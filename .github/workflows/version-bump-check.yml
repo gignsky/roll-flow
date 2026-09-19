@@ -29,6 +29,18 @@ jobs:
           echo "base (${{ github.base_ref }}) = ${base_ver:-<none>}"
           echo "head (this PR)               = ${head_ver:-<none>}"
 
+          # Mirrors VersionStatus::DevVersion in src/core/version.rs. A roll
+          # branch's Cargo.toml carries a `-roll<N>` marker that `rf graduate`
+          # strips; one reaching develop or main means the strip was skipped.
+          # This cannot be left to the comparison below: `sort -V` ranks
+          # "0.2.4-roll9" *above* "0.2.4", so a dev version would pass as a bump.
+          case "${head_ver}" in
+            *-roll[0-9]*)
+              echo "::error::Cargo.toml version (${head_ver}) still carries a roll's dev marker. Graduate the roll to strip it, or set it to a plain X.Y.Z."
+              exit 1
+              ;;
+          esac
+
           if [ -z "${head_ver}" ] || [ -z "${base_ver}" ]; then
             echo "::error::could not read a version from Cargo.toml (head='${head_ver}', base='${base_ver}')."
             exit 1

@@ -595,6 +595,9 @@ pub(crate) struct CreateOutcome {
     pub branch: String,
     pub stable: String,
     pub dry_run: bool,
+    /// The branch's number, so the caller can mark its version `-roll<N>`.
+    /// Shared with `hotfix_create`, which fills it with the hotfix number.
+    pub number: u32,
 }
 
 /// Create a roll branch `roll/N-MMDD-slug` off the stable branch.
@@ -640,6 +643,7 @@ pub(crate) fn create(
         branch: branch_name,
         stable: config.stable_branch.clone(),
         dry_run,
+        number: next,
     })
 }
 
@@ -738,6 +742,7 @@ pub(crate) fn hotfix_create(
         branch: branch_name,
         stable: config.stable_branch.clone(),
         dry_run,
+        number: next,
     })
 }
 
@@ -925,6 +930,13 @@ pub(crate) fn version_gate_error(
         VersionStatus::Unreadable => {
             anyhow!("could not read a version from Cargo.toml (head='{head}', base='{base}')")
         }
+        // A different fix from a bump, so a different message: the marker is
+        // what `rf graduate` strips, and a dev version must never reach stable
+        // — not least because it would be tagged `v{head}`.
+        VersionStatus::DevVersion => anyhow!(
+            "Cargo.toml version ({head}) on '{source}' still carries a roll's dev marker; \
+             graduate the roll to strip it, or set it to a plain X.Y.Z by hand"
+        ),
         VersionStatus::Ok | VersionStatus::NotApplicable => {
             anyhow!("version check passed unexpectedly")
         }
@@ -948,13 +960,68 @@ pub(crate) fn apply_version_bump(
         .ok_or_else(|| anyhow!("no readable version in Cargo.toml to bump"))?;
     let next = current.bump(level);
 
+    let message = format!("chore(release): bump version to {next} for {reason}");
+    commit_version_change(config, next, &message)?;
+    Ok((current, next))
+}
+
+/// Write `next` into `Cargo.toml`, refresh the lockfile, and commit both.
+///
+/// The shared body of [`apply_version_bump`], [`apply_dev_version`] and
+/// [`strip_dev_version`] — every path that rewrites the version does the same
+/// three things in the same order, and the lockfile refresh is the step that
+/// must not be forgotten: a workspace member's own version appears in
+/// `Cargo.lock`, and the configured `cargo update --workspace --locked` gate
+/// fails against a stale one.
+fn commit_version_change(config: &Config, next: Semver, message: &str) -> Result<()> {
+    let repo = &config.repo_root;
     version::write_version(repo, next)?;
     refresh_lockfile(repo);
+    git::commit_paths(repo, &["Cargo.toml", "Cargo.lock"], message)
+        .with_context(|| format!("failed to commit the version change to {next}"))
+}
 
-    let message = format!("chore(release): bump version to {next} for {reason}");
-    git::commit_paths(repo, &["Cargo.toml", "Cargo.lock"], &message)
-        .with_context(|| format!("failed to commit the version bump to {next}"))?;
-    Ok((current, next))
+/// Mark the checked-out roll branch's version as roll `number`'s dev version:
+/// `0.2.4` becomes `0.2.4-roll<number>`.
+///
+/// The base numbers are left alone on purpose. Graduation strips the marker
+/// back to exactly the version the roll branched from, so the promotion gate
+/// then reports `UNCHANGED` and demands a real bump — which is the point of the
+/// whole mechanism.
+///
+/// `Ok(None)` when the repo has no readable version, which is every repo
+/// without a `Cargo.toml`; marking is a convenience, never a precondition.
+pub(crate) fn apply_dev_version(config: &Config, number: u32) -> Result<Option<Semver>> {
+    let Some(current) = version::read_version(&config.repo_root)? else {
+        return Ok(None);
+    };
+    if current.dev_roll == Some(number) {
+        return Ok(None);
+    }
+    let next = current.as_dev(number);
+    let message = format!("chore(version): mark {next} as roll {number}'s dev version");
+    commit_version_change(config, next, &message)?;
+    Ok(Some(next))
+}
+
+/// Strip the dev marker from the checked-out branch's version, returning the
+/// version it became. `Ok(None)` when there was no marker to strip.
+///
+/// Called by `rf graduate` **before** the gates run, for the same reason the
+/// version bump is: it rewrites `Cargo.lock`, and `roll_to_rolling_gates`
+/// contains `cargo update --workspace --locked`, which fails against a stale
+/// lockfile.
+pub(crate) fn strip_dev_version(config: &Config, reason: &str) -> Result<Option<Semver>> {
+    let Some(current) = version::read_version(&config.repo_root)? else {
+        return Ok(None);
+    };
+    if !current.is_dev() {
+        return Ok(None);
+    }
+    let next = current.released();
+    let message = format!("chore(version): drop the dev marker from {current} for {reason}");
+    commit_version_change(config, next, &message)?;
+    Ok(Some(next))
 }
 
 /// Best-effort `Cargo.lock` refresh after a version rewrite.

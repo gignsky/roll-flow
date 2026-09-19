@@ -111,6 +111,12 @@ pub struct Config {
     /// whether the offer is made at all.
     #[serde(default = "default_true")]
     pub push_tag: bool,
+    /// Mark a new roll branch's `Cargo.toml` version as `X.Y.Z-roll<N>` at
+    /// `rf start`, so the checked-out version says which roll you are on.
+    /// `rf graduate` strips the marker again. Repos with no `Cargo.toml` are
+    /// unaffected regardless of this setting.
+    #[serde(default = "default_true")]
+    pub dev_versions: bool,
     /// Workflow ownership mode. Defaults to [`Mode::Manage`] for configs that
     /// predate this field (via `#[serde(default)]`).
     #[serde(default)]
@@ -216,6 +222,7 @@ impl Config {
             version_gate: default_true(),
             tag_on_promote: default_true(),
             push_tag: default_true(),
+            dev_versions: default_true(),
             mode: Mode::default(),
             username,
             hosts,
@@ -409,6 +416,7 @@ mod tests {
             version_gate: true,
             tag_on_promote: true,
             push_tag: true,
+            dev_versions: true,
             mode: super::Mode::default(),
             username: "old".to_string(),
             hosts: vec!["x".to_string()],
@@ -444,6 +452,7 @@ mod tests {
             version_gate: true,
             tag_on_promote: true,
             push_tag: true,
+            dev_versions: true,
             mode: Mode::Assist,
             username: "me".to_string(),
             hosts: vec![],
@@ -571,16 +580,26 @@ mod tests {
             version_gate = false
             tag_on_promote = false
             push_tag = false
+            dev_versions = false
         "#;
         let parsed: Config = toml::from_str(legacy).expect("parse");
         assert!(!parsed.version_gate);
         assert!(!parsed.tag_on_promote);
         assert!(!parsed.push_tag);
+        assert!(!parsed.dev_versions);
 
         let rendered = parsed.to_toml_string().expect("render");
         let reparsed: Config = toml::from_str(&rendered).expect("reparse");
         assert!(!reparsed.version_gate);
         assert!(!reparsed.tag_on_promote);
         assert!(!reparsed.push_tag);
+        assert!(!reparsed.dev_versions);
+
+        // And a config written before the flag existed still parses, defaulting
+        // the marker on — the `#[serde(default)]` contract every release flag
+        // here carries.
+        let predates = legacy.replace("dev_versions = false\n", "");
+        let parsed: Config = toml::from_str(&predates).expect("parse without the flag");
+        assert!(parsed.dev_versions);
     }
 }

@@ -103,6 +103,10 @@ pub enum Cmd {
         date: Option<String>,
         #[arg(long)]
         dry_run: bool,
+        /// Skip marking the new branch's Cargo.toml version as
+        /// `X.Y.Z-roll<N>`, overriding `dev_versions` in the config.
+        #[arg(long)]
+        no_dev_version: bool,
     },
 
     /// Merge a feature branch into the current roll.

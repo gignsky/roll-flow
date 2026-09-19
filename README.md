@@ -41,7 +41,7 @@ Run:
 
 ```text
 rf init [--rolling-branch <name>] [--stable-branch <name>] [--roll-prefix <prefix>] [--username <user>] [--hosts <h1,h2>] [--mode <manage|assist>] [--force] [--yes]
-rf create <slug> [--date MMDD] [--dry-run]            (alias: rf start)
+rf create <slug> [--date MMDD] [--dry-run] [--no-dev-version]  (alias: rf start)
 rf integrate <branch>
 rf hotfix [<slug>] [--date MMDD] [--land] [--dry-run]
 rf verify [--dry-run] [--bump <patch|minor|major>] [--yes]
@@ -97,6 +97,15 @@ equivalent:
   run, because it rewrites `Cargo.lock` and the gates include
   `cargo update --workspace --locked`. The TUI's `[b]` applies the same bump on
   demand, ahead of needing it — see [`status`](docs/commands/status.md#bumping-the-version).
+- **Dev versions** — `rf start` marks a new roll's version with the roll it
+  belongs to (`0.2.4` → `0.2.4-roll9`), so the checked-out version says which
+  roll you are on. `rf graduate` strips the marker again, back to exactly the
+  version the roll branched from — which is what leaves the promotion gate
+  reporting `UNCHANGED` and demanding a real bump. A `-roll<N>` version is
+  refused outright by `rf verify` and `rf promote` rather than compared, since
+  `0.2.5-roll9` is numerically above `0.2.4` and would otherwise promote and be
+  tagged. Off per repo with `dev_versions = false`, or per run with
+  `--no-dev-version` — see [`create`](docs/commands/create.md#dev-versions).
 - **Release tag** — a successful `rf promote` creates an annotated `vX.Y.Z` tag on
   the promotion merge commit, with the promoted rolls listed in the tag body. The
   subject matches the one `.github/workflows/tag-on-main.yml` writes, and, like

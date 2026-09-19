@@ -104,10 +104,23 @@ long list — that keeps two rolls adding rules in different areas from collidin
   `version-bump-check.yml`, `tag-on-main.yml`, `release-check.yml`. When changing
   one side, change the other. `src/core/version.rs` records which rule mirrors
   which workflow.
-- A version bump must be committed **before** the configured gates run, never
-  after: it rewrites `Cargo.lock`, and `rolling_to_main_gates` contains
+- Any version *rewrite* must be committed **before** the configured gates run,
+  never after: it rewrites `Cargo.lock`, and `rolling_to_main_gates` contains
   `cargo update --workspace --locked`, which fails on a stale lockfile. This is
-  why the bump is a CLI-level step in `main.rs` rather than part of `ops::promote`.
+  why the bump is a CLI-level step in `main.rs` rather than part of
+  `ops::promote`, and why `rf graduate` strips the dev marker at the same level
+  rather than inside `ops::graduate`. Both go through
+  `ops::commit_version_change`, which is the one place the write, the lockfile
+  refresh and the commit happen in that order.
+- A `-roll<N>` dev version must never reach `rolling` or the stable branch, and
+  is refused **before** the numbers are compared, not by them. `0.2.5-roll9` is
+  numerically above `0.2.4`, so a comparison alone would promote it — and then
+  tag it `v0.2.5-roll9`. Both sides state the rule separately for the same
+  reason: `sort -V` ranks a `-roll9` suffix *above* the bare version, and so
+  does a derived `Ord`, which is why `Semver`'s `Ord` is hand-written.
+- The dev marker is a roll *number*, not a free-form pre-release string. It keeps
+  `Semver` `Copy`, and any other suffix still fails to parse rather than being
+  silently dropped — dropping one could let a lower version read as higher.
 
 ## `rf clean`
 

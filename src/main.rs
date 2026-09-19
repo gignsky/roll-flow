@@ -47,7 +47,8 @@ fn main() -> Result<()> {
             slug,
             date,
             dry_run,
-        } => cmd_create(&slug, date, dry_run)?,
+            no_dev_version,
+        } => cmd_create(&slug, date, dry_run, no_dev_version)?,
         Cmd::Integrate { branch } => cmd_integrate(&branch)?,
         Cmd::Hotfix {
             slug,
@@ -248,11 +249,20 @@ fn config_diff(current: &str, detected: &str) -> String {
     out
 }
 
-fn cmd_create(slug: &str, date: Option<String>, dry_run: bool) -> Result<()> {
+fn cmd_create(slug: &str, date: Option<String>, dry_run: bool, no_dev_version: bool) -> Result<()> {
     let config = Config::load()?;
     ops::ensure_clean_state(&config)?;
     let outcome = ops::create(&config, slug, date, dry_run)?;
     print_create(&outcome);
+
+    // After the branch exists, and only on a real run: the mark is a commit, so
+    // a dry run must not leave one behind. A repo with no `Cargo.toml` reports
+    // `None` and nothing is said.
+    if !dry_run && config.dev_versions && !no_dev_version {
+        if let Some(dev) = ops::apply_dev_version(&config, outcome.number)? {
+            println!("version marked {dev}");
+        }
+    }
     Ok(())
 }
 
@@ -497,6 +507,7 @@ fn render_version_check(check: &VersionCheck, source: &str, target: &str) {
         VersionStatus::Unchanged => "UNCHANGED",
         VersionStatus::Lower => "LOWER",
         VersionStatus::Unreadable => "UNREADABLE",
+        VersionStatus::DevVersion => "DEV",
         VersionStatus::NotApplicable => return,
     };
     println!("Version: {head} on '{source}' (base '{target}' {base}) {verdict}");
@@ -547,6 +558,20 @@ fn cmd_graduate(dry_run: bool, force: bool, reason: Option<String>) -> Result<()
             config.stable_branch
         );
     }
+    // Before `ops::graduate`, which runs the gates and then merges: the strip
+    // rewrites `Cargo.lock`, and `roll_to_rolling_gates` contains
+    // `cargo update --workspace --locked`, which fails against a stale one.
+    // Same sequencing, and the same reason, as `resolve_version_gate`.
+    //
+    // Skipped on a dry run, which must leave no commit behind — so a dry run
+    // reports what the gates would say about the *unstripped* version. That is
+    // the honest answer for a preview that changes nothing.
+    if !dry_run {
+        if let Some(released) = ops::strip_dev_version(&config, &current)? {
+            println!("dropped the dev marker; version is now {released}");
+        }
+    }
+
     let outcome = ops::graduate(&config, &current, dry_run, &force)?;
     print_graduate(&outcome);
     Ok(())

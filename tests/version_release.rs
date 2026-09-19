@@ -432,3 +432,92 @@ fn verify_on_a_roll_branch_ignores_the_version_gate() {
         out.combined()
     );
 }
+
+// ── dev versions ────────────────────────────────────────────────────────────
+
+#[test]
+fn a_new_roll_is_marked_with_its_number_and_graduation_strips_it() {
+    // The whole point of the marker: the checked-out version says which roll
+    // you are on, and by graduation time it is gone again — leaving exactly the
+    // version the roll branched from, so promotion still demands a real bump.
+    let sb = Sandbox::cargo();
+    sb.init();
+
+    let out = sb.create_roll("dev-marked", "0611");
+    assert!(out.success, "create failed: {}", out.combined());
+    let branch = sb.current_branch();
+    assert_eq!(sb.cargo_version_at("HEAD"), "0.0.1-roll1");
+    assert!(out.combined().contains("0.0.1-roll1"), "{}", out.combined());
+
+    sb.commit_file("work.txt", "work\n", "do the work");
+    let out = sb.rf(&["graduate"]);
+    assert!(out.success, "graduate failed: {}", out.combined());
+
+    // Stripped on the roll branch itself, before the merge, so rolling carries
+    // a clean version and so does the roll.
+    assert_eq!(sb.cargo_version_at(&branch), "0.0.1");
+    assert_eq!(sb.cargo_version_at("rolling"), "0.0.1");
+
+    // And the gate then behaves exactly as it does without the marker.
+    sb.git(&["checkout", "rolling"]);
+    let out = sb.rf(&["promote"]);
+    assert!(
+        !out.success,
+        "promote should still demand a bump: {}",
+        out.combined()
+    );
+}
+
+#[test]
+fn a_dev_version_can_never_be_promoted() {
+    // Numerically above its target and still refused: `0.9.9-roll1 > 0.0.1`,
+    // but shipping a dev marker to stable — and tagging it `v0.9.9-roll1` —
+    // is what this gate exists to stop.
+    let sb = Sandbox::cargo();
+    sb.init();
+    graduate_one(&sb, "feature", "0611");
+
+    sb.write_cargo_version("0.9.9-roll1");
+    sb.git(&["add", "Cargo.toml"]);
+    sb.git(&["commit", "-m", "hand-written dev version on rolling"]);
+
+    let out = sb.rf(&["promote"]);
+    assert!(
+        !out.success,
+        "a dev version must not promote: {}",
+        out.combined()
+    );
+    assert!(
+        out.combined().contains("dev marker"),
+        "the error should name the fix: {}",
+        out.combined()
+    );
+}
+
+#[test]
+fn the_marker_can_be_declined_per_invocation() {
+    let sb = Sandbox::cargo();
+    sb.init();
+
+    let out = sb.rf(&["create", "plain", "--date", "0611", "--no-dev-version"]);
+    assert!(out.success, "create failed: {}", out.combined());
+    assert_eq!(sb.cargo_version_at("HEAD"), "0.0.1");
+}
+
+#[test]
+fn a_repo_without_a_manifest_is_untouched_by_the_marker() {
+    // The rule that keeps the dotfiles repo working: no `Cargo.toml`, nothing
+    // to mark, and no commit invented to say so.
+    let sb = Sandbox::plain();
+    sb.init();
+
+    let before = sb.rev("HEAD");
+    let out = sb.create_roll("no-manifest", "0611");
+    assert!(out.success, "create failed: {}", out.combined());
+    assert_eq!(sb.rev("HEAD"), before, "a commit was made anyway");
+    assert!(
+        !out.combined().contains("version marked"),
+        "{}",
+        out.combined()
+    );
+}
