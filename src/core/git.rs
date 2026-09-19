@@ -1,6 +1,7 @@
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
+use crate::core::proc;
 use crate::error::RfError;
 
 // ── Repository discovery ──────────────────────────────────────────────────────
@@ -28,13 +29,23 @@ pub fn repo_root(dir: &Path) -> Result<PathBuf, RfError> {
 
 // ── Primitives ────────────────────────────────────────────────────────────────
 
+/// Build a `git -C <repo> <args...>` command without running it.
+///
+/// Shared by the runners below and by callers that need to add environment
+/// variables (the sync commands set `GIT_TERMINAL_PROMPT`) before spawning.
+pub fn git_command(repo: &Path, args: &[&str]) -> Command {
+    let mut cmd = Command::new("git");
+    cmd.arg("-C").arg(repo).args(args);
+    cmd
+}
+
 /// Run a git command in `repo`, returning an error if it exits non-zero.
+///
+/// Goes through [`crate::core::proc::run`], so git's output is inherited by the
+/// terminal normally and relayed to the TUI's output panel when the calling
+/// thread has a sink installed.
 pub fn run_git(repo: &Path, args: &[&str]) -> Result<(), RfError> {
-    let status = Command::new("git")
-        .arg("-C")
-        .arg(repo)
-        .args(args)
-        .status()?;
+    let status = proc::run(&mut git_command(repo, args))?;
     if status.success() {
         Ok(())
     } else {
@@ -43,6 +54,70 @@ pub fn run_git(repo: &Path, args: &[&str]) -> Result<(), RfError> {
             args.join(" "),
             status
         )))
+    }
+}
+
+/// Run `cmd` as a git invocation described by `label`, folding git's stderr into
+/// the error message on failure.
+///
+/// [`run_git`] cannot do this: it inherits stdio, so by the time it sees a
+/// non-zero status the diagnosis has already gone to the terminal and only the
+/// exit code is left. The sync commands need the text — deciding whether a push
+/// was rejected as non-fast-forward, or refused because the lease was stale,
+/// means reading what git actually said.
+///
+/// Output still reaches an installed sink; the returned `stderr` is a *copy*
+/// collected alongside, not a diversion of it.
+pub fn run_git_capturing_stderr(mut cmd: Command, label: &str) -> Result<(), GitFailure> {
+    let (tx, rx) = std::sync::mpsc::channel();
+    let collector = std::thread::spawn(move || {
+        rx.iter()
+            .filter(|line: &proc::OutLine| line.is_err())
+            .map(|line| line.text().to_string())
+            .collect::<Vec<_>>()
+            .join("\n")
+    });
+
+    let status = proc::run_teed(&mut cmd, tx);
+    let stderr = collector.join().unwrap_or_default();
+
+    match status {
+        Err(err) => Err(GitFailure {
+            stderr,
+            message: format!("`{label}` could not run: {err}"),
+        }),
+        Ok(status) if status.success() => Ok(()),
+        Ok(status) => Err(GitFailure {
+            message: format!("`{label}` exited with {status}"),
+            stderr,
+        }),
+    }
+}
+
+/// A failed git invocation, with the stderr text that explains it.
+#[derive(Debug, Clone)]
+pub struct GitFailure {
+    /// Everything git wrote to stderr, newline-joined.
+    pub stderr: String,
+    /// One-line summary, used when `stderr` is empty.
+    pub message: String,
+}
+
+impl std::fmt::Display for GitFailure {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        if self.stderr.trim().is_empty() {
+            write!(f, "{}", self.message)
+        } else {
+            write!(f, "{}", self.stderr.trim())
+        }
+    }
+}
+
+impl std::error::Error for GitFailure {}
+
+impl From<GitFailure> for RfError {
+    fn from(err: GitFailure) -> Self {
+        RfError::Git(err.to_string())
     }
 }
 
@@ -220,6 +295,75 @@ impl LocalBranch {
     pub fn is_checked_out(&self) -> bool {
         !self.worktree.is_empty()
     }
+}
+
+/// How a local branch sits relative to its configured upstream.
+///
+/// Derived from `%(upstream:track)`, which git already computes during the
+/// single [`local_branch_details`] call — far cheaper than an
+/// [`ahead_behind`] subprocess per branch when the whole list needs the answer
+/// at once.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TrackState {
+    /// No upstream is configured for this branch.
+    NoUpstream,
+    /// An upstream is configured but its remote-tracking ref is gone.
+    Gone,
+    /// In sync with the upstream.
+    InSync,
+    /// Commits here that the upstream lacks.
+    Ahead(u32),
+    /// Commits on the upstream that are missing here.
+    Behind(u32),
+    /// Both, in either direction.
+    Diverged { ahead: u32, behind: u32 },
+}
+
+impl TrackState {
+    /// True when pushing would be rejected as non-fast-forward, so a push must
+    /// either be forced or preceded by a pull.
+    pub fn needs_force_to_push(&self) -> bool {
+        matches!(self, TrackState::Behind(_) | TrackState::Diverged { .. })
+    }
+}
+
+/// Classify a branch's relationship to its upstream.
+///
+/// The `track` field is empty in *two* different situations — in sync, and no
+/// upstream at all — so the upstream field is what separates them. Pure, so the
+/// whole table is testable without a repo.
+pub fn track_state(branch: &LocalBranch) -> TrackState {
+    if branch.upstream.is_empty() {
+        return TrackState::NoUpstream;
+    }
+    let track = branch.track.trim();
+    if matches!(track, "gone" | "[gone]") {
+        return TrackState::Gone;
+    }
+    match (
+        parse_track_count(track, "ahead"),
+        parse_track_count(track, "behind"),
+    ) {
+        (0, 0) => TrackState::InSync,
+        (ahead, 0) => TrackState::Ahead(ahead),
+        (0, behind) => TrackState::Behind(behind),
+        (ahead, behind) => TrackState::Diverged { ahead, behind },
+    }
+}
+
+/// Pull the number out of an `ahead 2`/`behind 1` fragment of a `track` string,
+/// returning 0 when the keyword is absent.
+///
+/// Hand-rolled rather than regex: the crate has no regex dependency, and the
+/// grammar git emits here is fixed at `"ahead N"`, `"behind N"`, or
+/// `"ahead N, behind M"`.
+fn parse_track_count(track: &str, keyword: &str) -> u32 {
+    track
+        .split(',')
+        .filter_map(|part| part.trim().strip_prefix(keyword))
+        .filter_map(|rest| rest.trim().parse().ok())
+        .next()
+        .unwrap_or(0)
 }
 
 /// Field separator for [`local_branch_details`]. Tab is safe: git refnames
@@ -510,7 +654,7 @@ pub fn commit_paths(repo: &Path, paths: &[&str], message: &str) -> Result<(), Rf
 mod tests {
     use super::{
         ahead_behind, local_branch_details, parse_ahead_behind, parse_local_branch_line,
-        remote_head_branch, remote_tracking_refs, remotes,
+        remote_head_branch, remote_tracking_refs, remotes, track_state, LocalBranch, TrackState,
     };
     use std::path::Path;
     use std::process::Command;
@@ -706,5 +850,125 @@ mod tests {
         let dir = tempfile::tempdir().expect("dir");
         git(dir.path(), &["init", "-b", "main"]);
         assert!(remotes(dir.path()).expect("remotes").is_empty());
+    }
+
+    /// Build a `LocalBranch` carrying only the two fields `track_state` reads.
+    fn tracked(upstream: &str, track: &str) -> LocalBranch {
+        LocalBranch {
+            name: "feature/x".to_string(),
+            upstream: upstream.to_string(),
+            remote_name: if upstream.is_empty() {
+                String::new()
+            } else {
+                "origin".to_string()
+            },
+            track: track.to_string(),
+            worktree: String::new(),
+        }
+    }
+
+    #[test]
+    fn an_empty_upstream_is_no_upstream_not_in_sync() {
+        // `track` is empty in both cases; only the upstream field separates them.
+        assert_eq!(track_state(&tracked("", "")), TrackState::NoUpstream);
+        assert_eq!(
+            track_state(&tracked("origin/feature/x", "")),
+            TrackState::InSync
+        );
+    }
+
+    #[test]
+    fn a_gone_upstream_is_reported_in_both_spellings() {
+        assert_eq!(
+            track_state(&tracked("origin/feature/x", "gone")),
+            TrackState::Gone
+        );
+        assert_eq!(
+            track_state(&tracked("origin/feature/x", "[gone]")),
+            TrackState::Gone
+        );
+    }
+
+    #[test]
+    fn ahead_behind_and_divergence_are_parsed_from_track() {
+        assert_eq!(
+            track_state(&tracked("origin/feature/x", "ahead 2")),
+            TrackState::Ahead(2)
+        );
+        assert_eq!(
+            track_state(&tracked("origin/feature/x", "behind 3")),
+            TrackState::Behind(3)
+        );
+        assert_eq!(
+            track_state(&tracked("origin/feature/x", "ahead 1, behind 4")),
+            TrackState::Diverged {
+                ahead: 1,
+                behind: 4
+            }
+        );
+    }
+
+    #[test]
+    fn unrecognised_track_text_degrades_to_in_sync_rather_than_erroring() {
+        // Never panics or misreports divergence on text we did not anticipate:
+        // showing "in sync" is wrong but harmless, whereas a panic kills the TUI.
+        assert_eq!(
+            track_state(&tracked("origin/feature/x", "something new")),
+            TrackState::InSync
+        );
+    }
+
+    #[test]
+    fn only_behind_and_diverged_require_a_force_push() {
+        assert!(!TrackState::NoUpstream.needs_force_to_push());
+        assert!(!TrackState::InSync.needs_force_to_push());
+        assert!(!TrackState::Ahead(3).needs_force_to_push());
+        assert!(!TrackState::Gone.needs_force_to_push());
+        assert!(TrackState::Behind(1).needs_force_to_push());
+        assert!(TrackState::Diverged {
+            ahead: 1,
+            behind: 1
+        }
+        .needs_force_to_push());
+    }
+
+    #[test]
+    fn track_state_matches_what_git_reports_for_a_real_diverged_branch() {
+        // Guards the parser against git changing its `%(upstream:track)` wording:
+        // every pure test above encodes that wording as a literal, so nothing
+        // else would notice if git started phrasing it differently.
+        let remote = tempfile::tempdir().expect("remote dir");
+        let local = tempfile::tempdir().expect("local dir");
+        let seed = tempfile::tempdir().expect("seed dir");
+        let (rp, lp, sp) = (remote.path(), local.path(), seed.path());
+
+        git(rp, &["init", "-b", "main", "--bare"]);
+        git(sp, &["clone", rp.to_str().unwrap(), "."]);
+        git(sp, &["config", "user.email", "t@e.test"]);
+        git(sp, &["config", "user.name", "t"]);
+        git(sp, &["commit", "--allow-empty", "-m", "init"]);
+        git(sp, &["push", "origin", "main"]);
+
+        git(lp, &["clone", rp.to_str().unwrap(), "."]);
+        git(lp, &["config", "user.email", "t@e.test"]);
+        git(lp, &["config", "user.name", "t"]);
+        git(lp, &["commit", "--allow-empty", "-m", "local a"]);
+        git(lp, &["commit", "--allow-empty", "-m", "local b"]);
+
+        git(sp, &["commit", "--allow-empty", "-m", "remote c"]);
+        git(sp, &["push", "origin", "main"]);
+        git(lp, &["fetch", "origin"]);
+
+        let details = local_branch_details(lp).expect("branch details");
+        let main = details.iter().find(|b| b.name == "main").expect("main");
+        assert_eq!(
+            track_state(main),
+            TrackState::Diverged {
+                ahead: 2,
+                behind: 1
+            },
+            "track was {:?}",
+            main.track
+        );
     }
 }

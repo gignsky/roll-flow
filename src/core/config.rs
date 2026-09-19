@@ -39,6 +39,55 @@ impl Mode {
     }
 }
 
+/// What the TUI's `[p]` key does to the checked-out branch.
+///
+/// Configurable because the right answer depends on the repo, not on rf: a roll
+/// branch that silently grows a merge commit from a surprise `git pull` is
+/// exactly the history that graduation detection has to reason about later, so
+/// the default refuses rather than merging. `Merge` and `Rebase` are there for
+/// repos that prefer git's own defaults.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "kebab-case")]
+pub enum PullMode {
+    /// `git pull --ff-only` — fast-forward or fail, never a merge commit.
+    #[default]
+    FfOnly,
+    /// `git pull` — git's default, merging on divergence.
+    Merge,
+    /// `git pull --rebase` — replay local commits on the upstream.
+    Rebase,
+}
+
+impl PullMode {
+    /// Parse a user-supplied value, with a clear error on anything else.
+    /// Accepts `ff-only` and `ff_only` since both spellings read naturally in
+    /// TOML.
+    ///
+    /// Serde handles the config file itself; this exists for the `--pull-mode`
+    /// style override a later CLI flag will want, and is exercised by tests so it
+    /// cannot rot.
+    #[allow(dead_code)]
+    pub fn parse(s: &str) -> Result<Self, RfError> {
+        match s.trim().to_ascii_lowercase().replace('_', "-").as_str() {
+            "ff-only" => Ok(PullMode::FfOnly),
+            "merge" => Ok(PullMode::Merge),
+            "rebase" => Ok(PullMode::Rebase),
+            other => Err(RfError::Config(format!(
+                "invalid pull_mode '{other}' (expected 'ff-only', 'merge' or 'rebase')"
+            ))),
+        }
+    }
+
+    /// The flag this mode adds to `git pull`, if any.
+    pub fn flag(&self) -> Option<&'static str> {
+        match self {
+            PullMode::FfOnly => Some("--ff-only"),
+            PullMode::Merge => None,
+            PullMode::Rebase => Some("--rebase"),
+        }
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Config {
     #[serde(default = "default_config_version")]
@@ -89,6 +138,15 @@ pub struct Config {
     /// names its own protected branches here.
     #[serde(default)]
     pub clean_protect: Vec<String>,
+    /// What the TUI's `[p]` key runs on the checked-out branch. Defaults to
+    /// [`PullMode::FfOnly`] for configs that predate this field.
+    #[serde(default)]
+    pub pull_mode: PullMode,
+    /// The command the TUI's `gg` binding launches. Overridable so a wrapper
+    /// script, a flake app, or an absolute path can stand in for a bare
+    /// `lazygit` on `PATH`.
+    #[serde(default = "default_lazygit")]
+    pub lazygit_command: String,
 }
 
 impl Config {
@@ -166,6 +224,8 @@ impl Config {
             rolling_to_main_gates: vec![],
             host_gates: vec![],
             clean_protect: vec![],
+            pull_mode: PullMode::default(),
+            lazygit_command: default_lazygit(),
         })
     }
 
@@ -223,6 +283,10 @@ impl Config {
 
 fn default_config_version() -> u32 {
     1
+}
+
+fn default_lazygit() -> String {
+    "lazygit".to_string()
 }
 
 fn default_true() -> bool {
@@ -332,7 +396,7 @@ fn parse_nix_string_value(content: &str, key: &str) -> Option<String> {
 mod tests {
     use std::path::PathBuf;
 
-    use super::Config;
+    use super::{default_lazygit, Config, PullMode};
 
     #[test]
     fn overrides_hosts_and_prefix() {
@@ -353,6 +417,8 @@ mod tests {
             rolling_to_main_gates: vec![],
             host_gates: vec![],
             clean_protect: vec![],
+            pull_mode: PullMode::default(),
+            lazygit_command: default_lazygit(),
         };
         let updated = cfg.with_overrides(
             Some("rolling".to_string()),
@@ -386,6 +452,8 @@ mod tests {
             rolling_to_main_gates: vec![],
             host_gates: vec![],
             clean_protect: vec![],
+            pull_mode: PullMode::default(),
+            lazygit_command: default_lazygit(),
         };
         let rendered = cfg.to_toml_string().expect("render");
         assert!(
@@ -414,6 +482,54 @@ mod tests {
         assert!(!parsed.is_assist());
         // Fields added later must not make an older config unloadable.
         assert!(parsed.clean_protect.is_empty());
+        assert_eq!(parsed.pull_mode, PullMode::FfOnly);
+        assert_eq!(parsed.lazygit_command, "lazygit");
+    }
+
+    #[test]
+    fn pull_mode_round_trips_through_toml_in_kebab_case() {
+        for (text, mode) in [
+            ("ff-only", PullMode::FfOnly),
+            ("merge", PullMode::Merge),
+            ("rebase", PullMode::Rebase),
+        ] {
+            let toml_src = format!(
+                r#"
+                config_version = 1
+                repo_root = "/tmp/repo"
+                rolling_branch = "rolling"
+                stable_branch = "main"
+                roll_prefix = "roll/"
+                username = "me"
+                hosts = []
+                pull_mode = "{text}"
+                "#
+            );
+            let parsed: Config = toml::from_str(&toml_src).expect("parse");
+            assert_eq!(parsed.pull_mode, mode, "for {text}");
+            // And back out again: `rf init` compares serialized output for
+            // idempotency, so a mode that does not round-trip would make every
+            // init report a spurious change.
+            assert!(
+                parsed.to_toml_string().expect("serialize").contains(text),
+                "{text} missing from serialized config"
+            );
+        }
+    }
+
+    #[test]
+    fn pull_mode_parse_accepts_both_separators_and_rejects_junk() {
+        assert_eq!(PullMode::parse("ff_only").unwrap(), PullMode::FfOnly);
+        assert_eq!(PullMode::parse("  Rebase ").unwrap(), PullMode::Rebase);
+        let err = PullMode::parse("ff").expect_err("should reject");
+        assert!(err.to_string().contains("expected"), "{err}");
+    }
+
+    #[test]
+    fn pull_mode_flags_match_the_git_invocations() {
+        assert_eq!(PullMode::FfOnly.flag(), Some("--ff-only"));
+        assert_eq!(PullMode::Merge.flag(), None);
+        assert_eq!(PullMode::Rebase.flag(), Some("--rebase"));
     }
 
     #[test]

@@ -7,3 +7,6 @@ rf list [--no-tui] [--deps] [--json]
 Lists roll branches and states, with the same `--no-tui`/`--json` options as
 [`status`](status.md). `--deps` adds the `deps`/`dependants` columns, which `list`
 leaves off by default.
+
+The keymap, the `sync`/chevron columns and the output panel are shared with
+`status` — see [`status`](status.md#keys).
