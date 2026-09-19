@@ -80,19 +80,20 @@ reports a stale lease, fetch with `[f]` and try again.
 
 `[b]` raises the `[package]` version in `Cargo.toml` on the **checked-out**
 branch — not the row under the cursor, because a bump is a commit and has to land
-on the branch the merge will be made from. The header carries the current version
-in its top-right corner as `v0.2.3`, so the effect is visible without opening
-anything — and it sits in the border rather than on the branch line, which a long
-roll name would otherwise crowd out.
+on the branch the merge will be made from. The bump modal shows the version it
+will raise, so the effect is visible before confirming.
+
+The header's top-right corner names the **binary that is running** — `rf v0.2.4`
+— not the checked-out branch's manifest. The two used to be conflated, and the
+corner changed on every `[space]`: in this repo it read as a roll's dev version,
+in any other repo as whatever that repo ships, and neither answers "which rf is
+this". Per-branch versions have their own table column.
 
 ```text
-┌ roll-flow ──────────────────────────────────────────── v0.2.3 ┐
+┌ roll-flow ───────────────────────────────────────── rf v0.2.4 ┐
 │Branch: roll/4-0918-x   Rolling: rolling   Stable: main        │
 └───────────────────────────────────────────────────────────────┘
 ```
-
-Repos with no `Cargo.toml` show nothing there, the same rule that makes `[b]`
-refuse in them.
 
 ```text
 ┌ bump version ────────────────────────┐

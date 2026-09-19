@@ -1665,22 +1665,19 @@ impl StatusApp {
                 Style::default().fg(Color::Green),
             ),
         ];
-        let mut block = Block::bordered().title(" roll-flow ");
-        // The version rides the top-right corner of the header border rather
-        // than the end of the branch line: it belongs to the repo, not to the
-        // branch, and the line it used to sit on grows with the branch name —
-        // on a long `roll/N-MMDD-slug` it was the first thing to be truncated.
-        // Only rendered when the repo has one; without that, `[b]` would be a
-        // key whose whole effect is a line in a dismissable panel.
-        if let Some(v) = self.version {
-            block = block.title_top(
-                Line::from(Span::styled(
-                    format!(" v{v} "),
-                    Style::default().fg(Color::Magenta),
-                ))
-                .right_aligned(),
-            );
-        }
+        // The corner names the binary that is running, not the checked-out
+        // branch's manifest. The two used to be conflated, and the corner would
+        // change on every `[space]` — in a repo that *is* roll-flow it read as
+        // the roll's dev version, in any other repo as whatever that repo ships.
+        // Neither is what "which rf is this" asks. The per-branch versions have
+        // their own column; the bump modal shows the manifest it will raise.
+        let block = Block::bordered().title(" roll-flow ").title_top(
+            Line::from(Span::styled(
+                format!(" rf v{} ", env!("CARGO_PKG_VERSION")),
+                Style::default().fg(Color::Magenta),
+            ))
+            .right_aligned(),
+        );
         f.render_widget(Paragraph::new(Line::from(spans)).block(block), area);
     }
 
@@ -3616,39 +3613,42 @@ mod tests {
     }
 
     #[test]
-    fn the_header_shows_the_version_only_when_the_repo_has_one() {
+    fn the_header_names_the_running_binary_not_the_manifest() {
+        // Whatever the checked-out branch's Cargo.toml says — or whether there
+        // is one — the corner answers "which rf is this".
         let mut app = StatusApp::new(test_config(), "main".to_string(), Vec::new(), false);
-        app.version = Some(v(1, 2, 3));
+        let expected = format!("rf v{}", env!("CARGO_PKG_VERSION"));
+
+        app.version = Some(v(9, 9, 9));
         let with = draw(|f, area| app.render_header(f, area));
-        assert!(with.contains("v1.2.3"), "{with}");
+        assert!(with.contains(&expected), "{with}");
+        assert!(
+            !with.contains("9.9.9"),
+            "manifest version leaked in:\n{with}"
+        );
 
         app.version = None;
         let without = draw(|f, area| app.render_header(f, area));
-        assert!(!without.contains("v1.2.3"), "{without}");
-        // The rest of the header is unaffected either way.
+        assert!(without.contains(&expected), "{without}");
         assert!(without.contains("Branch: main"), "{without}");
     }
 
     #[test]
     fn the_version_sits_in_the_top_right_corner_clear_of_the_branch_name() {
         // The branch line grows with the branch name, so the version has to be
-        // somewhere that length cannot push it out of. The corner is measured
-        // here rather than assumed: the first rendered row, past the midpoint.
-        let mut app = StatusApp::new(
+        // somewhere that length cannot push it out of. Measured, not assumed.
+        let app = StatusApp::new(
             test_config(),
             "roll/12-0918-a-deliberately-long-slug".to_string(),
             Vec::new(),
             false,
         );
-        app.version = Some(v(1, 2, 3));
         let out = draw(|f, area| app.render_header(f, area));
-
         let top = out.lines().next().expect("a top border row");
         let at = top
-            .find("v1.2.3")
+            .find("rf v")
             .unwrap_or_else(|| panic!("no version:\n{out}"));
         assert!(at > top.chars().count() / 2, "not right-aligned:\n{out}");
-        // And the branch it shares the header with is still intact below it.
         assert!(
             out.contains("roll/12-0918-a-deliberately-long-slug"),
             "{out}"
