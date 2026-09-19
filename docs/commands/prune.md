@@ -6,7 +6,8 @@ rf prune [--dry-run] [--local | --remote] [--yes] [--force] [--no-fetch]
 
 Deletes roll branches that have already been promoted to the stable branch,
 removing both the local branch and its copy on `origin`. Reachable from the TUI
-with `[x]`.
+with `[x]` — next to `[t]`, which is [`tidy`](tidy.md) and deletes the local copy
+only.
 
 Being promoted is not by itself treated as permission to delete. Promotion is
 inferred from commit subjects on stable, which establishes that the roll landed

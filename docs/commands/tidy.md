@@ -6,7 +6,8 @@ rf tidy [--state <active|blocked|diverged|graduated|promoted|all>,...] [--dry-ru
 
 Deletes **local** roll branches whose commits survive somewhere else, to clear
 what has piled up on one machine. It never touches `origin` — there is no
-`--remote` flag here to reach for by accident.
+`--remote` flag here to reach for by accident. Reachable from the TUI with
+`[t]`.
 
 This is the disk-cleanup counterpart to [`prune`](prune.md), and the difference
 is the question each one asks. Prune asks *has this landed?*, answers it against
@@ -34,6 +35,15 @@ runs `git fetch --prune origin` before planning. That is not a nicety: a cached
 remote-tracking ref for a branch already deleted upstream would certify as
 "recoverable" exactly the branches whose only remaining copy is the local one.
 `--no-fetch` opts out and plans against cached refs.
+
+## From the TUI
+
+`[t]` runs the default: the `graduated,promoted` states, no force, and the
+pruning fetch. It is repo-wide like `[x]`, so it acts on the whole list rather
+than the row under the cursor, and the confirm modal says `(local only)` where
+prune's says `(local + origin)` — that phrase is the difference between the two
+keys. A branch the safety gate rejects is reported as skipped in the output
+panel; clearing one of those still needs `rf tidy --force` from the CLI.
 
 ## Which rolls it looks at
 
