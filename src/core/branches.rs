@@ -392,7 +392,7 @@ fn scan_promoted(repo: &Path, stable_ref: &str) -> HashSet<String> {
 /// - `Graduate roll/N-... [...]` — an `rf graduate` structured merge.
 /// - `Merge pull request #M from OWNER/roll/N-...` — a GitHub PR merge, which is
 ///   how PR-based repos (including roll-flow dogfooding itself) land rolls.
-fn extract_graduated_branch(subject: &str) -> Option<String> {
+pub(crate) fn extract_graduated_branch(subject: &str) -> Option<String> {
     if let Some(rest) = subject.strip_prefix("Merge branch '") {
         // e.g. "roll/5-theme'" or "roll/5-theme' into rolling"
         rest.split('\'').next().map(|b| b.to_string())

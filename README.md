@@ -45,7 +45,7 @@ rf create <slug> [--date MMDD] [--dry-run]            (alias: rf start)
 rf integrate <branch>
 rf hotfix [<slug>] [--date MMDD] [--land] [--dry-run]
 rf verify [--dry-run] [--bump <patch|minor|major>] [--yes]
-rf graduate [--dry-run] [--force --reason <text>]
+rf graduate [--dry-run] [--force --reason <text>] [--yes]
 rf promote [--roll <branch>]... [--dry-run] [--force --reason <text>] [--bump <patch|minor|major>] [--no-tag] [--yes]
 rf status [--no-tui] [--no-deps] [--json]
 rf list [--no-tui] [--deps] [--json]
