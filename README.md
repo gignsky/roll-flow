@@ -131,7 +131,8 @@ cargo test
   release-tag push at the end of `rf promote`; and the TUI's `[p]`/`[P]`/`[f]`,
   which pull, push and fetch the selected branch
 - no daemon; `rf` only ever runs when invoked. The `status`/`list` TUI drives the
-  workflow (`i` integrate, `G` graduate, `m` promote, `u` update, `x` prune,
-  `t` tidy, `d` delete, `b` bump the version) and syncs the selected branch (`p` pull,
-  `P` push, `f` fetch, `gg` lazygit). A force *push* is available there behind a
-  confirmation; every other forced operation stays CLI-only by design
+  workflow (`i` integrate, `v` verify, `G` graduate, `m` promote, `u` update,
+  `x` prune, `t` tidy, `d` delete, `b` bump the version) and syncs the selected
+  branch (`p` pull, `P` push, `f` fetch, `gg` lazygit). A force *push* is
+  available there behind a confirmation; every other forced operation stays
+  CLI-only by design
