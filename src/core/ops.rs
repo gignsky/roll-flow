@@ -1682,16 +1682,49 @@ pub(crate) fn update(config: &Config, dry_run: bool) -> Result<UpdateOutcome> {
 
 // ── prune ───────────────────────────────────────────────────────────────────
 
-/// Which copies of a promoted roll branch `rf prune` may delete, and how strict
-/// to be about it.
+/// What has to be true of a branch tip before it may be deleted — the question
+/// "do these commits survive anywhere else?".
+///
+/// `rf prune` and `rf delete` ask it of the stable branch alone: they wind up
+/// work that has landed, and landing is the whole point. `rf tidy` asks a
+/// weaker question on purpose. It is reclaiming a machine's disk, not retiring
+/// work, so a branch whose commits are still on `origin` is fair game — `git
+/// fetch` brings it back.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Containment {
+    /// Only the stable branch (local or `origin/<stable>`) counts.
+    Stable,
+    /// Stable, the rolling branch, or the branch's own `origin/<branch>` copy.
+    Recoverable,
+}
+
+impl Containment {
+    /// Whether this policy needs a pruning fetch even when no remote copy is
+    /// being deleted.
+    ///
+    /// `Stable` does not: a stale `origin/<stable>` can only be *older* than
+    /// the real one, which under-reports containment and errs toward keeping
+    /// branches. `Recoverable` does, and load-bearingly so — it accepts
+    /// `origin/<branch>` as proof the commits survive, and a cached ref for a
+    /// branch already deleted upstream would certify exactly the branches whose
+    /// only remaining copy is the local one.
+    fn needs_fetch(self) -> bool {
+        matches!(self, Containment::Recoverable)
+    }
+}
+
+/// Which copies of a roll branch a deletion may touch, and how strict to be
+/// about it.
 pub(crate) struct PruneScope {
     pub local: bool,
     pub remote: bool,
-    /// Delete even when the branch tip holds commits the stable branch lacks.
+    /// Delete even when the branch tip holds commits the policy below does not
+    /// find anywhere else.
     pub force: bool,
-    /// Refresh remote-tracking refs before planning. Only meaningful with
-    /// `remote`.
+    /// Refresh remote-tracking refs before planning.
     pub fetch: bool,
+    /// What counts as "these commits survive elsewhere".
+    pub containment: Containment,
 }
 
 impl PruneScope {
@@ -1702,6 +1735,19 @@ impl PruneScope {
             remote: true,
             force: false,
             fetch: true,
+            containment: Containment::Stable,
+        }
+    }
+
+    /// The default `rf tidy`: local copies only, judged against everywhere the
+    /// commits could still be recovered from.
+    pub fn tidy(force: bool) -> Self {
+        PruneScope {
+            local: true,
+            remote: false,
+            force,
+            fetch: true,
+            containment: Containment::Recoverable,
         }
     }
 }
@@ -1756,30 +1802,48 @@ pub(crate) struct PruneResult {
     pub errors: Vec<String>,
 }
 
-/// Refs that count as "already in stable" for containment checks: the local
-/// stable branch and `origin/<stable>`, whichever resolve.
+/// Refs that count as "already in `branch`" for containment checks: the local
+/// branch and `origin/<branch>`, whichever resolve.
 ///
 /// Both are consulted because they routinely differ — a roll promoted upstream
 /// is contained in `origin/main` while a stale local `main` still lacks it, and
 /// checking only one side would skip branches that are genuinely safe to delete.
-fn stable_containment_refs(config: &Config) -> Vec<String> {
-    let repo = &config.repo_root;
+fn containment_refs(repo: &Path, branch: &str) -> Vec<String> {
     let mut refs = Vec::new();
-    if git::ref_exists(repo, &config.stable_branch) {
-        refs.push(config.stable_branch.clone());
+    if git::ref_exists(repo, branch) {
+        refs.push(branch.to_string());
     }
-    let remote_stable = format!("origin/{}", config.stable_branch);
-    if git::ref_exists(repo, &remote_stable) {
-        refs.push(remote_stable);
+    let tracking = format!("origin/{branch}");
+    if git::ref_exists(repo, &tracking) {
+        refs.push(tracking);
     }
     refs
 }
 
-/// True if every commit reachable from `tip` is already in one of `stable_refs`.
-fn contained_in_stable(repo: &Path, tip: &str, stable_refs: &[String]) -> bool {
-    stable_refs
-        .iter()
-        .any(|stable| git::is_ancestor(repo, tip, stable).unwrap_or(false))
+/// True if every commit reachable from `tip` is already in one of `refs`.
+fn contained_in_any(repo: &Path, tip: &str, refs: &[String]) -> bool {
+    refs.iter()
+        .any(|reference| git::is_ancestor(repo, tip, reference).unwrap_or(false))
+}
+
+/// Branch name -> worktree path for every local branch checked out somewhere.
+///
+/// One `for-each-ref` for the whole repo rather than a call per branch. A
+/// failure here is not fatal: without the map the guard simply does not fire
+/// and git refuses the delete itself, with a worse message.
+fn worktree_occupancy(repo: &Path) -> HashMap<String, String> {
+    git::local_branch_details(repo)
+        .map(|branches| {
+            branches
+                .into_iter()
+                .filter(|b| b.is_checked_out())
+                .map(|b| {
+                    let path = b.worktree.trim().to_string();
+                    (b.name, path)
+                })
+                .collect()
+        })
+        .unwrap_or_default()
 }
 
 /// Repo facts every deletion decision is made against, gathered once.
@@ -1789,7 +1853,13 @@ fn contained_in_stable(repo: &Path, tip: &str, stable_refs: &[String]) -> bool {
 struct DeletionContext {
     has_remote: bool,
     stable_refs: Vec<String>,
+    /// The rolling branch and `origin/<rolling>`, whichever resolve. Gathered
+    /// only for [`Containment::Recoverable`], which is the one policy that
+    /// counts them; empty otherwise rather than computed and ignored.
+    rolling_refs: Vec<String>,
     current: String,
+    /// Branches checked out in some worktree, mapped to that worktree's path.
+    worktrees: HashMap<String, String>,
 }
 
 impl DeletionContext {
@@ -1800,18 +1870,60 @@ impl DeletionContext {
         // Refresh first: `rf` is otherwise local-only, so `origin/*` refs can
         // claim branches that are already gone upstream — or, worse, name a tip
         // that is no longer the real one, which would judge containment against
-        // stale history and delete commits the check never saw.
-        if scope.remote && has_remote && scope.fetch {
+        // stale history and delete commits the check never saw. That applies
+        // whenever remote-tracking refs decide the outcome: because a remote
+        // copy is being deleted, or because the policy reads `origin/<branch>`
+        // to call a local copy recoverable.
+        if scope.fetch && has_remote && (scope.remote || scope.containment.needs_fetch()) {
             git::fetch_prune(repo, "origin")
                 .context("refreshing remote-tracking refs before deleting")?;
         }
 
+        let rolling_refs = match scope.containment {
+            Containment::Stable => Vec::new(),
+            Containment::Recoverable => containment_refs(repo, &config.rolling_branch),
+        };
+
         Ok(DeletionContext {
             has_remote,
-            stable_refs: stable_containment_refs(config),
+            stable_refs: containment_refs(repo, &config.stable_branch),
+            rolling_refs,
             current: git::current_branch(repo).unwrap_or_default(),
+            worktrees: worktree_occupancy(repo),
         })
     }
+
+    /// The worktree path a branch is checked out in, excluding the current
+    /// branch — that one has its own, plainer refusal.
+    fn other_worktree(&self, branch: &str) -> Option<&str> {
+        if branch == self.current {
+            return None;
+        }
+        self.worktrees.get(branch).map(String::as_str)
+    }
+}
+
+/// True when every commit on the local `branch` already lives somewhere
+/// `policy` accepts as survival.
+fn local_survives(repo: &Path, branch: &str, ctx: &DeletionContext, policy: Containment) -> bool {
+    if contained_in_any(repo, branch, &ctx.stable_refs) {
+        return true;
+    }
+    if policy == Containment::Stable {
+        return false;
+    }
+    if contained_in_any(repo, branch, &ctx.rolling_refs) {
+        return true;
+    }
+
+    // The branch's own copy on origin. A local tip that is an ancestor of it
+    // holds nothing that has not been pushed, so deleting the local copy loses
+    // no commits — the branch is one `git fetch` away. This leg is why the
+    // policy demands the pruning fetch above.
+    let tracking = format!("origin/{branch}");
+    ctx.has_remote
+        && git::ref_exists(repo, &tracking)
+        && git::is_ancestor(repo, branch, &tracking).unwrap_or(false)
 }
 
 /// Why a branch copy was declined. Kept as data rather than a formatted string
@@ -1820,44 +1932,60 @@ impl DeletionContext {
 enum SkipReason {
     /// The local copy is the checked-out branch.
     CheckedOut,
-    /// The local tip holds commits stable lacks.
+    /// The local copy is checked out in some *other* worktree. git refuses to
+    /// delete it regardless, so it is reported rather than attempted.
+    CheckedOutElsewhere,
+    /// The local tip holds commits the containment policy found nowhere else.
     LocalUncontained,
     /// The `origin` tip holds commits stable lacks.
     RemoteUncontained,
 }
 
-/// Which copies a deletion may touch, given facts already gathered from git.
-///
-/// The single implementation of the safety rules, shared by `rf prune` and
-/// `rf delete`. Two of them matter most: the checked-out branch's local copy is
-/// never deletable — that check sits *before* the force check, so `force` cannot
-/// override it — and a copy holding commits stable lacks needs `force`.
-///
-/// Pure, so the whole table is testable without a repo.
-fn decide_copies(
-    scope: &PruneScope,
+/// The per-branch facts a deletion decision is made from, gathered by
+/// [`plan_branch_deletion`] so [`decide_copies`] can stay pure.
+#[derive(Debug, Clone, Copy, Default)]
+struct CopyFacts {
     has_local: bool,
     has_remote_copy: bool,
+    /// The local copy is the branch HEAD is on.
     is_current: bool,
+    /// The local copy is checked out in a different worktree.
+    in_worktree: bool,
     local_contained: bool,
     remote_contained: bool,
-) -> (bool, bool, Vec<SkipReason>) {
+}
+
+/// Which copies a deletion may touch, given facts already gathered from git.
+///
+/// The single implementation of the safety rules, shared by `rf prune`,
+/// `rf delete` and `rf tidy`. Two of them matter most: a local copy that is
+/// checked out anywhere is never deletable — those checks sit *before* the
+/// force check, so `force` cannot reach past them — and a copy whose commits
+/// the containment policy could not find elsewhere needs `force`.
+///
+/// Pure, so the whole table is testable without a repo. Note it takes the
+/// *answers* about containment, not the policy: which refs were consulted is
+/// [`local_survives`]'s business, and keeping that out of here is what lets one
+/// table serve all three commands.
+fn decide_copies(scope: &PruneScope, facts: CopyFacts) -> (bool, bool, Vec<SkipReason>) {
     let mut skips = Vec::new();
     let mut delete_local = false;
     let mut delete_remote = false;
 
-    if scope.local && has_local {
-        if is_current {
+    if scope.local && facts.has_local {
+        if facts.is_current {
             skips.push(SkipReason::CheckedOut);
-        } else if scope.force || local_contained {
+        } else if facts.in_worktree {
+            skips.push(SkipReason::CheckedOutElsewhere);
+        } else if scope.force || facts.local_contained {
             delete_local = true;
         } else {
             skips.push(SkipReason::LocalUncontained);
         }
     }
 
-    if scope.remote && has_remote_copy {
-        if scope.force || remote_contained {
+    if scope.remote && facts.has_remote_copy {
+        if scope.force || facts.remote_contained {
             delete_remote = true;
         } else {
             skips.push(SkipReason::RemoteUncontained);
@@ -1885,27 +2013,32 @@ fn plan_branch_deletion(
     let remote_ref = format!("origin/{branch}");
     let has_local = git::ref_exists(repo, branch);
     let has_remote_copy = ctx.has_remote && git::ref_exists(repo, &remote_ref);
+    let worktree = ctx.other_worktree(branch);
 
     // Containment is only asked about copies whose answer could change the
     // outcome: `is_ancestor` is a subprocess, and `force` or the checked-out
-    // guard already decide those cases without it.
+    // guards already decide those cases without it.
     let local_contained = has_local
         && scope.local
         && !scope.force
         && branch != ctx.current
-        && contained_in_stable(repo, branch, &ctx.stable_refs);
+        && worktree.is_none()
+        && local_survives(repo, branch, ctx, scope.containment);
     let remote_contained = has_remote_copy
         && scope.remote
         && !scope.force
-        && contained_in_stable(repo, &remote_ref, &ctx.stable_refs);
+        && contained_in_any(repo, &remote_ref, &ctx.stable_refs);
 
     let (delete_local, delete_remote, skips) = decide_copies(
         scope,
-        has_local,
-        has_remote_copy,
-        branch == ctx.current,
-        local_contained,
-        remote_contained,
+        CopyFacts {
+            has_local,
+            has_remote_copy,
+            is_current: branch == ctx.current,
+            in_worktree: worktree.is_some(),
+            local_contained,
+            remote_contained,
+        },
     );
 
     for reason in skips {
@@ -1915,10 +2048,23 @@ fn plan_branch_deletion(
                 SkipReason::CheckedOut => {
                     "checked out — switch away to delete the local copy".to_string()
                 }
-                SkipReason::LocalUncontained => format!(
-                    "local tip has commits not in '{}' — use --force to delete anyway",
-                    config.stable_branch
+                SkipReason::CheckedOutElsewhere => format!(
+                    "checked out in worktree at {} — remove it to delete the branch",
+                    worktree.unwrap_or("another worktree")
                 ),
+                // Worded from the policy that was actually applied, so the
+                // reason names the refs that were consulted rather than a
+                // fixed one the user would then go and check by hand.
+                SkipReason::LocalUncontained => match scope.containment {
+                    Containment::Stable => format!(
+                        "local tip has commits not in '{}' — use --force to delete anyway",
+                        config.stable_branch
+                    ),
+                    Containment::Recoverable => format!(
+                        "local tip has commits not on origin, '{}' or '{}' — use --force to delete anyway",
+                        config.rolling_branch, config.stable_branch
+                    ),
+                },
                 SkipReason::RemoteUncontained => format!(
                     "origin copy has commits not in '{}' — use --force to delete anyway",
                     config.stable_branch
@@ -1944,13 +2090,47 @@ fn plan_branch_deletion(
 /// for containment in stable, and anything that fails is skipped with a reason
 /// unless `--force` is given.
 pub(crate) fn prune_plan(config: &Config, scope: &PruneScope) -> Result<PrunePlan> {
+    plan_rolls(config, scope, |state| {
+        *state == branches::RollState::Promoted
+    })
+}
+
+/// Decide what `rf tidy` would delete locally, without deleting anything.
+///
+/// The same plan as [`prune_plan`] behind the same safety table, differing in
+/// the two dimensions tidy cares about: it looks at whichever roll `states` the
+/// caller asked for rather than promoted ones only, and its `scope` carries
+/// [`Containment::Recoverable`], so a branch counts as safe when its commits
+/// are on rolling or still on `origin` — not only when they reached stable.
+///
+/// It takes a [`PruneScope`] like everything else here rather than a bespoke
+/// one: there is deliberately a single deletion path, and tidy is a set of
+/// arguments to it, not a second implementation.
+pub(crate) fn tidy_plan(
+    config: &Config,
+    scope: &PruneScope,
+    states: &[branches::RollState],
+) -> Result<PrunePlan> {
+    plan_rolls(config, scope, |state| states.contains(state))
+}
+
+/// The shared body of [`prune_plan`] and [`tidy_plan`]: walk every roll the
+/// `accept` predicate keeps and plan each one's deletion against `scope`.
+///
+/// The [`DeletionContext`] is built once, so the pruning fetch and the worktree
+/// scan are each paid for a single time no matter how many rolls match.
+fn plan_rolls(
+    config: &Config,
+    scope: &PruneScope,
+    accept: impl Fn(&branches::RollState) -> bool,
+) -> Result<PrunePlan> {
     let ctx = DeletionContext::build(config, scope)?;
 
     let mut candidates = Vec::new();
     let mut skipped = Vec::new();
 
     for roll in branches::list_rolls(config)? {
-        if roll.state != branches::RollState::Promoted {
+        if !accept(&roll.state) {
             continue;
         }
         if let Some(candidate) =
@@ -2072,7 +2252,7 @@ pub(crate) fn delete_branch_plan(
 /// [`delete_branch_plan`] at apply time.
 pub(crate) fn unmerged_commit_counts(config: &Config, branch: &str) -> (Option<u32>, Option<u32>) {
     let repo = &config.repo_root;
-    let stable_refs = stable_containment_refs(config);
+    let stable_refs = containment_refs(repo, &config.stable_branch);
     let remote_ref = format!("origin/{branch}");
 
     let count = |tip: &str| git::commits_not_in(repo, tip, &stable_refs).ok();
@@ -2186,7 +2366,7 @@ pub(crate) fn promotion_readiness(
 
 #[cfg(test)]
 mod tests {
-    use super::{decide_copies, PruneScope, SkipReason};
+    use super::{decide_copies, Containment, CopyFacts, PruneScope, SkipReason};
 
     /// A scope covering both copies, with `force` under test.
     fn both(force: bool) -> PruneScope {
@@ -2195,26 +2375,38 @@ mod tests {
             remote: true,
             force,
             fetch: false,
+            containment: Containment::Stable,
+        }
+    }
+
+    /// Both copies present, neither checked out, containment under test.
+    fn facts(local_contained: bool, remote_contained: bool) -> CopyFacts {
+        CopyFacts {
+            has_local: true,
+            has_remote_copy: true,
+            local_contained,
+            remote_contained,
+            ..CopyFacts::default()
         }
     }
 
     #[test]
     fn deletes_both_copies_when_contained() {
-        let (local, remote, skips) = decide_copies(&both(false), true, true, false, true, true);
+        let (local, remote, skips) = decide_copies(&both(false), facts(true, true));
         assert!(local && remote);
         assert!(skips.is_empty(), "nothing to explain: {skips:?}");
     }
 
     #[test]
     fn uncontained_copies_need_force() {
-        let (local, remote, skips) = decide_copies(&both(false), true, true, false, false, false);
+        let (local, remote, skips) = decide_copies(&both(false), facts(false, false));
         assert!(!local && !remote, "neither copy is safe without force");
         assert_eq!(
             skips,
             vec![SkipReason::LocalUncontained, SkipReason::RemoteUncontained]
         );
 
-        let (local, remote, skips) = decide_copies(&both(true), true, true, false, false, false);
+        let (local, remote, skips) = decide_copies(&both(true), facts(false, false));
         assert!(local && remote, "force is the documented override");
         assert!(skips.is_empty());
     }
@@ -2224,7 +2416,13 @@ mod tests {
         // The load-bearing rule: the checked-out guard sits ahead of the force
         // check, so `--force` cannot reach past it. Origin is still fair game.
         for force in [false, true] {
-            let (local, remote, skips) = decide_copies(&both(force), true, true, true, true, true);
+            let (local, remote, skips) = decide_copies(
+                &both(force),
+                CopyFacts {
+                    is_current: true,
+                    ..facts(true, true)
+                },
+            );
             assert!(!local, "checked-out local copy must survive force={force}");
             assert!(remote, "the origin copy is not checked out anywhere");
             assert_eq!(skips, vec![SkipReason::CheckedOut]);
@@ -2232,8 +2430,53 @@ mod tests {
     }
 
     #[test]
+    fn force_never_deletes_a_copy_checked_out_in_another_worktree() {
+        // Same rule, second worktree: git refuses the delete either way, so the
+        // guard exists to say *why* rather than to surface git's error. It also
+        // sits ahead of the force check — `rf tidy --force` in a repo with a
+        // worktree must not turn into a failed delete per branch.
+        for force in [false, true] {
+            let (local, remote, skips) = decide_copies(
+                &both(force),
+                CopyFacts {
+                    in_worktree: true,
+                    ..facts(true, true)
+                },
+            );
+            assert!(
+                !local,
+                "worktree-held local copy must survive force={force}"
+            );
+            assert!(remote, "the origin copy is not checked out anywhere");
+            assert_eq!(skips, vec![SkipReason::CheckedOutElsewhere]);
+        }
+    }
+
+    #[test]
+    fn the_current_branch_outranks_the_worktree_reason() {
+        // The current branch is always in *some* worktree. Naming this repo's
+        // own path back at the user reads as a puzzle; the plain refusal wins.
+        let (local, _, skips) = decide_copies(
+            &both(false),
+            CopyFacts {
+                is_current: true,
+                in_worktree: true,
+                ..facts(true, true)
+            },
+        );
+        assert!(!local);
+        assert_eq!(skips, vec![SkipReason::CheckedOut]);
+    }
+
+    #[test]
     fn a_copy_that_does_not_exist_is_neither_deleted_nor_skipped() {
-        let (local, remote, skips) = decide_copies(&both(false), false, true, false, false, true);
+        let (local, remote, skips) = decide_copies(
+            &both(false),
+            CopyFacts {
+                has_local: false,
+                ..facts(false, true)
+            },
+        );
         assert!(!local && remote);
         assert!(
             skips.is_empty(),
@@ -2244,28 +2487,57 @@ mod tests {
     #[test]
     fn scope_flags_exclude_a_copy_entirely() {
         let local_only = PruneScope {
-            local: true,
             remote: false,
-            force: false,
-            fetch: false,
+            ..both(false)
         };
         // The origin copy is uncontained, but out of scope — so it is neither
         // deleted nor reported, rather than surfacing a confusing refusal.
-        let (local, remote, skips) = decide_copies(&local_only, true, true, false, true, false);
+        let (local, remote, skips) = decide_copies(&local_only, facts(true, false));
         assert!(local && !remote);
         assert!(skips.is_empty(), "{skips:?}");
 
         let remote_only = PruneScope {
             local: false,
-            remote: true,
-            force: false,
-            fetch: false,
+            ..both(false)
         };
-        let (local, remote, skips) = decide_copies(&remote_only, true, true, true, true, true);
+        let (local, remote, skips) = decide_copies(
+            &remote_only,
+            CopyFacts {
+                is_current: true,
+                ..facts(true, true)
+            },
+        );
         assert!(!local && remote);
         assert!(
             skips.is_empty(),
             "the checked-out local copy is out of scope, not refused: {skips:?}"
         );
+    }
+
+    #[test]
+    fn tidy_scope_is_local_only_and_never_reaches_the_remote() {
+        // `rf tidy` cleans a machine. Whatever else changes about it, it must
+        // not acquire a path to the remote: that is prune's and delete's job,
+        // under their own confirmations.
+        for force in [false, true] {
+            let scope = PruneScope::tidy(force);
+            assert!(scope.local && !scope.remote);
+            assert_eq!(scope.containment, Containment::Recoverable);
+            assert!(scope.fetch, "the recoverable policy reads origin/<branch>");
+
+            let (_, remote, skips) = decide_copies(&scope, facts(true, true));
+            assert!(!remote, "tidy must never delete an origin copy");
+            assert!(skips.is_empty(), "{skips:?}");
+        }
+    }
+
+    #[test]
+    fn only_the_recoverable_policy_forces_a_fetch() {
+        // `Stable` consults `origin/<stable>`, but a stale copy of it is only
+        // ever *older*, which under-reports containment and keeps branches.
+        // `Recoverable` reads `origin/<branch>` as proof commits survive, so a
+        // stale ref there would delete the last copy of them.
+        assert!(!Containment::Stable.needs_fetch());
+        assert!(Containment::Recoverable.needs_fetch());
     }
 }

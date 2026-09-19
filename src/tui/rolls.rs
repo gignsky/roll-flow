@@ -812,6 +812,7 @@ pub(crate) fn prune_scope_for(scope: DeleteScope, force: bool) -> ops::PruneScop
         remote,
         force,
         fetch: remote,
+        ..ops::PruneScope::both()
     }
 }
 
