@@ -17,7 +17,7 @@ use std::process::Command;
 use anyhow::{anyhow, bail, Context, Result};
 
 use crate::core::version::{BumpLevel, Semver, VersionCheck, VersionStatus};
-use crate::core::{branches, config::Config, git, version};
+use crate::core::{branches, config::Config, git, proc, version};
 
 /// Prefix for the hotfix tier. Parallel to `roll_prefix`, but fixed rather than
 /// configurable — hotfixes are a rarely-used sanctioned exception with their own
@@ -354,6 +354,19 @@ pub(crate) struct GateReport {
     pub notices: Vec<GateNotice>,
 }
 
+/// Build the `sh -c <gate>` command a gate runs as.
+///
+/// Gates go through [`proc::run`] rather than `Command::status()` so their
+/// output reaches the TUI's panel when one is listening. That also decides how
+/// stdin is handled: with a sink installed nobody is reading the terminal on the
+/// gate's behalf, so `proc` hands it `/dev/null` and a gate that tries to prompt
+/// fails fast instead of hanging behind the alternate screen.
+fn gate_command(gate: &str, repo: &Path) -> Command {
+    let mut cmd = Command::new("sh");
+    cmd.arg("-c").arg(gate).current_dir(repo);
+    cmd
+}
+
 /// Run the configured gates. Without `--force`, a failing gate aborts the
 /// operation (the normal hard block). With `--force`, all gates still run but
 /// failures are collected so the caller can record them in the merge commit
@@ -375,11 +388,7 @@ fn run_gates(
             notices.push(GateNotice::DryRun(gate.clone()));
             continue;
         }
-        let status = Command::new("sh")
-            .arg("-c")
-            .arg(gate)
-            .current_dir(repo)
-            .status()
+        let status = proc::run(&mut gate_command(gate, repo))
             .with_context(|| format!("failed to run gate: {gate}"))?;
         if !status.success() {
             if force.enabled {
@@ -468,11 +477,7 @@ fn run_host_gates(config: &Config, dry_run: bool, force: &ForceOpts) -> Result<H
                 notices.push(GateNotice::DryRunHost(cmd));
                 continue;
             }
-            let status = Command::new("sh")
-                .arg("-c")
-                .arg(&cmd)
-                .current_dir(&config.repo_root)
-                .status()
+            let status = proc::run(&mut gate_command(&cmd, &config.repo_root))
                 .with_context(|| format!("failed to run host gate: {cmd}"))?;
             if !status.success() {
                 if force.enabled {
