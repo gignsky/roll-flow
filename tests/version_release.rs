@@ -521,3 +521,25 @@ fn a_repo_without_a_manifest_is_untouched_by_the_marker() {
         out.combined()
     );
 }
+
+#[test]
+fn verify_marks_a_roll_that_was_created_without_the_marker() {
+    // A roll that predates the feature, or was started with --no-dev-version,
+    // is brought in line by the first verify rather than needing a hand edit.
+    let sb = Sandbox::cargo();
+    sb.init();
+    let out = sb.rf(&["create", "late", "--date", "0611", "--no-dev-version"]);
+    assert!(out.success, "{}", out.combined());
+    assert_eq!(sb.cargo_version_at("HEAD"), "0.0.1");
+    sb.commit_file("work.txt", "work\n", "work");
+
+    let out = sb.rf(&["verify"]);
+    assert!(out.success, "verify failed: {}", out.combined());
+    assert_eq!(sb.cargo_version_at("HEAD"), "0.0.1-roll1");
+
+    // Idempotent: a second verify has nothing to mark and makes no commit.
+    let before = sb.rev("HEAD");
+    let out = sb.rf(&["verify"]);
+    assert!(out.success, "{}", out.combined());
+    assert_eq!(sb.rev("HEAD"), before);
+}

@@ -9,6 +9,12 @@ Checks graduation/promotion readiness for the current branch:
 - `roll/* -> rolling`
 - `rolling -> main`
 
+On a roll branch, `verify` also applies the roll's dev marker to `Cargo.toml` if
+it is missing (`0.2.4` → `0.2.4-roll9`, see [`create`](create.md#dev-versions))
+— so a roll created before the marker existed, or with `--no-dev-version`, is
+brought in line by its first verify. Idempotent, skipped by `--dry-run`, and
+off when `dev_versions = false`.
+
 Validation includes:
 
 - clean tree

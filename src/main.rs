@@ -334,6 +334,20 @@ fn cmd_verify(dry_run: bool, bump: Option<BumpLevel>, yes: bool) -> Result<()> {
     let config = Config::load()?;
     ops::ensure_clean_state(&config)?;
 
+    // On a roll branch, verify is also where a missing dev marker gets applied:
+    // a roll created before the marker existed, or with `--no-dev-version`, can
+    // be brought in line without a manual edit. Same sequencing as the bump
+    // below and for the same reason — it is a commit that touches Cargo.lock,
+    // so it has to land before the `--locked` gates run. A dry run leaves it.
+    let current = git::current_branch(&config.repo_root)?;
+    if !dry_run && config.dev_versions {
+        if let Some(number) = branches::parse_roll_number(&current, &config.roll_prefix) {
+            if let Some(dev) = ops::apply_dev_version(&config, number)? {
+                println!("version marked {dev}");
+            }
+        }
+    }
+
     // Resolved before `ops::verify` so an accepted bump is already committed by
     // the time the gates (and their `--locked` cargo commands) run.
     resolve_version_gate(&config, bump, yes, false, dry_run)?;
