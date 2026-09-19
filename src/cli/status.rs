@@ -3,7 +3,7 @@ use std::io::IsTerminal;
 use anyhow::Result;
 
 use crate::core::{
-    branches::{self, BranchLocation, RollInfo},
+    branches::{self, BranchLocation, HotfixInfo, RollInfo},
     config::Config,
     git,
 };
@@ -27,10 +27,11 @@ pub fn run(no_tui: bool, show_deps: bool) -> Result<()> {
     print_current_roll_line(&config, &current_roll);
     println!();
 
-    if rolls.is_empty() {
+    let hotfixes = branches::list_hotfixes(&config)?;
+    if rolls.is_empty() && hotfixes.is_empty() {
         println!("  (no roll branches found)");
     } else {
-        print_rolls_table(&rolls, show_deps);
+        print_rolls_table(&rolls, &hotfixes, show_deps);
     }
 
     Ok(())
@@ -69,11 +70,13 @@ fn print_current_roll_line(config: &Config, current_roll: &Option<String>) {
 
 // ── Roll table ────────────────────────────────────────────────────────────────
 
-fn print_rolls_table(rolls: &[RollInfo], show_deps: bool) {
-    // Compute column widths dynamically.
+fn print_rolls_table(rolls: &[RollInfo], hotfixes: &[HotfixInfo], show_deps: bool) {
+    // Compute column widths dynamically — over the hotfix names too, since
+    // they share the columns.
     let name_w = rolls
         .iter()
         .map(|r| r.branch.len())
+        .chain(hotfixes.iter().map(|h| h.branch.len()))
         .max()
         .unwrap_or(4)
         .max(4);
@@ -137,6 +140,7 @@ fn print_rolls_table(rolls: &[RollInfo], show_deps: bool) {
             sw = state_w,
         );
     }
+    crate::print_hotfix_rows(hotfixes, name_w, state_w);
     println!();
     println!("  loc: L=local  R=remote  B=both");
     if show_deps {

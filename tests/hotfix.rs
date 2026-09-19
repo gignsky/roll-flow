@@ -162,3 +162,51 @@ fn hotfix_land_errors_off_hotfix_branch() {
         out.combined()
     );
 }
+
+#[test]
+fn hotfixes_appear_in_status_and_read_landed_once_merged() {
+    let sb = Sandbox::plain();
+    sb.init();
+
+    let out = sb.rf(&["hotfix", "urgent", "--date", "0720"]);
+    assert!(out.success, "hotfix create failed: {}", out.combined());
+    sb.commit_file("fix.txt", "fix\n", "the fix");
+
+    // Open: listed under the rolls with its own `h<N>` number, and in --json.
+    let status = sb.rf(&["status", "--no-tui"]);
+    assert!(status.success, "{}", status.combined());
+    assert!(
+        status.stdout.contains("h1  hotfix/1-0720-urgent"),
+        "{}",
+        status.stdout
+    );
+    assert!(status.stdout.contains("hotfix"), "{}", status.stdout);
+    assert!(!status.stdout.contains("landed"), "{}", status.stdout);
+
+    let json = sb.rf(&["status", "--json"]);
+    assert!(
+        json.stdout.contains("\"branch\": \"hotfix/1-0720-urgent\""),
+        "{}",
+        json.stdout
+    );
+    assert!(
+        json.stdout.contains("\"state\": \"open\""),
+        "{}",
+        json.stdout
+    );
+
+    // Landing writes `Hotfix hotfix/1-urgent into main` on stable — the short
+    // name, date dropped — and that is what flips the row.
+    let out = sb.rf(&["hotfix", "--land"]);
+    assert!(out.success, "hotfix land failed: {}", out.combined());
+    let status = sb.rf(&["status", "--no-tui"]);
+    assert!(status.stdout.contains("✓ landed"), "{}", status.stdout);
+    let list = sb.rf(&["list", "--no-tui"]);
+    assert!(list.stdout.contains("✓ landed"), "{}", list.stdout);
+    let json = sb.rf(&["status", "--json"]);
+    assert!(
+        json.stdout.contains("\"state\": \"landed\""),
+        "{}",
+        json.stdout
+    );
+}
