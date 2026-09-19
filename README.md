@@ -128,9 +128,11 @@ cargo test
   `[d]`), which fetch and delete branches on `origin`; `rf clean`, which fetches
   from every remote and deletes there only with `--with-remote`; the confirmed
   release-tag push at the end of `rf promote`; and the TUI's `[p]`/`[P]`/`[f]`,
-  which pull, push and fetch the selected branch
+  which pull, push and fetch the selected branch, plus `PP`, which pushes every
+  branch that can be fast-forwarded
 - no daemon; `rf` only ever runs when invoked. The `status`/`list` TUI drives the
   workflow (`i` integrate, `G` graduate, `m` promote, `u` update, `x` prune,
   `d` delete, `b` bump the version) and syncs the selected branch (`p` pull,
-  `P` push, `f` fetch, `gg` lazygit). A force *push* is available there behind a
+  `P` push, `PP` push every branch that needs it, `f` fetch, `gg` lazygit). A
+  force *push* is available there behind a
   confirmation; every other forced operation stays CLI-only by design

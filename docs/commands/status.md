@@ -23,9 +23,9 @@ neither locally nor on `origin` is not listed.
 
 ```text
 [q] quit   [j/k ↑/↓] nav   [space] switch   [enter] detail   [r]efresh
-[p] pull   [P] push   [f] fetch   [gg] lazygit   [esc] close output
+[p] pull   [P] push   [PP] push all   [f] fetch   [gg] lazygit
 [c]reate   [i]ntegrate   [G]raduate   [m] promote   [u]pdate   [b]ump
-[d]elete   [x] prune   [PgUp/PgDn/End] scroll output
+[d]elete   [x] prune   [esc] close output   [PgUp/PgDn/End] scroll
 ```
 
 The sync keys follow lazygit, which is why graduate is `[G]` and promote is `[m]`
@@ -75,6 +75,35 @@ git refuses the push — a red confirmation states how many commits would be
 overwritten and asks. Only `y` proceeds, and it uses `--force-with-lease`, so a
 push someone else landed in the meantime is refused rather than clobbered. If git
 reports a stale lease, fetch with `[f]` and try again.
+
+### `PP` — push everything that needs it
+
+Double-tapping `P` pushes every branch in the table that is ahead of its
+upstream or has no upstream yet, in the order they are listed. A modal names
+them first, and only `y` proceeds.
+
+What it will **not** push is the point of the key:
+
+| sync state | `PP` |
+|---|---|
+| `↑2` ahead | pushed — a fast-forward |
+| `—` no upstream | pushed with `--set-upstream`; creates the branch on the remote |
+| `✓` in sync | not mentioned; there is nothing to push |
+| `↓1` behind, `↑2↓1` diverged | skipped, with the reason — pushing needs a force |
+| `gone` | skipped — the upstream was deleted on purpose |
+
+Every push `PP` performs is one `[P]` would have performed without asking
+anything. Forcing stays a per-branch decision behind its own red confirmation,
+so a bulk key can never be the thing that overwrites a remote ref; and a `gone`
+upstream is left alone so `PP` cannot resurrect a branch that
+[`prune`](prune.md) or [`clean`](clean.md) retired. Branches it skips are listed
+in the modal *and* in the output panel, so they are not silently dropped.
+
+Because `[P]` alone already pushes, the chord needs a timeout where `gg` does
+not: a lone `P` is held about 400 ms to see whether a second one follows. Any
+other key inside that window resolves it as the single push straight away — that
+key is consumed rather than also acted on, so press it again once the push has
+started.
 
 ## Bumping the version
 

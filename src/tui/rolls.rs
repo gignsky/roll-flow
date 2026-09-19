@@ -13,7 +13,7 @@
 //! aside to make room for it.
 
 use std::collections::HashMap;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use anyhow::{anyhow, Result};
 use crossterm::event::{self, Event, KeyCode, KeyEventKind};
@@ -225,6 +225,15 @@ enum Mode {
     /// opened, so the previews it shows and the bump it applies agree.
     Bump {
         current: Semver,
+    },
+    /// `PP`: confirm pushing every branch that needs it.
+    ///
+    /// Its own variant rather than a `Confirm` action, for the same reason
+    /// `Delete` is: the answer carries a list of resolved [`SyncTarget`]s that
+    /// `Action` cannot hold, and a key that writes to several remote refs at
+    /// once has to show which ones before it does.
+    PushAll {
+        plan: PushAllPlan,
     },
     /// A push was refused as non-fast-forward (or is already known to be behind
     /// its upstream). Asks whether to force it.
@@ -447,6 +456,9 @@ struct StatusApp {
     /// True after a bare `g`, waiting to see whether the next key makes it `gg`.
     /// `g` has no action of its own, so this needs no timeout.
     pending_g: bool,
+    /// When a bare `P` was pressed, waiting to see whether it becomes `PP`.
+    /// Unlike `pending_g` this *is* timed — see [`PUSH_CHORD_WINDOW`].
+    pending_push: Option<Instant>,
 }
 
 /// Entry point. Takes ownership of the data so the app can rebuild it after an
@@ -506,6 +518,126 @@ pub(crate) fn prunable_count(rolls: &[RollInfo]) -> usize {
         .iter()
         .filter(|r| matches!(r.state, RollState::Promoted))
         .count()
+}
+
+/// How long a lone `P` is held before it is taken to be a single-branch push.
+///
+/// `PP` cannot be resolved the way `gg` is — `g` does nothing on its own, so a
+/// pending `g` can wait forever for the next key, while a lone `P` has to fire
+/// by itself. So this is a real timeout: long enough that a deliberate double
+/// tap lands inside it, short enough that the ordinary `[P]` does not feel
+/// stuck. The push it starts takes seconds, so the delay is lost in the noise.
+pub(crate) const PUSH_CHORD_WINDOW: Duration = Duration::from_millis(400);
+
+/// What the key following a bare `P` makes of it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum PushChord {
+    /// A second `P`: push every branch that needs it.
+    All,
+    /// Anything else: the single-branch push the first `P` already meant.
+    Single,
+}
+
+/// Decide a pending `P` from the key that followed it.
+///
+/// Only a second `P` completes the chord; every other key — including `Esc` —
+/// falls back to the single push rather than cancelling. The first `P` is taken
+/// as the user's decision to push the selected branch, so nothing here can turn
+/// it into a no-op; the chord only ever widens what gets pushed.
+pub(crate) fn push_chord_key(code: KeyCode) -> PushChord {
+    match code {
+        KeyCode::Char('P') => PushChord::All,
+        _ => PushChord::Single,
+    }
+}
+
+/// One branch `PP` will push.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct PushItem {
+    pub target: SyncTarget,
+    /// True when the branch has no upstream yet, so this push *creates* the ref
+    /// on the remote rather than advancing one. Called out separately in the
+    /// modal because they are different acts.
+    pub creates: bool,
+}
+
+/// A branch `PP` deliberately leaves for a `[P]` of its own, and why.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct PushSkip {
+    pub branch: String,
+    pub reason: String,
+}
+
+/// What `PP` would do: the branches it pushes, and the ones it declines to.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub(crate) struct PushAllPlan {
+    pub items: Vec<PushItem>,
+    pub skipped: Vec<PushSkip>,
+}
+
+/// Plan a `PP` over every row in the table, in the order they are listed.
+///
+/// The selection rule is the point of this function, and it is deliberately
+/// narrow: **every push `PP` performs is one `[P]` would have performed without
+/// a prompt.** A branch ahead of its upstream fast-forwards it; a branch with no
+/// upstream is created and tracked, which cannot lose anything. Everything else
+/// is listed as skipped with the key to press instead:
+///
+/// - behind or diverged — pushing needs a force, and forcing is a per-branch
+///   decision behind its own y/N. A bulk key must never be the thing that
+///   overwrites a remote ref, so these are never in `items` even though they are
+///   exactly the branches whose sync column looks unfinished.
+/// - `gone` — the upstream was deleted, most likely by `rf prune` or
+///   `rf clean --with-remote`. Pushing would *resurrect* a branch someone
+///   retired on purpose, so re-creating it stays an explicit `[P]` on the row.
+///
+/// A branch with no local copy, or one in sync, is not mentioned at all: there
+/// is nothing to push and nothing to explain. So is one absent from `tracking`,
+/// which is the same state the sync column renders as `—`.
+pub(crate) fn plan_push_all(
+    rows: &[(String, BranchLocation)],
+    current_branch: &str,
+    tracking: &HashMap<String, git::LocalBranch>,
+) -> PushAllPlan {
+    let mut plan = PushAllPlan::default();
+    for (branch, location) in rows {
+        if !matches!(location, BranchLocation::Local | BranchLocation::Both) {
+            continue;
+        }
+        let target = SyncTarget::resolve(
+            branch,
+            current_branch,
+            location.clone(),
+            tracking.get(branch),
+        );
+        let mut skip = |reason: String| {
+            plan.skipped.push(PushSkip {
+                branch: branch.clone(),
+                reason,
+            })
+        };
+        match target.track {
+            None | Some(TrackState::InSync) => {}
+            Some(TrackState::Ahead(_)) => plan.items.push(PushItem {
+                target,
+                creates: false,
+            }),
+            Some(TrackState::NoUpstream) => plan.items.push(PushItem {
+                target,
+                creates: true,
+            }),
+            Some(TrackState::Behind(n)) => {
+                skip(format!("behind by {n} — [p] to pull, then [P] to force"))
+            }
+            Some(TrackState::Diverged { ahead, behind }) => skip(format!(
+                "diverged ↑{ahead}↓{behind} — [P] on the row to force"
+            )),
+            Some(TrackState::Gone) => {
+                skip("upstream deleted — [P] on the row to re-create it".to_string())
+            }
+        }
+    }
+    plan
 }
 
 /// Build the dependency rows to show in the detail view for `selected`.
@@ -841,6 +973,7 @@ impl StatusApp {
             job: None,
             panel: None,
             pending_g: false,
+            pending_push: None,
         }
     }
 
@@ -850,6 +983,7 @@ impl StatusApp {
             // Before reading input, so a job that finished during the poll is
             // reflected in this frame rather than the next one.
             self.poll_job()?;
+            self.resolve_lapsed_push();
 
             if event::poll(Duration::from_millis(50))? {
                 if let Event::Key(key) = event::read()? {
@@ -858,6 +992,8 @@ impl StatusApp {
                     }
                     if matches!(self.mode, Mode::Confirm { .. }) {
                         self.handle_confirm(key.code);
+                    } else if matches!(self.mode, Mode::PushAll { .. }) {
+                        self.handle_push_all(key.code);
                     } else if matches!(self.mode, Mode::ForcePush { .. }) {
                         self.handle_force_push(key.code);
                     } else if matches!(self.mode, Mode::Bump { .. }) {
@@ -950,6 +1086,21 @@ impl StatusApp {
             return Ok(false);
         }
 
+        // `PP` pushes every branch that needs it. The first key after a bare `P`
+        // always resolves the chord and does nothing else: a second `P` makes it
+        // the bulk push, anything else falls back to the single-branch `[P]` the
+        // user has already committed to. That key is consumed rather than also
+        // acted on, because resolving may open the force-push modal or start a
+        // job — applying a browsing binding to a screen that just moved is worse
+        // than a keystroke the user can simply repeat.
+        if self.pending_push.take().is_some() {
+            match push_chord_key(code) {
+                PushChord::All => self.start_push_all(),
+                PushChord::Single => self.start_push(),
+            }
+            return Ok(false);
+        }
+
         match code {
             KeyCode::Char('q') => return Ok(true),
             // `esc` dismisses the output panel when one is up, and only quits
@@ -996,7 +1147,7 @@ impl StatusApp {
                 }
             }
             KeyCode::Char('p') => self.start_pull(),
-            KeyCode::Char('P') => self.start_push(),
+            KeyCode::Char('P') => self.arm_push(),
             KeyCode::Char('f') => self.start_fetch(),
             KeyCode::Char('G') => self.request(Action::Graduate),
             KeyCode::Char('i') => self.request_integrate(),
@@ -1068,6 +1219,21 @@ impl StatusApp {
                     std::mem::replace(&mut self.mode, Mode::Browsing)
                 {
                     self.execute(action, target);
+                }
+            }
+            KeyCode::Char('n') | KeyCode::Char('N') | KeyCode::Esc => {
+                self.mode = Mode::Browsing;
+            }
+            _ => {}
+        }
+    }
+
+    /// Answer the `PP` modal. Only an explicit `y` pushes.
+    fn handle_push_all(&mut self, code: KeyCode) {
+        match code {
+            KeyCode::Char('y') | KeyCode::Char('Y') => {
+                if let Mode::PushAll { plan } = std::mem::replace(&mut self.mode, Mode::Browsing) {
+                    self.push_all_job(plan);
                 }
             }
             KeyCode::Char('n') | KeyCode::Char('N') | KeyCode::Esc => {
@@ -1410,6 +1576,119 @@ impl StatusApp {
         self.push_job(target, false);
     }
 
+    /// `[P]` — arm the push chord. The push itself does not start until the
+    /// chord resolves, in [`Self::handle_browsing`] or
+    /// [`Self::resolve_lapsed_push`].
+    ///
+    /// The busy check happens here rather than only at the far end so that a `P`
+    /// during a running job is refused the instant it is pressed, as every other
+    /// mutating key is, instead of after the window.
+    fn arm_push(&mut self) {
+        if self.busy() {
+            return;
+        }
+        self.pending_push = Some(Instant::now());
+        self.message = Some("P again to push every branch that needs it".to_string());
+    }
+
+    /// Fire a pending `P` that nothing followed: the chord window lapsed, so it
+    /// was a single-branch push after all. Called once per loop iteration,
+    /// before the frame is drawn.
+    fn resolve_lapsed_push(&mut self) {
+        let lapsed = self
+            .pending_push
+            .is_some_and(|armed| armed.elapsed() >= PUSH_CHORD_WINDOW);
+        if lapsed {
+            self.pending_push = None;
+            self.message = None;
+            self.start_push();
+        }
+    }
+
+    /// `PP` — plan a push of every branch that needs one and open its modal.
+    ///
+    /// Nothing is pushed here. The plan is resolved from the tracking data the
+    /// view already loaded, so the modal states exactly what the job will do.
+    fn start_push_all(&mut self) {
+        if self.busy() {
+            return;
+        }
+        let rows: Vec<(String, BranchLocation)> = self
+            .bases
+            .iter()
+            .map(|b| (b.branch.clone(), b.location.clone()))
+            .chain(
+                self.rolls
+                    .iter()
+                    .map(|r| (r.branch.clone(), r.location.clone())),
+            )
+            .collect();
+        let plan = plan_push_all(&rows, &self.current_branch, &self.tracking);
+        if plan.items.is_empty() {
+            self.message = Some(match plan.skipped.len() {
+                0 => "nothing to push — every branch is in sync".to_string(),
+                n => format!(
+                    "nothing to push without a force — {n} branch{} need{} a [P] of its own",
+                    if n == 1 { "" } else { "es" },
+                    if n == 1 { "s" } else { "" }
+                ),
+            });
+            return;
+        }
+        self.mode = Mode::PushAll { plan };
+    }
+
+    /// Push every branch in the plan, in table order, reporting each one.
+    ///
+    /// One job rather than one per branch: they share a panel and a reload, and
+    /// a half-finished sweep is easier to read as a single log. A branch that
+    /// fails does not stop the sweep — the remaining branches are independent
+    /// refs, and stopping would leave the user guessing which were reached.
+    /// `force` is not a parameter and never will be: see [`plan_push_all`].
+    fn push_all_job(&mut self, plan: PushAllPlan) {
+        let repo = self.config.repo_root.clone();
+        let title = format!("git push ×{}", plan.items.len());
+        self.start_job(title, move || {
+            let mut lines = Vec::new();
+            let mut failed = 0;
+            for item in &plan.items {
+                let target = &item.target;
+                match sync::run_push(&repo, target, false) {
+                    Ok(PushOutcome::Pushed) if item.creates => lines.push(format!(
+                        "Pushed '{}' to {} (new, now tracking it)",
+                        target.branch, target.remote
+                    )),
+                    Ok(PushOutcome::Pushed) => {
+                        lines.push(format!("Pushed '{}' to {}", target.branch, target.remote))
+                    }
+                    // The plan said this was a fast-forward, so a refusal means
+                    // the remote moved since the table was loaded. Reported, not
+                    // retried with a force: that decision belongs to `[P]` on
+                    // the row, behind its own y/N.
+                    Ok(PushOutcome::Rejected { .. }) => {
+                        failed += 1;
+                        lines.push(format!(
+                            "'{}' was rejected by {} — press [P] on the row to force it",
+                            target.branch, target.remote
+                        ));
+                    }
+                    Err(err) => {
+                        failed += 1;
+                        lines.push(format!("'{}' failed: {}", target.branch, sync_error(err)));
+                    }
+                }
+            }
+            push_push_skips(&mut lines, &plan.skipped);
+            if failed > 0 {
+                lines.push(format!(
+                    "{failed} of {} branches were not pushed",
+                    plan.items.len()
+                ));
+            }
+            Ok(JobDone::lines(lines))
+        });
+    }
+
     /// Run one push attempt. On a non-fast-forward refusal the job finishes
     /// *successfully* carrying a [`Followup::OfferForcePush`] — the refusal is an
     /// expected answer to be acted on, not an error to report and stop at.
@@ -1607,6 +1886,7 @@ impl StatusApp {
             Mode::ForcePush { branch, remote } => {
                 render_force_push_modal(f, area, branch, remote, self.tracking.get(branch))
             }
+            Mode::PushAll { plan } => render_push_all_modal(f, area, plan),
             Mode::Browsing => {}
         }
     }
@@ -1765,13 +2045,14 @@ impl StatusApp {
         let nav_line =
             Line::from(" [q] quit   [j/k ↑/↓] nav   [space] switch   [enter] detail   [r]efresh");
         let sync_line =
-            Line::from(" [p] pull   [P] push   [f] fetch   [gg] lazygit   [esc] close output");
+            Line::from(" [p] pull   [P] push   [PP] push all   [f] fetch   [gg] lazygit");
         // Split across two lines because thirteen bindings do not fit on one at
         // 80 columns, and `Paragraph` truncates rather than wrapping — the roll
         // lifecycle first, then what removes things plus the panel's own keys.
         let roll_line =
             Line::from(" [c]reate   [i]ntegrate   [G]raduate   [m] promote   [u]pdate   [b]ump");
-        let extra_line = Line::from(" [d]elete   [x] prune   [PgUp/PgDn/End] scroll output");
+        let extra_line =
+            Line::from(" [d]elete   [x] prune   [esc] close output   [PgUp/PgDn/End] scroll");
         f.render_widget(
             Paragraph::new(vec![msg_line, nav_line, sync_line, roll_line, extra_line]),
             area,
@@ -2213,6 +2494,89 @@ fn render_delete_modal(f: &mut Frame, area: Rect, config: &Config, preview: &Del
     f.render_widget(body, modal);
 }
 
+/// How many branches the `PP` modal lists before it summarises the rest. Chosen
+/// so the modal still fits an 80×24 terminal once the skip lines and the hint
+/// are added.
+const PUSH_ALL_LIST_LIMIT: usize = 8;
+
+/// Render the `PP` confirmation: what will be pushed, what will not, and why.
+///
+/// A bulk write to the remote has to be legible before it happens, so the
+/// branches are listed rather than counted — the count alone would not show that
+/// the one branch the user cared about is in the skipped half.
+fn render_push_all_modal(f: &mut Frame, area: Rect, plan: &PushAllPlan) {
+    let dim = Style::default().fg(Color::DarkGray);
+    let n = plan.items.len();
+    let mut lines = vec![Line::from(Span::styled(
+        format!(
+            "Push {n} branch{} to their remotes?",
+            if n == 1 { "" } else { "es" }
+        ),
+        Style::default().add_modifier(Modifier::BOLD),
+    ))];
+
+    for item in plan.items.iter().take(PUSH_ALL_LIST_LIMIT) {
+        let note = if item.creates {
+            "new on the remote".to_string()
+        } else {
+            match item.target.track {
+                Some(TrackState::Ahead(n)) => format!("↑{n}"),
+                // Unreachable via `plan_push_all`, which only ever queues the two
+                // states above; rendered rather than asserted so a future state
+                // shows up in the modal instead of panicking in a draw.
+                _ => String::new(),
+            }
+        };
+        lines.push(Line::from(vec![
+            Span::styled(item.target.branch.clone(), Style::default().fg(Color::Cyan)),
+            Span::raw("  "),
+            Span::styled(note, Style::default().fg(Color::Green)),
+        ]));
+    }
+    if n > PUSH_ALL_LIST_LIMIT {
+        lines.push(Line::from(Span::styled(
+            format!("… and {} more", n - PUSH_ALL_LIST_LIMIT),
+            dim,
+        )));
+    }
+
+    for skip in plan.skipped.iter().take(PUSH_ALL_LIST_LIMIT) {
+        lines.push(Line::from(Span::styled(
+            format!("skipped {}: {}", skip.branch, skip.reason),
+            Style::default().fg(Color::Yellow),
+        )));
+    }
+    if plan.skipped.len() > PUSH_ALL_LIST_LIMIT {
+        lines.push(Line::from(Span::styled(
+            format!(
+                "… and {} more skipped",
+                plan.skipped.len() - PUSH_ALL_LIST_LIMIT
+            ),
+            dim,
+        )));
+    }
+
+    lines.push(Line::from(Span::styled("[y] confirm    [n] cancel", dim)));
+
+    let width = lines.iter().map(|l| l.width()).max().unwrap_or(32) as u16 + 4;
+    let height = lines.len() as u16 + 2;
+    let modal = centered_rect(area, width.max(36), height);
+
+    f.render_widget(Clear, modal);
+    let body = Paragraph::new(lines)
+        .alignment(Alignment::Center)
+        .block(Block::bordered().title(" push all "));
+    f.render_widget(body, modal);
+}
+
+/// Append the skipped branches to a `PP` job's output, so the log says the same
+/// thing the modal did rather than silently omitting them.
+fn push_push_skips(lines: &mut Vec<String>, skipped: &[PushSkip]) {
+    for skip in skipped {
+        lines.push(format!("skipped '{}': {}", skip.branch, skip.reason));
+    }
+}
+
 /// Human wording for which copies a scope covers, used in the force-confirm
 /// line and nowhere else.
 fn scope_label(scope: DeleteScope) -> &'static str {
@@ -2609,6 +2973,163 @@ mod tests {
         assert_eq!(prunable_count(&with_promoted), 2);
         // Prune is repo-wide, so it validates with no selection.
         assert!(validate_action(Action::Prune, None, &with_promoted, "main", "roll/").is_ok());
+    }
+
+    /// A `git::LocalBranch` with the upstream fields `track_state` reads.
+    fn tracked(name: &str, track: &str) -> git::LocalBranch {
+        git::LocalBranch {
+            name: name.to_string(),
+            upstream: format!("origin/{name}"),
+            remote_name: "origin".to_string(),
+            track: track.to_string(),
+            worktree: String::new(),
+        }
+    }
+
+    /// A local branch that was never pushed: no upstream at all.
+    fn untracked(name: &str) -> git::LocalBranch {
+        git::LocalBranch {
+            name: name.to_string(),
+            upstream: String::new(),
+            remote_name: String::new(),
+            track: String::new(),
+            worktree: String::new(),
+        }
+    }
+
+    fn push_all_rows(names: &[&str]) -> Vec<(String, BranchLocation)> {
+        names
+            .iter()
+            .map(|n| (n.to_string(), BranchLocation::Both))
+            .collect()
+    }
+
+    #[test]
+    fn push_all_takes_only_the_branches_a_plain_push_would_carry() {
+        let mut tracking = HashMap::new();
+        tracking.insert("main".to_string(), tracked("main", ""));
+        tracking.insert("rolling".to_string(), tracked("rolling", "ahead 2"));
+        tracking.insert("roll/1-x".to_string(), untracked("roll/1-x"));
+        let rows = push_all_rows(&["main", "rolling", "roll/1-x"]);
+
+        let plan = plan_push_all(&rows, "rolling", &tracking);
+
+        // Ahead and never-pushed are both fast-forwards or creations; in-sync is
+        // not mentioned at all, because there is nothing to say about it.
+        let pushed: Vec<_> = plan
+            .items
+            .iter()
+            .map(|i| (i.target.branch.as_str(), i.creates))
+            .collect();
+        assert_eq!(pushed, vec![("rolling", false), ("roll/1-x", true)]);
+        assert!(plan.skipped.is_empty(), "{:?}", plan.skipped);
+    }
+
+    #[test]
+    fn push_all_never_queues_a_branch_that_would_need_a_force() {
+        let mut tracking = HashMap::new();
+        tracking.insert("behind".to_string(), tracked("behind", "behind 3"));
+        tracking.insert(
+            "diverged".to_string(),
+            tracked("diverged", "ahead 1, behind 2"),
+        );
+        let rows = push_all_rows(&["behind", "diverged"]);
+
+        let plan = plan_push_all(&rows, "main", &tracking);
+
+        // The whole safety argument for a bulk push key: it can only ever
+        // fast-forward. Forcing stays a per-branch decision behind its own y/N.
+        assert!(plan.items.is_empty(), "{:?}", plan.items);
+        let reasons: Vec<_> = plan
+            .skipped
+            .iter()
+            .map(|s| (s.branch.as_str(), s.reason.as_str()))
+            .collect();
+        assert_eq!(
+            reasons,
+            vec![
+                ("behind", "behind by 3 — [p] to pull, then [P] to force"),
+                ("diverged", "diverged ↑1↓2 — [P] on the row to force"),
+            ]
+        );
+    }
+
+    #[test]
+    fn push_all_does_not_resurrect_a_deleted_upstream() {
+        // `rf prune` and `rf clean --with-remote` delete branches on origin on
+        // purpose. A bulk push that re-created them would quietly undo that, so
+        // `gone` is reported and left for an explicit `[P]`.
+        let mut tracking = HashMap::new();
+        tracking.insert("roll/1-x".to_string(), tracked("roll/1-x", "gone"));
+        let plan = plan_push_all(&push_all_rows(&["roll/1-x"]), "main", &tracking);
+
+        assert!(plan.items.is_empty());
+        assert_eq!(plan.skipped.len(), 1);
+        assert!(
+            plan.skipped[0].reason.starts_with("upstream deleted"),
+            "{:?}",
+            plan.skipped[0]
+        );
+    }
+
+    #[test]
+    fn push_all_ignores_branches_with_nothing_local_to_push() {
+        let mut tracking = HashMap::new();
+        tracking.insert("roll/1-x".to_string(), tracked("roll/1-x", "ahead 1"));
+        // Remote-only: no local copy, so nothing to push even though the
+        // tracking map happens to carry an entry for the name.
+        let rows = vec![
+            ("roll/1-x".to_string(), BranchLocation::Remote),
+            // Local but absent from the tracking batch — the state the sync
+            // column renders as `—`. Unknown is not a reason to push.
+            ("roll/2-y".to_string(), BranchLocation::Local),
+        ];
+
+        let plan = plan_push_all(&rows, "main", &tracking);
+
+        assert!(plan.items.is_empty(), "{:?}", plan.items);
+        assert!(plan.skipped.is_empty(), "{:?}", plan.skipped);
+    }
+
+    #[test]
+    fn only_a_second_p_widens_a_push_and_nothing_cancels_one() {
+        assert_eq!(push_chord_key(KeyCode::Char('P')), PushChord::All);
+        // Lowercase `p` is pull, not push — it must not complete the chord.
+        // `Esc` resolves to the single push rather than cancelling: the first
+        // `P` was already a decision to push the selected branch.
+        for key in [
+            KeyCode::Char('p'),
+            KeyCode::Esc,
+            KeyCode::Char('q'),
+            KeyCode::Enter,
+            KeyCode::Down,
+        ] {
+            assert_eq!(push_chord_key(key), PushChord::Single, "{key:?}");
+        }
+    }
+
+    #[test]
+    fn the_push_all_modal_lists_both_halves_of_the_plan() {
+        let mut tracking = HashMap::new();
+        tracking.insert("rolling".to_string(), tracked("rolling", "ahead 2"));
+        tracking.insert("roll/1-x".to_string(), untracked("roll/1-x"));
+        tracking.insert("roll/2-y".to_string(), tracked("roll/2-y", "gone"));
+        let plan = plan_push_all(
+            &push_all_rows(&["rolling", "roll/1-x", "roll/2-y"]),
+            "main",
+            &tracking,
+        );
+
+        let out = draw(|f, area| render_push_all_modal(f, area, &plan));
+
+        assert!(out.contains("Push 2 branches to their remotes?"), "{out}");
+        assert!(out.contains("rolling"), "{out}");
+        assert!(out.contains("↑2"), "{out}");
+        assert!(out.contains("new on the remote"), "{out}");
+        // The skipped half is the reason this is a list and not a count: the
+        // branch the user cared about may be in it.
+        assert!(out.contains("skipped roll/2-y"), "{out}");
+        assert!(out.contains("[y] confirm"), "{out}");
     }
 
     #[test]
@@ -3258,6 +3779,7 @@ mod tests {
             "[r]efresh",
             "[p] pull",
             "[P] push",
+            "[PP] push all",
             "[f] fetch",
             "[gg] lazygit",
             "[esc] close output",
@@ -3268,7 +3790,7 @@ mod tests {
             "[u]pdate",
             "[d]elete",
             "[x] prune",
-            "scroll output",
+            "[PgUp/PgDn/End] scroll",
         ] {
             assert!(out.contains(key), "{key} truncated away:\n{out}");
         }
@@ -3284,7 +3806,7 @@ mod tests {
             app.render_status_bar(f, chunks[0])
         });
         assert!(
-            out.contains("scroll output"),
+            out.contains("[PgUp/PgDn/End] scroll"),
             "last hint line clipped:\n{out}"
         );
     }
@@ -3334,6 +3856,7 @@ mod tests {
             job: None,
             panel: None,
             pending_g: false,
+            pending_push: None,
         };
 
         let out = draw(|f, area| app.render_table(f, area));
@@ -3376,6 +3899,7 @@ mod tests {
             job: None,
             panel: None,
             pending_g: false,
+            pending_push: None,
         };
         let out = draw(|f, area| app.render_table(f, area));
         let row = out
@@ -3750,6 +4274,7 @@ mod tests {
             job: None,
             panel: None,
             pending_g: false,
+            pending_push: None,
         };
 
         // Tall enough for the header, three table rows and the four-line status
