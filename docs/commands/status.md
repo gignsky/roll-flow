@@ -24,7 +24,7 @@ neither locally nor on `origin` is not listed.
 ```text
 [q] quit   [j/k ↑/↓] nav   [space] switch   [enter] detail   [r]efresh
 [p] pull   [P] push   [f] fetch   [gg] lazygit   [esc] close output
-[c]reate   [i]ntegrate   [G]raduate   [m] promote   [u]pdate
+[c]reate   [i]ntegrate   [G]raduate   [m] promote   [u]pdate   [b]ump
 [d]elete   [x] prune   [PgUp/PgDn/End] scroll output
 ```
 
@@ -75,3 +75,39 @@ git refuses the push — a red confirmation states how many commits would be
 overwritten and asks. Only `y` proceeds, and it uses `--force-with-lease`, so a
 push someone else landed in the meantime is refused rather than clobbered. If git
 reports a stale lease, fetch with `[f]` and try again.
+
+## Bumping the version
+
+`[b]` raises the `[package]` version in `Cargo.toml` on the **checked-out**
+branch — not the row under the cursor, because a bump is a commit and has to land
+on the branch the merge will be made from. The header carries the current version
+so the effect is visible without opening anything.
+
+```text
+┌ bump version ────────────────────────┐
+│Current: 0.2.0  on roll/1-0101-alpha  │
+│                                      │
+│[1] patch → 0.2.1                     │
+│[2] minor → 0.3.0                     │
+│[3] major → 1.0.0                     │
+│                                      │
+│[n] cancel                            │
+└──────────────────────────────────────┘
+```
+
+The keys are digits rather than initials, unlike the delete modal's `l`/`r`/`b`.
+"minor" and "major" both start with `m`, and separating two choices an order of
+magnitude apart by the shift key alone is a mistake waiting to happen; the digits
+also carry the ordering. Every row shows the version it would produce, so the
+choice needs no semver arithmetic in your head.
+
+It writes `Cargo.toml`, refreshes `Cargo.lock`, and commits both as
+`chore(release): bump version to <X> for <branch>` — identical to what
+`rf promote --bump` does, and the reason a clean working tree is required: the
+commit stages its two files and then commits the index, so anything else staged
+would be swept in.
+
+In a repo with no `Cargo.toml` — the dotfiles repo, for instance — the header
+shows no version and `[b]` says so rather than opening an empty picker. See
+[Versioning and release tags](../../README.md#versioning-and-release-tags) for
+what the version is actually gating.

@@ -94,7 +94,8 @@ equivalent:
   `chore(release): bump version to X.Y.Z for <branch>`; a version *lower* than the
   target is always a hard error. The bump is applied before the configured gates
   run, because it rewrites `Cargo.lock` and the gates include
-  `cargo update --workspace --locked`.
+  `cargo update --workspace --locked`. The TUI's `[b]` applies the same bump on
+  demand, ahead of needing it — see [`status`](docs/commands/status.md#bumping-the-version).
 - **Release tag** — a successful `rf promote` creates an annotated `vX.Y.Z` tag on
   the promotion merge commit, with the promoted rolls listed in the tag body. The
   subject matches the one `.github/workflows/tag-on-main.yml` writes, and, like
@@ -129,6 +130,6 @@ cargo test
   which pull, push and fetch the selected branch
 - no daemon; `rf` only ever runs when invoked. The `status`/`list` TUI drives the
   workflow (`i` integrate, `G` graduate, `m` promote, `u` update, `x` prune,
-  `d` delete) and syncs the selected branch (`p` pull, `P` push, `f` fetch,
-  `gg` lazygit). A force *push* is available there behind a confirmation; every
-  other forced operation stays CLI-only by design
+  `d` delete, `b` bump the version) and syncs the selected branch (`p` pull,
+  `P` push, `f` fetch, `gg` lazygit). A force *push* is available there behind a
+  confirmation; every other forced operation stays CLI-only by design
