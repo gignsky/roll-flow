@@ -51,6 +51,7 @@ rf status [--no-tui] [--no-deps] [--json]
 rf list [--no-tui] [--deps] [--json]
 rf update [--dry-run]
 rf prune [--dry-run] [--local | --remote] [--yes] [--force] [--no-fetch]
+rf tidy [--state <active|blocked|diverged|graduated|promoted|all>,...] [--dry-run] [--yes] [--force] [--no-fetch]
 rf delete <branch> [--dry-run] [--local | --remote] [--yes] [--force] [--no-fetch]
 rf clean [--dry-run] [--yes] [--force] [--with-remote] [--no-fetch]
 rf version
