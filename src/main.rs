@@ -570,25 +570,49 @@ fn cmd_promote(
     // and deliberately works from any branch, rather than being redirected to
     // graduate because HEAD happens to sit on a roll.
     if !rolls.is_empty() {
-        // No version-bump prompt here: a per-roll promotion merges a commit that
-        // already exists on rolling, so there is no branch to land a bump on —
-        // the gate compares what that commit carries and says so if it is short.
-        // Say so rather than dropping the flag on the floor.
-        if bump.is_some() {
-            eprintln!(
-                "warning: --bump is ignored with --roll; a roll's version is whatever \
-                 its graduation commit already carries"
-            );
+        // Advancing stable to a roll's graduation commit lands whatever
+        // graduated ahead of it too (see `ops::PromoteTarget::Rolls`). That is
+        // how the route keeps stable a prefix of rolling, but it is not what
+        // someone naming one roll assumes — so it is disclosed and confirmed
+        // before any merge, never reported afterwards.
+        if !confirm_carried_rolls(&config, &rolls, dry_run, yes)? {
+            return Ok(());
         }
+
+        // A per-roll promotion merges a commit that already exists on rolling,
+        // so there is no branch to land a bump commit on ahead of the merge —
+        // which used to make the version gate a dead end here: it reported
+        // UNCHANGED and pointed at `--bump`, and `--bump` was ignored. The bump
+        // now lands *inside* the promotion merge (see `ops::promote`), and this
+        // is where the level is decided: the flag, `--yes` for the same patch
+        // default the whole-rolling route uses, or a prompt when a named roll
+        // would actually need one.
+        let level = match bump {
+            Some(level) => Some(level),
+            None if dry_run => None,
+            None if yes => Some(BumpLevel::Patch),
+            None if per_roll_needs_bump(&config, &rolls)? && std::io::stdin().is_terminal() => {
+                println!(
+                    "Version is unchanged from '{}'; a per-roll promotion bumps it inside the merge",
+                    config.stable_branch
+                );
+                prompt_bump_level()?
+            }
+            None => None,
+        };
         let outcome = ops::promote(
             &config,
             &ops::PromoteTarget::Rolls(rolls),
             dry_run,
             &force,
             tag,
+            level,
         )?;
         print_promote(&outcome);
         offer_step_tag_pushes(&config, &outcome, yes)?;
+        if !dry_run {
+            offer_update(&config, yes)?;
+        }
         return Ok(());
     }
 
@@ -607,12 +631,114 @@ fn cmd_promote(
             // gets merged, and so it precedes the `--locked` cargo gates.
             resolve_version_gate(&config, bump, yes, forced, dry_run)?;
 
-            let outcome =
-                ops::promote(&config, &ops::PromoteTarget::Rolling, dry_run, &force, tag)?;
+            let outcome = ops::promote(
+                &config,
+                &ops::PromoteTarget::Rolling,
+                dry_run,
+                &force,
+                tag,
+                None,
+            )?;
             print_promote(&outcome);
             offer_step_tag_pushes(&config, &outcome, yes)?;
         }
         None => return Err(ops::not_promotable_error(&config, &current)),
+    }
+    Ok(())
+}
+
+/// Show the rolls a per-roll promotion would carry besides the ones named, and
+/// ask whether to proceed. Returns false when the user declined and nothing
+/// should be promoted.
+///
+/// Silent when the named rolls are all there is to land, so the common case is
+/// unchanged. A dry-run asks nothing — it renders the same list through
+/// [`print_promote`] instead. An unattended run with extra rolls in the plan
+/// fails rather than proceeding: a script that expected one roll should not land
+/// three because nobody was there to read the prompt, and `--yes` says it may.
+fn confirm_carried_rolls(
+    config: &Config,
+    rolls: &[String],
+    dry_run: bool,
+    yes: bool,
+) -> Result<bool> {
+    let preview = ops::preview_roll_promotion(config, rolls)?;
+    if dry_run || !preview.carries_extra() {
+        return Ok(true);
+    }
+
+    for step in &preview.steps {
+        if step.carried.is_empty() {
+            continue;
+        }
+        let roll = step.roll.as_deref().unwrap_or(&step.source);
+        println!(
+            "Promoting '{}' to '{}' also lands, in graduation order:",
+            roll, config.stable_branch
+        );
+        for carried in &step.carried {
+            println!("  {carried}");
+        }
+        println!(
+            "(stable is advanced to {}'s graduation commit on '{}', which those are part of)",
+            roll, config.rolling_branch
+        );
+    }
+
+    match cli::confirm(yes, "\nProceed? [y/N] ")? {
+        cli::Confirm::Yes => Ok(true),
+        cli::Confirm::Declined => {
+            println!("Aborted; nothing was promoted.");
+            Ok(false)
+        }
+        cli::Confirm::Unattended => bail!(
+            "promoting these rolls would also land rolls that graduated earlier; \
+             re-run with --yes to accept, or name them explicitly"
+        ),
+    }
+}
+
+/// Whether any of the named rolls' graduation commits carries a version equal
+/// to stable's — the case a per-roll promotion can only pass by bumping inside
+/// its merge. A cheap read ahead of the prompt so the user is only asked when
+/// the answer matters; the step itself re-checks against stable as advanced.
+fn per_roll_needs_bump(config: &Config, rolls: &[String]) -> Result<bool> {
+    let Some(stable_ref) = git::resolve_branch(&config.repo_root, &config.stable_branch) else {
+        return Ok(false);
+    };
+    for info in branches::list_rolls(config)? {
+        let named = rolls
+            .iter()
+            .any(|r| *r == info.branch || r.parse::<u32>().ok() == Some(info.number));
+        let Some(source) = info.graduation_commit.as_deref().filter(|_| named) else {
+            continue;
+        };
+        if ops::version_check(config, source, &stable_ref)?.status == VersionStatus::Unchanged {
+            return Ok(true);
+        }
+    }
+    Ok(false)
+}
+
+/// After a promotion, offer to merge stable into the active local rolls — the
+/// branches that now trail what just landed. Unattended runs are told how to
+/// do it rather than having their rolls merged into behind their back.
+fn offer_update(config: &Config, yes: bool) -> Result<()> {
+    match cli::confirm(
+        yes,
+        &format!(
+            "\nUpdate active local rolls from '{}' now? [y/N] ",
+            config.stable_branch
+        ),
+    )? {
+        cli::Confirm::Yes => print_update(ops::update(config, false)?),
+        cli::Confirm::Declined => {}
+        cli::Confirm::Unattended => {
+            println!(
+                "\nActive rolls not updated; run `rf update` to merge '{}' into them.",
+                config.stable_branch
+            )
+        }
     }
     Ok(())
 }
@@ -637,12 +763,31 @@ fn print_promote(outcome: &ops::PromoteOutcome) {
         } else {
             println!("Promoted '{}' into '{}'", what, outcome.stable);
         }
+        // Named in dry-runs as well, which is the whole disclosure there —
+        // `--dry-run` previews rather than prompts.
+        let verb = if outcome.dry_run {
+            "would also land"
+        } else {
+            "also landed"
+        };
+        for carried in &step.carried {
+            println!("  {verb}: {carried}");
+        }
+        if let (Some(from), Some(to)) = (step.bumped_from, step.version.head) {
+            println!("Bumped version {from} -> {to} inside the promotion merge");
+        }
         if let Some(line) = step.tag.describe() {
             println!("{line}");
         }
     }
     for skip in &outcome.skipped {
         println!("skipped '{}': {}", skip.roll, skip.reason);
+    }
+    if outcome.reintegrated {
+        println!(
+            "Reintegrated '{}' into '{}' so rolling carries the bumped version",
+            outcome.stable, outcome.rolling
+        );
     }
 }
 
@@ -736,7 +881,12 @@ fn cmd_list_json() -> Result<()> {
 
 fn cmd_update(dry_run: bool) -> Result<()> {
     let config = Config::load()?;
-    match ops::update(&config, dry_run)? {
+    print_update(ops::update(&config, dry_run)?);
+    Ok(())
+}
+
+fn print_update(outcome: ops::UpdateOutcome) {
+    match outcome {
         ops::UpdateOutcome::NoActiveRolls => {
             println!("no active local rolls to update");
         }
@@ -759,7 +909,6 @@ fn cmd_update(dry_run: bool) -> Result<()> {
             }
         }
     }
-    Ok(())
 }
 
 /// `rf prune` — delete roll branches already promoted to stable.

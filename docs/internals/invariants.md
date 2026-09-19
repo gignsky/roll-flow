@@ -10,7 +10,16 @@ long list — that keeps two rolls adding rules in different areas from collidin
 - `main` only receives merges from `rolling`, never directly from roll branches.
   Per-roll promotion does not weaken this: it merges a graduation *commit* that
   lives on rolling, which is why stable's history stays a prefix of rolling's
-  rather than a divergent line.
+  rather than a divergent line. When a per-roll step has to bump the version,
+  the bump goes *inside* that merge commit, never as a commit beside it — and
+  stable is then merged back into rolling so the tiers do not silently diverge
+  (the same reintegration a landed hotfix performs).
+- A per-roll promotion that would land rolls the user did not name must say
+  which, and get an answer, *before* it merges — `rf promote --roll` prompts
+  (`--yes` accepts, unattended fails) and the TUI's `[m]` lists them in its
+  confirmation. Carrying earlier graduations is inherent to advancing stable to a
+  graduation commit; landing them silently is not, and any new promotion entry
+  point inherits the disclosure, not just the merge.
 - A roll is "graduated" if a merge commit exists on the rolling branch whose subject
   matches `Merge branch 'roll/N-...'` OR `Graduate roll/N-...`. Both formats must be
   checked everywhere graduation is tested.
