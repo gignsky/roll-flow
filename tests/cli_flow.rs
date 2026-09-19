@@ -764,3 +764,80 @@ fn init_never_flips_a_host_the_file_already_names() {
         "new host not listed in hosts:\n{after}"
     );
 }
+
+// ── layered config (roll/19) ─────────────────────────────────────────────────
+
+#[test]
+fn a_global_config_supplies_what_the_repo_file_leaves_out() {
+    let sb = Sandbox::nixos();
+    sb.init();
+    // A repo file reduced to what marks it as roll-flow's, plus one override.
+    let path = sb.path().join(".roll-flow.toml");
+    std::fs::write(
+        &path,
+        "stable_branch = \"main\"\nclean_protect = [\"repo-only\"]\n",
+    )
+    .expect("write");
+
+    let xdg = tempfile::tempdir().expect("xdg");
+    let global_dir = xdg.path().join("roll-flow");
+    std::fs::create_dir_all(&global_dir).expect("mkdir");
+    std::fs::write(
+        global_dir.join("config.toml"),
+        "rolling_branch = \"rolling\"\nstable_branch = \"WRONG\"\nroll_prefix = \"roll/\"\nusername = \"global-me\"\nbogus = true\n",
+    )
+    .expect("write global");
+    let env = [("XDG_CONFIG_HOME", xdg.path().to_str().unwrap())];
+
+    let out = sb.rf_with_env(&["status", "--no-tui"], &env);
+    assert!(out.success, "{}", out.combined());
+    // rolling came from the global file, stable from the repo file.
+    assert!(
+        out.stdout.contains("Rolling: rolling"),
+        "{}",
+        out.combined()
+    );
+    assert!(out.stdout.contains("Stable: main"), "{}", out.combined());
+    // And the global file's typo is named as the global file's.
+    assert!(
+        out.stderr.contains("unknown key 'bogus' in")
+            && out.stderr.contains("roll-flow/config.toml"),
+        "{}",
+        out.combined()
+    );
+
+    // Without the global layer the same repo file is short a required key.
+    let out = sb.rf_with_env(
+        &["status", "--no-tui"],
+        &[("XDG_CONFIG_HOME", "/nonexistent")],
+    );
+    assert!(!out.success);
+    assert!(
+        out.combined().contains("rolling_branch"),
+        "{}",
+        out.combined()
+    );
+}
+
+#[test]
+fn a_global_config_alone_does_not_make_a_repo_roll_flows() {
+    // The repo file is the marker. A machine-wide file is defaults, not an opt-in.
+    let sb = Sandbox::plain();
+    let xdg = tempfile::tempdir().expect("xdg");
+    std::fs::create_dir_all(xdg.path().join("roll-flow")).expect("mkdir");
+    std::fs::write(
+        xdg.path().join("roll-flow/config.toml"),
+        "rolling_branch = \"rolling\"\nstable_branch = \"main\"\nroll_prefix = \"roll/\"\n",
+    )
+    .expect("write global");
+    let out = sb.rf_with_env(
+        &["status", "--no-tui"],
+        &[("XDG_CONFIG_HOME", xdg.path().to_str().unwrap())],
+    );
+    assert!(!out.success);
+    assert!(
+        out.combined().contains("run `rf init` first"),
+        "{}",
+        out.combined()
+    );
+}

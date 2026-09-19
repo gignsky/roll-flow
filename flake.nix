@@ -116,5 +116,86 @@
 
       homeManagerModules.roll-flow = import ./modules/home-manager/roll-flow.nix;
       nixosModules.roll-flow = import ./modules/nixos/roll-flow.nix;
+
+      # Both modules evaluated against a stub of the option tree they need, so
+      # `nix flake check` catches a broken module without needing a full Home
+      # Manager or NixOS evaluation. The HM check goes further: the config file
+      # the module generates is fed to the freshly built `rf`, which must load
+      # it without a single warning — the module's keys and rf's `Config::KEYS`
+      # are thereby held to agree.
+      checks = forAllSystems (
+        sys:
+        let
+          p = pkgsFor sys;
+          inherit (p) lib;
+          rf = self.packages.${sys}.default;
+          hm = lib.evalModules {
+            modules = [
+              ./modules/home-manager/roll-flow.nix
+              {
+                options.home.packages = lib.mkOption { type = lib.types.listOf lib.types.package; };
+                options.xdg.configFile = lib.mkOption {
+                  type = lib.types.attrsOf (
+                    lib.types.submodule { options.source = lib.mkOption { type = lib.types.path; }; }
+                  );
+                };
+                config = {
+                  _module.args.pkgs = p;
+                  programs.roll-flow = {
+                    enable = true;
+                    settings = {
+                      username = "check";
+                      host_active = {
+                        alpha = true;
+                        beta = false;
+                      };
+                      lazygit_command = "lazygit";
+                    };
+                  };
+                };
+              }
+            ];
+          };
+          nixos = lib.evalModules {
+            modules = [
+              ./modules/nixos/roll-flow.nix
+              {
+                options.environment.systemPackages = lib.mkOption { type = lib.types.listOf lib.types.package; };
+                config = {
+                  _module.args.pkgs = p;
+                  programs.roll-flow.enable = true;
+                };
+              }
+            ];
+          };
+        in
+        {
+          hm-module =
+            p.runCommand "roll-flow-hm-module-check"
+              {
+                nativeBuildInputs = [
+                  rf
+                  p.git
+                ];
+              }
+              ''
+                cp ${hm.config.xdg.configFile."roll-flow/config.toml".source} config.toml
+                echo "generated config:"; cat config.toml
+                # rf reads the global file from XDG_CONFIG_HOME and needs a repo
+                # with its own marker file to run at all.
+                export HOME=$PWD XDG_CONFIG_HOME=$PWD/xdg
+                mkdir -p xdg/roll-flow repo && cp config.toml xdg/roll-flow/config.toml
+                cd repo && git init -q -b main && git -c user.email=t@t -c user.name=t commit -q --allow-empty -m init
+                git branch rolling
+                printf 'stable_branch = "main"\n' > .roll-flow.toml
+                rf list --no-tui 2>stderr.txt || { cat stderr.txt; exit 1; }
+                if grep -q warning stderr.txt; then echo "rf warned about the generated config:"; cat stderr.txt; exit 1; fi
+                touch $out
+              '';
+          nixos-module = p.writeText "roll-flow-nixos-module-check" (
+            lib.concatStringsSep "\n" (map (pkg: pkg.name) nixos.config.environment.systemPackages)
+          );
+        }
+      );
     };
 }

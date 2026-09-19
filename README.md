@@ -115,6 +115,13 @@ in [docs/config.md](docs/config.md) turn each piece off.
 See [CONTRIBUTING.md](CONTRIBUTING.md) for how this repo uses roll-flow on itself,
 and [CLAUDE.md](CLAUDE.md) for the internal domain model.
 
+## Nix modules
+
+The flake exports `homeManagerModules.roll-flow` and `nixosModules.roll-flow`.
+The Home Manager one writes the machine-wide `~/.config/roll-flow/config.toml`
+that every repo's `.roll-flow.toml` is laid over — see
+[docs/nix-modules.md](docs/nix-modules.md) and [docs/config.md](docs/config.md).
+
 ## Testing
 
 ```bash

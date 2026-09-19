@@ -99,6 +99,9 @@ impl PullMode {
 pub struct Config {
     #[serde(default = "default_config_version")]
     pub config_version: u32,
+    /// Ignored on load — always re-read from git — and kept only so a rendered
+    /// file says where it was written. Optional for that reason.
+    #[serde(default)]
     pub repo_root: PathBuf,
     pub rolling_branch: String,
     pub stable_branch: String,
@@ -122,7 +125,13 @@ pub struct Config {
     /// predate this field (via `#[serde(default)]`).
     #[serde(default)]
     pub mode: Mode,
+    /// Informational today; see `docs/config.md`. Optional so a machine-wide
+    /// config can supply it and a repo file can leave it out.
+    #[serde(default)]
     pub username: String,
+    /// Order for `host_active`; may be empty, in which case the table's keys
+    /// are used. Optional for the same reason as `username`.
+    #[serde(default)]
     pub hosts: Vec<String>,
     #[serde(default)]
     pub host_active: BTreeMap<String, bool>,
@@ -202,51 +211,106 @@ impl Config {
             .collect()
     }
 
-    /// Load config from `<repo>/.roll-flow.toml`.
+    /// Load the effective config for the repo at `.`: the machine-wide file at
+    /// [`Self::global_config_path`], if any, with `<repo>/.roll-flow.toml` laid
+    /// over it key by key.
     ///
-    /// Loud but forgiving: anything the file gets wrong that can be worked
+    /// The repo file is required — it is what marks a repo as roll-flow's —
+    /// but it may be as small as the three branch keys, with everything else
+    /// coming from the global file. That is the file a Home Manager module can
+    /// write: a git checkout is nowhere a Nix module can put a file, but
+    /// `~/.config/roll-flow/config.toml` is.
+    ///
+    /// Loud but forgiving: anything a file gets wrong that can be worked
     /// around is reported on stderr and worked around, so a typo is visible on
     /// every run without an older rf refusing a file a newer one wrote. Only a
-    /// file that cannot be parsed at all, or lacks a key with no default, is an
-    /// error — and that error says how to regenerate it.
+    /// file that cannot be parsed at all, or a merged result missing a key with
+    /// no default, is an error — and that error says how to regenerate it.
     pub fn load() -> Result<Self, RfError> {
         let repo_root = crate::core::git::repo_root(Path::new("."))?;
-        let path = Self::config_path(&repo_root);
-        if !path.exists() {
+        let repo_path = Self::config_path(&repo_root);
+        if !repo_path.exists() {
             return Err(RfError::Config(format!(
                 "no roll-flow config found at {}; run `rf init` first",
-                path.display()
+                repo_path.display()
             )));
         }
-        let content = std::fs::read_to_string(&path)?;
-        let (config, warnings) = Self::parse(&content, &repo_root)?;
+        let repo_text = std::fs::read_to_string(&repo_path)?;
+
+        let global = Self::global_config_path().filter(|p| p.exists());
+        let global_text = match &global {
+            Some(path) => Some(std::fs::read_to_string(path)?),
+            None => None,
+        };
+
+        let mut layers: Vec<(String, &str)> = Vec::new();
+        if let (Some(path), Some(text)) = (&global, &global_text) {
+            layers.push((path.display().to_string(), text.as_str()));
+        }
+        layers.push((repo_path.display().to_string(), repo_text.as_str()));
+        let layers: Vec<(&str, &str)> = layers.iter().map(|(l, t)| (l.as_str(), *t)).collect();
+
+        let (config, warnings) = Self::from_layers(&layers, &repo_root)?;
         for warning in warnings {
-            eprintln!("warning: {warning} (in {})", path.display());
+            eprintln!("warning: {warning}");
         }
         Ok(config)
     }
 
-    /// Parse config text, returning the config and every warning it earned.
-    ///
-    /// Split from [`Self::load`] so the warnings are data — testable, and
-    /// printable by whichever caller has a terminal. `repo_root` always comes
-    /// from git, never from the file: the file's value is what `rf init` wrote
-    /// on whichever machine ran it, and the checkout may since have moved.
-    pub fn parse(content: &str, repo_root: &Path) -> Result<(Self, Vec<String>), RfError> {
-        let mut warnings = Vec::new();
+    /// The machine-wide defaults file: `$XDG_CONFIG_HOME/roll-flow/config.toml`,
+    /// or `~/.config/roll-flow/config.toml`. `None` when neither variable is
+    /// usable, which is not an error — it just means there is no global layer.
+    pub fn global_config_path() -> Option<PathBuf> {
+        let base = std::env::var_os("XDG_CONFIG_HOME")
+            .map(PathBuf::from)
+            .filter(|p| p.is_absolute())
+            .or_else(|| std::env::var_os("HOME").map(|h| PathBuf::from(h).join(".config")))?;
+        Some(base.join("roll-flow").join("config.toml"))
+    }
 
-        // Unknown keys first, from the raw table, because serde's default is to
-        // drop them without a word — which turns `clean_protct = [...]` into a
-        // setting that silently never applies.
-        let raw: toml::Table =
-            toml::from_str(content).map_err(|e| RfError::Config(e.to_string()))?;
-        for key in raw.keys() {
-            if !Self::KEYS.contains(&key.as_str()) {
-                warnings.push(format!("unknown key '{key}' is ignored"));
+    /// Parse one config file's text on its own — the repo file with no global
+    /// layer. The simple entry point the unit tests use; production goes
+    /// through [`Self::load`] and [`Self::from_layers`].
+    #[cfg(test)]
+    pub fn parse(content: &str, repo_root: &Path) -> Result<(Self, Vec<String>), RfError> {
+        Self::from_layers(&[(CONFIG_NAME, content)], repo_root)
+    }
+
+    /// Parse and merge config layers, lowest precedence first, returning the
+    /// config and every warning it earned.
+    ///
+    /// Merging is by top-level key: a key present in a later layer replaces the
+    /// earlier one whole — an array or the `[host_active]` table included —
+    /// rather than being spliced into it, so what a repo file says is exactly
+    /// what applies and nothing from the global file leaks through a gap in it.
+    /// Each layer's unknown keys are reported against that layer's label.
+    ///
+    /// `repo_root` always comes from git, never from a file: a file's value is
+    /// what `rf init` wrote on whichever machine ran it, and the checkout may
+    /// since have moved.
+    pub fn from_layers(
+        layers: &[(&str, &str)],
+        repo_root: &Path,
+    ) -> Result<(Self, Vec<String>), RfError> {
+        let mut warnings = Vec::new();
+        let mut merged = toml::Table::new();
+
+        for (label, content) in layers {
+            // Unknown keys first, from the raw table, because serde's default
+            // is to drop them without a word — which turns `clean_protct = [...]`
+            // into a setting that silently never applies.
+            let raw: toml::Table = toml::from_str(content)
+                .map_err(|e| RfError::Config(format!("{label}: {}", e.to_string().trim_end())))?;
+            for (key, value) in raw {
+                if Self::KEYS.contains(&key.as_str()) {
+                    merged.insert(key, value);
+                } else {
+                    warnings.push(format!("unknown key '{key}' in {label} is ignored"));
+                }
             }
         }
 
-        let mut config: Config = toml::from_str(content).map_err(|e| {
+        let mut config: Config = merged.try_into().map_err(|e: toml::de::Error| {
             RfError::Config(format!(
                 "{}; run `rf init` to regenerate the file",
                 e.to_string().trim_end()
@@ -865,6 +929,78 @@ mod tests {
         // A file that describes no hosts is `None`, not an empty success —
         // `rf init` must not overwrite real hosts with nothing.
         assert!(parse_hosts_nix("{ description = \"x\"; }").is_none());
+    }
+
+    #[test]
+    fn a_repo_file_overrides_the_global_layer_key_by_key() {
+        let global = r#"
+            rolling_branch = "develop"
+            stable_branch = "main"
+            roll_prefix = "roll/"
+            username = "me"
+            lazygit_command = "lg"
+            clean_protect = ["staging", "demo"]
+            [host_active]
+            merlin = true
+            wsl = true
+        "#;
+        // The repo file can be tiny: it overrides what it names and inherits the rest.
+        let repo = r#"
+            stable_branch = "master"
+            clean_protect = ["only-this"]
+        "#;
+        let (cfg, warnings) = Config::from_layers(
+            &[("global", global), ("repo", repo)],
+            std::path::Path::new("/r"),
+        )
+        .expect("layers merge");
+        assert!(warnings.is_empty(), "{warnings:?}");
+        assert_eq!(cfg.rolling_branch, "develop", "inherited from global");
+        assert_eq!(cfg.stable_branch, "master", "repo wins");
+        assert_eq!(cfg.lazygit_command, "lg");
+        // Replaced whole, not spliced: nothing of the global array leaks through.
+        assert_eq!(cfg.clean_protect, vec!["only-this"]);
+        assert_eq!(cfg.active_hosts(), vec!["merlin", "wsl"], "table inherited");
+    }
+
+    #[test]
+    fn unknown_keys_are_reported_against_the_file_that_has_them() {
+        let global =
+            "rolling_branch = \"r\"\nstable_branch = \"m\"\nroll_prefix = \"roll/\"\nbogus = 1\n";
+        let repo = "clean_protct = []\n";
+        let (_, warnings) = Config::from_layers(
+            &[
+                ("~/.config/roll-flow/config.toml", global),
+                (".roll-flow.toml", repo),
+            ],
+            std::path::Path::new("/r"),
+        )
+        .expect("parse");
+        assert!(
+            warnings
+                .iter()
+                .any(|w| w.contains("'bogus' in ~/.config/roll-flow/config.toml")),
+            "{warnings:?}"
+        );
+        assert!(
+            warnings
+                .iter()
+                .any(|w| w.contains("'clean_protct' in .roll-flow.toml")),
+            "{warnings:?}"
+        );
+    }
+
+    #[test]
+    fn only_the_branch_keys_are_required() {
+        // username and hosts used to be required too, which made a global file
+        // pointless: the repo file had to repeat them anyway.
+        let minimal =
+            "rolling_branch = \"rolling\"\nstable_branch = \"main\"\nroll_prefix = \"roll/\"\n";
+        let (cfg, warnings) = parse(minimal);
+        assert!(warnings.is_empty(), "{warnings:?}");
+        assert!(cfg.username.is_empty());
+        assert!(cfg.hosts.is_empty());
+        assert_eq!(cfg.repo_root, PathBuf::from("/real/checkout"));
     }
 
     #[test]

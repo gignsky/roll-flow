@@ -31,12 +31,32 @@ merlin = true
 wsl = false
 ```
 
+## Layers
+
+rf reads two files and lays one over the other:
+
+1. `$XDG_CONFIG_HOME/roll-flow/config.toml` (or `~/.config/roll-flow/config.toml`)
+   — machine-wide defaults. Optional. This is the file the
+   [Home Manager module](nix-modules.md) writes.
+2. `<repo>/.roll-flow.toml` — the repo's own. **Required**: it is what marks a
+   repo as roll-flow's, and `rf init` writes it. It may be as small as the
+   branch names; anything it leaves out comes from the global file.
+
+Merging is by top-level key: a key in the repo file replaces the global one
+*whole* — an array or the `[host_active]` table included — rather than being
+spliced into it, so what the repo file says is exactly what applies. `rf init`
+only ever writes the repo file. Unknown keys are warned about naming the file
+they are in.
+
+Only `rolling_branch`, `stable_branch` and `roll_prefix` must be present once
+the layers are merged; everything else has a default.
+
 ## Every key
 
 | key | default | set by `rf init` | read by |
 |---|---|---|---|
 | `config_version` | `1` | on a fresh file only; an existing value is kept | load — warned about when it differs from what this rf writes, never refused |
-| `repo_root` | — | always (from `git rev-parse`) | nothing: the value on disk is **ignored** and re-read from git on every run, so a checkout can move. Required to be present |
+| `repo_root` | `""` | always (from `git rev-parse`) | nothing: the value on disk is **ignored** and re-read from git on every run, so a checkout can move |
 | `rolling_branch` | — | always (first of `rolling`, `develop`, `integration` that exists) | everything |
 | `stable_branch` | — | always (`main` or `master`) | everything |
 | `roll_prefix` | — | fresh file, or `--roll-prefix` | everything; a value without a trailing `/` is normalized with a warning |
@@ -44,8 +64,8 @@ wsl = false
 | `tag_on_promote` | `true` | fresh file | `rf promote` |
 | `push_tag` | `true` | fresh file | `rf promote` |
 | `mode` | `"manage"` | `--mode`, else kept | **nothing yet** — round-tripped only; intended to let `assist` make mutating commands report instead of merge |
-| `username` | — | detected: `vars/default.nix` `username`, then `$USER`, then git `user.name` | **nothing yet** — reserved for attributing `user@host` rebuild commits |
-| `hosts` | — | detected from `vars/hosts.nix` | ordering for `host_gates`; may be empty (see `host_active`) |
+| `username` | `""` | detected: `vars/default.nix` `username`, then `$USER`, then git `user.name` | **nothing yet** — reserved for attributing `user@host` rebuild commits |
+| `hosts` | `[]` | detected from `vars/hosts.nix` | ordering for `host_gates`; may be empty (see `host_active`) |
 | `host_active` | `{}` | detected from `vars/hosts.nix` | the source of truth for which hosts gate; when `hosts` is empty its keys are used |
 | `roll_to_rolling_gates` | `[]` | never — hand-edited | `rf verify` / `rf graduate` |
 | `rolling_to_main_gates` | `[]` | never — hand-edited | `rf verify` / `rf promote` |
@@ -71,9 +91,9 @@ visible on every run without an older rf refusing a file a newer one wrote:
 - a host in `hosts` that `[host_active]` does not mention counts as active and is
   pointed out
 
-Only a file that cannot be parsed at all, or lacks a key with no default
-(`repo_root`, `rolling_branch`, `stable_branch`, `roll_prefix`, `username`,
-`hosts`), is an error — and the error says to run `rf init`.
+Only a file that cannot be parsed at all, or a merged result lacking a key with
+no default (`rolling_branch`, `stable_branch`, `roll_prefix`), is an error — and
+the error says to run `rf init`.
 
 `repo_root` is never taken from the file. It is what `rf init` wrote on whichever
 machine ran it, and the checkout may since have moved; git knows where the repo
