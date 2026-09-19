@@ -242,7 +242,8 @@ fn deps_base_ref(roll: &RollInfo, stable_ref: &str) -> String {
 // ── Per-roll checks (exposed for use in graduate/promote commands) ─────────────
 
 /// True if the roll has a graduation (merge) commit on the rolling branch.
-/// Checks both `Merge branch 'roll/N-...'` and `Graduate roll/N-...` formats.
+/// Every merge-subject shape [`extract_graduated_branch`] knows is checked,
+/// including the hand-written ones a conflicted merge leaves behind.
 pub fn check_graduated(repo: &Path, roll_branch: &str, rolling_ref: &str) -> bool {
     let rolling = match git::resolve_branch(repo, rolling_ref) {
         Some(r) => r,
@@ -386,28 +387,78 @@ fn scan_promoted(repo: &Path, stable_ref: &str) -> HashSet<String> {
     promoted
 }
 
-/// Extract the branch name from a graduation subject line. Handles the three
-/// merge-subject shapes a roll can land through:
+/// Extract the *source* branch name from a merge subject line. Handles the three
+/// shapes a roll lands through, plus subjects a human typed:
 /// - `Merge branch 'roll/N-...'[ into ...]` — a local `git merge --no-ff`.
 /// - `Graduate roll/N-... [...]` — an `rf graduate` structured merge.
 /// - `Merge pull request #M from OWNER/roll/N-...` — a GitHub PR merge, which is
 ///   how PR-based repos (including roll-flow dogfooding itself) land rolls.
+/// - anything else beginning with `merge` that names a branch — see the fallback.
+///
+/// Matching is case-insensitive, and that is not cosmetic. A merge that
+/// conflicts drops the user in an editor, and what comes back is whatever they
+/// wrote: `merge branch 'roll/8-0918-help-menu'`, lowercase and without the
+/// `into` clause, is in this repo's own history. The anchored, case-sensitive
+/// match this replaced returned `None` for it, and since this one function is
+/// how *every* consumer reads a merge subject, that single miss took the roll's
+/// dependency, its graduation and its graduation commit with it.
 fn extract_graduated_branch(subject: &str) -> Option<String> {
-    if let Some(rest) = subject.strip_prefix("Merge branch '") {
-        // e.g. "roll/5-theme'" or "roll/5-theme' into rolling"
-        rest.split('\'').next().map(|b| b.to_string())
-    } else if let Some(rest) = subject.strip_prefix("Graduate ") {
-        // e.g. "roll/5-theme into rolling"
-        rest.split_whitespace().next().map(|b| b.to_string())
-    } else if subject.starts_with("Merge pull request #") {
-        // "Merge pull request #M from OWNER/BRANCH" — split off the owner only,
-        // since BRANCH itself contains '/' (e.g. "gignsky/roll/5-theme").
-        subject
+    // Cut the ` into ` clause first. It names the merge *target*, never the
+    // source, and dropping it is what makes the lenient fallback below safe:
+    // `Merge branch 'roll/8-x' into roll/7-y` must never yield roll/7, because
+    // on the rolling branch that reads as "roll/7 graduated" — a far worse
+    // failure than missing a dependency.
+    let subject = before_into(subject);
+
+    // The PR shape is tried first because its token carries the owner
+    // (`OWNER/roll/N-…`), which the fallback would hand back verbatim.
+    if let Some(rest) = strip_prefix_ci(subject, "Merge pull request #") {
+        return rest
             .split_once(" from ")
             .and_then(|(_, owner_branch)| owner_branch.split_once('/'))
-            .map(|(_owner, branch)| branch.trim().to_string())
-    } else {
-        None
+            .map(|(_owner, branch)| branch.trim().to_string());
+    }
+    if let Some(rest) = strip_prefix_ci(subject, "Merge branch '") {
+        // e.g. "roll/5-theme'" or "roll/5-theme' into rolling"
+        return rest.split('\'').next().map(|b| b.to_string());
+    }
+    if let Some(rest) = strip_prefix_ci(subject, "Graduate ") {
+        // e.g. "roll/5-theme into rolling"
+        return rest.split_whitespace().next().map(|b| b.to_string());
+    }
+
+    // Hand-written merges: `merge roll/8-0918-help-menu`, `Merged roll/8-x`.
+    // Gated on the subject still announcing itself as a merge, which is what
+    // keeps `Revert "Merge branch 'roll/8-x'"` from reading as a graduation.
+    // The token is returned unvalidated on purpose — every caller already
+    // matches it against real roll branch names or runs it through
+    // `parse_roll_number`, so a candidate that is not a roll simply never
+    // matches anything.
+    strip_prefix_ci(subject, "merge")?;
+    subject
+        .split_whitespace()
+        .map(|token| token.trim_matches(['\'', '"', ',', '.']))
+        .find(|token| token.contains('/'))
+        .map(|token| token.to_string())
+}
+
+/// `strip_prefix`, ignoring ASCII case.
+fn strip_prefix_ci<'a>(s: &'a str, prefix: &str) -> Option<&'a str> {
+    s.get(..prefix.len())
+        .filter(|head| head.eq_ignore_ascii_case(prefix))
+        .map(|head| &s[head.len()..])
+}
+
+/// The part of `subject` before a ` into ` clause, which names the merge target.
+///
+/// The index comes from an ASCII-lowercased copy, which is byte-for-byte the
+/// same length as the original — `to_ascii_lowercase` only maps `A-Z` — so it
+/// stays a valid index into `subject` even when the subject holds multi-byte
+/// characters.
+fn before_into(subject: &str) -> &str {
+    match subject.to_ascii_lowercase().find(" into ") {
+        Some(at) => &subject[..at],
+        None => subject,
     }
 }
 
@@ -527,5 +578,74 @@ mod tests {
         assert_eq!(parse_roll_number("claude/some-fix", "roll/"), None);
         // Unrelated subject.
         assert_eq!(extract_graduated_branch("chore: bump version"), None);
+    }
+
+    #[test]
+    fn extracts_branch_from_a_hand_written_merge_subject() {
+        // The literal subject on roll/7 in this repo, kept as a regression
+        // fixture: the merge conflicted, so the subject was typed by hand and
+        // came back lowercase and without the `into` clause. The anchored,
+        // case-sensitive match this replaced returned `None` here, which is how
+        // roll/7 came to have no recorded dependency on roll/8.
+        assert_eq!(
+            extract_graduated_branch("merge branch 'roll/8-0918-help-menu'").as_deref(),
+            Some("roll/8-0918-help-menu")
+        );
+        // No `branch`, no quotes — still a merge, still names its source.
+        assert_eq!(
+            extract_graduated_branch("merge roll/8-0918-help-menu").as_deref(),
+            Some("roll/8-0918-help-menu")
+        );
+        assert_eq!(
+            extract_graduated_branch("Merged roll/8-0918-help-menu into the keymap").as_deref(),
+            Some("roll/8-0918-help-menu")
+        );
+        // Case is ignored on the structured shapes too.
+        assert_eq!(
+            extract_graduated_branch("graduate roll/5-0611-theme into develop").as_deref(),
+            Some("roll/5-0611-theme")
+        );
+    }
+
+    #[test]
+    fn a_merge_subject_never_yields_its_target() {
+        // The safety property the lenient fallback rests on. Reporting the
+        // target would mark an unmerged roll as graduated, which is far worse
+        // than missing a dependency — so the ` into ` clause is cut before
+        // anything else looks at the subject.
+        for subject in [
+            "Merge branch 'roll/8-x' into roll/7-y",
+            "merge branch 'roll/8-x' INTO roll/7-y",
+            "merge roll/8-x into roll/7-y",
+        ] {
+            assert_eq!(
+                extract_graduated_branch(subject).as_deref(),
+                Some("roll/8-x"),
+                "{subject}"
+            );
+        }
+        // A merge whose source is not a roll yields the source, not the target,
+        // and simply matches no roll downstream.
+        assert_eq!(
+            extract_graduated_branch("Merge branch 'feature/x' into roll/7-y").as_deref(),
+            Some("feature/x")
+        );
+        assert_eq!(parse_roll_number("feature/x", "roll/"), None);
+    }
+
+    #[test]
+    fn a_revert_is_not_a_graduation() {
+        // The fallback is gated on the subject announcing itself as a merge.
+        // Without that gate this reads as "roll/8 graduated" — the exact
+        // opposite of what the commit did.
+        assert_eq!(
+            extract_graduated_branch(r#"Revert "Merge branch 'roll/8-0918-help-menu'""#),
+            None
+        );
+        // And an ordinary subject that happens to mention a branch is untouched.
+        assert_eq!(
+            extract_graduated_branch("docs: explain roll/8-0918-help-menu"),
+            None
+        );
     }
 }
