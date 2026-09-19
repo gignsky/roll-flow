@@ -1128,6 +1128,121 @@ pub(crate) fn verify(config: &Config, dry_run: bool) -> Result<VerifyOutcome> {
     })
 }
 
+/// Why a roll in a verify-many pass did not produce a plain pass.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum VerifyVerdict {
+    Passed,
+    /// The gates, hosts or version gate refused it. Carries the reason.
+    Failed(String),
+    /// Nothing was checked: no local copy, or nothing to merge. Carries why.
+    Skipped(String),
+}
+
+/// One roll's result from [`verify_many`].
+pub(crate) struct VerifyManyResult {
+    pub branch: String,
+    /// `None` when the roll was skipped before `verify` could run.
+    pub outcome: Option<VerifyOutcome>,
+    pub verdict: VerifyVerdict,
+}
+
+impl VerifyManyResult {
+    fn skipped(branch: &str, why: impl Into<String>) -> Self {
+        VerifyManyResult {
+            branch: branch.to_string(),
+            outcome: None,
+            verdict: VerifyVerdict::Skipped(why.into()),
+        }
+    }
+}
+
+/// The verdict `verify`'s outcome amounts to, so the CLI's `rf verify`, the
+/// TUI's `[v]` and [`verify_many`] all draw the line in the same place.
+pub(crate) fn verify_verdict(outcome: &VerifyOutcome) -> VerifyVerdict {
+    if !outcome.failed_hosts.is_empty() {
+        return VerifyVerdict::Failed(format!(
+            "host verification failed: {}",
+            outcome.failed_hosts.join(", ")
+        ));
+    }
+    if !outcome.version.is_satisfied() {
+        return VerifyVerdict::Failed(
+            version_gate_error(&outcome.version, &outcome.source, &outcome.target).to_string(),
+        );
+    }
+    VerifyVerdict::Passed
+}
+
+/// Verify several rolls in one pass, returning a result per branch in the
+/// order given.
+///
+/// `verify` judges the checked-out branch and runs the gates in the working
+/// tree, so this has to check each roll out in turn — which is the whole
+/// design problem. The rules that make it safe:
+///
+/// - A dirty tree is refused up front, before the first switch, rather than
+///   discovered halfway through with HEAD somewhere else.
+/// - The starting branch is recorded first and restored **unconditionally** at
+///   the end: after a failed gate, after a `verify` error, after a roll that
+///   would not even check out. A pass that leaves HEAD on roll 3 because roll 3
+///   failed has turned a report into a surprise.
+/// - A roll with no local copy is skipped with a reason, never fetched: nothing
+///   here writes to or reads from the remote, and a switch that would create a
+///   branch from `origin/` is a side effect the user did not ask for.
+/// - "Nothing to merge" is a skip, not a failure: the roll has nothing to be
+///   judged on, which is not the same as failing judgement.
+///
+/// Every gate's output still streams through `core::proc`'s sink as it runs,
+/// so the caller sees each roll's gates as they happen; this returns only the
+/// structured summary.
+pub(crate) fn verify_many(config: &Config, branches: &[String]) -> Result<Vec<VerifyManyResult>> {
+    ensure_clean_state(config)?;
+    let repo = &config.repo_root;
+    let start = git::current_branch(repo)?;
+
+    let mut results = Vec::with_capacity(branches.len());
+    for branch in branches {
+        if !git::ref_exists(repo, branch) {
+            results.push(VerifyManyResult::skipped(
+                branch,
+                "no local copy — pull it first",
+            ));
+            continue;
+        }
+        if let Err(err) = git::run_git(repo, &["switch", "--quiet", branch]) {
+            results.push(VerifyManyResult::skipped(
+                branch,
+                format!("could not switch to it: {err}"),
+            ));
+            continue;
+        }
+        results.push(match verify(config, false) {
+            Ok(outcome) => {
+                let verdict = verify_verdict(&outcome);
+                VerifyManyResult {
+                    branch: branch.clone(),
+                    outcome: Some(outcome),
+                    verdict,
+                }
+            }
+            Err(err) if err.to_string().starts_with("nothing to merge") => {
+                VerifyManyResult::skipped(branch, err.to_string())
+            }
+            Err(err) => VerifyManyResult {
+                branch: branch.clone(),
+                outcome: None,
+                verdict: VerifyVerdict::Failed(err.to_string()),
+            },
+        });
+    }
+
+    // Unconditional, and the one error this function refuses to swallow: a
+    // report that cannot say where it left HEAD is worse than no report.
+    git::run_git(repo, &["switch", "--quiet", &start])
+        .with_context(|| format!("verified, but could not switch back to '{start}'"))?;
+    Ok(results)
+}
+
 // ── graduate ────────────────────────────────────────────────────────────────
 
 /// Outcome of graduating a roll into the rolling branch.

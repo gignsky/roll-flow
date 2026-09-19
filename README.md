@@ -44,7 +44,7 @@ rf init [--rolling-branch <name>] [--stable-branch <name>] [--roll-prefix <prefi
 rf create <slug> [--date MMDD] [--dry-run]            (alias: rf start)
 rf integrate <branch>
 rf hotfix [<slug>] [--date MMDD] [--land] [--dry-run]
-rf verify [--dry-run] [--bump <patch|minor|major>] [--yes]
+rf verify [--dry-run] [--bump <patch|minor|major>] [--yes] [--all] [--state <set>]
 rf graduate [--dry-run] [--force --reason <text>]
 rf promote [--roll <branch>]... [--dry-run] [--force --reason <text>] [--bump <patch|minor|major>] [--no-tag] [--yes]
 rf status [--no-tui] [--no-deps] [--json]
@@ -134,7 +134,7 @@ cargo test
   release-tag push at the end of `rf promote`; and the TUI's `[p]`/`[P]`/`[f]`,
   which pull, push and fetch the selected branch
 - no daemon; `rf` only ever runs when invoked. The `status`/`list` TUI drives
-  the workflow (`i` integrate, `v` verify, `G` graduate, `m` promote, `u`
+  the workflow (`i` integrate, `v` verify, `V` verify many, `G` graduate, `m` promote, `u`
   update, `x` prune, `t` tidy, `d` delete, `b` bump the version) and syncs the
   selected branch (`p` pull, `P` push, `f` fetch, `gg` lazygit). The status bar
   carries only the basics; `?` opens a fuzzy-searchable list of every key, and

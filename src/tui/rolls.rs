@@ -27,7 +27,7 @@ use ratatui::{
 
 use super::output::{self, Followup, JobDone, JobProgress};
 use crate::core::{
-    branches::{self, BranchLocation, RollInfo, RollState},
+    branches::{self, BranchLocation, RollInfo, RollState, VerifySet},
     config::Config,
     git::{self, TrackState},
     ops,
@@ -120,6 +120,37 @@ pub(crate) fn bump_key(code: KeyCode) -> BumpOutcome {
         KeyCode::Char('n') | KeyCode::Char('N') | KeyCode::Esc => BumpOutcome::Cancel,
         _ => BumpOutcome::Ignore,
     }
+}
+
+/// What a keypress in the `[V]` picker resolves to.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub(crate) enum VerifyManyOutcome {
+    Ignore,
+    Cancel,
+    Set(VerifySet),
+}
+
+/// Decide a keystroke in the verify-many picker: digits pick a set in the
+/// order [`VerifySet::ALL`] lists them, `n`/`esc` cancel. Digits for the same
+/// reason the bump modal uses them — six choices share too many initials.
+pub(crate) fn verify_many_key(code: KeyCode) -> VerifyManyOutcome {
+    match code {
+        KeyCode::Char(c @ '1'..='9') => {
+            let index = (c as usize) - ('1' as usize);
+            match VerifySet::ALL.get(index) {
+                Some(set) => VerifyManyOutcome::Set(*set),
+                None => VerifyManyOutcome::Ignore,
+            }
+        }
+        KeyCode::Char('n') | KeyCode::Char('N') | KeyCode::Esc => VerifyManyOutcome::Cancel,
+        _ => VerifyManyOutcome::Ignore,
+    }
+}
+
+/// How many rolls each set would verify, in menu order. Computed once when the
+/// modal opens so the counts it shows are the counts the pass will use.
+pub(crate) fn verify_set_counts(rolls: &[RollInfo]) -> [(VerifySet, usize); 6] {
+    VerifySet::ALL.map(|set| (set, set.select(rolls).len()))
 }
 
 /// The three levels and what each would produce, in the order the modal lists
@@ -229,6 +260,12 @@ enum Mode {
     /// opened, so the previews it shows and the bump it applies agree.
     Bump {
         current: Semver,
+    },
+    /// `[V]`: pick which set of rolls to verify in one pass. Holds the counts
+    /// read when the modal opened, so the numbers it shows and the set it
+    /// runs agree.
+    VerifyMany {
+        counts: [(VerifySet, usize); 6],
     },
     /// `?`: the searchable keymap. Holds the filter text and the cursor's
     /// position in the *filtered* list, which is why editing the query resets
@@ -677,6 +714,13 @@ pub(crate) const BINDINGS: &[Binding] = &[
         group: "roll",
         hint: None,
         replay: &[KeyCode::Char('v')],
+    },
+    Binding {
+        keys: "V",
+        label: "verify all rolls, or a set of them",
+        group: "roll",
+        hint: None,
+        replay: &[KeyCode::Char('V')],
     },
     Binding {
         keys: "G",
@@ -1288,6 +1332,8 @@ impl StatusApp {
                         self.handle_force_push(key.code);
                     } else if matches!(self.mode, Mode::Bump { .. }) {
                         self.handle_bump(key.code);
+                    } else if matches!(self.mode, Mode::VerifyMany { .. }) {
+                        self.handle_verify_many(key.code);
                     } else if matches!(self.mode, Mode::Detail { .. }) {
                         self.handle_detail(key.code);
                     } else if matches!(self.mode, Mode::CreateInput { .. }) {
@@ -1431,6 +1477,7 @@ impl StatusApp {
             KeyCode::Char('P') => self.start_push(),
             KeyCode::Char('f') => self.start_fetch(),
             KeyCode::Char('v') => self.start_verify(),
+            KeyCode::Char('V') => self.request_verify_many(),
             KeyCode::Char('G') => self.request(Action::Graduate),
             KeyCode::Char('i') => self.request_integrate(),
             KeyCode::Char('b') => self.request_bump(),
@@ -1637,6 +1684,67 @@ impl StatusApp {
             Ok(current) => self.mode = Mode::Bump { current },
             Err(msg) => self.message = Some(msg),
         }
+    }
+
+    /// `[V]` — open the verify-many picker, or say why it cannot run.
+    ///
+    /// The clean-tree check happens here as well as inside `ops::verify_many`,
+    /// so the refusal is a status-bar message before the modal opens rather
+    /// than a failed job after the user has already chosen a set.
+    fn request_verify_many(&mut self) {
+        if self.busy() {
+            return;
+        }
+        if let Err(err) = ops::ensure_clean_state(&self.config) {
+            self.message = Some(format!("{err} — verifying many rolls switches branches"));
+            return;
+        }
+        self.mode = Mode::VerifyMany {
+            counts: verify_set_counts(&self.rolls),
+        };
+    }
+
+    /// Handle a keypress while the verify-many picker is open.
+    fn handle_verify_many(&mut self, code: KeyCode) {
+        match verify_many_key(code) {
+            VerifyManyOutcome::Ignore => {}
+            VerifyManyOutcome::Cancel => self.mode = Mode::Browsing,
+            VerifyManyOutcome::Set(set) => {
+                self.mode = Mode::Browsing;
+                self.execute_verify_many(set);
+            }
+        }
+    }
+
+    /// Verify every roll in `set`, as one job. Sequential and in one panel: a
+    /// pass that switches branches under the table must not race another job,
+    /// and the roll-by-roll log reads best as a single scroll.
+    fn execute_verify_many(&mut self, set: VerifySet) {
+        let selected = set.select(&self.rolls);
+        if selected.is_empty() {
+            self.message = Some(format!("no rolls to verify ({})", set.label()));
+            return;
+        }
+        let config = self.config.clone();
+        let n = selected.len();
+        self.start_job(
+            format!("rf verify --all ({}, {n})", set.label()),
+            move || {
+                let results = ops::verify_many(&config, &selected)?;
+                let (lines, failed) = render_verify_many(&results);
+                if failed.is_empty() {
+                    Ok(JobDone::lines(lines))
+                } else {
+                    // Folded into the error so a failed panel still carries the
+                    // per-roll report rather than only the names.
+                    Err(anyhow!(
+                        "{}\nverification failed for: {}",
+                        lines.join("\n"),
+                        failed.join(", ")
+                    ))
+                }
+            },
+        );
     }
 
     /// Handle a keypress while the bump picker is open.
@@ -2098,6 +2206,7 @@ impl StatusApp {
             Mode::CreateInput { slug } => render_create_input(f, area, &self.config, slug),
             Mode::Delete { preview } => render_delete_modal(f, area, &self.config, preview),
             Mode::Bump { current } => render_bump_modal(f, area, *current, &self.current_branch),
+            Mode::VerifyMany { counts } => render_verify_many_modal(f, area, counts),
             Mode::ForcePush { branch, remote } => {
                 render_force_push_modal(f, area, branch, remote, self.tracking.get(branch))
             }
@@ -2507,6 +2616,91 @@ fn track_of(tracking: &HashMap<String, git::LocalBranch>, branch: &str) -> Optio
 /// Render the version-bump picker.
 ///
 /// Every level shows the version it would produce, not just its name: "minor" is
+/// Render a verify-many pass as printable lines, plus the branches that failed.
+///
+/// Mirrors `run_verify`'s vocabulary roll by roll, then a summary line, so a
+/// six-roll pass reads like six `[v]` results stacked — and never offers a
+/// bump, which is a commit on one branch where this pass walks many.
+fn render_verify_many(results: &[ops::VerifyManyResult]) -> (Vec<String>, Vec<String>) {
+    let mut lines = Vec::new();
+    let mut failed = Vec::new();
+    let mut passed = 0;
+    let mut skipped = 0;
+    for result in results {
+        lines.push(format!("── {} ──", result.branch));
+        if let Some(o) = &result.outcome {
+            if o.diverged_note {
+                lines.push(format!(
+                    "note: '{}' has commits not in '{}'; graduation/promotion will create a --no-ff merge",
+                    o.target, o.source
+                ));
+            }
+            push_version_check(&mut lines, &o.version, &o.source, &o.target);
+            push_gate_notices(&mut lines, &o.gate_notices);
+            push_gate_notices(&mut lines, &o.host_notices);
+            push_host_results(&mut lines, &o.host_results);
+        }
+        match &result.verdict {
+            ops::VerifyVerdict::Passed => {
+                passed += 1;
+                lines.push("PASSED".to_string());
+            }
+            ops::VerifyVerdict::Failed(why) => {
+                failed.push(result.branch.clone());
+                lines.push(format!("FAILED: {why}"));
+            }
+            ops::VerifyVerdict::Skipped(why) => {
+                skipped += 1;
+                lines.push(format!("skipped: {why}"));
+            }
+        }
+    }
+    lines.push(format!(
+        "{passed} passed, {} failed, {skipped} skipped",
+        failed.len()
+    ));
+    (lines, failed)
+}
+
+/// Render the `[V]` picker: each set with how many rolls it would cover.
+fn render_verify_many_modal(f: &mut Frame, area: Rect, counts: &[(VerifySet, usize); 6]) {
+    let mut lines = vec![
+        Line::from(Span::styled(
+            "Verify which rolls? (switches to each, then back)",
+            Style::default().add_modifier(Modifier::BOLD),
+        )),
+        Line::from(""),
+    ];
+    for (i, (set, n)) in counts.iter().enumerate() {
+        lines.push(Line::from(vec![
+            Span::styled(format!("[{}] ", i + 1), Style::default().fg(Color::Yellow)),
+            Span::raw(format!("{:<24}", set.label())),
+            Span::styled(
+                format!("{n} roll{}", if *n == 1 { "" } else { "s" }),
+                Style::default().fg(Color::DarkGray),
+            ),
+        ]));
+    }
+    lines.push(Line::from(""));
+    lines.push(Line::from(Span::styled(
+        "[n] cancel",
+        Style::default().fg(Color::Yellow),
+    )));
+
+    let width = lines
+        .iter()
+        .map(|l| l.width())
+        .max()
+        .unwrap_or(32)
+        .clamp(28, 70) as u16;
+    let modal = centered_rect(area, width + 4, lines.len() as u16 + 2);
+    f.render_widget(Clear, modal);
+    f.render_widget(
+        Paragraph::new(lines).block(Block::bordered().title(" verify all ")),
+        modal,
+    );
+}
+
 /// abstract, `0.2.0 → 0.3.0` is not, and seeing all three at once is what makes
 /// picking the right one obvious.
 fn render_bump_modal(f: &mut Frame, area: Rect, current: Semver, branch: &str) {
@@ -4366,6 +4560,109 @@ mod tests {
             let key = KeyCode::Char(char::from_digit(i as u32 + 1, 10).unwrap());
             assert_eq!(bump_key(key), BumpOutcome::Level(level), "row {}", i + 1);
         }
+    }
+
+    #[test]
+    fn the_verify_many_picker_maps_digits_to_sets_in_menu_order() {
+        for (i, set) in VerifySet::ALL.iter().enumerate() {
+            let key = KeyCode::Char(char::from_digit(i as u32 + 1, 10).unwrap());
+            assert_eq!(
+                verify_many_key(key),
+                VerifyManyOutcome::Set(*set),
+                "{key:?}"
+            );
+        }
+        // A digit past the menu is ignored rather than wrapping or panicking.
+        assert_eq!(
+            verify_many_key(KeyCode::Char('9')),
+            VerifyManyOutcome::Ignore
+        );
+        for key in [KeyCode::Char('n'), KeyCode::Char('N'), KeyCode::Esc] {
+            assert_eq!(verify_many_key(key), VerifyManyOutcome::Cancel, "{key:?}");
+        }
+        // Enter is deliberately unbound: this pass switches branches, so a
+        // stray Enter must not start it.
+        for key in [KeyCode::Enter, KeyCode::Char(' '), KeyCode::Char('V')] {
+            assert_eq!(verify_many_key(key), VerifyManyOutcome::Ignore, "{key:?}");
+        }
+    }
+
+    #[test]
+    fn verify_sets_select_by_state_and_never_include_promoted_rolls() {
+        let rolls = vec![
+            roll_n(1, RollState::Active),
+            roll_n(2, RollState::Blocked),
+            roll_n(3, RollState::Graduated),
+            roll_n(4, RollState::Diverged),
+            roll_n(5, RollState::Promoted),
+            RollInfo {
+                location: BranchLocation::Remote,
+                ..roll_n(6, RollState::Active)
+            },
+        ];
+        let names = |set: VerifySet| -> Vec<u32> {
+            set.select(&rolls)
+                .iter()
+                .map(|b| branches::parse_roll_number(b, "roll/").unwrap())
+                .collect()
+        };
+        // Promoted has nowhere left to go, so it is in no set — not even All.
+        assert_eq!(names(VerifySet::All), vec![1, 2, 3, 4, 6]);
+        assert_eq!(names(VerifySet::Active), vec![1, 6]);
+        assert_eq!(names(VerifySet::Blocked), vec![2]);
+        assert_eq!(names(VerifySet::Graduated), vec![3]);
+        assert_eq!(names(VerifySet::Diverged), vec![4]);
+        // Local is a location filter: the remote-only roll drops out.
+        assert_eq!(names(VerifySet::Local), vec![1, 2, 3, 4]);
+
+        let counts = verify_set_counts(&rolls);
+        assert_eq!(counts[0], (VerifySet::All, 5));
+        assert_eq!(counts[5], (VerifySet::Local, 4));
+    }
+
+    #[test]
+    fn the_verify_many_modal_shows_each_set_with_its_count() {
+        let rolls = vec![
+            roll_n(1, RollState::Active),
+            roll_n(2, RollState::Graduated),
+        ];
+        let counts = verify_set_counts(&rolls);
+        let out = draw(|f, area| render_verify_many_modal(f, area, &counts));
+        assert!(out.contains("[1] all rolls"), "{out}");
+        assert!(out.contains("2 rolls"), "{out}");
+        assert!(out.contains("[2] active"), "{out}");
+        assert!(out.contains("1 roll "), "{out}");
+        assert!(out.contains("[n] cancel"), "{out}");
+    }
+
+    #[test]
+    fn a_verify_many_report_summarises_and_names_the_failures() {
+        let results = vec![
+            ops::VerifyManyResult {
+                branch: "roll/1-x".to_string(),
+                outcome: None,
+                verdict: ops::VerifyVerdict::Passed,
+            },
+            ops::VerifyManyResult {
+                branch: "roll/2-y".to_string(),
+                outcome: None,
+                verdict: ops::VerifyVerdict::Failed("gate exited 1".to_string()),
+            },
+            ops::VerifyManyResult {
+                branch: "roll/3-z".to_string(),
+                outcome: None,
+                verdict: ops::VerifyVerdict::Skipped("no local copy".to_string()),
+            },
+        ];
+        let (lines, failed) = render_verify_many(&results);
+        assert_eq!(failed, vec!["roll/2-y"]);
+        assert!(lines.contains(&"── roll/2-y ──".to_string()), "{lines:?}");
+        assert!(
+            lines.contains(&"FAILED: gate exited 1".to_string()),
+            "{lines:?}"
+        );
+        assert!(lines.contains(&"skipped: no local copy".to_string()));
+        assert_eq!(lines.last().unwrap(), "1 passed, 1 failed, 1 skipped");
     }
 
     #[test]

@@ -298,6 +298,12 @@ impl Sandbox {
         self.set_gate_array("rolling_to_main_gates", gates);
     }
 
+    /// Rewrite the `roll_to_rolling_gates` array — the gates `rf graduate` and
+    /// `rf verify` on a roll branch run.
+    pub fn set_graduate_gates(&self, gates: &[&str]) {
+        self.set_gate_array("roll_to_rolling_gates", gates);
+    }
+
     /// Replace a root-level array-of-strings key in the sandbox's
     /// `.roll-flow.toml` (call after `rf init`). Each entry is emitted as a TOML
     /// string, so `{host}` templates and shell snippets round-trip verbatim.
