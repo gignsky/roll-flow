@@ -136,3 +136,74 @@ fn status_table_shows_both_columns_by_default() {
         out.combined()
     );
 }
+
+// ── outdated ─────────────────────────────────────────────────────────────────
+
+/// `outdated` for a roll branch, from `rf list --json`.
+fn outdated(sb: &Sandbox, branch: &str) -> Vec<u64> {
+    numbers(sb, branch, "outdated")
+}
+
+#[test]
+fn a_dependency_that_moves_after_integration_marks_the_dependant_outdated() {
+    let sb = sandbox_with_integration();
+    assert!(
+        outdated(&sb, "roll/2-0612-beta").is_empty(),
+        "fresh integration"
+    );
+
+    // Real work lands on alpha after beta integrated it.
+    sb.git(&["checkout", "roll/1-0611-alpha"]);
+    sb.commit_file("alpha.txt", "a\nmore\n", "alpha follow-up");
+
+    assert_eq!(outdated(&sb, "roll/2-0612-beta"), vec![1]);
+    assert_eq!(
+        sb.roll_state("roll/2-0612-beta").as_deref(),
+        Some("⛔ blocked"),
+        "the lifecycle state is untouched; outdated is reported beside it"
+    );
+    let out = sb.rf(&["status", "--no-tui"]);
+    assert!(out.stdout.contains("⟳ ⛔ blocked"), "{}", out.combined());
+    assert!(
+        out.stdout.contains("⟳ a dependency has changed"),
+        "{}",
+        out.combined()
+    );
+
+    // Re-integrating catches up, and the marker clears.
+    sb.git(&["checkout", "roll/2-0612-beta"]);
+    let out = sb.rf(&["integrate", "roll/1-0611-alpha"]);
+    assert!(out.success, "re-integrate: {}", out.combined());
+    assert!(
+        outdated(&sb, "roll/2-0612-beta").is_empty(),
+        "after re-integration"
+    );
+}
+
+#[test]
+fn a_version_only_change_on_a_dependency_does_not_outdate_anyone() {
+    // The dev-version marker and a bump touch the manifest and lockfile and
+    // nothing else; a dependant has not fallen behind any work.
+    let sb = Sandbox::cargo();
+    sb.init();
+
+    sb.create_roll("alpha", "0611");
+    sb.commit_file("alpha.txt", "a\n", "alpha work");
+    sb.git(&["checkout", "main"]);
+    sb.create_roll("beta", "0612");
+    let out = sb.rf(&["integrate", "roll/1-0611-alpha"]);
+    assert!(out.success, "integrate: {}", out.combined());
+
+    sb.git(&["checkout", "roll/1-0611-alpha"]);
+    sb.commit_cargo_version("0.0.2");
+
+    assert!(
+        outdated(&sb, "roll/2-0612-beta").is_empty(),
+        "a bump alone must not read as outdated: {:?}",
+        sb.list_json()
+    );
+
+    // But a bump *plus* real work does.
+    sb.commit_file("alpha.txt", "a\nb\n", "alpha work 2");
+    assert_eq!(outdated(&sb, "roll/2-0612-beta"), vec![1]);
+}

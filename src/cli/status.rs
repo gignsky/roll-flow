@@ -83,7 +83,12 @@ fn print_rolls_table(rolls: &[RollInfo], show_deps: bool) {
         .max()
         .unwrap_or(1)
         .max(1);
-    let state_w = "✓ graduated".len(); // longest label
+    let state_w = rolls
+        .iter()
+        .map(|r| r.state_display().chars().count())
+        .max()
+        .unwrap_or(0)
+        .max("✓ graduated".len());
     let (dep_w, dependant_w) = crate::dep_column_widths(rolls);
 
     // Header
@@ -131,7 +136,7 @@ fn print_rolls_table(rolls: &[RollInfo], show_deps: bool) {
             num = roll.number,
             name = roll.branch,
             loc = location_symbol(&roll.location),
-            state = roll.state.label(),
+            state = roll.state_display(),
             nw = num_w,
             ew = name_w,
             sw = state_w,
@@ -141,6 +146,9 @@ fn print_rolls_table(rolls: &[RollInfo], show_deps: bool) {
     println!("  loc: L=local  R=remote  B=both");
     if show_deps {
         println!("  deps: rolls this one integrated  |  dependants: rolls that integrated it");
+    }
+    if rolls.iter().any(|r| !r.outdated.is_empty()) {
+        println!("  ⟳ a dependency has changed since it was integrated");
     }
 }
 

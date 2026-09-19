@@ -19,6 +19,13 @@ Branch names are configurable. Defaults: `rolling_branch = "rolling"`, `stable_b
 - **diverged** — graduated but branch has commits after the merge point (needs re-graduation)
 - **blocked** — has ungraduated dependencies that must graduate first
 
+One flag sits beside the state rather than in it: **outdated** (`⟳`) — a
+dependency's branch has changed since this roll integrated it, beyond a version
+line. It is orthogonal to the lifecycle (a blocked roll can be outdated; so can a
+graduated one), which is why it is a `RollInfo::outdated` list and not a sixth
+state. Re-integrating the dependency clears it. See the dependency-detection
+notes in [algorithms.md](algorithms.md).
+
 ## Quasi-rolls
 
 Direct-to-rolling commits that happen between roll merge points are grouped into virtual

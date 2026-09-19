@@ -12,8 +12,16 @@ The table carries a `deps` column (roll numbers this roll integrated) and a
 `dependants` column (roll numbers that integrated it) — `--no-deps` hides both.
 They are shown whatever the roll's state, so a roll that has already graduated
 still reports what it depends on and what depends on it. Press `[enter]` on a
-roll for the detail overlay, which breaks the same two relationships out with
-per-dependency blocker markers.
+roll for the detail overlay, which follows the dependencies all the way down —
+roll 12 depends on 9, which depends on 8, which depends on 7 — one indented line
+per link, each with its state and a `⛔ blocker` / `✓ ok` marker. A roll reached
+twice (a diamond) is shown once more as `↑ shown above`.
+
+A `⟳` in front of a roll's state means a dependency has **changed since it was
+integrated** — real changes, not a version bump or the `-rollN` dev marker,
+which touch only version lines. The overlay names which dependencies moved and
+marks the link (`⟳ moved since integration`); `rf integrate` again to catch up,
+and the marker clears. `--json` reports the same list as `outdated`.
 
 The TUI table pins the stable and rolling branches above the rolls, so `[space]`
 switches to them the same way it switches to a roll. A base branch that exists

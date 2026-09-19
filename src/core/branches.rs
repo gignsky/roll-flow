@@ -72,11 +72,32 @@ pub struct RollInfo {
     /// roll. Precomputed in [`list_rolls`] from a single reverse index so
     /// renderers never rescan the whole list per row.
     pub dependents: Vec<u32>,
+    /// Dependencies whose branch has moved since this roll integrated them —
+    /// in a way that changes content, not just a version line. A subset of
+    /// [`deps`](Self::deps). Deliberately a field rather than a [`RollState`]:
+    /// being outdated is orthogonal to the lifecycle (a `blocked` roll can be
+    /// outdated too, and so can a graduated one), and folding it into the enum
+    /// would force one of the two facts to win.
+    pub outdated: Vec<u32>,
     /// Hash of this roll's graduation merge on the rolling branch, or `None`
     /// when it has not graduated. This is the commit `rf promote --roll` merges
     /// into stable: advancing stable to it promotes exactly this roll (and
     /// whatever graduated before it), which keeps stable a prefix of rolling.
     pub graduation_commit: Option<String>,
+}
+
+impl RollInfo {
+    /// The state as the tables print it: the lifecycle label, prefixed with
+    /// `⟳` when a dependency has moved since it was integrated. One helper so
+    /// the TUI table, `rf status --no-tui` and `rf list --no-tui` cannot drift.
+    /// `--json` keeps `state` and `outdated` as separate fields instead.
+    pub fn state_display(&self) -> String {
+        if self.outdated.is_empty() {
+            self.state.label().to_string()
+        } else {
+            format!("⟳ {}", self.state.label())
+        }
+    }
 }
 
 // ── Public API ────────────────────────────────────────────────────────────────
@@ -165,6 +186,7 @@ pub fn list_rolls(config: &Config) -> Result<Vec<RollInfo>, RfError> {
             location,
             deps: Vec::new(),
             dependents: Vec::new(),
+            outdated: Vec::new(),
             graduation_commit,
         });
     }
@@ -182,14 +204,26 @@ pub fn list_rolls(config: &Config) -> Result<Vec<RollInfo>, RfError> {
     // integration holds a roll back from graduating, but once the roll itself
     // has graduated the relationship is history, not a blocker.
     let snapshot = rolls.clone();
+    // Each roll's tip, resolved once: the outdated check below compares it
+    // against every integration that pulled the roll in.
+    let tips: HashMap<u32, String> = snapshot
+        .iter()
+        .filter_map(|r| {
+            let tip = git::resolve_branch(repo, &r.branch)
+                .and_then(|refspec| git::rev_parse(repo, &refspec).ok())?;
+            Some((r.number, tip))
+        })
+        .collect();
     for roll in &mut rolls {
-        roll.deps = integration_deps(
+        let integrations = integration_merges(
             repo,
             &roll.branch,
             roll.number,
             &config.roll_prefix,
             &deps_base_ref(roll, &config.stable_branch),
         );
+        roll.deps = integrations.iter().map(|i| i.number).collect();
+        roll.outdated = outdated_deps(repo, &integrations, &tips);
         if roll.state == RollState::Active {
             let blocked = roll.deps.iter().any(|dep| {
                 snapshot
@@ -469,14 +503,28 @@ fn subjects_contain_graduation(subjects: &[String], roll_branch: &str) -> bool {
         .any(|b| b == roll_branch)
 }
 
-/// Roll numbers this roll has *directly integrated* via `rf integrate`
-/// (`git merge --no-ff <branch>`).
+/// One `rf integrate` merge in a roll's own history: which roll it pulled in
+/// and the merge commit that did it. The merge's second parent is the
+/// dependency's tip *as integrated*, which is what the outdated check compares
+/// against the dependency's tip today.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct Integration {
+    number: u32,
+    merge: String,
+}
+
+/// The rolls this roll has *directly integrated* via `rf integrate`
+/// (`git merge --no-ff <branch>`), each with the merge commit that did it.
 ///
 /// Detected by parsing the roll's own first-parent merge history in the range
 /// `<base>..<roll>`. `--first-parent` combined with that range restricts results
 /// to merges THIS roll introduced (direct integrations), excluding transitive
 /// ones carried in by an integrated roll's own history. Each subject matching
 /// `Merge branch 'roll/<N>-…'` yields `<N>`.
+///
+/// A roll integrated twice keeps only its *latest* merge — the log is newest
+/// first — since that is the tip the roll actually holds now. Results are
+/// sorted by roll number.
 ///
 /// `base_ref` is chosen by [`deps_base_ref`] — the stable branch for an
 /// ungraduated roll, the graduation merge's first parent otherwise. It may be a
@@ -485,13 +533,13 @@ fn subjects_contain_graduation(subjects: &[String], roll_branch: &str) -> bool {
 ///
 /// This is the only dependency signal that gates blocking: file overlap and
 /// broad ancestry are intentionally excluded (see `list_rolls`).
-fn integration_deps(
+fn integration_merges(
     repo: &Path,
     roll_branch: &str,
     roll_num: u32,
     prefix: &str,
     base_ref: &str,
-) -> Vec<u32> {
+) -> Vec<Integration> {
     let (Some(roll_ref), Some(base)) = (
         git::resolve_branch(repo, roll_branch),
         git::rev_parse(repo, base_ref)
@@ -502,19 +550,125 @@ fn integration_deps(
     };
 
     let range = format!("{base}..{roll_ref}");
-    let subjects =
-        git::log_subjects(repo, &["--first-parent", "--merges", &range]).unwrap_or_default();
+    let out = git::capture_git(
+        repo,
+        &[
+            "log",
+            "--first-parent",
+            "--merges",
+            "--format=%H%x09%s",
+            &range,
+        ],
+    )
+    .unwrap_or_default();
 
-    let mut deps: Vec<u32> = subjects
-        .iter()
-        .filter_map(|s| extract_graduated_branch(s))
-        .filter_map(|b| parse_roll_number(&b, prefix))
-        .filter(|&n| n != roll_num)
+    let mut seen = HashSet::new();
+    let mut found: Vec<Integration> = out
+        .lines()
+        .filter_map(|line| line.split_once('\t'))
+        .filter_map(|(hash, subject)| {
+            let branch = extract_graduated_branch(subject)?;
+            let number = parse_roll_number(&branch, prefix)?;
+            Some(Integration {
+                number,
+                merge: hash.to_string(),
+            })
+        })
+        .filter(|i| i.number != roll_num)
+        .filter(|i| seen.insert(i.number))
         .collect();
+    found.sort_by_key(|i| i.number);
+    found
+}
 
-    deps.sort_unstable();
-    deps.dedup();
-    deps
+/// Which of `integrations` point at a dependency that has since moved in a way
+/// that matters — see [`only_version_lines_changed`] for what does not.
+///
+/// Cheap by construction: the moved check is two SHA comparisons, and a diff
+/// is only run for a dependency whose tip is actually no longer the one that
+/// was merged. A dependency whose tip cannot be resolved is not outdated; it
+/// is simply unknown, and unknown is not a reason to alarm.
+fn outdated_deps(
+    repo: &Path,
+    integrations: &[Integration],
+    tips: &HashMap<u32, String>,
+) -> Vec<u32> {
+    integrations
+        .iter()
+        .filter(|i| {
+            let Some(now) = tips.get(&i.number) else {
+                return false;
+            };
+            let Ok(then) = git::rev_parse(repo, &format!("{}^2", i.merge)) else {
+                return false;
+            };
+            if &then == now {
+                return false;
+            }
+            dependency_moved_meaningfully(repo, &then, now)
+        })
+        .map(|i| i.number)
+        .collect()
+}
+
+/// True when `then..now` changes something other than version lines.
+///
+/// Two subprocesses at most: a `--name-only` diff decides the common case
+/// outright — any file besides the manifest and lockfile touched is a real
+/// change — and only when the change is confined to those two does a `-U0`
+/// diff of them get classified line by line.
+fn dependency_moved_meaningfully(repo: &Path, then: &str, now: &str) -> bool {
+    let Ok(names) = git::capture_git(repo, &["diff", "--name-only", then, now]) else {
+        return false;
+    };
+    let names: Vec<&str> = names.lines().filter(|l| !l.is_empty()).collect();
+    if names.is_empty() {
+        return false;
+    }
+    if names.iter().any(|n| !VERSION_ONLY_FILES.contains(n)) {
+        return true;
+    }
+    let mut args = vec!["diff", "-U0", then, now, "--"];
+    args.extend(names.iter());
+    match git::capture_git(repo, &args) {
+        Ok(diff) => !only_version_lines_changed(&diff),
+        Err(_) => false,
+    }
+}
+
+/// The files a version bump or dev marker rewrites. A change confined to these
+/// files, and within them to `version` lines, is not a change to the work.
+const VERSION_ONLY_FILES: &[&str] = &["Cargo.toml", "Cargo.lock"];
+
+/// True when every added or removed line in a unified diff is a `version = …`
+/// assignment — the shape of a version bump or an `rf start` dev marker.
+///
+/// This is what keeps the dev-version mechanism from outdating every
+/// dependant: marking `0.2.4` as `0.2.4-roll9` touches the manifest and the
+/// lockfile and nothing else, and a dependant that integrated the roll before
+/// the mark has not fallen behind any *work*. Pure, so the rule is testable
+/// without a repository.
+pub fn only_version_lines_changed(diff: &str) -> bool {
+    let mut saw_change = false;
+    for line in diff.lines() {
+        let (sign, rest) = match line.as_bytes().first() {
+            Some(b'+') => ('+', &line[1..]),
+            Some(b'-') => ('-', &line[1..]),
+            _ => continue,
+        };
+        // File headers (`+++ b/…`, `--- a/…`), not content.
+        if (sign == '+' && rest.starts_with("++")) || (sign == '-' && rest.starts_with("--")) {
+            continue;
+        }
+        saw_change = true;
+        let Some(after) = rest.trim_start().strip_prefix("version") else {
+            return false;
+        };
+        if !after.trim_start().starts_with('=') {
+            return false;
+        }
+    }
+    saw_change
 }
 
 /// Find the git hash of the merge/graduation commit for `roll_branch` on
@@ -540,7 +694,53 @@ fn find_graduation_commit(repo: &Path, roll_branch: &str, rolling_ref: &str) -> 
 
 #[cfg(test)]
 mod tests {
-    use super::{extract_graduated_branch, parse_roll_number};
+    use super::{extract_graduated_branch, only_version_lines_changed, parse_roll_number};
+
+    #[test]
+    fn a_diff_touching_only_version_lines_is_not_a_real_change() {
+        // What `rf start`'s dev marker and a bump produce: the manifest's
+        // version line and the lockfile's entry for the package, nothing else.
+        let bump = "\
+diff --git a/Cargo.toml b/Cargo.toml
+--- a/Cargo.toml
++++ b/Cargo.toml
+@@ -3 +3 @@
+-version = \"0.2.4\"
++version = \"0.2.4-roll9\"
+diff --git a/Cargo.lock b/Cargo.lock
+--- a/Cargo.lock
++++ b/Cargo.lock
+@@ -12 +12 @@
+-version = \"0.2.4\"
++version = \"0.2.4-roll9\"
+";
+        assert!(only_version_lines_changed(bump));
+        // Indented and spaced variants still count as version lines.
+        assert!(only_version_lines_changed(
+            "-  version=\"1\"\n+  version = \"2\"\n"
+        ));
+    }
+
+    #[test]
+    fn any_other_changed_line_makes_the_diff_real() {
+        let real = "\
+--- a/Cargo.toml
++++ b/Cargo.toml
+@@ -3,2 +3,2 @@
+-version = \"0.2.4\"
++version = \"0.2.5\"
+-edition = \"2021\"
++edition = \"2024\"
+";
+        assert!(!only_version_lines_changed(real));
+        // A dependency's version key under another table is still a change to
+        // the manifest's content, but the classifier is line-based on purpose:
+        // it cannot tell, and errs toward "outdated", which is the safe side.
+        assert!(!only_version_lines_changed("+serde = \"1\"\n"));
+        // No changed lines at all is not \"only version lines\".
+        assert!(!only_version_lines_changed("--- a/x\n+++ b/x\n"));
+        assert!(!only_version_lines_changed(""));
+    }
 
     #[test]
     fn parses_roll_number() {

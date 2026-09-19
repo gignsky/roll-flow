@@ -87,6 +87,41 @@ The token it returns is not validated against the roll prefix, and does not need
 to be: every caller either compares it to a real roll branch name or runs it
 through `parse_roll_number`, so a candidate that is not a roll matches nothing.
 
+**Outdated dependencies.** Each integrate merge also records *which tip* was
+merged: its second parent, `<merge>^2`. `list_rolls` compares that against the
+dependency's tip today, and when they differ diffs the two. A dependency counts
+as **moved** — and its dependant as `outdated` with respect to it — only if that
+diff touches something other than `version = …` lines in `Cargo.toml` and
+`Cargo.lock`. The dev-version marker `rf start` writes and an ordinary bump both
+change exactly those lines, and a dependant that integrated a roll before its
+mark has not fallen behind any work. The classifier is
+`branches::only_version_lines_changed`, line-based on purpose: it cannot tell a
+package version from a dependency's, and errs toward "outdated", which is the
+safe side.
+
+The check is cheap by construction: two SHA comparisons per integration, and a
+diff only for a dependency whose tip actually moved — `--name-only` first, and a
+`-U0` diff of the manifest and lockfile only when nothing else changed. Where a
+roll integrated the same dependency twice, the latest merge is the one that
+counts, since that is the tip it holds now. Re-integrating clears the mark.
+
+`outdated` is a field on `RollInfo`, not a `RollState`: it is orthogonal to the
+lifecycle — a `⛔ blocked` roll can be outdated too, and so can a graduated one
+— and folding it into the enum would force one of the two facts to win. The
+tables show it as a `⟳` prefix on the state cell; the detail view names the
+dependencies that moved and marks the link in the chain; `--json` carries it as
+its own `outdated` array beside `deps`.
+
+**Dependency chain.** The detail view (`[enter]`) walks `deps` transitively —
+roll 12 depends on 9, which depends on 8, which depends on 7 — through
+`tui::rolls::dep_chain`. Each level is exactly `dep_rows` of its parent, so there
+is one definition of a direct dependency row and the chain only adds depth. A
+roll reached a second time (a diamond, or a cycle if hand-written merge subjects
+ever produce one) is listed once more as `↑ shown above` and not descended into,
+so the walk is finite and every roll's own dependencies appear exactly once.
+The table's `deps` column stays direct-only; widening it for transitive counts
+would cost the `branch` column, which has nothing to spare.
+
 One consequence worth knowing, since `[i]` makes roll-into-roll merges cheap: the
 graduated scan below has a second pass *without* `--first-parent`, so once M
 graduates, N's integrate merge is reachable from rolling and N reports as
