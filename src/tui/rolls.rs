@@ -40,6 +40,10 @@ use crate::core::{
 pub(crate) enum Action {
     /// Graduate the selected roll into the rolling branch.
     Graduate,
+    /// Merge the *selected* roll into the *checked-out* one. The only action here
+    /// whose subject and object are different rows: everything else acts on the
+    /// row under the cursor, this one acts on HEAD using that row as the source.
+    Integrate,
     /// Promote the rolling branch into stable.
     Promote,
     /// Update all active local rolls from stable.
@@ -54,6 +58,7 @@ impl Action {
     fn job_title(&self, target: Option<&str>) -> String {
         let verb = match self {
             Action::Graduate => "graduate",
+            Action::Integrate => "integrate",
             Action::Promote => "promote",
             Action::Update => "update",
             Action::Prune => "prune",
@@ -554,12 +559,48 @@ pub(crate) fn promote_target_for(
     }
 }
 
+/// The roll `[i]` would merge into the current branch, or the reason it cannot.
+///
+/// Unlike every other action, integration reads *two* rows: the source is the one
+/// under the cursor and the destination is whatever is checked out. That is why
+/// this needs `current_branch` when the other gates do not, and why "no roll
+/// selected" is only one of several ways it can be refused.
+pub(crate) fn integrate_target_for(
+    current_branch: &str,
+    roll_prefix: &str,
+    selected: Option<&RollInfo>,
+) -> Result<String, String> {
+    // Mirrors the check inside `ops::integrate`, so the key is never offered for
+    // something the core would refuse anyway.
+    if !current_branch.starts_with(roll_prefix) {
+        return Err(format!(
+            "'{current_branch}' is not a roll branch — integrate merges into a roll"
+        ));
+    }
+    let sel = selected.ok_or_else(|| "no roll selected".to_string())?;
+    if sel.branch == current_branch {
+        return Err(format!("'{}' is already the current branch", sel.branch));
+    }
+    // `ops::integrate` resolves the source with a bare `ref_exists`, so a
+    // remote-only roll would fail there as "branch not found" — a confusing way to
+    // say "fetch it first".
+    if !matches!(sel.location, BranchLocation::Local | BranchLocation::Both) {
+        return Err(format!(
+            "'{}' exists only on origin — press [space] or [p] to get it locally first",
+            sel.branch
+        ));
+    }
+    Ok(sel.branch.clone())
+}
+
 /// Validate an action against the current selection/list. `Ok(())` means the
 /// confirm modal may open; `Err(msg)` is a brief reason to surface instead.
 pub(crate) fn validate_action(
     action: Action,
     selected: Option<&RollInfo>,
     rolls: &[RollInfo],
+    current_branch: &str,
+    roll_prefix: &str,
 ) -> Result<(), String> {
     match action {
         Action::Graduate => {
@@ -573,6 +614,9 @@ pub(crate) fn validate_action(
                     sel.state.label()
                 ))
             }
+        }
+        Action::Integrate => {
+            integrate_target_for(current_branch, roll_prefix, selected).map(|_| ())
         }
         Action::Promote => promote_target_for(selected, rolls).map(|_| ()),
         Action::Update => {
@@ -895,6 +939,7 @@ impl StatusApp {
             KeyCode::Char('P') => self.start_push(),
             KeyCode::Char('f') => self.start_fetch(),
             KeyCode::Char('G') => self.request(Action::Graduate),
+            KeyCode::Char('i') => self.request_integrate(),
             KeyCode::Char('m') => self.request(Action::Promote),
             KeyCode::Char('u') => self.request(Action::Update),
             KeyCode::Char('x') => self.request(Action::Prune),
@@ -994,9 +1039,18 @@ impl StatusApp {
     /// Validate an action and either open the confirm modal or set a message.
     fn request(&mut self, action: Action) {
         let selected = self.selected_roll();
-        let validation = validate_action(action, selected, &self.rolls);
+        let validation = validate_action(
+            action,
+            selected,
+            &self.rolls,
+            &self.current_branch,
+            &self.config.roll_prefix,
+        );
         let target = match action {
             Action::Graduate => selected.map(|r| r.branch.clone()),
+            Action::Integrate => {
+                integrate_target_for(&self.current_branch, &self.config.roll_prefix, selected).ok()
+            }
             // `None` here means "the whole rolling branch", not "no target".
             Action::Promote => promote_target_for(selected, &self.rolls).unwrap_or(None),
             _ => None,
@@ -1010,6 +1064,38 @@ impl StatusApp {
     /// Open the delete modal for the selected roll, or say why it cannot be
     /// deleted. The per-copy unmerged counts are taken here, once, so the modal
     /// can state what a delete would cost without re-shelling out on every draw.
+    /// `[i]` — merge the roll under the cursor into the checked-out branch.
+    ///
+    /// Not routed through [`Self::request`] because the row under the cursor is
+    /// the *source* here, and because a base row needs its own answer: `main` and
+    /// `rolling` are selectable, but merging them into a roll is a different
+    /// operation with its own key.
+    fn request_integrate(&mut self) {
+        if self.busy() {
+            return;
+        }
+        if let Some(RowKind::Base(i)) = self.selected_row() {
+            self.message = Some(format!(
+                "'{}' is a base branch — [u]pdate brings stable into your rolls",
+                self.bases[i].branch
+            ));
+            return;
+        }
+        match integrate_target_for(
+            &self.current_branch,
+            &self.config.roll_prefix,
+            self.selected_roll(),
+        ) {
+            Ok(branch) => {
+                self.mode = Mode::Confirm {
+                    action: Action::Integrate,
+                    target: Some(branch),
+                }
+            }
+            Err(msg) => self.message = Some(msg),
+        }
+    }
+
     fn request_delete(&mut self) -> Result<()> {
         let Some(roll) = self.selected_roll() else {
             self.message = Some("no roll selected".to_string());
@@ -1379,8 +1465,8 @@ impl StatusApp {
         let chunks = Layout::vertical([
             Constraint::Length(3),
             Constraint::Min(3),
-            // One message line plus three hint lines.
-            Constraint::Length(4),
+            // One message line plus four hint lines.
+            Constraint::Length(5),
         ])
         .split(area);
 
@@ -1403,6 +1489,7 @@ impl StatusApp {
                     *action,
                     target.as_deref(),
                     &self.rolls,
+                    &self.current_branch,
                 );
             }
             Mode::Detail { roll, ahead_behind } => {
@@ -1562,10 +1649,13 @@ impl StatusApp {
             Line::from(" [q] quit   [j/k ↑/↓] nav   [space] switch   [enter] detail   [r]efresh");
         let sync_line =
             Line::from(" [p] pull   [P] push   [f] fetch   [gg] lazygit   [esc] close output");
-        let action_line =
-            Line::from(" [c]reate   [G]raduate   [m] promote   [u]pdate   [d]elete   [x] prune");
+        // Split across two lines because thirteen bindings do not fit on one at
+        // 80 columns, and `Paragraph` truncates rather than wrapping — the roll
+        // lifecycle first, then what removes things plus the panel's own keys.
+        let roll_line = Line::from(" [c]reate   [i]ntegrate   [G]raduate   [m] promote   [u]pdate");
+        let extra_line = Line::from(" [d]elete   [x] prune   [PgUp/PgDn/End] scroll output");
         f.render_widget(
-            Paragraph::new(vec![msg_line, nav_line, sync_line, action_line]),
+            Paragraph::new(vec![msg_line, nav_line, sync_line, roll_line, extra_line]),
             area,
         );
     }
@@ -1629,6 +1719,16 @@ fn run_op(config: &Config, action: Action, target: Option<&str>) -> Result<Vec<S
             push_gate_notices(&mut lines, &o.gate_notices);
             lines.push(format!("Graduated '{}' into '{}'", o.roll, o.rolling));
         }
+        Action::Integrate => {
+            let roll = target.ok_or_else(|| anyhow!("no roll selected"))?;
+            // Deliberately no `ensure_clean_state`: this is the same operation as
+            // `rf integrate`, and git already refuses a merge that would clobber
+            // local changes while carrying harmless ones through. A conflict is a
+            // legitimate outcome to go and resolve, not a reason to refuse up
+            // front.
+            let o = ops::integrate(config, roll).map_err(|err| integrate_error(config, err))?;
+            lines.push(format!("Integrated '{}' into '{}'", o.branch, o.current));
+        }
         Action::Promote => {
             ops::ensure_clean_state(config)?;
             let promote_target = match target {
@@ -1691,6 +1791,23 @@ fn run_op(config: &Config, action: Action, target: Option<&str>) -> Result<Vec<S
         }
     }
     Ok(lines)
+}
+
+/// Add a recovery hint to a failed integrate when it left a merge in progress.
+///
+/// A conflicted merge is the common failure, and the raw
+/// ``  `git merge --no-ff X` exited with exit status: 1`` says nothing about the
+/// worktree now being mid-merge — which is the only fact the user needs next.
+/// `MERGE_HEAD` exists exactly while a merge is unresolved, so `ref_exists`
+/// answers this without a new git helper.
+fn integrate_error(config: &Config, err: anyhow::Error) -> anyhow::Error {
+    if git::ref_exists(&config.repo_root, "MERGE_HEAD") {
+        return anyhow!(
+            "{err}\nmerge left conflicts — resolve them and commit,\n\
+             press gg for lazygit, or run `git merge --abort`"
+        );
+    }
+    err
 }
 
 /// Read every local branch's upstream tracking state, keyed by branch name.
@@ -1795,12 +1912,18 @@ fn render_modal(
     action: Action,
     target: Option<&str>,
     rolls: &[RollInfo],
+    current_branch: &str,
 ) {
     let prompt = match action {
         Action::Graduate => format!(
             "Graduate {} into {}?",
             target.unwrap_or("(selected roll)"),
             config.rolling_branch
+        ),
+        Action::Integrate => format!(
+            "Integrate {} into {}?",
+            target.unwrap_or("(selected roll)"),
+            current_branch
         ),
         // `target` is the selected roll when `[p]` was pressed on one, and
         // `None` for a whole-branch promotion — the prompt must say which,
@@ -2305,7 +2428,7 @@ mod tests {
         ];
         assert!(!can_prune(&unpromoted));
         assert_eq!(prunable_count(&unpromoted), 0);
-        assert!(validate_action(Action::Prune, None, &unpromoted).is_err());
+        assert!(validate_action(Action::Prune, None, &unpromoted, "main", "roll/").is_err());
 
         let mut with_promoted = unpromoted.clone();
         with_promoted.push(roll_n(5, RollState::Promoted));
@@ -2313,7 +2436,7 @@ mod tests {
         assert!(can_prune(&with_promoted));
         assert_eq!(prunable_count(&with_promoted), 2);
         // Prune is repo-wide, so it validates with no selection.
-        assert!(validate_action(Action::Prune, None, &with_promoted).is_ok());
+        assert!(validate_action(Action::Prune, None, &with_promoted, "main", "roll/").is_ok());
     }
 
     #[test]
@@ -2356,17 +2479,26 @@ mod tests {
         let graduated = vec![roll(RollState::Graduated, BranchLocation::Both)];
 
         // Graduate needs a valid selection.
-        assert!(validate_action(Action::Graduate, None, &active).is_err());
-        assert!(validate_action(Action::Graduate, Some(&active[0]), &active).is_ok());
-        assert!(validate_action(Action::Graduate, Some(&graduated[0]), &graduated).is_err());
+        assert!(validate_action(Action::Graduate, None, &active, "main", "roll/").is_err());
+        assert!(
+            validate_action(Action::Graduate, Some(&active[0]), &active, "main", "roll/").is_ok()
+        );
+        assert!(validate_action(
+            Action::Graduate,
+            Some(&graduated[0]),
+            &graduated,
+            "main",
+            "roll/"
+        )
+        .is_err());
 
         // Promote needs a graduated roll on rolling.
-        assert!(validate_action(Action::Promote, None, &active).is_err());
-        assert!(validate_action(Action::Promote, None, &graduated).is_ok());
+        assert!(validate_action(Action::Promote, None, &active, "main", "roll/").is_err());
+        assert!(validate_action(Action::Promote, None, &graduated, "main", "roll/").is_ok());
 
         // Update needs a local active roll.
-        assert!(validate_action(Action::Update, None, &active).is_ok());
-        assert!(validate_action(Action::Update, None, &graduated).is_err());
+        assert!(validate_action(Action::Update, None, &active, "main", "roll/").is_ok());
+        assert!(validate_action(Action::Update, None, &graduated, "main", "roll/").is_err());
     }
 
     #[test]
@@ -2465,7 +2597,9 @@ mod tests {
             roll_n(2, RollState::Active),
         ];
         assert!(promote_target_for(Some(&rolls[1]), &rolls).is_err());
-        assert!(validate_action(Action::Promote, Some(&rolls[1]), &rolls).is_err());
+        assert!(
+            validate_action(Action::Promote, Some(&rolls[1]), &rolls, "main", "roll/").is_err()
+        );
     }
 
     #[test]
@@ -2956,10 +3090,13 @@ mod tests {
             "[gg] lazygit",
             "[esc] close output",
             "[c]reate",
+            "[i]ntegrate",
             "[G]raduate",
             "[m] promote",
+            "[u]pdate",
             "[d]elete",
             "[x] prune",
+            "scroll output",
         ] {
             assert!(out.contains(key), "{key} truncated away:\n{out}");
         }
@@ -2971,10 +3108,13 @@ mod tests {
         // than that and the last binding silently disappears.
         let app = StatusApp::new(test_config(), "main".to_string(), Vec::new(), false);
         let out = draw(|f, area| {
-            let chunks = Layout::vertical([Constraint::Length(4)]).split(area);
+            let chunks = Layout::vertical([Constraint::Length(5)]).split(area);
             app.render_status_bar(f, chunks[0])
         });
-        assert!(out.contains("[x] prune"), "last hint line clipped:\n{out}");
+        assert!(
+            out.contains("scroll output"),
+            "last hint line clipped:\n{out}"
+        );
     }
 
     #[test]
@@ -3172,6 +3312,119 @@ mod tests {
             draw(|f, area| render_force_push_modal(f, area, "roll/1", "origin", Some(&details)));
         assert!(out.contains("1 commit you don't"), "{out}");
         assert!(!out.contains("1 commits"), "{out}");
+    }
+
+    #[test]
+    fn integrate_merges_the_hovered_roll_into_the_checked_out_one() {
+        let mut other = roll_n(1, RollState::Active);
+        other.branch = "roll/1-0101-alpha".to_string();
+        other.location = BranchLocation::Both;
+        assert_eq!(
+            integrate_target_for("roll/2-0102-beta", "roll/", Some(&other)),
+            Ok("roll/1-0101-alpha".to_string())
+        );
+    }
+
+    #[test]
+    fn integrate_needs_a_roll_branch_checked_out() {
+        // `ops::integrate` refuses this too; catching it here means the message
+        // names the branch instead of surfacing a core error after the modal.
+        let other = roll_n(1, RollState::Active);
+        for head in ["main", "rolling", "feature/x"] {
+            let err = integrate_target_for(head, "roll/", Some(&other))
+                .expect_err("{head} should be refused");
+            assert!(err.contains("not a roll branch"), "{head}: {err}");
+        }
+    }
+
+    #[test]
+    fn integrate_refuses_a_roll_into_itself() {
+        let mut same = roll_n(1, RollState::Active);
+        same.branch = "roll/1-0101-alpha".to_string();
+        let err = integrate_target_for("roll/1-0101-alpha", "roll/", Some(&same))
+            .expect_err("self-merge should be refused");
+        assert!(err.contains("already the current branch"), "{err}");
+    }
+
+    #[test]
+    fn integrate_refuses_a_remote_only_roll_with_advice() {
+        // `ops::integrate` resolves the source with a bare `ref_exists`, so
+        // without this the user would get "branch not found" for a roll plainly
+        // listed on screen.
+        let mut remote = roll_n(1, RollState::Active);
+        remote.branch = "roll/1-0101-alpha".to_string();
+        remote.location = BranchLocation::Remote;
+        let err = integrate_target_for("roll/2-0102-beta", "roll/", Some(&remote))
+            .expect_err("a remote-only roll should be refused");
+        assert!(err.contains("only on origin"), "{err}");
+    }
+
+    #[test]
+    fn integrate_needs_something_selected() {
+        let err = integrate_target_for("roll/2-0102-beta", "roll/", None)
+            .expect_err("nothing selected should be refused");
+        assert!(err.contains("no roll selected"), "{err}");
+    }
+
+    #[test]
+    fn integrate_accepts_an_already_graduated_roll() {
+        // Merging a graduated roll into yours is legitimate — you want its code —
+        // and the dependency it records is simply already satisfied.
+        let mut graduated = roll_n(1, RollState::Graduated);
+        graduated.branch = "roll/1-0101-alpha".to_string();
+        graduated.location = BranchLocation::Local;
+        assert!(integrate_target_for("roll/2-0102-beta", "roll/", Some(&graduated)).is_ok());
+    }
+
+    #[test]
+    fn integrate_honours_a_non_default_roll_prefix() {
+        let mut other = roll_n(1, RollState::Active);
+        other.branch = "batch/1-0101-alpha".to_string();
+        other.location = BranchLocation::Local;
+        assert!(integrate_target_for("batch/2-0102-beta", "batch/", Some(&other)).is_ok());
+        assert!(integrate_target_for("batch/2-0102-beta", "roll/", Some(&other)).is_err());
+    }
+
+    #[test]
+    fn validate_action_gates_integrate_the_same_way() {
+        // The single validation entry point must agree with the helper, or the
+        // key and the modal could disagree about what is allowed.
+        let mut rolls = vec![roll_n(1, RollState::Active)];
+        rolls[0].branch = "roll/1-0101-alpha".to_string();
+        rolls[0].location = BranchLocation::Both;
+        assert!(validate_action(
+            Action::Integrate,
+            Some(&rolls[0]),
+            &rolls,
+            "roll/2-0102-beta",
+            "roll/"
+        )
+        .is_ok());
+        assert!(
+            validate_action(Action::Integrate, Some(&rolls[0]), &rolls, "main", "roll/").is_err()
+        );
+    }
+
+    #[test]
+    fn the_integrate_modal_names_both_the_source_and_the_destination() {
+        // The direction is the whole point and the easiest thing to get backwards,
+        // so the prompt has to spell it out.
+        let cfg = config("main", "rolling");
+        let out = draw(|f, area| {
+            render_modal(
+                f,
+                area,
+                &cfg,
+                Action::Integrate,
+                Some("roll/1-0101-alpha"),
+                &[],
+                "roll/2-0102-beta",
+            )
+        });
+        assert!(
+            out.contains("Integrate roll/1-0101-alpha into roll/2-0102-beta?"),
+            "{out}"
+        );
     }
 
     #[test]

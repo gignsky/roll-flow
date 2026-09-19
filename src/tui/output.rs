@@ -158,7 +158,7 @@ pub enum Status {
 }
 
 /// One retained line, tagged so stderr, results and errors can be styled apart.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Kind {
     Stdout,
     Stderr,
@@ -209,6 +209,20 @@ impl Panel {
     }
 
     fn push(&mut self, kind: Kind, text: String) {
+        // rf's own messages (a failure plus its recovery hint) arrive as one
+        // multi-line string, and a `\n` inside a `Span` is not a line break —
+        // ratatui would render it as a control character. Child output never gets
+        // here with embedded newlines, since the reader splits on them already.
+        if text.contains('\n') {
+            for part in text.split('\n') {
+                self.push_one(kind, part.to_string());
+            }
+            return;
+        }
+        self.push_one(kind, text);
+    }
+
+    fn push_one(&mut self, kind: Kind, text: String) {
         if self.lines.len() == SCROLLBACK {
             self.lines.pop_front();
         }
@@ -316,7 +330,7 @@ pub fn panel_rect(area: Rect, content_lines: usize) -> Rect {
     let wanted = u16::try_from(content_lines)
         .unwrap_or(u16::MAX)
         .saturating_add(2);
-    let width = area.width.saturating_sub(2).clamp(24, 60);
+    let width = area.width.saturating_sub(2).clamp(24, 66);
     let height = wanted.clamp(3, area.height.saturating_sub(2).clamp(3, 12));
     // A frame too small for even the clamped minimum gets whatever is left; the
     // widget clips rather than panicking.
@@ -467,7 +481,7 @@ mod tests {
             height: 40,
         };
         let r = panel_rect(area, 50);
-        assert_eq!(r.width, 60, "clamped to the maximum width");
+        assert_eq!(r.width, 66, "clamped to the maximum width");
         assert_eq!(r.height, 12, "clamped to the maximum height");
         assert_eq!(r.x + r.width, 99, "one cell of right margin");
         assert_eq!(r.y + r.height, 39, "one cell of bottom margin");
@@ -523,6 +537,21 @@ mod tests {
         assert!(!p.is_running());
         assert_eq!(p.lines.back().unwrap().text, "Pushed roll/1");
         assert_eq!(p.lines.back().unwrap().kind, Kind::Result);
+    }
+
+    #[test]
+    fn a_multi_line_message_becomes_one_panel_line_per_line() {
+        // A failure and its recovery hint arrive as a single string; rendered as
+        // one `Span` the newline would show as a control character instead of a
+        // break.
+        let mut p = Panel::new("test");
+        p.finish_failed(vec![
+            "it broke".to_string(),
+            "try this\nor that".to_string(),
+        ]);
+        let texts: Vec<String> = p.lines.iter().map(|l| l.text.clone()).collect();
+        assert_eq!(texts, vec!["it broke", "try this", "or that"]);
+        assert!(texts.iter().all(|t| !t.contains('\n')));
     }
 
     #[test]
