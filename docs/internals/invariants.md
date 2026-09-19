@@ -49,12 +49,30 @@ long list — that keeps two rolls adding rules in different areas from collidin
 
 - `rf promote` may push a release tag, but only after an explicit y/N
   confirmation (or `--yes`), and only when `push_tag` is enabled.
-- Writing to the remote (`git push --delete`) happens in exactly three places:
-  `rf prune`, `rf delete` (including the TUI's `[d]`), and `rf clean --with-remote`.
-  All of them `git fetch --prune` before planning a remote delete, so containment is
-  never judged against a stale ref — a stale one names an old tip, and deleting against
-  it would destroy commits the check never saw. The TUI also fetches a single branch
-  when switching to a remote-only roll. Everything else is local-only; keep it that way.
+- Deleting a ref on the remote (`git push --delete`) happens in exactly three
+  places: `rf prune`, `rf delete` (including the TUI's `[d]`), and
+  `rf clean --with-remote`. All of them `git fetch --prune` before planning a
+  remote delete, so containment is never judged against a stale ref — a stale one
+  names an old tip, and deleting against it would destroy commits the check never
+  saw. Do not add a fourth.
+- *Advancing* a ref on the remote happens in one place: the TUI's `[P]`, via
+  `core::sync::run_push`. It is a different act from a delete and is governed by
+  different rules, which is why it is a separate bullet rather than a fourth
+  entry above:
+  - It is always user-initiated on the branch under the cursor. Nothing pushes as
+    a side effect of another op, and there is no `--all`.
+  - A non-fast-forward push is never forced silently. Either the tracking state
+    already shows the branch is behind, or git refuses and
+    `core::sync::is_rejection` recognises the refusal; either way the user answers
+    an explicit y/N first, and only `y` sets `force`.
+  - Forcing uses `--force-with-lease` and nothing else. If git reports `stale
+    info` the push is *refused*, not retried with `--force`: a stale lease means
+    we do not know what is on the remote, and the honest response is to fetch and
+    look. This is a deliberate divergence from lazygit, which does fall back.
+  - `rf` still never syncs on its own. Every fetch and push is a keypress.
+- Sync commands run with `GIT_TERMINAL_PROMPT=0`. Their output is piped into the
+  TUI's panel, so nobody is reading the terminal on git's behalf — without this a
+  credential prompt blocks forever on a pipe instead of failing.
 
 ## Versioning and release tags
 
