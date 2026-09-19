@@ -24,7 +24,8 @@ neither locally nor on `origin` is not listed.
 ```text
 [q] quit   [j/k ↑/↓] nav   [space] switch   [enter] detail   [r]efresh
 [p] pull   [P] push   [f] fetch   [gg] lazygit   [esc] close output
-[c]reate   [G]raduate   [m] promote   [u]pdate   [d]elete   [x] prune
+[c]reate   [i]ntegrate   [G]raduate   [m] promote   [u]pdate
+[d]elete   [x] prune   [PgUp/PgDn/End] scroll output
 ```
 
 The sync keys follow lazygit, which is why graduate is `[G]` and promote is `[m]`
@@ -32,7 +33,9 @@ rather than the `[g]`/`[p]` they used to be — `[p]` and `[P]` are pull and pus
 everywhere else, and matching that mattered more than keeping two letters.
 
 A `›` marks the checked-out branch; the separate `▶` cursor marks the selection,
-which is usually somewhere else. The `sync` column reports each branch against
+which is usually somewhere else. Both matter for `[i]`, the one key that reads two
+rows: it merges the roll under the cursor into the roll wearing the chevron — see
+[`integrate`](integrate.md#from-the-tui). The `sync` column reports each branch against
 its upstream: `✓` in sync, `↑2` ahead, `↓1` behind, `↑2↓1` diverged, `gone` once
 the upstream is deleted, and `—` when there is nothing to compare (no upstream,
 or no local copy).

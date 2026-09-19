@@ -60,7 +60,17 @@ hard git dependency. Only checks lower-numbered ungraduated rolls.
 
 **Method 2b — merge subject parsing**: scans merge commit subjects for
 `Merge branch 'roll/N-...'` patterns within this roll's history. Precise — avoids
-false positives from shared ancestry.
+false positives from shared ancestry. This is the method that gives
+[`rf integrate`](../commands/integrate.md) (and the TUI's `[i]`) its meaning:
+merging roll N into roll M leaves exactly that subject in M's history, so M gains
+a dependency on N and stays `⛔ blocked` until N graduates.
+
+One consequence worth knowing, since `[i]` makes roll-into-roll merges cheap: the
+graduated scan below has a second pass *without* `--first-parent`, so once M
+graduates, N's integrate merge is reachable from rolling and N reports as
+graduated too. That is accurate — N's commits really are on rolling, carried in by
+M — and the `⛔ blocked` gate is what keeps it from happening out of order. It is
+only reachable at all via `rf graduate --force`.
 
 **Method 3 — file overlap**: if rolls modify the same files and the other roll has a
 lower number, it's a dependency. Uses `--first-parent --no-merges` on the other roll
