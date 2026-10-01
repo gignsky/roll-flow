@@ -48,3 +48,17 @@ already refuses a merge that would clobber local changes and carries harmless on
 through. A conflict is a normal outcome — the merge stops, the panel shows git's
 own `CONFLICT` lines, and you resolve it and commit, press `gg` for lazygit, or
 run `git merge --abort`.
+
+## No gate runs afterward
+
+`integrate` is deliberately not one of the gated steps — the configured
+`roll_to_rolling_gates`/`rolling_to_main_gates` only run at `graduate` and
+`promote`, so an integrate stays cheap enough to use for routine
+reintegration. The cost is that a merge can be *textually* clean — no
+`CONFLICT` lines, nothing to resolve — while still breaking the build, when
+two branches independently extend the same code in non-overlapping ways (a
+struct gaining a field on one side, a new literal of that struct on the
+other). Nothing catches that until the next `rf verify` or `rf graduate`
+actually runs the gates, so after any `integrate` that touched source files,
+it's worth running the repo's gate commands (`cargo test`, typically) before
+trusting the result.
