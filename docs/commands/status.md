@@ -14,10 +14,12 @@ that exists locally, `origin/<branch>` for one that only exists on the remote.
 Repos without a manifest, which is every dotfiles repo, get no column at all,
 the same rule the header version follows. There is no flag for it.
 
-The cell shows the three numbers and nothing else. A roll carrying a dev version
-like `0.2.4-roll9` still reads `0.2.4`, because the `#` column already says which
-roll the row is, and the suffix would cost four characters out of `branch` — the
-one column with nothing to spare at 80 columns.
+The cell shows the full version, dev marker included: a roll carrying one reads
+`0.2.4-roll9`, not `0.2.4`. The `#` column says which roll a row is, but not
+whether that roll's dev marker has actually been applied yet — a roll created
+before the marker existed, or with `--no-dev-version`, reads as a plain release
+version until its first `rf verify` (see [`verify`](verify.md)) — so the version
+cell is the only place that distinction is visible.
 
 All versions are read in a single `git cat-file --batch`, so the column costs one
 subprocess per reload rather than one per branch.

@@ -1220,11 +1220,8 @@ pub(crate) fn version_column(
         .zip(refs.iter())
         .filter_map(|(roll, refspec)| {
             let v = by_ref.get(refspec)?;
-            // The numbers alone, never `Display` — see `tui::rolls::version_cell`.
-            Some((
-                roll.branch.clone(),
-                format!("{}.{}.{}", v.major, v.minor, v.patch),
-            ))
+            // Through `Display`, dev marker included — see `tui::rolls::version_cell`.
+            Some((roll.branch.clone(), v.to_string()))
         })
         .collect();
 

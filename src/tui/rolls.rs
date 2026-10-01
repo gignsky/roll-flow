@@ -2158,12 +2158,21 @@ impl StatusApp {
             Constraint::Length(13),
         ];
         // Present only in repos that have a `Cargo.toml`, the same rule the
-        // header version follows — so a dotfiles repo pays nothing for it. Wide
-        // enough for `12.34.5`; `branch` is the Fill column that pays for it,
-        // which is why the cell shows the numbers alone.
+        // header version follows — so a dotfiles repo pays nothing for it.
+        // Sized to the longest cell on screen (a dev marker like `-roll10`
+        // makes this wider than a bare `12.34.5`), the same way `main.rs`'s
+        // `version_column` sizes the plain tables; `branch` is the Fill
+        // column that pays for it.
         let show_versions = !self.versions.is_empty();
         if show_versions {
-            col_constraints.push(Constraint::Length(7));
+            let width = self
+                .versions
+                .values()
+                .map(|v| v.to_string().chars().count())
+                .max()
+                .unwrap_or(0)
+                .max("version".len());
+            col_constraints.push(Constraint::Length(width as u16));
         }
         if self.show_deps {
             col_constraints.push(Constraint::Length(8));
@@ -2561,15 +2570,18 @@ fn load_versions(
         .collect()
 }
 
-/// The version cell for `branch`: the three numbers, or a dash.
+/// The version cell for `branch`: the full version through `Semver`'s
+/// `Display` — numbers plus a `-rollN` dev marker when the branch carries one
+/// — or a dash.
 ///
-/// Deliberately formatted from the fields rather than through `Semver`'s
-/// `Display`. The table already carries a `#` column, so a `-rollN` dev suffix
-/// would be repeating what the row next door says — and it would cost four more
-/// columns out of `branch`, which is the one column with nothing to spare.
+/// The `#` column also names the roll, but not whether its dev marker has
+/// actually been applied yet: a roll created before the marker existed, or
+/// with `--no-dev-version`, reads as a plain release version until its first
+/// `rf verify` (see `ops::apply_dev_version`). The version cell is the only
+/// place that distinction is visible.
 pub(crate) fn version_cell(version: Option<Semver>) -> String {
     match version {
-        Some(v) => format!("{}.{}.{}", v.major, v.minor, v.patch),
+        Some(v) => v.to_string(),
         None => "—".to_string(),
     }
 }
@@ -4399,11 +4411,18 @@ mod tests {
     }
 
     #[test]
-    fn a_version_cell_drops_any_dev_suffix() {
-        // Formatted from the fields, never through `Display`. The `#` column
-        // already says which roll this is, so a `-rollN` suffix would repeat it
-        // and cost four columns out of `branch`.
+    fn a_version_cell_shows_the_dev_suffix() {
+        // Through `Display`: the `#` column says which roll a row is, not
+        // whether that roll's dev marker has actually been applied yet, so the
+        // suffix has to show here.
         assert_eq!(version_cell(Some(v(0, 2, 4))), "0.2.4");
+        assert_eq!(
+            version_cell(Some(Semver {
+                dev_roll: Some(9),
+                ..v(0, 2, 4)
+            })),
+            "0.2.4-roll9"
+        );
         assert_eq!(version_cell(None), "—");
     }
 
