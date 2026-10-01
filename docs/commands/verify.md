@@ -4,7 +4,11 @@
 rf verify [--dry-run] [--bump <patch|minor|major>] [--yes]
 ```
 
-Checks graduation/promotion readiness for the current branch:
+Checks graduation/promotion readiness for the current branch. Reachable from the
+TUI with `[v]`, which runs the same checks minus the bump offer — see
+[`status`](status.md#verifying).
+
+Routes checked:
 
 - `roll/* -> rolling`
 - `rolling -> main`
