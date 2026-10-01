@@ -94,6 +94,19 @@ graduated too. That is accurate — N's commits really are on rolling, carried i
 M — and the `⛔ blocked` gate is what keeps it from happening out of order. It is
 only reachable at all via `rf graduate --force`.
 
+Integrating the rolling branch itself (`[I]`, see
+[integrate](../commands/integrate.md#i--integrate-rolling)) is the one case Method
+2b cannot read off the subject: `git merge --no-ff <rolling>` leaves a subject
+naming rolling, not a roll, so the scan above finds nothing even though the merge
+just brought in every roll already graduated onto it. `branches::integration_deps`
+handles it as a narrow, deliberate exception to "file overlap and broad ancestry
+are not used": when one of the merges in range names the rolling branch, it falls
+back to ancestry — checking each known graduated roll's graduation commit (from
+the same `scan_graduated` pass `list_rolls` already did) against the roll's new
+tip — and adds every one that is now an ancestor. This is scoped to *that merge*,
+not a general ancestry check: a roll that merely shares history with another
+roll through stable does not gain a dependency from it.
+
 **Method 3 — file overlap**: if rolls modify the same files and the other roll has a
 lower number, it's a dependency. Uses `--first-parent --no-merges` on the other roll
 to avoid false positives from cross-merges.

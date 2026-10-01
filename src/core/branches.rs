@@ -176,7 +176,8 @@ pub fn list_rolls(config: &Config) -> Result<Vec<RollInfo>, RfError> {
     // `rf integrate` — detected from its own first-parent merge history. File
     // overlap and broad ancestry are deliberately NOT used here: in a dotfiles
     // repo nearly every roll touches flake.lock, which made them spuriously
-    // block one another.
+    // block one another. The one exception is a merge of the rolling branch
+    // itself (`[I]` / `rf integrate <rolling>`): see `integration_deps`.
     //
     // Blocking, by contrast, only applies to Active rolls: an ungraduated
     // integration holds a roll back from graduating, but once the roll itself
@@ -189,6 +190,8 @@ pub fn list_rolls(config: &Config) -> Result<Vec<RollInfo>, RfError> {
             roll.number,
             &config.roll_prefix,
             &deps_base_ref(roll, &config.stable_branch),
+            &config.rolling_branch,
+            &graduated,
         );
         if roll.state == RollState::Active {
             let blocked = roll.deps.iter().any(|dep| {
@@ -484,13 +487,23 @@ fn subjects_contain_graduation(subjects: &[String], roll_branch: &str) -> bool {
 /// `rev_parse` and only falls back to branch resolution.
 ///
 /// This is the only dependency signal that gates blocking: file overlap and
-/// broad ancestry are intentionally excluded (see `list_rolls`).
+/// broad ancestry are intentionally excluded (see `list_rolls`) — with one
+/// exception. A direct merge of the rolling branch itself (`[I]` / `rf
+/// integrate <rolling>`) produces a subject naming rolling, not a roll, so the
+/// subject scan alone finds nothing — yet that merge brings in every roll
+/// already graduated onto it. When one of the merges in range names the
+/// rolling branch, `graduated` (every known graduated branch mapped to its
+/// graduation commit, already computed once by `list_rolls`) is consulted:
+/// any graduation commit that is now an ancestor of this roll is a real
+/// dependency, acquired in that one merge.
 fn integration_deps(
     repo: &Path,
     roll_branch: &str,
     roll_num: u32,
     prefix: &str,
     base_ref: &str,
+    rolling_branch: &str,
+    graduated: &HashMap<String, String>,
 ) -> Vec<u32> {
     let (Some(roll_ref), Some(base)) = (
         git::resolve_branch(repo, roll_branch),
@@ -505,12 +518,30 @@ fn integration_deps(
     let subjects =
         git::log_subjects(repo, &["--first-parent", "--merges", &range]).unwrap_or_default();
 
-    let mut deps: Vec<u32> = subjects
-        .iter()
-        .filter_map(|s| extract_graduated_branch(s))
-        .filter_map(|b| parse_roll_number(&b, prefix))
-        .filter(|&n| n != roll_num)
-        .collect();
+    let mut merged_rolling = false;
+    let mut deps: Vec<u32> = Vec::new();
+    for branch in subjects.iter().filter_map(|s| extract_graduated_branch(s)) {
+        match parse_roll_number(&branch, prefix) {
+            Some(n) if n != roll_num => deps.push(n),
+            Some(_) => {}
+            None if branch == rolling_branch => merged_rolling = true,
+            None => {}
+        }
+    }
+
+    if merged_rolling {
+        for (branch, commit) in graduated {
+            if branch == roll_branch {
+                continue;
+            }
+            let Some(n) = parse_roll_number(branch, prefix) else {
+                continue;
+            };
+            if n != roll_num && git::is_ancestor(repo, commit, &roll_ref).unwrap_or(false) {
+                deps.push(n);
+            }
+        }
+    }
 
     deps.sort_unstable();
     deps.dedup();

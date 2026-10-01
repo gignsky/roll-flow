@@ -116,6 +116,45 @@ fn dependency_and_dependant_survive_promotion() {
     assert_eq!(dependants(&sb, "roll/1-0611-alpha"), vec![2]);
 }
 
+/// Integrating the rolling branch itself (`[I]` / `rf integrate rolling`) must
+/// surface every roll already graduated onto it as a dependency, even though
+/// the merge's own subject names rolling, not a roll — the gap this test
+/// guards against is `rf integrate rolling` reporting no new dependencies at
+/// all.
+#[test]
+fn integrating_rolling_reports_every_graduated_roll_as_a_dependency() {
+    let sb = Sandbox::plain();
+    sb.init();
+
+    sb.create_roll("alpha", "0611");
+    sb.commit_file("alpha.txt", "a\n", "alpha work");
+    assert!(sb.rf(&["graduate"]).success, "graduate alpha");
+
+    sb.git(&["checkout", "main"]);
+    sb.create_roll("beta", "0612");
+    sb.commit_file("beta.txt", "b\n", "beta work");
+    assert!(sb.rf(&["graduate"]).success, "graduate beta");
+
+    sb.git(&["checkout", "main"]);
+    sb.create_roll("gamma", "0613");
+    sb.commit_file("gamma.txt", "c\n", "gamma work");
+
+    // Bring rolling (with alpha and beta already graduated onto it) into
+    // gamma directly, the way `[I]` does.
+    let out = sb.rf(&["integrate", "rolling"]);
+    assert!(
+        out.success,
+        "integrate rolling into gamma: {}",
+        out.combined()
+    );
+
+    let mut got = deps(&sb, "roll/3-0613-gamma");
+    got.sort_unstable();
+    assert_eq!(got, vec![1, 2]);
+    assert_eq!(dependants(&sb, "roll/1-0611-alpha"), vec![3]);
+    assert_eq!(dependants(&sb, "roll/2-0612-beta"), vec![3]);
+}
+
 #[test]
 fn status_table_shows_both_columns_by_default() {
     let sb = sandbox_with_integration();
