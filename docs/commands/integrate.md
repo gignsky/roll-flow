@@ -36,13 +36,31 @@ base branch (`[u]pdate` is the key for bringing stable into your rolls), or when
 the selected roll exists only on `origin` — fetch it first with `[space]` or
 `[p]`.
 
+### `[I]` — integrate rolling
+
+`[I]` needs no selection: it merges the rolling branch itself into the
+checked-out roll, equivalent to `rf integrate <rolling_branch>`. Rolling already
+contains every graduated roll, so the one merge picks all of them up as
+dependencies too (method 2 in
+[algorithms](../internals/algorithms.md#dependency-detection-coredependenciesrs)).
+
+This is the recovery path when a roll fails to merge into rolling at graduation
+time: rather than let `graduate` hit the conflict ungracefully, press `[I]` to
+bring rolling into the roll first, resolve the conflict here — same as any
+other `[i]`/`[I]` conflict, in the panel or in lazygit (`gg`) — commit it, and
+then graduate normally.
+
+It is refused when the checked-out branch is not a roll, or when it already
+*is* the rolling branch.
+
 ## After a conflicting graduation
 
 This is also what [`graduate`](graduate.md#when-the-merge-conflicts) recommends
 when its merge conflicts with a roll already on rolling: integrating that roll
 reproduces the conflict on your branch, where you resolve and commit it, and
 records the dependency the conflict revealed. `rf graduate --yes` does it for
-you.
+you. [`rf verify`](verify.md) finds the same conflict ahead of time, without
+merging anything, and prints the same `rf integrate <roll>` lines.
 
 ## Consequences
 
