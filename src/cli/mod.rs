@@ -21,6 +21,27 @@ pub(crate) fn prompt_yes(msg: &str) -> anyhow::Result<bool> {
     Ok(ans == "y" || ans == "yes")
 }
 
+/// Prompt for one of `1..=max`, returning `default` on an empty line. Any
+/// other answer re-prompts, so a stray keypress never picks an option.
+pub(crate) fn prompt_choice(max: usize, default: usize) -> anyhow::Result<usize> {
+    use std::io::Write;
+    loop {
+        print!("Choose [1-{max}, default {default}]: ");
+        std::io::stdout().flush()?;
+        let mut line = String::new();
+        std::io::stdin().read_line(&mut line)?;
+        let ans = line.trim();
+        if ans.is_empty() {
+            return Ok(default);
+        }
+        if let Ok(n) = ans.parse::<usize>() {
+            if (1..=max).contains(&n) {
+                return Ok(n);
+            }
+        }
+    }
+}
+
 /// How a destructive command's confirmation resolved.
 ///
 /// [`Confirm::Declined`] and [`Confirm::Unattended`] both mean "do nothing", but
@@ -147,6 +168,10 @@ pub enum Cmd {
         /// Justification recorded as `Force-Reason:` in the merge commit.
         #[arg(long)]
         reason: Option<String>,
+        /// When the merge conflicts, take the recommended way forward without
+        /// asking: integrate the conflicting roll(s) into this one.
+        #[arg(long)]
+        yes: bool,
     },
 
     /// Promote rolling into the stable branch (--no-ff merge). On a roll

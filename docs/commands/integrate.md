@@ -36,6 +36,14 @@ base branch (`[u]pdate` is the key for bringing stable into your rolls), or when
 the selected roll exists only on `origin` — fetch it first with `[space]` or
 `[p]`.
 
+## After a conflicting graduation
+
+This is also what [`graduate`](graduate.md#when-the-merge-conflicts) recommends
+when its merge conflicts with a roll already on rolling: integrating that roll
+reproduces the conflict on your branch, where you resolve and commit it, and
+records the dependency the conflict revealed. `rf graduate --yes` does it for
+you.
+
 ## Consequences
 
 Integrating roll N into roll M makes **M depend on N**, which the dashboard shows

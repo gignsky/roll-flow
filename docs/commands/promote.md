@@ -8,7 +8,12 @@ Merges rolling into the stable branch with `--no-ff` and a structured subject
 (`Promote roll/N-slug to main`, or `Promote rolling to main` with the included
 rolls listed in the body when several graduated rolls ride along). Run from a
 roll branch it redirects to graduation. Conflicts abort and restore, same as
-[`graduate`](graduate.md), and `--force`/`--reason` behave the same way.
+[`graduate`](graduate.md), and are diagnosed the same way — each conflicted
+path is attributed to the merges on stable that touched it, which for a
+promotion means a hotfix landed there since. There is no integrate option on
+this route (the source is a commit on rolling, not a branch to merge into); the
+choices are the by-hand commands or leaving the merge staged on stable for
+lazygit. `--force`/`--reason` behave the same way as for graduate.
 
 The gates run against the *staged merge result* rather than whatever was checked
 out, so what they check is what lands on stable. A gate that modifies tracked
