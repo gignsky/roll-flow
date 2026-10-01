@@ -65,6 +65,28 @@ false positives from shared ancestry. This is the method that gives
 merging roll N into roll M leaves exactly that subject in M's history, so M gains
 a dependency on N and stays `⛔ blocked` until N graduates.
 
+Subjects are read by `branches::extract_graduated_branch`, and it is deliberately
+lenient, because the subject is not always the one git wrote. A merge that
+conflicts opens an editor, and what comes back is whatever the user typed —
+`merge branch 'roll/8-0918-help-menu'`, lowercase and shorn of its `into` clause,
+is in this repo's own history. So matching ignores case, and a subject that still
+begins with `merge` but fits none of the known shapes falls back to "the first
+token containing a `/`".
+
+Two rules keep that leniency from doing damage:
+
+- **The ` into ` clause is cut before anything else looks at the subject.** It
+  names the merge *target*, never the source. Without the cut,
+  `Merge branch 'roll/8-x' into roll/7-y` could yield roll/7 — and on the rolling
+  branch that reads as "roll/7 graduated", which is far worse than missing a
+  dependency.
+- **The fallback only fires on a subject that announces itself as a merge**, so
+  `Revert "Merge branch 'roll/8-x'"` is not mistaken for a graduation.
+
+The token it returns is not validated against the roll prefix, and does not need
+to be: every caller either compares it to a real roll branch name or runs it
+through `parse_roll_number`, so a candidate that is not a roll matches nothing.
+
 One consequence worth knowing, since `[i]` makes roll-into-roll merges cheap: the
 graduated scan below has a second pass *without* `--first-parent`, so once M
 graduates, N's integrate merge is reachable from rolling and N reports as
