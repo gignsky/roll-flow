@@ -494,8 +494,19 @@ fn subjects_contain_graduation(subjects: &[String], roll_branch: &str) -> bool {
 /// already graduated onto it. When one of the merges in range names the
 /// rolling branch, `graduated` (every known graduated branch mapped to its
 /// graduation commit, already computed once by `list_rolls`) is consulted:
-/// any graduation commit that is now an ancestor of this roll is a real
-/// dependency, acquired in that one merge.
+/// any graduation commit newly reachable from this roll is a real dependency,
+/// acquired in that one merge.
+///
+/// "Newly reachable" is load-bearing, not merely an ancestor of the roll's
+/// tip: a graduation from months ago is an ancestor of nearly every branch
+/// created afterward, because `rf promote` folds it into stable and every
+/// roll forks from stable. Without excluding `base`'s own ancestry too, every
+/// roll that ever did an `[I]` merge reports a dependency on the *entire*
+/// graduation history of the repo — the exact "broad ancestry" explosion the
+/// paragraph above says this function avoids. Requiring the commit to be
+/// absent from `base` restricts it to graduations this merge actually
+/// introduced, matching the `base..roll` scoping the subject scan above
+/// already uses.
 fn integration_deps(
     repo: &Path,
     roll_branch: &str,
@@ -537,7 +548,9 @@ fn integration_deps(
             let Some(n) = parse_roll_number(branch, prefix) else {
                 continue;
             };
-            if n != roll_num && git::is_ancestor(repo, commit, &roll_ref).unwrap_or(false) {
+            let newly_reachable = git::is_ancestor(repo, commit, &roll_ref).unwrap_or(false)
+                && !git::is_ancestor(repo, commit, &base).unwrap_or(true);
+            if n != roll_num && newly_reachable {
                 deps.push(n);
             }
         }
