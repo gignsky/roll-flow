@@ -10,10 +10,29 @@ long list — that keeps two rolls adding rules in different areas from collidin
 - `main` only receives merges from `rolling`, never directly from roll branches.
   Per-roll promotion does not weaken this: it merges a graduation *commit* that
   lives on rolling, which is why stable's history stays a prefix of rolling's
-  rather than a divergent line.
+  rather than a divergent line. When a per-roll step has to bump the version,
+  the bump goes *inside* that merge commit, never as a commit beside it — and
+  stable is then merged back into rolling so the tiers do not silently diverge
+  (the same reintegration a landed hotfix performs).
+- A per-roll promotion that would land rolls the user did not name must say
+  which, and get an answer, *before* it merges — `rf promote --roll` prompts
+  (`--yes` accepts, unattended fails) and the TUI's `[m]` lists them in its
+  confirmation. Carrying earlier graduations is inherent to advancing stable to a
+  graduation commit; landing them silently is not, and any new promotion entry
+  point inherits the disclosure, not just the merge.
 - A roll is "graduated" if a merge commit exists on the rolling branch whose subject
-  matches `Merge branch 'roll/N-...'` OR `Graduate roll/N-...`. Both formats must be
-  checked everywhere graduation is tested.
+  names it as the merge *source* — `Merge branch 'roll/N-...'`, `Graduate roll/N-...`,
+  a GitHub `Merge pull request` subject, or a hand-written one a conflicted merge
+  left behind. Every shape must be checked everywhere graduation is tested, which
+  is why there is exactly one reader of merge subjects,
+  `branches::extract_graduated_branch`, and why new callers must go through it
+  rather than matching a prefix themselves. A single missed shape costs the roll
+  its dependency, its graduated state *and* its graduation commit at once, since
+  all three are read from that one function.
+- **Source, never target.** A subject's ` into ` clause names where the merge
+  landed, and must never be read as a branch that graduated. Misreading it marks
+  an unmerged roll as graduated — strictly worse than failing to notice a real
+  one, which is why the clause is cut before any shape is matched.
 
 ## Rolls and branch resolution
 

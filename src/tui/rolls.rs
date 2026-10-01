@@ -15,7 +15,7 @@
 use std::collections::HashMap;
 use std::time::Duration;
 
-use anyhow::{anyhow, Result};
+use anyhow::{anyhow, bail, Result};
 use crossterm::event::{self, Event, KeyCode, KeyEventKind};
 use ratatui::{
     layout::{Alignment, Constraint, Layout, Rect},
@@ -32,7 +32,7 @@ use crate::core::{
     git::{self, TrackState},
     ops,
     sync::{self, PullPlan, PushOutcome, SyncTarget},
-    version::{self, BumpLevel, Semver},
+    version::{self, BumpLevel, Semver, VersionCheck, VersionStatus},
 };
 
 /// A workflow operation reachable from the view. Navigation, quit and refresh
@@ -203,6 +203,12 @@ enum Mode {
         /// The roll branch an action targets (graduate); `None` for repo-wide
         /// ops (promote / update).
         target: Option<String>,
+        /// For `[m]` on a roll row: the rolls that graduated ahead of it and
+        /// would land on stable with it. Read once when the modal opens — it
+        /// costs git calls, and a draw must not — and empty for every other
+        /// action. The modal states them because advancing stable to one roll's
+        /// graduation commit is not what "promote this roll" sounds like.
+        carried: Vec<String>,
     },
     /// Read-only drill-down for a single roll: its identity plus its dependency
     /// rows (issue #61). A snapshot of the selected roll is captured on open so
@@ -676,6 +682,13 @@ pub(crate) const BINDINGS: &[Binding] = &[
         replay: &[KeyCode::Char('i')],
     },
     Binding {
+        keys: "v",
+        label: "verify the checked-out branch",
+        group: "roll",
+        hint: None,
+        replay: &[KeyCode::Char('v')],
+    },
+    Binding {
         keys: "G",
         label: "graduate the selected roll into rolling",
         group: "roll",
@@ -882,6 +895,46 @@ pub(crate) fn handle_help_key(
         }
         _ => HelpOutcome::Continue,
     }
+}
+
+/// The route `[v]` would check, as `(source, target)`, or `None` when the
+/// checked-out branch is not on one.
+///
+/// Verify reads HEAD rather than the row under the cursor, for the same reason
+/// `[b]` does: the gates run in the working tree, so the branch they judge is
+/// the checked-out one whatever the cursor is on. Deferring to
+/// [`ops::infer_route`] keeps the TUI and `rf verify` agreeing on what a branch
+/// tier means — there is one definition of the route, not two.
+pub(crate) fn verify_route_for(config: &Config, current_branch: &str) -> Option<(String, String)> {
+    match ops::infer_route(config, current_branch)? {
+        ops::Route::Graduate { roll } => Some((roll, config.rolling_branch.clone())),
+        ops::Route::Promote => Some((config.rolling_branch.clone(), config.stable_branch.clone())),
+    }
+}
+
+/// Render a version check the way `main.rs` prints it, so the TUI and the CLI
+/// report the same comparison in the same words.
+fn push_version_check(lines: &mut Vec<String>, check: &VersionCheck, source: &str, target: &str) {
+    let verdict = match check.status {
+        VersionStatus::Ok => "OK",
+        VersionStatus::Unchanged => "UNCHANGED",
+        VersionStatus::Lower => "LOWER",
+        VersionStatus::Unreadable => "UNREADABLE",
+        // Repos with no `Cargo.toml`, and repos with the gate switched off, have
+        // nothing to say here — the same silence `rf verify` keeps.
+        VersionStatus::NotApplicable => return,
+    };
+    let head = check
+        .head
+        .map(|v| v.to_string())
+        .unwrap_or_else(|| "<unreadable>".to_string());
+    let base = check
+        .base
+        .map(|v| v.to_string())
+        .unwrap_or_else(|| "none".to_string());
+    lines.push(format!(
+        "Version: {head} on '{source}' (base '{target}' {base}) {verdict}"
+    ));
 }
 
 /// Build the dependency rows to show in the detail view for `selected`.
@@ -1389,6 +1442,7 @@ impl StatusApp {
             KeyCode::Char('p') => self.start_pull(),
             KeyCode::Char('P') => self.start_push(),
             KeyCode::Char('f') => self.start_fetch(),
+            KeyCode::Char('v') => self.start_verify(),
             KeyCode::Char('G') => self.request(Action::Graduate),
             KeyCode::Char('i') => self.request_integrate(),
             KeyCode::Char('b') => self.request_bump(),
@@ -1464,7 +1518,7 @@ impl StatusApp {
     fn handle_confirm(&mut self, code: KeyCode) {
         match code {
             KeyCode::Char('y') | KeyCode::Char('Y') => {
-                if let Mode::Confirm { action, target } =
+                if let Mode::Confirm { action, target, .. } =
                     std::mem::replace(&mut self.mode, Mode::Browsing)
                 {
                     self.execute(action, target);
@@ -1542,8 +1596,18 @@ impl StatusApp {
             Action::Promote => promote_target_for(selected, &self.rolls).unwrap_or(None),
             _ => None,
         };
+        let carried = match (action, &target) {
+            (Action::Promote, Some(roll)) => carried_by_promoting(&self.config, roll),
+            _ => Vec::new(),
+        };
         match validation {
-            Ok(()) => self.mode = Mode::Confirm { action, target },
+            Ok(()) => {
+                self.mode = Mode::Confirm {
+                    action,
+                    target,
+                    carried,
+                }
+            }
             Err(msg) => self.message = Some(msg),
         }
     }
@@ -1577,6 +1641,7 @@ impl StatusApp {
                 self.mode = Mode::Confirm {
                     action: Action::Integrate,
                     target: Some(branch),
+                    carried: Vec::new(),
                 }
             }
             Err(msg) => self.message = Some(msg),
@@ -1880,6 +1945,32 @@ impl StatusApp {
         });
     }
 
+    /// `[v]` — check whether the checked-out branch could graduate or promote,
+    /// running the configured gates.
+    ///
+    /// Not an [`Action`] and deliberately not behind the confirm modal: that
+    /// modal exists for the ops that mutate the repo, and verify is the one key
+    /// whose entire output is a verdict. The route is resolved here rather than
+    /// inside the job so the panel title names it before the gates start — on a
+    /// repo with `cargo test` gates that is the difference between a title the
+    /// user can trust and several silent minutes.
+    fn start_verify(&mut self) {
+        if self.busy() {
+            return;
+        }
+        let Some((source, target)) = verify_route_for(&self.config, &self.current_branch) else {
+            self.message = Some(format!(
+                "'{}' is not promotable — check out {} or a {}branch to verify",
+                self.current_branch, self.config.rolling_branch, self.config.roll_prefix
+            ));
+            return;
+        };
+        let config = self.config.clone();
+        self.start_job(format!("rf verify {source} → {target}"), move || {
+            Ok(JobDone::lines(run_verify(&config)?))
+        });
+    }
+
     /// `gg` — hand the terminal to lazygit, then take it back.
     ///
     /// The one action that still suspends: lazygit is a full-screen application
@@ -2014,15 +2105,22 @@ impl StatusApp {
         }
 
         match &self.mode {
-            Mode::Confirm { action, target } => {
+            Mode::Confirm {
+                action,
+                target,
+                carried,
+            } => {
                 render_modal(
                     f,
                     area,
                     &self.config,
-                    *action,
-                    target.as_deref(),
-                    &self.rolls,
-                    &self.current_branch,
+                    &ConfirmModal {
+                        action: *action,
+                        target: target.as_deref(),
+                        carried,
+                        rolls: &self.rolls,
+                        current_branch: &self.current_branch,
+                    },
                 );
             }
             Mode::Detail { roll, ahead_behind } => {
@@ -2040,7 +2138,7 @@ impl StatusApp {
     }
 
     fn render_header(&self, f: &mut Frame, area: Rect) {
-        let mut spans = vec![
+        let spans = vec![
             Span::styled("Branch: ", Style::default().add_modifier(Modifier::BOLD)),
             Span::raw(self.current_branch.as_str()),
             Span::raw("   Rolling: "),
@@ -2054,20 +2152,20 @@ impl StatusApp {
                 Style::default().fg(Color::Green),
             ),
         ];
-        // Only when the repo has one. Without this, `[b]` would be a key whose
-        // whole effect is a line in a dismissable panel.
-        if let Some(v) = self.version {
-            spans.push(Span::raw("   Version: "));
-            spans.push(Span::styled(
-                v.to_string(),
+        // The corner names the binary that is running, not the checked-out
+        // branch's manifest. The two used to be conflated, and the corner would
+        // change on every `[space]` — in a repo that *is* roll-flow it read as
+        // the roll's dev version, in any other repo as whatever that repo ships.
+        // Neither is what "which rf is this" asks. The per-branch versions have
+        // their own column; the bump modal shows the manifest it will raise.
+        let block = Block::bordered().title(" roll-flow ").title_top(
+            Line::from(Span::styled(
+                format!(" rf v{} ", env!("CARGO_PKG_VERSION")),
                 Style::default().fg(Color::Magenta),
-            ));
-        }
-        let header_line = Line::from(spans);
-        f.render_widget(
-            Paragraph::new(header_line).block(Block::bordered().title(" roll-flow ")),
-            area,
+            ))
+            .right_aligned(),
         );
+        f.render_widget(Paragraph::new(Line::from(spans)).block(block), area);
     }
 
     fn render_table(&mut self, f: &mut Frame, area: Rect) {
@@ -2266,6 +2364,62 @@ fn run_delete(
     Ok(render_prune_outcome(&plan, &results))
 }
 
+/// Run `ops::verify` and render its outcome, mirroring `main.rs`'s `cmd_verify`
+/// line for line — the same checks in the same order, so a verdict in the panel
+/// and a verdict in the terminal never disagree.
+///
+/// Two deliberate differences, both because this is the TUI:
+///
+/// - no version *bump*. `cmd_verify` offers one before the gates run; here the
+///   gate failure points at `[b]`, which is the key that already does it and the
+///   only place a bump commit is written from.
+/// - nothing is forced and nothing is dry-run. `[v]` has no flags to carry.
+///
+/// A failed host or an unsatisfied version gate is an `Err`, not a line: the
+/// panel marks a failed job, and a verdict that reads as "done" when it is
+/// really "blocked" is the one outcome worth being loud about. Everything the
+/// gates printed is already in the panel either way, streamed as they ran.
+fn run_verify(config: &Config) -> Result<Vec<String>> {
+    ops::ensure_clean_state(config)?;
+    let outcome = ops::verify(config, false)?;
+
+    let mut lines = Vec::new();
+    if outcome.diverged_note {
+        lines.push(format!(
+            "note: '{}' has commits not in '{}'; graduation/promotion will create a --no-ff merge",
+            outcome.target, outcome.source
+        ));
+    }
+    push_version_check(
+        &mut lines,
+        &outcome.version,
+        &outcome.source,
+        &outcome.target,
+    );
+    push_gate_notices(&mut lines, &outcome.gate_notices);
+    push_gate_notices(&mut lines, &outcome.host_notices);
+    push_host_results(&mut lines, &outcome.host_results);
+
+    if !outcome.failed_hosts.is_empty() {
+        bail!(
+            "host verification failed: {}",
+            outcome.failed_hosts.join(", ")
+        );
+    }
+    if !outcome.version.is_satisfied() {
+        return Err(anyhow!(
+            "{}\npress [b] to bump the version on '{}'",
+            ops::version_gate_error(&outcome.version, &outcome.source, &outcome.target),
+            outcome.source
+        ));
+    }
+    lines.push(format!(
+        "Verification passed: {} -> {}",
+        outcome.source, outcome.target
+    ));
+    Ok(lines)
+}
+
 /// Drive a workflow operation through `core::ops`, rendering its structured
 /// outcome into printable lines. Never runs dry and never forces.
 fn run_op(config: &Config, action: Action, target: Option<&str>) -> Result<Vec<String>> {
@@ -2298,13 +2452,16 @@ fn run_op(config: &Config, action: Action, target: Option<&str>) -> Result<Vec<S
             // Tagging is on; the version gate hard-fails here rather than
             // prompting, since the TUI has no place to offer a bump — the
             // error names the `rf promote --bump` fix.
-            let o = ops::promote(config, &promote_target, false, &force, true)?;
+            let o = ops::promote(config, &promote_target, false, &force, true, None)?;
             for step in &o.steps {
                 push_gate_notices(&mut lines, &step.gate_notices);
                 push_gate_notices(&mut lines, &step.host_notices);
                 push_host_results(&mut lines, &step.host_results);
                 let what = step.roll.as_deref().unwrap_or(&o.rolling);
                 lines.push(format!("Promoted '{}' into '{}'", what, o.stable));
+                for carried in &step.carried {
+                    lines.push(format!("  also landed: {carried}"));
+                }
                 if let Some(line) = step.tag.describe() {
                     lines.push(line);
                 }
@@ -2579,16 +2736,31 @@ fn plural(n: u32) -> &'static str {
     }
 }
 
-/// Render the centered confirmation popup for a pending action.
-fn render_modal(
-    f: &mut Frame,
-    area: Rect,
-    config: &Config,
+/// Everything the confirm modal reads, gathered so the renderer takes one
+/// parameter per *thing* rather than one per field.
+struct ConfirmModal<'a> {
     action: Action,
-    target: Option<&str>,
-    rolls: &[RollInfo],
-    current_branch: &str,
-) {
+    /// The roll a roll-scoped action targets; `None` for the repo-wide shapes.
+    target: Option<&'a str>,
+    /// See [`Mode::Confirm`]'s field of the same name.
+    carried: &'a [String],
+    rolls: &'a [RollInfo],
+    current_branch: &'a str,
+}
+
+/// Render the centered confirmation popup for a pending action.
+///
+/// `carried` is non-empty only for `[m]` on a roll row, and the modal then grows
+/// to list those rolls: the merge lands them on stable too, and the confirmation
+/// is the last place the user can see that before it happens.
+fn render_modal(f: &mut Frame, area: Rect, config: &Config, modal: &ConfirmModal) {
+    let ConfirmModal {
+        action,
+        target,
+        carried,
+        rolls,
+        current_branch,
+    } = *modal;
     let prompt = match action {
         Action::Graduate => format!(
             "Graduate {} into {}?",
@@ -2634,14 +2806,45 @@ fn render_modal(
     };
     let hint = "[y] confirm    [n] cancel";
 
-    let width = (prompt.chars().count().max(hint.len()) as u16) + 4;
-    let modal = centered_rect(area, width, 4);
+    let mut lines = vec![Line::from(prompt)];
+    if !carried.is_empty() {
+        let yellow = Style::default().fg(Color::Yellow);
+        lines.push(Line::from(Span::styled(
+            "also lands, in graduation order:",
+            yellow,
+        )));
+        for roll in carried {
+            lines.push(Line::from(Span::styled(roll.clone(), yellow)));
+        }
+    }
+    lines.push(Line::from(hint));
+
+    let width = lines.iter().map(|l| l.width()).max().unwrap_or(20) as u16 + 4;
+    let modal = centered_rect(area, width, lines.len() as u16 + 2);
 
     f.render_widget(Clear, modal);
-    let body = Paragraph::new(vec![Line::from(prompt), Line::from(hint)])
+    let body = Paragraph::new(lines)
         .alignment(Alignment::Center)
         .block(Block::bordered().title(" confirm "));
     f.render_widget(body, modal);
+}
+
+/// The rolls that `[m]` on `roll` would land on stable besides `roll` itself.
+///
+/// Best-effort: a planning failure yields an empty list rather than an error.
+/// The keypress opens a confirmation, and `ops::promote` reports the real
+/// problem a moment later if there is one — refusing to draw the modal because
+/// the disclosure could not be computed would be the worse trade.
+fn carried_by_promoting(config: &Config, roll: &str) -> Vec<String> {
+    ops::preview_roll_promotion(config, &[roll.to_string()])
+        .map(|preview| {
+            preview
+                .steps
+                .into_iter()
+                .flat_map(|step| step.carried)
+                .collect()
+        })
+        .unwrap_or_default()
 }
 
 /// Render the centered delete popup. Its shape follows `preview.prompt`, and
@@ -3398,6 +3601,54 @@ mod tests {
         // A query with no match says so rather than rendering an empty box.
         let none = draw(|f, area| render_help(f, area, "zzzz", 0));
         assert!(none.contains("no key matches"), "{none}");
+    }
+
+    #[test]
+    fn verify_reads_head_and_resolves_the_route_from_its_tier() {
+        let cfg = config("main", "rolling");
+
+        // A roll branch checks its graduation into rolling...
+        assert_eq!(
+            verify_route_for(&cfg, "roll/4-0918-x"),
+            Some(("roll/4-0918-x".to_string(), "rolling".to_string()))
+        );
+        // ...and rolling checks its promotion to stable.
+        assert_eq!(
+            verify_route_for(&cfg, "rolling"),
+            Some(("rolling".to_string(), "main".to_string()))
+        );
+        // Stable itself has nowhere to go, and neither does anything off the
+        // tiers — `[v]` says so rather than guessing a route.
+        assert_eq!(verify_route_for(&cfg, "main"), None);
+        assert_eq!(verify_route_for(&cfg, "feature/whatever"), None);
+    }
+
+    #[test]
+    fn the_version_line_matches_the_one_the_cli_prints() {
+        let check = |status, head: Option<Semver>, base: Option<Semver>| {
+            let mut lines = Vec::new();
+            push_version_check(
+                &mut lines,
+                &VersionCheck { head, base, status },
+                "rolling",
+                "main",
+            );
+            lines
+        };
+
+        assert_eq!(
+            check(VersionStatus::Unchanged, Some(v(0, 2, 3)), Some(v(0, 2, 3))),
+            vec!["Version: 0.2.3 on 'rolling' (base 'main' 0.2.3) UNCHANGED"]
+        );
+        // A repo with no `Cargo.toml` says nothing at all, rather than reporting
+        // a comparison it did not make.
+        assert!(check(VersionStatus::NotApplicable, None, None).is_empty());
+        // And an unreadable version still reports both sides, naming which one
+        // could not be read.
+        assert_eq!(
+            check(VersionStatus::Unreadable, None, Some(v(1, 0, 0))),
+            vec!["Version: <unreadable> on 'rolling' (base 'main' 1.0.0) UNREADABLE"]
+        );
     }
 
     #[test]
@@ -4387,17 +4638,46 @@ mod tests {
     }
 
     #[test]
-    fn the_header_shows_the_version_only_when_the_repo_has_one() {
+    fn the_header_names_the_running_binary_not_the_manifest() {
+        // Whatever the checked-out branch's Cargo.toml says — or whether there
+        // is one — the corner answers "which rf is this".
         let mut app = StatusApp::new(test_config(), "main".to_string(), Vec::new(), false);
-        app.version = Some(v(1, 2, 3));
+        let expected = format!("rf v{}", env!("CARGO_PKG_VERSION"));
+
+        app.version = Some(v(9, 9, 9));
         let with = draw(|f, area| app.render_header(f, area));
-        assert!(with.contains("Version: 1.2.3"), "{with}");
+        assert!(with.contains(&expected), "{with}");
+        assert!(
+            !with.contains("9.9.9"),
+            "manifest version leaked in:\n{with}"
+        );
 
         app.version = None;
         let without = draw(|f, area| app.render_header(f, area));
-        assert!(!without.contains("Version:"), "{without}");
-        // The rest of the header is unaffected either way.
+        assert!(without.contains(&expected), "{without}");
         assert!(without.contains("Branch: main"), "{without}");
+    }
+
+    #[test]
+    fn the_version_sits_in_the_top_right_corner_clear_of_the_branch_name() {
+        // The branch line grows with the branch name, so the version has to be
+        // somewhere that length cannot push it out of. Measured, not assumed.
+        let app = StatusApp::new(
+            test_config(),
+            "roll/12-0918-a-deliberately-long-slug".to_string(),
+            Vec::new(),
+            false,
+        );
+        let out = draw(|f, area| app.render_header(f, area));
+        let top = out.lines().next().expect("a top border row");
+        let at = top
+            .find("rf v")
+            .unwrap_or_else(|| panic!("no version:\n{out}"));
+        assert!(at > top.chars().count() / 2, "not right-aligned:\n{out}");
+        assert!(
+            out.contains("roll/12-0918-a-deliberately-long-slug"),
+            "{out}"
+        );
     }
 
     #[test]
@@ -4563,16 +4843,53 @@ mod tests {
                 f,
                 area,
                 &cfg,
-                Action::Integrate,
-                Some("roll/1-0101-alpha"),
-                &[],
-                "roll/2-0102-beta",
+                &ConfirmModal {
+                    action: Action::Integrate,
+                    target: Some("roll/1-0101-alpha"),
+                    carried: &[],
+                    rolls: &[],
+                    current_branch: "roll/2-0102-beta",
+                },
             )
         });
         assert!(
             out.contains("Integrate roll/1-0101-alpha into roll/2-0102-beta?"),
             "{out}"
         );
+    }
+
+    #[test]
+    fn the_promote_modal_lists_the_rolls_a_roll_promotion_would_carry() {
+        // `[m]` on one roll advances stable to that roll's graduation commit, so
+        // earlier graduations land too. The modal is the last place the user can
+        // see that before the merge, so it has to name them.
+        let cfg = config("main", "rolling");
+        let carried = vec![
+            "roll/4-0918-version-corner".to_string(),
+            "roll/7-0918-verify-button".to_string(),
+        ];
+        let out = draw(|f, area| {
+            render_modal(
+                f,
+                area,
+                &cfg,
+                &ConfirmModal {
+                    action: Action::Promote,
+                    target: Some("roll/8-0918-help-menu"),
+                    carried: &carried,
+                    rolls: &[],
+                    current_branch: "rolling",
+                },
+            )
+        });
+        assert!(
+            out.contains("Promote roll/8-0918-help-menu into main?"),
+            "{out}"
+        );
+        assert!(out.contains("also lands"), "{out}");
+        for roll in &carried {
+            assert!(out.contains(roll.as_str()), "{roll} missing from:\n{out}");
+        }
     }
 
     #[test]
@@ -4585,14 +4902,39 @@ mod tests {
             roll_n(2, RollState::Promoted),
         ];
 
-        let tidy = draw(|f, area| render_modal(f, area, &cfg, Action::Tidy, None, &rolls, "main"));
+        let tidy = draw(|f, area| {
+            render_modal(
+                f,
+                area,
+                &cfg,
+                &ConfirmModal {
+                    action: Action::Tidy,
+                    target: None,
+                    carried: &[],
+                    rolls: &rolls,
+                    current_branch: "main",
+                },
+            )
+        });
         assert!(
             tidy.contains("Delete 2 local graduated/promoted roll branches (local only)?"),
             "{tidy}"
         );
 
-        let prune =
-            draw(|f, area| render_modal(f, area, &cfg, Action::Prune, None, &rolls, "main"));
+        let prune = draw(|f, area| {
+            render_modal(
+                f,
+                area,
+                &cfg,
+                &ConfirmModal {
+                    action: Action::Prune,
+                    target: None,
+                    carried: &[],
+                    rolls: &rolls,
+                    current_branch: "main",
+                },
+            )
+        });
         assert!(
             prune.contains("Delete 1 promoted roll branch (local + origin)?"),
             "{prune}"
