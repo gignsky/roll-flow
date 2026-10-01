@@ -94,6 +94,19 @@ graduated too. That is accurate — N's commits really are on rolling, carried i
 M — and the `⛔ blocked` gate is what keeps it from happening out of order. It is
 only reachable at all via `rf graduate --force`.
 
+**Divergence after integration.** `⛔ blocked` only covers a dependency that
+has not graduated at all (`RollState::Active`/`Blocked`) — the ordering
+constraint. A dependency can also be `RollState::Diverged`: it graduated once,
+but has since gained commits on its own branch that never went through M's
+`[i]`. Those commits are not blocking M's graduation (the ordering constraint
+was already satisfied), so folding them into "blocker" would overstate the
+situation — M's `can_graduate` genuinely does not care. But M's copy of that
+dependency is now stale, and that is worth surfacing on its own: the roll
+detail view (`tui::rolls::dep_rows`/`dependent_rows`) marks a diverged
+dependency `⚠ reintegrate` rather than `⛔ blocker`, so M notices it needs
+another `[i]` to pick up what changed, without being told it cannot graduate
+until that happens.
+
 **Method 3 — file overlap**: if rolls modify the same files and the other roll has a
 lower number, it's a dependency. Uses `--first-parent --no-merges` on the other roll
 to avoid false positives from cross-merges.

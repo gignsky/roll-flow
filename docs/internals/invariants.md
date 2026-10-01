@@ -38,6 +38,15 @@ long list — that keeps two rolls adding rules in different areas from collidin
 
 - Roll numbers are monotonically increasing; detect from local + remote branches combined.
 - Branch resolution always tries local first, then `origin/<branch>` as fallback.
+- A `Diverged` dependency (one that graduated, then gained commits the dependent
+  never integrated) is never reported as a `⛔ blocker` — it does not gate the
+  dependent's graduation, since the ordering constraint was satisfied the moment
+  it first graduated. It must still be surfaced, distinctly, as needing
+  reintegration (`⚠ reintegrate` in the detail view's `dep_rows`/
+  `dependent_rows`), so a roll that integrated it notices the drift instead of
+  reading it as a satisfied, unremarkable dependency. Conflating the two markers
+  is a correctness bug, not a cosmetic one: it either falsely claims graduation
+  is blocked, or silently drops the notice that a reintegration is worth doing.
   Functions that need the ref string should return `Option<String>` (null = doesn't exist).
 
 ## Verification

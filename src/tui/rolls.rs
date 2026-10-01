@@ -425,14 +425,22 @@ pub(crate) fn initial_selection(bases: &[BaseBranch], rolls: &[RollInfo]) -> Opt
     Some(0)
 }
 
-/// One dependency row rendered in the [`Mode::Detail`] view. `is_blocker` marks
-/// a dep that holds the roll back — one that is not yet graduated/promoted.
+/// One dependency row rendered in the [`Mode::Detail`] view.
+///
+/// `is_blocker` and `needs_reintegration` are mutually exclusive and mirror
+/// [`RollState::Blocked`]'s own rule: only an `Active`/`Blocked` dep actually
+/// gates graduation (the ordering constraint), so only those set `is_blocker`.
+/// A `Diverged` dep already graduated once — it does not hold the roll back —
+/// but it has gained commits since whichever roll integrated it, so its copy is
+/// stale; `needs_reintegration` flags that distinctly rather than folding it
+/// into "blocker", which would wrongly claim graduation is gated on it.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct DepRow {
     pub number: u32,
     pub branch: String,
     pub state: RollState,
     pub is_blocker: bool,
+    pub needs_reintegration: bool,
 }
 
 /// Owns everything needed to render and to *reload* after an action.
@@ -936,10 +944,14 @@ fn push_version_check(lines: &mut Vec<String>, check: &VersionCheck, source: &st
 /// Build the dependency rows to show in the detail view for `selected`.
 ///
 /// Each number in `selected.deps` is looked up in `all` to recover the
-/// dependency's branch and state. A dep is flagged as a *blocker* when it is not
-/// yet graduated/promoted (state is `Active`/`Blocked`/`Diverged`) — those are
-/// what actually hold the roll back. Unknown dep numbers (not present in `all`)
-/// are skipped. The empty result means "no dependencies / not blocked".
+/// dependency's branch and state. A dep is flagged as a *blocker* when it has
+/// not yet graduated (state is `Active`/`Blocked`) — those are what actually
+/// hold the roll back, matching the same rule `list_rolls` uses to set
+/// `RollState::Blocked`. A `Diverged` dep already graduated, so it is not a
+/// blocker, but it has picked up commits since `selected` integrated it —
+/// `needs_reintegration` flags that so the roll notices it instead of reading
+/// as silently satisfied. Unknown dep numbers (not present in `all`) are
+/// skipped. The empty result means "no dependencies / not blocked".
 pub(crate) fn dep_rows(selected: &RollInfo, all: &[RollInfo]) -> Vec<DepRow> {
     selected
         .deps
@@ -949,7 +961,8 @@ pub(crate) fn dep_rows(selected: &RollInfo, all: &[RollInfo]) -> Vec<DepRow> {
             number: dep.number,
             branch: dep.branch.clone(),
             state: dep.state.clone(),
-            is_blocker: !matches!(dep.state, RollState::Graduated | RollState::Promoted),
+            is_blocker: matches!(dep.state, RollState::Active | RollState::Blocked),
+            needs_reintegration: matches!(dep.state, RollState::Diverged),
         })
         .collect()
 }
@@ -964,13 +977,18 @@ pub(crate) fn dep_rows(selected: &RollInfo, all: &[RollInfo]) -> Vec<DepRow> {
 /// `all`) are skipped, mirroring [`dep_rows`].
 ///
 /// A row's `is_blocker` here is repurposed to mean "this dependent is still
-/// gated by the target" — true while `target` has not yet graduated/promoted,
-/// since until then the dependent cannot advance past it. The detail view does
-/// not render a per-row blocker marker for dependents, so this flag is purely
-/// informational, but it keeps the field meaningful and testable. A roll is
-/// never its own dependent, even if a self-referential entry somehow appears.
+/// gated by the target" — true while `target` is `Active`/`Blocked`, mirroring
+/// [`dep_rows`]'s rule, since until it graduates the dependent cannot advance
+/// past it. When `target` is `Diverged` it no longer gates anything (it already
+/// graduated once), but every dependent integrated it before those extra
+/// commits landed, so each row's copy of `target` is stale —
+/// `needs_reintegration` flags that instead. The detail view does not render a
+/// per-row marker for dependents, so both flags are purely informational here,
+/// but they keep the fields meaningful and testable. A roll is never its own
+/// dependent, even if a self-referential entry somehow appears.
 pub(crate) fn dependent_rows(target: &RollInfo, all: &[RollInfo]) -> Vec<DepRow> {
-    let target_gates = !matches!(target.state, RollState::Graduated | RollState::Promoted);
+    let target_gates = matches!(target.state, RollState::Active | RollState::Blocked);
+    let target_diverged = matches!(target.state, RollState::Diverged);
     target
         .dependents
         .iter()
@@ -981,6 +999,7 @@ pub(crate) fn dependent_rows(target: &RollInfo, all: &[RollInfo]) -> Vec<DepRow>
             branch: dep.branch.clone(),
             state: dep.state.clone(),
             is_blocker: target_gates,
+            needs_reintegration: target_diverged,
         })
         .collect()
 }
@@ -3095,10 +3114,12 @@ fn render_detail(
         )));
     } else {
         let blockers = rows.iter().filter(|r| r.is_blocker).count();
-        let header = if blockers > 0 {
-            format!("dependencies ({blockers} blocking):")
-        } else {
-            "dependencies (all graduated):".to_string()
+        let stale = rows.iter().filter(|r| r.needs_reintegration).count();
+        let header = match (blockers, stale) {
+            (0, 0) => "dependencies (all graduated):".to_string(),
+            (0, s) => format!("dependencies ({s} diverged — reintegrate):"),
+            (b, 0) => format!("dependencies ({b} blocking):"),
+            (b, s) => format!("dependencies ({b} blocking, {s} diverged):"),
         };
         lines.push(Line::from(Span::styled(
             header,
@@ -3107,6 +3128,8 @@ fn render_detail(
         for r in &rows {
             let (marker, marker_style) = if r.is_blocker {
                 ("⛔ blocker", Style::default().fg(Color::Red))
+            } else if r.needs_reintegration {
+                ("⚠ reintegrate", Style::default().fg(Color::Yellow))
             } else {
                 ("✓ ok", Style::default().fg(Color::Green))
             };
@@ -3701,19 +3724,32 @@ mod tests {
 
         let rows = dep_rows(&selected, &all);
         assert_eq!(rows.len(), 4);
-        // Graduated / promoted deps are satisfied — not blockers.
-        assert!(!rows.iter().find(|r| r.number == 1).unwrap().is_blocker);
-        assert!(!rows.iter().find(|r| r.number == 4).unwrap().is_blocker);
-        // Active / diverged deps hold the roll back.
-        assert!(rows.iter().find(|r| r.number == 2).unwrap().is_blocker);
-        assert!(rows.iter().find(|r| r.number == 3).unwrap().is_blocker);
+        // Graduated / promoted deps are satisfied — not blockers, not stale.
+        let r1 = rows.iter().find(|r| r.number == 1).unwrap();
+        assert!(!r1.is_blocker && !r1.needs_reintegration);
+        let r4 = rows.iter().find(|r| r.number == 4).unwrap();
+        assert!(!r4.is_blocker && !r4.needs_reintegration);
+        // An active dep holds the roll back — it has not graduated at all.
+        let r2 = rows.iter().find(|r| r.number == 2).unwrap();
+        assert!(r2.is_blocker && !r2.needs_reintegration);
+        // A diverged dep already graduated — it is not a blocker, but it has
+        // moved on since `selected` integrated it and needs reintegrating.
+        let r3 = rows.iter().find(|r| r.number == 3).unwrap();
+        assert!(!r3.is_blocker && r3.needs_reintegration);
 
         let blockers: Vec<u32> = rows
             .iter()
             .filter(|r| r.is_blocker)
             .map(|r| r.number)
             .collect();
-        assert_eq!(blockers, vec![2, 3]);
+        assert_eq!(blockers, vec![2]);
+
+        let stale: Vec<u32> = rows
+            .iter()
+            .filter(|r| r.needs_reintegration)
+            .map(|r| r.number)
+            .collect();
+        assert_eq!(stale, vec![3]);
     }
 
     #[test]
@@ -3833,6 +3869,25 @@ mod tests {
         assert_eq!(rows[0].state, RollState::Graduated);
         // A graduated target no longer gates anything.
         assert!(!rows[0].is_blocker);
+        assert!(!rows[0].needs_reintegration);
+    }
+
+    #[test]
+    fn dependent_rows_flag_reintegration_when_target_diverged() {
+        // Mirrors `dep_rows`: a diverged target already graduated (it does not
+        // gate its dependents), but it has moved on since they integrated it —
+        // this is exactly roll/27's situation with its roll/26 dependency.
+        let mut r27 = roll_n(27, RollState::Active);
+        r27.deps = vec![26];
+        let mut target = roll_n(26, RollState::Diverged);
+        target.dependents = vec![27];
+        let all = vec![r27, target.clone()];
+
+        let rows = dependent_rows(&target, &all);
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].number, 27);
+        assert!(!rows[0].is_blocker);
+        assert!(rows[0].needs_reintegration);
     }
 
     #[test]

@@ -13,7 +13,11 @@ The table carries a `deps` column (roll numbers this roll integrated) and a
 They are shown whatever the roll's state, so a roll that has already graduated
 still reports what it depends on and what depends on it. Press `[enter]` on a
 roll for the detail overlay, which breaks the same two relationships out with
-per-dependency blocker markers.
+per-dependency markers: `⛔ blocker` for a dep that has not graduated yet (it
+gates this roll's graduation), and `⚠ reintegrate` for one that already
+graduated but has gained commits since this roll integrated it — it is not
+blocking anything, but this roll's copy of it is stale (see
+[divergence after integration](../internals/algorithms.md#dependency-detection-coredependenciesrs)).
 
 The TUI table pins the stable and rolling branches above the rolls, so `[space]`
 switches to them the same way it switches to a roll. A base branch that exists
