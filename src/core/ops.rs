@@ -1059,6 +1059,10 @@ pub(crate) struct VerifyOutcome {
     /// Crate-version comparison of source against target. `NotApplicable` when
     /// the repo has no `Cargo.toml` or the gate is disabled.
     pub version: VersionCheck,
+    /// What the eventual `--no-ff` merge would do. Conflicts only reach the
+    /// caller under `--dry-run`; otherwise `verify` fails on them before any
+    /// gate runs.
+    pub merge_preview: git::MergePreview,
 }
 
 pub(crate) fn verify(config: &Config, dry_run: bool) -> Result<VerifyOutcome> {
@@ -1094,6 +1098,22 @@ pub(crate) fn verify(config: &Config, dry_run: bool) -> Result<VerifyOutcome> {
         MergeState::FastForwardable => {}
     }
 
+    // A fast-forwardable target cannot conflict, so only a diverged pair needs
+    // the trial merge. It runs in the object store (`git merge-tree`), so the
+    // tree we are about to gate is left untouched. Checked before the version
+    // gate and the gates: a conflict means graduate/promote would stop at the
+    // merge however the gates come out, so there is no point running them.
+    let merge_preview = if diverged_note {
+        git::preview_merge(&config.repo_root, &target, &source)?
+    } else {
+        git::MergePreview::Clean
+    };
+    if !dry_run {
+        if let git::MergePreview::Conflicts(paths) = &merge_preview {
+            bail!(merge_conflict_error(&source, &target, paths));
+        }
+    }
+
     // Checked before the gates so an unbumped version fails in milliseconds
     // rather than after a full `cargo test` run. Only the promotion route
     // carries the bump requirement — graduating a roll into rolling is
@@ -1125,7 +1145,26 @@ pub(crate) fn verify(config: &Config, dry_run: bool) -> Result<VerifyOutcome> {
         host_notices: host_report.notices,
         failed_hosts,
         version,
+        merge_preview,
     })
+}
+
+/// The error `rf verify` raises when merging `source` into `target` would
+/// conflict, with the fix spelled out: settle it on the source branch, where
+/// the work belongs, so the graduation/promotion merge itself stays clean.
+pub(crate) fn merge_conflict_error(source: &str, target: &str, paths: &[String]) -> String {
+    let mut msg = format!(
+        "merging '{source}' into '{target}' would conflict in {} file{}:\n",
+        paths.len(),
+        if paths.len() == 1 { "" } else { "s" }
+    );
+    for path in paths {
+        msg.push_str(&format!("  {path}\n"));
+    }
+    msg.push_str(&format!(
+        "resolve it on '{source}' first: `git merge {target}`, fix the conflicts, commit, then re-run `rf verify`"
+    ));
+    msg
 }
 
 // ── graduate ────────────────────────────────────────────────────────────────

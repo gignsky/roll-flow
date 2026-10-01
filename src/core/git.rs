@@ -544,6 +544,72 @@ pub fn commits_not_in(repo: &Path, tip: &str, excludes: &[String]) -> Result<u32
         .map_err(|_| RfError::Git(format!("could not parse commit count from {out:?}")))
 }
 
+/// What merging two commits would do, computed without touching the worktree.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum MergePreview {
+    /// The merge resolves cleanly.
+    Clean,
+    /// The merge stops on these paths (deduplicated, in git's order).
+    Conflicts(Vec<String>),
+    /// This git cannot answer (`merge-tree --write-tree` needs git 2.38+).
+    /// Carries git's explanation so the caller can say why it was skipped.
+    Unavailable(String),
+}
+
+/// Preview merging `theirs` into `ours` with `git merge-tree --write-tree`.
+///
+/// This is a real three-way merge done entirely in the object store: no
+/// checkout, no index, no `MERGE_HEAD`, so it is safe to run on a dirty tree or
+/// from any branch. Its only side effect is a few unreachable tree/blob objects
+/// that `git gc` collects. Exit 0 is clean, 1 is conflicted, and anything else
+/// (an old git that does not know `--write-tree`) is reported as unavailable
+/// rather than as an error, because the real merge will still catch a conflict.
+pub fn preview_merge(repo: &Path, ours: &str, theirs: &str) -> Result<MergePreview, RfError> {
+    let output = Command::new("git")
+        .arg("-C")
+        .arg(repo)
+        .args([
+            "merge-tree",
+            "--write-tree",
+            "--name-only",
+            "--no-messages",
+            "-z",
+            ours,
+            theirs,
+        ])
+        .output()?;
+    match output.status.code() {
+        Some(0) => Ok(MergePreview::Clean),
+        Some(1) => Ok(MergePreview::Conflicts(parse_merge_tree_conflicts(
+            &output.stdout,
+        ))),
+        _ => Ok(MergePreview::Unavailable(
+            String::from_utf8_lossy(&output.stderr)
+                .lines()
+                .next()
+                .unwrap_or("git merge-tree failed")
+                .trim()
+                .to_string(),
+        )),
+    }
+}
+
+/// Parse `merge-tree --write-tree --name-only --no-messages -z` output: the
+/// result tree's OID, then each conflicted path, all NUL-terminated.
+pub fn parse_merge_tree_conflicts(stdout: &[u8]) -> Vec<String> {
+    let mut paths: Vec<String> = Vec::new();
+    for field in stdout.split(|b| *b == 0).skip(1) {
+        if field.is_empty() {
+            continue;
+        }
+        let path = String::from_utf8_lossy(field).into_owned();
+        if !paths.contains(&path) {
+            paths.push(path);
+        }
+    }
+    paths
+}
+
 /// Return the best common ancestor of `a` and `b`.
 pub fn merge_base(repo: &Path, a: &str, b: &str) -> Result<String, RfError> {
     capture_git(repo, &["merge-base", a, b])
@@ -654,7 +720,8 @@ pub fn commit_paths(repo: &Path, paths: &[&str], message: &str) -> Result<(), Rf
 mod tests {
     use super::{
         ahead_behind, local_branch_details, parse_ahead_behind, parse_local_branch_line,
-        remote_head_branch, remote_tracking_refs, remotes, track_state, LocalBranch, TrackState,
+        parse_merge_tree_conflicts, preview_merge, remote_head_branch, remote_tracking_refs,
+        remotes, track_state, LocalBranch, MergePreview, TrackState,
     };
     use std::path::Path;
     use std::process::Command;
@@ -970,5 +1037,49 @@ mod tests {
             "track was {:?}",
             main.track
         );
+    }
+
+    #[test]
+    fn parse_merge_tree_conflicts_skips_oid_and_dedupes() {
+        let out = b"1e40f69f\0a.txt\0dir/b c.txt\0a.txt\0";
+        assert_eq!(
+            parse_merge_tree_conflicts(out),
+            vec!["a.txt".to_string(), "dir/b c.txt".to_string()]
+        );
+        assert!(parse_merge_tree_conflicts(b"1e40f69f\0").is_empty());
+    }
+
+    #[test]
+    fn preview_merge_reports_conflicts_without_touching_worktree() {
+        let dir = tempfile::tempdir().expect("dir");
+        let p = dir.path();
+        git(p, &["init", "-b", "main"]);
+        git(p, &["config", "user.email", "t@e.test"]);
+        git(p, &["config", "user.name", "t"]);
+        std::fs::write(p.join("f"), "base\n").unwrap();
+        std::fs::write(p.join("ok"), "base\n").unwrap();
+        git(p, &["add", "."]);
+        git(p, &["commit", "-m", "base"]);
+        git(p, &["switch", "-c", "side"]);
+        std::fs::write(p.join("f"), "side\n").unwrap();
+        git(p, &["commit", "-am", "side"]);
+        git(p, &["switch", "-c", "clean", "main"]);
+        std::fs::write(p.join("ok"), "clean\n").unwrap();
+        git(p, &["commit", "-am", "clean"]);
+        git(p, &["switch", "main"]);
+        std::fs::write(p.join("f"), "main\n").unwrap();
+        git(p, &["commit", "-am", "main"]);
+
+        assert_eq!(
+            preview_merge(p, "main", "side").unwrap(),
+            MergePreview::Conflicts(vec!["f".to_string()])
+        );
+        assert_eq!(
+            preview_merge(p, "main", "clean").unwrap(),
+            MergePreview::Clean
+        );
+        // Still on main with the main content: nothing was checked out or staged.
+        assert_eq!(std::fs::read_to_string(p.join("f")).unwrap(), "main\n");
+        assert!(!p.join(".git/MERGE_HEAD").exists());
     }
 }

@@ -334,6 +334,18 @@ fn cmd_verify(dry_run: bool, bump: Option<BumpLevel>, yes: bool) -> Result<()> {
             outcome.target, outcome.source
         );
     }
+    match &outcome.merge_preview {
+        // Only reachable under `--dry-run`: a real run already failed on it.
+        git::MergePreview::Conflicts(paths) => println!(
+            "warning: {}",
+            ops::merge_conflict_error(&outcome.source, &outcome.target, paths)
+        ),
+        git::MergePreview::Unavailable(why) => println!(
+            "note: could not pre-check '{}' -> '{}' for merge conflicts ({why}); the merge itself will still stop on one",
+            outcome.source, outcome.target
+        ),
+        git::MergePreview::Clean => {}
+    }
     render_version_check(&outcome.version, &outcome.source, &outcome.target);
     render_gate_notices(&outcome.gate_notices);
     render_gate_notices(&outcome.host_notices);
