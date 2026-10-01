@@ -121,6 +121,82 @@ fn dependency_and_dependant_survive_promotion() {
     assert_eq!(dependants(&sb, "roll/1-0611-alpha"), vec![2]);
 }
 
+/// Integrating the rolling branch itself (`[I]` / `rf integrate rolling`) must
+/// surface every roll already graduated onto it as a dependency, even though
+/// the merge's own subject names rolling, not a roll — the gap this test
+/// guards against is `rf integrate rolling` reporting no new dependencies at
+/// all.
+#[test]
+fn integrating_rolling_reports_every_graduated_roll_as_a_dependency() {
+    let sb = Sandbox::plain();
+    sb.init();
+
+    sb.create_roll("alpha", "0611");
+    sb.commit_file("alpha.txt", "a\n", "alpha work");
+    assert!(sb.rf(&["graduate"]).success, "graduate alpha");
+
+    sb.git(&["checkout", "main"]);
+    sb.create_roll("beta", "0612");
+    sb.commit_file("beta.txt", "b\n", "beta work");
+    assert!(sb.rf(&["graduate"]).success, "graduate beta");
+
+    sb.git(&["checkout", "main"]);
+    sb.create_roll("gamma", "0613");
+    sb.commit_file("gamma.txt", "c\n", "gamma work");
+
+    // Bring rolling (with alpha and beta already graduated onto it) into
+    // gamma directly, the way `[I]` does.
+    let out = sb.rf(&["integrate", "rolling"]);
+    assert!(
+        out.success,
+        "integrate rolling into gamma: {}",
+        out.combined()
+    );
+
+    let mut got = deps(&sb, "roll/3-0613-gamma");
+    got.sort_unstable();
+    assert_eq!(got, vec![1, 2]);
+    assert_eq!(dependants(&sb, "roll/1-0611-alpha"), vec![3]);
+    assert_eq!(dependants(&sb, "roll/2-0612-beta"), vec![3]);
+}
+
+/// The false positive the ancestry fallback must not reintroduce: a roll that
+/// forks from stable *after* an old roll was promoted already has that roll's
+/// commits as ancestors through stable, with no `[I]` merge involved at all.
+/// A later, unrelated `[I]` merge on a *different* roll must not read that
+/// pre-existing ancestry as a dependency it just acquired — only graduations
+/// genuinely new to the merge's own `base..roll` range count.
+#[test]
+fn integrating_rolling_does_not_claim_a_dependency_already_baked_in_via_stable() {
+    let sb = Sandbox::plain();
+    sb.init();
+
+    sb.create_roll("alpha", "0611");
+    sb.commit_file("alpha.txt", "a\n", "alpha work");
+    assert!(sb.rf(&["graduate"]).success, "graduate alpha");
+    sb.git(&["checkout", "rolling"]);
+    assert!(sb.rf(&["promote"]).success, "promote alpha to stable");
+
+    // beta forks from stable *after* the promotion, so alpha's commit is
+    // already its ancestor — unrelated to anything beta merges from rolling.
+    sb.git(&["checkout", "main"]);
+    sb.create_roll("beta", "0612");
+    sb.commit_file("beta.txt", "b\n", "beta work");
+
+    let out = sb.rf(&["integrate", "rolling"]);
+    assert!(
+        out.success,
+        "integrate rolling into beta: {}",
+        out.combined()
+    );
+
+    assert!(
+        deps(&sb, "roll/2-0612-beta").is_empty(),
+        "beta's ancestry already contains alpha via stable; the [I] merge introduced nothing new"
+    );
+    assert!(dependants(&sb, "roll/1-0611-alpha").is_empty());
+}
+
 #[test]
 fn status_table_shows_both_columns_by_default() {
     let sb = sandbox_with_integration();
