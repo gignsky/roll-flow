@@ -9,6 +9,7 @@ use std::io::{self, Stdout};
 use std::panic;
 
 pub mod output;
+pub mod queue;
 pub mod rolls;
 
 pub type Tui = Terminal<CrosstermBackend<Stdout>>;

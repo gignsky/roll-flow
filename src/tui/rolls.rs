@@ -26,6 +26,7 @@ use ratatui::{
 };
 
 use super::output::{self, Followup, JobDone, JobProgress};
+use super::queue::{self, Pending, Queue};
 use crate::core::{
     branches::{self, BranchLocation, RollInfo, RollState},
     config::Config,
@@ -261,6 +262,9 @@ enum Mode {
     ForcePush {
         branch: String,
         remote: String,
+        /// Opened because a push was rejected, which also held the queue: a
+        /// `y` then runs the forced push ahead of the queue and releases it.
+        rejected: bool,
     },
 }
 
@@ -476,9 +480,23 @@ struct StatusApp {
     /// Transient one-line feedback (e.g. why an action was rejected), cleared on
     /// the next browsing keypress.
     message: Option<String>,
-    /// The command currently running, if any. Mutating keys are refused while
-    /// this is set; navigation is not.
+    /// The command currently running, if any. A mutating key pressed while
+    /// this is set queues behind it rather than racing it.
     job: Option<output::Job>,
+    /// The running command's panel title, for naming it when it fails.
+    job_title: String,
+    /// Whether the running command can change the checked-out branch.
+    job_moves_head: bool,
+    /// Commands waiting for the running one to finish. See [`queue`].
+    queue: Queue,
+    /// True after a `q` that would have dropped queued commands, waiting for a
+    /// second `q` to confirm. Any other key disarms it.
+    quit_armed: bool,
+    /// A modal a finished job asked for while another was open. Jobs now finish
+    /// under open modals — `[c]` can be typing a slug mid-push — and replacing
+    /// the modal would throw away what the user was in the middle of, so it
+    /// opens once they are back to browsing.
+    deferred_mode: Option<Mode>,
     /// The output log. Outlives its job so a result stays readable until `esc`.
     panel: Option<output::Panel>,
     /// True after a bare `g`, waiting to see whether the next key makes it `gg`.
@@ -917,6 +935,22 @@ pub(crate) const BINDINGS: &[Binding] = &[
         group: "output",
         hint: None,
         replay: &[KeyCode::End],
+    },
+    Binding {
+        keys: "s",
+        // "resume" and "continue" are both what someone types looking for this
+        // after a conflict, and the search is a subsequence match.
+        label: "resume (continue) the queued commands a failure held",
+        group: "queue",
+        hint: None,
+        replay: &[KeyCode::Char('s')],
+    },
+    Binding {
+        keys: "S",
+        label: "drop every queued command",
+        group: "queue",
+        hint: None,
+        replay: &[KeyCode::Char('S')],
     },
 ];
 
@@ -1466,6 +1500,11 @@ impl StatusApp {
             mode: Mode::Browsing,
             message: None,
             job: None,
+            job_title: String::new(),
+            job_moves_head: false,
+            queue: Queue::default(),
+            quit_armed: false,
+            deferred_mode: None,
             panel: None,
             pending_g: false,
             pending_push: None,
@@ -1478,6 +1517,7 @@ impl StatusApp {
             // Before reading input, so a job that finished during the poll is
             // reflected in this frame rather than the next one.
             self.poll_job()?;
+            self.open_deferred_mode();
             self.resolve_lapsed_push();
 
             if event::poll(Duration::from_millis(50))? {
@@ -1526,13 +1566,30 @@ impl StatusApp {
         if let Some(panel) = self.panel.as_mut() {
             panel.tick();
         }
-        let JobProgress::Finished(next) = progress else {
+        let JobProgress::Finished { ok, next } = progress else {
             return Ok(());
         };
         self.job = None;
         // Reload regardless of outcome: a failed op may still have changed the
         // repo, and a stale table is worse than a redundant refresh.
         self.reload()?;
+        self.finish_job(ok, next);
+        Ok(())
+    }
+
+    /// Act on a finished job's outcome — hold the queue on a failure, apply
+    /// its follow-up — and start whatever is next. Split from
+    /// [`Self::poll_job`] so the sequencing is testable without a repo to
+    /// reload from.
+    fn finish_job(&mut self, ok: bool, next: Option<Followup>) {
+        if !ok && !self.queue.is_empty() {
+            let reason = format!("'{}' failed", self.job_title);
+            self.message = Some(format!(
+                "{reason} — {} queued kept; resolve it, then [s] resume or [S] drop",
+                self.queue.len()
+            ));
+            self.queue.hold(reason);
+        }
         match next {
             Some(Followup::SelectBranch(branch)) => {
                 if let Some(idx) = self.rolls.iter().position(|r| r.branch == branch) {
@@ -1540,40 +1597,191 @@ impl StatusApp {
                 }
             }
             Some(Followup::OfferForcePush { branch, remote }) => {
-                self.mode = Mode::ForcePush { branch, remote };
+                // The commands behind a push were queued expecting it to land,
+                // so they wait on the answer: `y` runs the forced push ahead of
+                // them and carries on, `n` leaves them held.
+                self.queue.hold(format!("push of '{branch}' was rejected"));
+                self.open_mode(Mode::ForcePush {
+                    branch,
+                    remote,
+                    rejected: true,
+                });
             }
             None => {}
         }
-        Ok(())
+        self.advance_queue();
     }
 
-    /// Start a background job, replacing any previous panel.
+    /// Open `mode` now if nothing else is open, otherwise once the view is back
+    /// to browsing — see [`StatusApp::deferred_mode`].
+    fn open_mode(&mut self, mode: Mode) {
+        if matches!(self.mode, Mode::Browsing) {
+            self.mode = mode;
+        } else {
+            self.deferred_mode = Some(mode);
+        }
+    }
+
+    /// Open a deferred modal once the one in its way has closed. Called once
+    /// per loop iteration.
+    fn open_deferred_mode(&mut self) {
+        if matches!(self.mode, Mode::Browsing) {
+            if let Some(mode) = self.deferred_mode.take() {
+                self.mode = mode;
+            }
+        }
+    }
+
+    /// Run a command as a background job, or queue it behind the running one.
     ///
-    /// Replacing rather than appending keeps one panel to one operation, so its
-    /// border colour means something: a green panel is *this* command's success,
-    /// not the last one's.
+    /// A fresh command replaces any previous panel, which keeps one panel to
+    /// one plan so its border colour means something: a green panel is *this*
+    /// command's success, not the last one's. A queued command instead
+    /// continues the panel it follows — see [`output::Panel::chain`].
     fn start_job(
         &mut self,
         title: impl Into<String>,
         body: impl FnOnce() -> Result<JobDone> + Send + 'static,
     ) {
-        self.panel = Some(output::Panel::new(title));
-        self.job = Some(output::Job::spawn(body));
+        self.submit(Pending::new(title, false, Box::new(body)), false);
     }
 
-    /// Refuse a mutating key while a job is in flight, so two commands cannot
-    /// race on the same repo. Returns true when the caller should stop.
+    /// [`Self::start_job`] for a command that can change the checked-out
+    /// branch. Keys that read HEAD are refused while one is pending — see
+    /// [`Self::head_will_move`].
+    fn start_head_job(
+        &mut self,
+        title: impl Into<String>,
+        body: impl FnOnce() -> Result<JobDone> + Send + 'static,
+    ) {
+        self.submit(Pending::new(title, true, Box::new(body)), false);
+    }
+
+    /// Start `pending` now if nothing is running or waiting, otherwise queue
+    /// it. `front` puts it ahead of everything waiting and releases a hold —
+    /// for the one command that answers what held the queue.
+    fn submit(&mut self, pending: Pending, front: bool) {
+        if self.job.is_none() && self.queue.is_empty() {
+            self.panel = Some(output::Panel::new(pending.title.clone()));
+            self.run(pending);
+            return;
+        }
+        if front {
+            self.queue.push_front(pending);
+            self.queue.resume();
+        } else {
+            let title = pending.title.clone();
+            self.queue.push(pending);
+            self.message = Some(match self.queue.held() {
+                Some(_) => format!("queued '{title}' behind the held commands — [s] resumes them"),
+                None => format!("queued '{title}' — it runs when the commands ahead finish"),
+            });
+        }
+        self.advance_queue();
+    }
+
+    /// Start the next queued command, if nothing is running and the queue is
+    /// not held. Continues the current panel rather than replacing it.
+    fn advance_queue(&mut self) {
+        if self.job.is_some() {
+            return;
+        }
+        let Some(pending) = self.queue.next() else {
+            return;
+        };
+        match self.panel.as_mut() {
+            Some(panel) => panel.chain(pending.title.clone()),
+            None => self.panel = Some(output::Panel::new(pending.title.clone())),
+        }
+        self.run(pending);
+    }
+
+    fn run(&mut self, pending: Pending) {
+        self.job_title = pending.title;
+        self.job_moves_head = pending.moves_head;
+        self.job = Some(output::Job::spawn(pending.body));
+    }
+
+    /// `[s]` — release a held queue and carry on with the next command.
+    fn resume_queue(&mut self) {
+        if self.queue.resume() {
+            self.message = None;
+            self.advance_queue();
+        } else if self.queue.is_empty() {
+            self.message = Some("nothing is queued".to_string());
+        } else {
+            self.message = Some("the queue is not held — it runs on its own".to_string());
+        }
+    }
+
+    /// `[S]` — drop every queued command. The running one, if any, finishes:
+    /// it is already a subprocess, and killing git mid-operation is how a repo
+    /// ends up half-merged.
+    fn drop_queue(&mut self) {
+        self.message = Some(match self.queue.clear() {
+            0 => "nothing is queued".to_string(),
+            1 => "dropped 1 queued command".to_string(),
+            n => format!("dropped {n} queued commands"),
+        });
+    }
+
+    /// The command that will change the checked-out branch before anything
+    /// queued now gets to run, if one is running or waiting.
+    fn head_will_move(&self) -> Option<&str> {
+        if self.job.is_some() && self.job_moves_head {
+            return Some(&self.job_title);
+        }
+        self.queue.first_head_mover()
+    }
+
+    /// Refuse a key that reads the checked-out branch *now* while a pending
+    /// command will change it. Such a key would capture one branch and, by the
+    /// time its turn came, act on another — `[i]` would merge into a roll the
+    /// user never confirmed. Returns true when the caller should stop.
+    fn waits_on_head(&mut self, key: &str) -> bool {
+        let Some(title) = self.head_will_move() else {
+            return false;
+        };
+        self.message = Some(format!(
+            "{key} acts on the checked-out branch, which '{title}' is about to change — press it again once that has run"
+        ));
+        true
+    }
+
+    /// Refuse `gg` while a job is running: lazygit takes the terminal and the
+    /// repo, and a git command racing it is exactly what the queue avoids. A
+    /// *held* queue is fine — that is when lazygit is most needed. Returns
+    /// true when the caller should stop.
     fn busy(&mut self) -> bool {
         if self.job.is_some() {
-            self.message = Some("a git command is already running".to_string());
+            self.message = Some(format!(
+                "'{}' is still running — gg once it finishes",
+                self.job_title
+            ));
             return true;
         }
+        false
+    }
+
+    /// Whether a quit key should actually quit. With commands queued, the
+    /// first press only warns, since quitting drops them.
+    fn confirm_quit(&mut self, armed: bool) -> bool {
+        if self.queue.is_empty() || armed {
+            return true;
+        }
+        self.quit_armed = true;
+        let n = self.queue.len();
+        self.message = Some(format!(
+            "{n} queued command{} will be dropped — press it again to quit",
+            if n == 1 { "" } else { "s" }
+        ));
         false
     }
 
     /// Handle a keypress while browsing. Returns `Ok(true)` to quit.
     fn handle_browsing(&mut self, terminal: &mut super::Tui, code: KeyCode) -> Result<bool> {
         self.message = None;
+        let quit_armed = std::mem::take(&mut self.quit_armed);
 
         // `gg` opens lazygit. `g` alone does nothing, so a pending `g` needs no
         // timeout: any other key clears it and is then handled normally.
@@ -1603,14 +1811,14 @@ impl StatusApp {
         }
 
         match code {
-            KeyCode::Char('q') => return Ok(true),
+            KeyCode::Char('q') => return Ok(self.confirm_quit(quit_armed)),
             // `esc` dismisses the output panel when one is up, and only quits
             // when there is nothing left to dismiss.
             KeyCode::Esc => {
                 if self.panel.is_some() && self.job.is_none() {
                     self.panel = None;
                 } else if self.panel.is_none() {
-                    return Ok(true);
+                    return Ok(self.confirm_quit(quit_armed));
                 }
             }
             KeyCode::Down | KeyCode::Char('j') => self.select_next(),
@@ -1624,29 +1832,21 @@ impl StatusApp {
                 self.message = Some("refreshed".to_string());
             }
             KeyCode::Char('c') => {
-                if self.busy() {
-                    return Ok(false);
-                }
                 self.mode = Mode::CreateInput {
                     slug: String::new(),
                 }
             }
-            KeyCode::Char(' ') => {
-                if self.busy() {
-                    return Ok(false);
+            KeyCode::Char(' ') => match self.selected_row() {
+                Some(RowKind::Roll(i)) => {
+                    let roll = self.rolls[i].clone();
+                    self.execute_switch(roll.branch, roll.location);
                 }
-                match self.selected_row() {
-                    Some(RowKind::Roll(i)) => {
-                        let roll = self.rolls[i].clone();
-                        self.execute_switch(roll.branch, roll.location);
-                    }
-                    Some(RowKind::Base(i)) => {
-                        let base = self.bases[i].clone();
-                        self.execute_switch(base.branch, base.location);
-                    }
-                    None => self.message = Some("no branch selected".to_string()),
+                Some(RowKind::Base(i)) => {
+                    let base = self.bases[i].clone();
+                    self.execute_switch(base.branch, base.location);
                 }
-            }
+                None => self.message = Some("no branch selected".to_string()),
+            },
             KeyCode::Char('p') => self.start_pull(),
             KeyCode::Char('P') => self.arm_push(),
             KeyCode::Char('f') => self.start_fetch(),
@@ -1660,8 +1860,10 @@ impl StatusApp {
             KeyCode::Char('x') => self.request(Action::Prune),
             KeyCode::Char('t') => self.request(Action::Tidy),
             KeyCode::Char('d') => self.request_delete()?,
-            // No busy guard: the list changes nothing, and every binding it can
-            // run carries its own.
+            KeyCode::Char('s') => self.resume_queue(),
+            KeyCode::Char('S') => self.drop_queue(),
+            // No guard: the list changes nothing, and every binding it can run
+            // carries its own.
             KeyCode::Char('?') => {
                 self.mode = Mode::Help {
                     query: String::new(),
@@ -1846,7 +2048,7 @@ impl StatusApp {
     /// `rolling` are selectable, but merging them into a roll is a different
     /// operation with its own key.
     fn request_integrate(&mut self) {
-        if self.busy() {
+        if self.waits_on_head("[i]") {
             return;
         }
         if let Some(RowKind::Base(i)) = self.selected_row() {
@@ -1877,7 +2079,7 @@ impl StatusApp {
     /// Needs no selection, unlike `[i]`: the source is always rolling, which
     /// isn't a roll row to point the cursor at.
     fn request_integrate_rolling(&mut self) {
-        if self.busy() {
+        if self.waits_on_head("[I]") {
             return;
         }
         match integrate_rolling_target_for(
@@ -1901,7 +2103,7 @@ impl StatusApp {
     /// Always the current branch, never the row under the cursor: a bump is a
     /// commit, and it has to land where the merge that needs it will be made from.
     fn request_bump(&mut self) {
-        if self.busy() {
+        if self.waits_on_head("[b]") {
             return;
         }
         match bump_gate(self.version) {
@@ -2040,7 +2242,7 @@ impl StatusApp {
     /// other failure and never aborts the TUI.
     fn execute_create(&mut self, slug: String) {
         let config = self.config.clone();
-        self.start_job("rf create", move || {
+        self.start_head_job("rf create", move || {
             let outcome = ops::create(&config, &slug, None, false)?;
             Ok(JobDone::with_next(
                 vec![format!("Created {}", outcome.branch)],
@@ -2055,8 +2257,11 @@ impl StatusApp {
     /// Serves both roll rows and the pinned base-branch rows.
     fn execute_switch(&mut self, branch: String, location: BranchLocation) {
         let config = self.config.clone();
-        let current = self.current_branch.clone();
-        self.start_job(format!("git switch {branch}"), move || {
+        self.start_head_job(format!("git switch {branch}"), move || {
+            // Read HEAD when the switch runs, not when it was queued: a switch
+            // queued behind another one would otherwise compare against a
+            // branch that is no longer checked out.
+            let current = git::current_branch(&config.repo_root)?;
             Ok(JobDone::lines(run_switch(
                 &config, &current, &branch, &location,
             )?))
@@ -2093,7 +2298,7 @@ impl StatusApp {
     /// `[p]` — pull the selected branch. What that means depends on whether it is
     /// checked out; see [`sync::pull_plan`].
     fn start_pull(&mut self) {
-        if self.busy() {
+        if self.waits_on_head("[p]") {
             return;
         }
         let Some(target) = self.sync_target() else {
@@ -2122,7 +2327,7 @@ impl StatusApp {
     /// goes straight to the confirmation, which is what lazygit does: there is no
     /// point spending a round-trip to be told what the tracking ref already says.
     fn start_push(&mut self) {
-        if self.busy() {
+        if self.waits_on_head("[P]") {
             return;
         }
         let Some(target) = self.sync_target() else {
@@ -2143,21 +2348,22 @@ impl StatusApp {
             self.mode = Mode::ForcePush {
                 branch: target.branch.clone(),
                 remote: target.remote.clone(),
+                rejected: false,
             };
             return;
         }
-        self.push_job(target, false);
+        self.push_job(target, false, false);
     }
 
     /// `[P]` — arm the push chord. The push itself does not start until the
     /// chord resolves, in [`Self::handle_browsing`] or
     /// [`Self::resolve_lapsed_push`].
     ///
-    /// The busy check happens here rather than only at the far end so that a `P`
-    /// during a running job is refused the instant it is pressed, as every other
-    /// mutating key is, instead of after the window.
+    /// The HEAD check happens here as well as at the far end so that a `P`
+    /// that cannot run is refused the instant it is pressed, instead of after
+    /// the window.
     fn arm_push(&mut self) {
-        if self.busy() {
+        if self.waits_on_head("[P]") {
             return;
         }
         self.pending_push = Some(Instant::now());
@@ -2183,7 +2389,7 @@ impl StatusApp {
     /// Nothing is pushed here. The plan is resolved from the tracking data the
     /// view already loaded, so the modal states exactly what the job will do.
     fn start_push_all(&mut self) {
-        if self.busy() {
+        if self.waits_on_head("PP") {
             return;
         }
         let rows: Vec<(String, BranchLocation)> = self
@@ -2265,40 +2471,40 @@ impl StatusApp {
     /// Run one push attempt. On a non-fast-forward refusal the job finishes
     /// *successfully* carrying a [`Followup::OfferForcePush`] — the refusal is an
     /// expected answer to be acted on, not an error to report and stop at.
-    fn push_job(&mut self, target: SyncTarget, force: bool) {
+    ///
+    /// `answers_hold` marks the forced retry of a push whose rejection held the
+    /// queue: it jumps ahead of the commands that were waiting on that push and
+    /// releases them.
+    fn push_job(&mut self, target: SyncTarget, force: bool, answers_hold: bool) {
         let repo = self.config.repo_root.clone();
         let title = if force {
             format!("git push --force-with-lease {}", target.branch)
         } else {
             format!("git push {}", target.branch)
         };
-        self.start_job(title, move || {
-            match sync::run_push(&repo, &target, force).map_err(sync_error)? {
-                PushOutcome::Pushed => Ok(JobDone::lines(vec![format!(
-                    "Pushed '{}' to {}",
+        let body = move || match sync::run_push(&repo, &target, force).map_err(sync_error)? {
+            PushOutcome::Pushed => Ok(JobDone::lines(vec![format!(
+                "Pushed '{}' to {}",
+                target.branch, target.remote
+            )])),
+            PushOutcome::Rejected { .. } => Ok(JobDone::with_next(
+                vec![format!(
+                    "'{}' was rejected by {}",
                     target.branch, target.remote
-                )])),
-                PushOutcome::Rejected { .. } => Ok(JobDone::with_next(
-                    vec![format!(
-                        "'{}' was rejected by {}",
-                        target.branch, target.remote
-                    )],
-                    Followup::OfferForcePush {
-                        branch: target.branch.clone(),
-                        remote: target.remote.clone(),
-                    },
-                )),
-            }
-        });
+                )],
+                Followup::OfferForcePush {
+                    branch: target.branch.clone(),
+                    remote: target.remote.clone(),
+                },
+            )),
+        };
+        self.submit(Pending::new(title, false, Box::new(body)), answers_hold);
     }
 
     /// `[f]` — refresh every remote-tracking ref and drop the ones whose upstream
     /// is gone, so the sync column and every containment check that follows are
     /// judged against current data.
     fn start_fetch(&mut self) {
-        if self.busy() {
-            return;
-        }
         let repo = self.config.repo_root.clone();
         self.start_job("git fetch --prune", move || {
             sync::run_fetch(&repo, "origin").map_err(sync_error)?;
@@ -2316,7 +2522,7 @@ impl StatusApp {
     /// repo with `cargo test` gates that is the difference between a title the
     /// user can trust and several silent minutes.
     fn start_verify(&mut self) {
-        if self.busy() {
+        if self.waits_on_head("[v]") {
             return;
         }
         let Some((source, target)) = verify_route_for(&self.config, &self.current_branch) else {
@@ -2389,8 +2595,9 @@ impl StatusApp {
             ForcePushOutcome::Ignore => {}
             ForcePushOutcome::Cancel => self.mode = Mode::Browsing,
             ForcePushOutcome::Force => {
-                let Mode::ForcePush { branch, .. } =
-                    std::mem::replace(&mut self.mode, Mode::Browsing)
+                let Mode::ForcePush {
+                    branch, rejected, ..
+                } = std::mem::replace(&mut self.mode, Mode::Browsing)
                 else {
                     return;
                 };
@@ -2404,7 +2611,7 @@ impl StatusApp {
                     location,
                     self.tracking.get(&branch),
                 );
-                self.push_job(target, true);
+                self.push_job(target, true, rejected);
             }
         }
     }
@@ -2461,7 +2668,7 @@ impl StatusApp {
         // Over the table, never over the hints: the panel is passed the table's
         // area so the keymap stays readable while a job runs.
         if let Some(panel) = &self.panel {
-            output::render(f, chunks[1], panel);
+            output::render(f, chunks[1], panel, panel_footer(&self.queue));
         }
 
         match &self.mode {
@@ -2489,7 +2696,7 @@ impl StatusApp {
             Mode::CreateInput { slug } => render_create_input(f, area, &self.config, slug),
             Mode::Delete { preview } => render_delete_modal(f, area, &self.config, preview),
             Mode::Bump { current } => render_bump_modal(f, area, *current, &self.current_branch),
-            Mode::ForcePush { branch, remote } => {
+            Mode::ForcePush { branch, remote, .. } => {
                 render_force_push_modal(f, area, branch, remote, self.tracking.get(branch))
             }
             Mode::PushAll { plan } => render_push_all_modal(f, area, plan),
@@ -2638,12 +2845,25 @@ impl StatusApp {
     }
 
     fn render_status_bar(&self, f: &mut Frame, area: Rect) {
-        let msg_line = match &self.message {
-            Some(m) => Line::from(Span::styled(
+        // A transient message wins; otherwise a non-empty queue keeps the line,
+        // so a held queue stays in view after its panel is dismissed.
+        let msg_line = match (&self.message, queue::summary(&self.queue)) {
+            (Some(m), _) => Line::from(Span::styled(
                 format!(" {m}"),
                 Style::default().fg(Color::Yellow),
             )),
-            None => Line::from(""),
+            (None, Some(summary)) => {
+                let color = if self.queue.held().is_some() {
+                    Color::Red
+                } else {
+                    Color::Cyan
+                };
+                Line::from(Span::styled(
+                    format!(" {summary}"),
+                    Style::default().fg(color),
+                ))
+            }
+            (None, None) => Line::from(""),
         };
         // One line, built from the keymap rather than written out. Four hand-kept
         // lines listing twenty bindings crowded the bottom of the screen and had
@@ -2654,6 +2874,18 @@ impl StatusApp {
             Paragraph::new(vec![msg_line, Line::from(basic_hints())]),
             area,
         );
+    }
+}
+
+/// The output panel's bottom hint while commands are queued, `None` to keep its
+/// default. A held queue names the keys that act on it, since the panel showing
+/// the failure is where the user is looking.
+fn panel_footer(queue: &Queue) -> Option<String> {
+    let n = queue.len();
+    match (n, queue.held()) {
+        (0, _) => None,
+        (_, Some(_)) => Some(format!("{n} held · [s] resume · [S] drop · [esc] close")),
+        (_, None) => Some(format!("+{n} queued")),
     }
 }
 
@@ -5000,6 +5232,11 @@ mod tests {
             mode: Mode::Browsing,
             message: None,
             job: None,
+            job_title: String::new(),
+            job_moves_head: false,
+            queue: Queue::default(),
+            quit_armed: false,
+            deferred_mode: None,
             panel: None,
             pending_g: false,
             pending_push: None,
@@ -5043,6 +5280,11 @@ mod tests {
             mode: Mode::Browsing,
             message: None,
             job: None,
+            job_title: String::new(),
+            job_moves_head: false,
+            queue: Queue::default(),
+            quit_armed: false,
+            deferred_mode: None,
             panel: None,
             pending_g: false,
             pending_push: None,
@@ -5517,6 +5759,280 @@ mod tests {
         );
     }
 
+    // ── Job queue ───────────────────────────────────────────────────────────
+
+    /// An idle view over a repo that is never touched: these tests drive the
+    /// queue directly and never reload.
+    fn idle_app() -> StatusApp {
+        StatusApp {
+            config: test_config(),
+            current_branch: "roll/1-0101-x".to_string(),
+            bases: Vec::new(),
+            rolls: Vec::new(),
+            show_deps: false,
+            tracking: HashMap::new(),
+            version: None,
+            table: TableState::default(),
+            mode: Mode::Browsing,
+            message: None,
+            job: None,
+            job_title: String::new(),
+            job_moves_head: false,
+            queue: Queue::default(),
+            quit_armed: false,
+            deferred_mode: None,
+            panel: None,
+            pending_g: false,
+            pending_push: None,
+        }
+    }
+
+    /// Wait for the running job and hand its outcome to the view, exactly as
+    /// `poll_job` does minus the reload.
+    fn settle(app: &mut StatusApp) {
+        loop {
+            let (Some(job), Some(panel)) = (app.job.as_mut(), app.panel.as_mut()) else {
+                panic!("settle called with nothing running");
+            };
+            if let JobProgress::Finished { ok, next } = job.drain(panel) {
+                app.job = None;
+                app.finish_job(ok, next);
+                return;
+            }
+            std::thread::yield_now();
+        }
+    }
+
+    fn says(lines: &'static str) -> impl FnOnce() -> Result<JobDone> + Send + 'static {
+        move || Ok(JobDone::lines(vec![lines.to_string()]))
+    }
+
+    #[test]
+    fn a_command_pressed_mid_job_queues_and_runs_after_it() {
+        let mut app = idle_app();
+        let (release, gate) = std::sync::mpsc::channel::<()>();
+        app.start_job("first", move || {
+            gate.recv().ok();
+            Ok(JobDone::lines(vec!["first done".to_string()]))
+        });
+        app.start_job("second", says("second done"));
+
+        assert_eq!(app.job_title, "first", "the second must not start early");
+        assert_eq!(app.queue.len(), 1);
+        assert!(
+            app.message.as_deref().unwrap().contains("queued 'second'"),
+            "{:?}",
+            app.message
+        );
+
+        release.send(()).unwrap();
+        settle(&mut app);
+        assert_eq!(app.job_title, "second", "it starts as the first finishes");
+        assert!(app.queue.is_empty());
+        settle(&mut app);
+        assert!(app.job.is_none());
+
+        let panel = app.panel.as_ref().unwrap();
+        assert_eq!(panel.title, "second");
+        assert_eq!(panel.status(), output::Status::Ok);
+    }
+
+    #[test]
+    fn a_failure_holds_the_queue_until_resumed() {
+        let mut app = idle_app();
+        let (release, gate) = std::sync::mpsc::channel::<()>();
+        app.start_job("rf integrate", move || {
+            gate.recv().ok();
+            anyhow::bail!("merge conflict")
+        });
+        app.start_job("rf create", says("created"));
+        release.send(()).unwrap();
+        settle(&mut app);
+
+        assert!(app.job.is_none(), "nothing may run behind a failure");
+        assert_eq!(app.queue.len(), 1, "the queue is kept, not discarded");
+        assert_eq!(app.queue.held(), Some("'rf integrate' failed"));
+        assert!(app.message.as_deref().unwrap().contains("[s] resume"));
+        assert_eq!(
+            panel_footer(&app.queue).as_deref(),
+            Some("1 held · [s] resume · [S] drop · [esc] close")
+        );
+
+        // A command pressed while held waits with the rest instead of jumping
+        // ahead of a conflict the user has not resolved yet.
+        app.start_job("git fetch --prune", says("fetched"));
+        assert!(app.job.is_none());
+        assert_eq!(app.queue.len(), 2);
+
+        app.resume_queue();
+        assert_eq!(app.job_title, "rf create");
+        settle(&mut app);
+        assert_eq!(app.job_title, "git fetch --prune");
+        settle(&mut app);
+        assert!(app.queue.is_empty());
+    }
+
+    #[test]
+    fn dropping_the_queue_discards_it_and_lets_the_next_command_run() {
+        let mut app = idle_app();
+        app.start_job("bad", || anyhow::bail!("nope"));
+        app.start_job("a", says("a"));
+        app.start_job("b", says("b"));
+        settle(&mut app);
+        assert_eq!(app.queue.len(), 2);
+
+        app.drop_queue();
+        assert!(app.queue.is_empty());
+        assert_eq!(app.queue.held(), None);
+        assert_eq!(app.message.as_deref(), Some("dropped 2 queued commands"));
+
+        app.start_job("fresh", says("ok"));
+        assert_eq!(app.job_title, "fresh", "no stale hold may linger");
+        settle(&mut app);
+    }
+
+    #[test]
+    fn a_failure_with_nothing_queued_holds_nothing() {
+        let mut app = idle_app();
+        app.start_job("bad", || anyhow::bail!("nope"));
+        settle(&mut app);
+        assert_eq!(app.queue.held(), None);
+        assert_eq!(app.message, None);
+        app.start_job("next", says("ok"));
+        assert_eq!(app.job_title, "next");
+        settle(&mut app);
+    }
+
+    #[test]
+    fn keys_that_read_head_wait_for_a_pending_switch() {
+        let mut app = idle_app();
+        let (release, gate) = std::sync::mpsc::channel::<()>();
+        app.start_job("git fetch --prune", move || {
+            gate.recv().ok();
+            Ok(JobDone::default())
+        });
+        assert!(!app.waits_on_head("[i]"), "a fetch leaves HEAD alone");
+
+        app.start_head_job("git switch main", says("switched"));
+        assert!(app.waits_on_head("[i]"));
+        let msg = app.message.clone().unwrap();
+        assert!(
+            msg.contains("[i]") && msg.contains("git switch main"),
+            "{msg}"
+        );
+
+        // And `[i]` itself is refused rather than opening its modal.
+        app.request_integrate();
+        assert!(matches!(app.mode, Mode::Browsing));
+
+        release.send(()).unwrap();
+        settle(&mut app);
+        assert_eq!(app.job_title, "git switch main");
+        assert!(app.waits_on_head("[v]"), "still pending while it runs");
+        settle(&mut app);
+        assert!(!app.waits_on_head("[v]"));
+    }
+
+    #[test]
+    fn quitting_with_commands_queued_asks_first() {
+        let mut app = idle_app();
+        assert!(app.confirm_quit(false), "nothing queued: quit at once");
+
+        app.start_job("bad", || anyhow::bail!("nope"));
+        app.start_job("held", says("x"));
+        settle(&mut app);
+        assert!(!app.confirm_quit(false));
+        assert!(app.quit_armed);
+        assert!(app.message.as_deref().unwrap().contains("will be dropped"));
+        assert!(app.confirm_quit(true));
+    }
+
+    #[test]
+    fn a_rejected_push_holds_the_queue_and_a_force_runs_ahead_of_it() {
+        let mut app = idle_app();
+        let (release, gate) = std::sync::mpsc::channel::<()>();
+        app.start_job("git push roll/1", move || {
+            gate.recv().ok();
+            Ok(JobDone::with_next(
+                vec!["rejected".to_string()],
+                Followup::OfferForcePush {
+                    branch: "roll/1".to_string(),
+                    remote: "origin".to_string(),
+                },
+            ))
+        });
+        app.start_job("rf create", says("created"));
+        release.send(()).unwrap();
+        settle(&mut app);
+
+        assert!(matches!(app.mode, Mode::ForcePush { rejected: true, .. }));
+        assert!(app.job.is_none(), "the queue waits on the answer");
+        assert!(app.queue.held().unwrap().contains("rejected"));
+
+        // What `y` submits: the forced retry, flagged as answering the hold.
+        app.submit(
+            Pending::new(
+                "git push --force-with-lease roll/1",
+                false,
+                Box::new(says("forced")),
+            ),
+            true,
+        );
+        assert_eq!(app.job_title, "git push --force-with-lease roll/1");
+        assert_eq!(app.queue.held(), None);
+        settle(&mut app);
+        assert_eq!(app.job_title, "rf create");
+        settle(&mut app);
+    }
+
+    #[test]
+    fn a_force_prompt_waits_for_an_open_modal_to_close() {
+        let mut app = idle_app();
+        app.start_job("git push roll/1", || {
+            Ok(JobDone::with_next(
+                vec!["rejected".to_string()],
+                Followup::OfferForcePush {
+                    branch: "roll/1".to_string(),
+                    remote: "origin".to_string(),
+                },
+            ))
+        });
+        app.mode = Mode::CreateInput {
+            slug: "half-typ".to_string(),
+        };
+        settle(&mut app);
+        app.open_deferred_mode();
+        assert!(
+            matches!(&app.mode, Mode::CreateInput { slug } if slug == "half-typ"),
+            "the slug being typed must survive"
+        );
+
+        app.mode = Mode::Browsing;
+        app.open_deferred_mode();
+        assert!(matches!(app.mode, Mode::ForcePush { .. }));
+    }
+
+    #[test]
+    fn the_status_bar_keeps_a_held_queue_in_view() {
+        use ratatui::{backend::TestBackend, Terminal};
+
+        let mut app = idle_app();
+        app.start_job("bad", || anyhow::bail!("nope"));
+        app.start_job("rf create", says("x"));
+        settle(&mut app);
+        // The panel dismissed and the transient message gone, as after `esc`.
+        app.panel = None;
+        app.message = None;
+
+        let mut terminal = Terminal::new(TestBackend::new(160, 2)).unwrap();
+        terminal
+            .draw(|f| app.render_status_bar(f, f.area()))
+            .unwrap();
+        let out = format!("{:?}", terminal.backend().buffer());
+        assert!(out.contains("held"), "{out}");
+        assert!(out.contains("rf create"), "{out}");
+    }
+
     #[test]
     fn a_job_title_names_the_roll_it_targets() {
         assert_eq!(
@@ -5560,6 +6076,11 @@ mod tests {
             mode: Mode::Browsing,
             message: None,
             job: None,
+            job_title: String::new(),
+            job_moves_head: false,
+            queue: Queue::default(),
+            quit_armed: false,
+            deferred_mode: None,
             panel: None,
             pending_g: false,
             pending_push: None,

@@ -54,6 +54,22 @@ long list — that keeps two rolls adding rules in different areas from collidin
   active — exactly the case that matters before merging a batch of dependent
   rolls against a dependency someone keeps pushing to.
 
+## TUI command queue
+
+- One git command runs at a time. A mutating key pressed mid-job is queued
+  (`tui::queue`), never run concurrently and never silently refused.
+- A failed command *holds* the queue. Nothing behind a failure runs until the
+  user presses `[s]`; nothing is discarded until they press `[S]`. A command
+  pressed while held goes to the back, never ahead of the unresolved failure.
+  The one command that may jump the queue is a confirmed force push answering
+  the rejection that held it.
+- A key that captures the checked-out branch at keypress time must refuse
+  (`StatusApp::waits_on_head`) while a HEAD-moving job is running or queued
+  (`start_head_job`: switch, create). Work that only needs HEAD when it runs
+  should read it inside the job instead, as `git switch` does.
+- `gg` is refused only while a job is *running*. A held queue is exactly when
+  lazygit is needed.
+
 ## Verification
 
 - Active hosts only. Never require verification from inactive hosts.

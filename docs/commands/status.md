@@ -88,6 +88,7 @@ The full list:
 | `d` / `x` / `t` | delete / prune / tidy branches |
 | `esc` | close the output panel |
 | `PgUp` / `PgDn` / `End` | scroll the panel, or follow new output |
+| `s` / `S` | [resume / drop a held queue](#chaining-commands) |
 
 The sync keys follow lazygit, which is why graduate is `[G]` and promote is `[m]`
 rather than the `[g]`/`[p]` they used to be — `[p]` and `[P]` are pull and push
@@ -107,8 +108,41 @@ An action does not take the screen away. Its output streams into a panel in the
 bottom-right corner while the table stays drawn and navigable — `j`/`k` and
 `[enter]` keep working mid-push — and `[esc]` dismisses the panel once the
 command has finished. `PageUp`/`PageDown` scroll its scrollback and `End` returns
-to following new output. Only one command runs at a time; a second action while
-one is in flight is refused rather than queued.
+to following new output.
+
+### Chaining commands
+
+Only one git command runs at a time, but you do not have to wait for it: an
+action pressed while one is in flight is **queued** behind it and starts the
+moment the one ahead finishes. Press `[c]` mid-push and the new roll is created
+once the push lands. The queued command continues the same panel under a
+`── title ──` divider, so the whole chain reads as one log, and the status bar
+lists what is still waiting (`⏳ 2 queued: git fetch --prune → rf create`).
+
+When a command **fails**, the queue is *held*, not run and not thrown away —
+the commands behind it were chosen assuming it would succeed. The status bar
+turns red and stays that way even after `[esc]` closes the panel. Resolve the
+problem — a merge conflict is the usual one, and `gg` opens lazygit to fix it
+(lazygit is refused only while a command is actually running, never while the
+queue is merely held) — then:
+
+- `[s]` resumes the queue from the next command;
+- `[S]` drops every queued command.
+
+Anything you press while the queue is held joins the back of it rather than
+jumping ahead of a conflict you have not resolved yet. A push rejected as
+non-fast-forward holds the queue too: answering `y` to the force prompt runs the
+forced push *ahead* of the queue and releases it, `n` leaves it held.
+
+Two guards keep a chain from doing something you did not ask for:
+
+- Keys that act on the **checked-out branch** — `[i]`, `[I]`, `[b]`, `[v]`,
+  `[p]`, `[P]`, `PP` — are refused while a queued or running `space` switch or
+  `[c]` create is pending, because they capture the branch when pressed and
+  would act on a different one by the time their turn came. Press them again
+  once the switch has run.
+- `q` with commands queued only warns the first time; a second `q` quits and
+  drops them.
 
 `gg` is the exception: lazygit is full-screen and owns the terminal, so `rf`
 suspends, hands it over, and redraws when lazygit exits. Set `lazygit_command` in
