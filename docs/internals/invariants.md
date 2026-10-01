@@ -39,6 +39,20 @@ long list — that keeps two rolls adding rules in different areas from collidin
 - Roll numbers are monotonically increasing; detect from local + remote branches combined.
 - Branch resolution always tries local first, then `origin/<branch>` as fallback.
   Functions that need the ref string should return `Option<String>` (null = doesn't exist).
+- A dependency that has not graduated (`RollState::Active`/`Blocked`) is a real
+  `⛔ blocker` — the ordering constraint. Whether it has also *moved* since the
+  dependent integrated it is a separate question, answered by an ancestry check
+  (`RollInfo::stale_deps`), not by `RollState`: an `Active` dependency that
+  keeps gaining commits is exactly as stale as a `Diverged` one that graduated
+  and then moved, and either must be surfaced as needing reintegration
+  (`⚠ reintegrate` in `tui::rolls::dep_rows`/`dependent_rows`, the same `⚠` in
+  the plain table and `stale_deps` in `--json`). The two signals are not
+  mutually exclusive and must not be conflated into one marker: a dependency
+  can be both an active blocker and stale at once, and collapsing that to
+  "blocked" alone hides the staleness, while gating the reintegration notice on
+  `RollState::Diverged` alone misses every dependency that is stale while still
+  active — exactly the case that matters before merging a batch of dependent
+  rolls against a dependency someone keeps pushing to.
 
 ## Verification
 
@@ -98,12 +112,19 @@ long list — that keeps two rolls adding rules in different areas from collidin
   The TUI's `[t]` is the same command and inherits the same rule — it builds its
   scope with `PruneScope::tidy`, whose `remote: false` is the thing that keeps it
   out of this list.
-- *Advancing* a ref on the remote happens in one place: the TUI's `[P]`, via
-  `core::sync::run_push`. It is a different act from a delete and is governed by
-  different rules, which is why it is a separate bullet rather than a fourth
-  entry above:
-  - It is always user-initiated on the branch under the cursor. Nothing pushes as
-    a side effect of another op, and there is no `--all`.
+- *Advancing* a ref on the remote happens through one function,
+  `core::sync::run_push`, reached from the TUI's `[P]` and `PP`. It is a
+  different act from a delete and is governed by different rules, which is why it
+  is a separate bullet rather than a fourth entry above:
+  - It is always user-initiated. Nothing pushes as a side effect of another op.
+  - `PP` is the one bulk form, and it exists only because it cannot do anything
+    `[P]` would have stopped to ask about. `tui::rolls::plan_push_all` queues a
+    branch **only** when it is ahead of its upstream or has none — a
+    fast-forward, or a creation. Behind/diverged branches are skipped, so the
+    bulk key can never be what forces a push; a `gone` upstream is skipped too,
+    so it can never resurrect a branch `rf prune` or `rf clean --with-remote`
+    deleted on purpose. Both halves are reported, never silently dropped. A wider
+    `PP` is not a feature request — it is the thing this rule forbids.
   - A non-fast-forward push is never forced silently. Either the tracking state
     already shows the branch is behind, or git refuses and
     `core::sync::is_rejection` recognises the refusal; either way the user answers

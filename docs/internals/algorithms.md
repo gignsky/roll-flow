@@ -94,6 +94,53 @@ graduated too. That is accurate — N's commits really are on rolling, carried i
 M — and the `⛔ blocked` gate is what keeps it from happening out of order. It is
 only reachable at all via `rf graduate --force`.
 
+Integrating the rolling branch itself (`[I]`, see
+[integrate](../commands/integrate.md#i--integrate-rolling)) is the one case Method
+2b cannot read off the subject: `git merge --no-ff <rolling>` leaves a subject
+naming rolling, not a roll, so the scan above finds nothing even though the merge
+just brought in every roll already graduated onto it. `branches::integration_deps`
+handles it as a narrow, deliberate exception to "file overlap and broad ancestry
+are not used": when one of the merges in range names the rolling branch, it falls
+back to ancestry — checking each known graduated roll's graduation commit (from
+the same `scan_graduated` pass `list_rolls` already did) against the roll's new
+tip.
+
+A plain ancestor check is not enough, and was the actual shape of a real bug: a
+graduation from months ago is an ancestor of nearly every branch created after
+it, because `rf promote` folds it into stable and every roll forks from stable.
+Checking only "is this commit now an ancestor of the roll" therefore reported a
+dependency on the repo's *entire* graduation history on every roll that had ever
+done an `[I]` merge — exactly the explosion the opening paragraph says this
+function avoids. The fix is to also require the commit be *absent* from
+`base`'s ancestry (the same `base` the subject scan above is ranged over): a
+graduation only counts if it is newly reachable in `base..roll`, i.e. actually
+introduced by this merge, not merely inherited from stable before the roll
+branched. A roll that shares history with another roll only through stable
+gains no dependency from it.
+
+**Staleness after integration.** `⛔ blocked` only covers a dependency that
+has not graduated at all (`RollState::Active`/`Blocked`) — the ordering
+constraint. That is a *state* question and answers nothing about whether N has
+kept moving since M integrated it: N can gain commits on its own branch at any
+point, blocked or not, graduated or not, and none of that is blocking M's
+graduation (the ordering constraint only cares about N reaching rolling once).
+So staleness is tracked as its own signal, `RollInfo::stale_deps`
+(`branches::dep_tip_missing`): a direct `git merge-base --is-ancestor` check of
+N's *current* tip against M, independent of `RollState` entirely. A dependency
+that is still `Active` and simply kept gaining commits after `[i]` is exactly
+as stale as one that graduated and then diverged — both fail the ancestry
+check the same way, and `dep_tip_missing` does not care which.
+
+This is why `is_blocker` and `needs_reintegration` (`tui::rolls::DepRow`) are
+not mutually exclusive: a dependency can be both still-ungraduated *and*
+stale, which is precisely the case that matters before merging a batch of
+dependent rolls against a dependency someone keeps pushing to — each dependent
+needs to say whether it has that dependency's latest work, not just whether
+the dependency has graduated. The plain table surfaces the same signal with a
+`⚠` suffix on the dep number (`branches::format_deps_with_staleness`), and
+`rf list/status --json` carries it as `stale_deps`, so the check does not
+require opening the detail view.
+
 **Method 3 — file overlap**: if rolls modify the same files and the other roll has a
 lower number, it's a dependency. Uses `--first-parent --no-merges` on the other roll
 to avoid false positives from cross-merges.

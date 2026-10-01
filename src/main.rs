@@ -1268,7 +1268,7 @@ fn cmd_list_text(no_tui: bool, deps: bool) -> Result<()> {
         let deps_col = if deps {
             format!(
                 "  {:<dep_w$}  {}",
-                branches::format_roll_numbers(&roll.deps),
+                branches::format_deps_with_staleness(&roll.deps, &roll.stale_deps),
                 branches::format_roll_numbers(&roll.dependents),
             )
         } else {
@@ -1355,20 +1355,27 @@ pub(crate) const DEPENDANTS_HDR: &str = "dependants";
 /// Widths for the `deps` / `dependants` columns: wide enough for the header and
 /// for the longest comma-joined number list in the table. Trailing whitespace on
 /// the last column is trimmed by the caller's format, so only `deps` needs a
-/// computed width — `dependants` is returned for the separator rule.
+/// computed width — `dependants` is returned for the separator rule. `deps`
+/// measures [`branches::format_deps_with_staleness`] rather than the plain
+/// listing, so a `⚠` suffix never gets truncated by a width computed without it.
 pub(crate) fn dep_column_widths(rolls: &[branches::RollInfo]) -> (usize, usize) {
-    let widest = |pick: fn(&branches::RollInfo) -> &Vec<u32>, hdr: &str| {
-        rolls
-            .iter()
-            .map(|r| branches::format_roll_numbers(pick(r)).chars().count())
-            .max()
-            .unwrap_or(0)
-            .max(hdr.chars().count())
-    };
-    (
-        widest(|r| &r.deps, DEPS_HDR),
-        widest(|r| &r.dependents, DEPENDANTS_HDR),
-    )
+    let deps_w = rolls
+        .iter()
+        .map(|r| {
+            branches::format_deps_with_staleness(&r.deps, &r.stale_deps)
+                .chars()
+                .count()
+        })
+        .max()
+        .unwrap_or(0)
+        .max(DEPS_HDR.chars().count());
+    let dependants_w = rolls
+        .iter()
+        .map(|r| branches::format_roll_numbers(&r.dependents).chars().count())
+        .max()
+        .unwrap_or(0)
+        .max(DEPENDANTS_HDR.chars().count());
+    (deps_w, dependants_w)
 }
 
 #[derive(Serialize)]
@@ -1402,6 +1409,13 @@ struct JsonRoll {
     /// The `[package]` version at this roll's tip. `null` in repos with no
     /// `Cargo.toml`, which is the same absence the tables render as a dash.
     version: Option<String>,
+    /// Subset of `deps` whose current tip this roll has not integrated — the
+    /// ancestry check behind the TUI's `⚠ reintegrate` marker, exposed so a
+    /// script deciding whether to merge a batch of dependent rolls can check
+    /// each one is caught up with a still-moving dependency before doing so,
+    /// rather than inferring it from `state` (which only answers whether the
+    /// dependency has graduated, not whether it has moved since).
+    stale_deps: Vec<u32>,
 }
 
 fn rolls_for_json(config: &Config, rolls: Vec<branches::RollInfo>) -> Vec<JsonRoll> {
@@ -1417,6 +1431,7 @@ fn rolls_for_json(config: &Config, rolls: Vec<branches::RollInfo>) -> Vec<JsonRo
             is_current: r.is_current,
             deps: r.deps,
             dependants: r.dependents,
+            stale_deps: r.stale_deps,
         })
         .collect()
 }
