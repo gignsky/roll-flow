@@ -3,6 +3,7 @@ mod core;
 mod error;
 mod tui;
 
+use std::collections::HashMap;
 use std::io::IsTerminal;
 
 use anyhow::{bail, Context, Result};
@@ -10,7 +11,7 @@ use clap::Parser;
 use serde::Serialize;
 
 use cli::{Cli, Cmd};
-use core::version::{BumpLevel, VersionCheck, VersionStatus};
+use core::version::{self, BumpLevel, VersionCheck, VersionStatus};
 use core::{branches, config::Config, git, ops};
 
 fn main() -> Result<()> {
@@ -875,7 +876,10 @@ fn cmd_status_json() -> Result<()> {
 fn cmd_list_json() -> Result<()> {
     let config = Config::load()?;
     let rolls = branches::list_rolls(&config)?;
-    println!("{}", serde_json::to_string_pretty(&rolls_for_json(rolls))?);
+    println!(
+        "{}",
+        serde_json::to_string_pretty(&rolls_for_json(&config, rolls))?
+    );
     Ok(())
 }
 
@@ -1219,13 +1223,22 @@ fn cmd_list_text(no_tui: bool, deps: bool) -> Result<()> {
     let state_w = "⛔ blocked".len();
 
     let (dep_w, dependant_w) = dep_column_widths(&rolls);
+    // Empty in a repo with no `Cargo.toml`, which drops the column entirely.
+    let (versions, ver_w) = version_column(&config, &rolls);
 
     println!(
-        "  {num:>3}  {name:<nw$}  {loc:<3}  {state:<sw$}{deps_hdr}",
+        "  {num:>3}  {name:<nw$}  {loc:<3}  {state:<sw$}{ver_hdr}{deps_hdr}",
         num = "#",
         name = "branch",
         loc = "loc",
         state = "state",
+        ver_hdr = if versions.is_empty() {
+            String::new()
+        } else if deps {
+            format!("  {VERSION_HDR:<ver_w$}")
+        } else {
+            format!("  {VERSION_HDR}")
+        },
         deps_hdr = if deps {
             format!("  {DEPS_HDR:<dep_w$}  {DEPENDANTS_HDR}")
         } else {
@@ -1235,9 +1248,14 @@ fn cmd_list_text(no_tui: bool, deps: bool) -> Result<()> {
         sw = state_w,
     );
     println!(
-        "  ───  {sep_e}  ───  {sep_s}{sep_d}",
+        "  ───  {sep_e}  ───  {sep_s}{sep_v}{sep_d}",
         sep_e = "─".repeat(name_w),
         sep_s = "─".repeat(state_w),
+        sep_v = if versions.is_empty() {
+            String::new()
+        } else {
+            format!("  {}", "─".repeat(ver_w))
+        },
         sep_d = if deps {
             format!("  {}  {}", "─".repeat(dep_w), "─".repeat(dependant_w))
         } else {
@@ -1250,14 +1268,29 @@ fn cmd_list_text(no_tui: bool, deps: bool) -> Result<()> {
         let deps_col = if deps {
             format!(
                 "  {:<dep_w$}  {}",
-                branches::format_roll_numbers(&roll.deps),
+                branches::format_deps_with_staleness(&roll.deps, &roll.stale_deps),
                 branches::format_roll_numbers(&roll.dependents),
             )
         } else {
             String::new()
         };
+        // Padded only when the deps columns follow it, so a last column leaves
+        // no trailing whitespace — the same rule `dependants` follows.
+        let ver_col = if versions.is_empty() {
+            String::new()
+        } else {
+            let v = versions
+                .get(&roll.branch)
+                .map(String::as_str)
+                .unwrap_or("—");
+            if deps {
+                format!("  {v:<ver_w$}")
+            } else {
+                format!("  {v}")
+            }
+        };
         println!(
-            "{cur} {num:>3}  {name:<nw$}  {loc:<3}  {state:<sw$}{deps_col}",
+            "{cur} {num:>3}  {name:<nw$}  {loc:<3}  {state:<sw$}{ver_col}{deps_col}",
             num = roll.number,
             name = roll.branch,
             loc = roll.location.symbol(),
@@ -1270,6 +1303,50 @@ fn cmd_list_text(no_tui: bool, deps: bool) -> Result<()> {
     Ok(())
 }
 
+/// Header for the per-branch crate version, shared by both plain tables.
+pub(crate) const VERSION_HDR: &str = "version";
+
+/// The version string to print per roll, keyed by branch, plus the column width.
+///
+/// An empty map means "no column": either the repo has no `Cargo.toml` at all —
+/// every dotfiles repo — or nothing readable was found, and in both cases the
+/// table is better off without a column of dashes. The same rule the TUI table
+/// and the header version follow.
+///
+/// Versions are read at [`branches::content_ref`] per roll, so the plain tables
+/// and the TUI report the same commit's manifest.
+pub(crate) fn version_column(
+    config: &Config,
+    rolls: &[branches::RollInfo],
+) -> (HashMap<String, String>, usize) {
+    let refs: Vec<String> = rolls
+        .iter()
+        .map(|r| branches::content_ref(&r.branch, &r.location))
+        .collect();
+    let by_ref = version::versions_at(&config.repo_root, &refs);
+
+    let by_branch: HashMap<String, String> = rolls
+        .iter()
+        .zip(refs.iter())
+        .filter_map(|(roll, refspec)| {
+            let v = by_ref.get(refspec)?;
+            // The numbers alone, never `Display` — see `tui::rolls::version_cell`.
+            Some((
+                roll.branch.clone(),
+                format!("{}.{}.{}", v.major, v.minor, v.patch),
+            ))
+        })
+        .collect();
+
+    let width = by_branch
+        .values()
+        .map(|v| v.chars().count())
+        .max()
+        .unwrap_or(0)
+        .max(VERSION_HDR.chars().count());
+    (by_branch, width)
+}
+
 /// Column headers for the dependency pair, shared by `rf list --no-tui --deps`
 /// and `rf status --no-tui` so the two tables read identically.
 pub(crate) const DEPS_HDR: &str = "deps";
@@ -1278,20 +1355,27 @@ pub(crate) const DEPENDANTS_HDR: &str = "dependants";
 /// Widths for the `deps` / `dependants` columns: wide enough for the header and
 /// for the longest comma-joined number list in the table. Trailing whitespace on
 /// the last column is trimmed by the caller's format, so only `deps` needs a
-/// computed width — `dependants` is returned for the separator rule.
+/// computed width — `dependants` is returned for the separator rule. `deps`
+/// measures [`branches::format_deps_with_staleness`] rather than the plain
+/// listing, so a `⚠` suffix never gets truncated by a width computed without it.
 pub(crate) fn dep_column_widths(rolls: &[branches::RollInfo]) -> (usize, usize) {
-    let widest = |pick: fn(&branches::RollInfo) -> &Vec<u32>, hdr: &str| {
-        rolls
-            .iter()
-            .map(|r| branches::format_roll_numbers(pick(r)).chars().count())
-            .max()
-            .unwrap_or(0)
-            .max(hdr.chars().count())
-    };
-    (
-        widest(|r| &r.deps, DEPS_HDR),
-        widest(|r| &r.dependents, DEPENDANTS_HDR),
-    )
+    let deps_w = rolls
+        .iter()
+        .map(|r| {
+            branches::format_deps_with_staleness(&r.deps, &r.stale_deps)
+                .chars()
+                .count()
+        })
+        .max()
+        .unwrap_or(0)
+        .max(DEPS_HDR.chars().count());
+    let dependants_w = rolls
+        .iter()
+        .map(|r| branches::format_roll_numbers(&r.dependents).chars().count())
+        .max()
+        .unwrap_or(0)
+        .max(DEPENDANTS_HDR.chars().count());
+    (deps_w, dependants_w)
 }
 
 #[derive(Serialize)]
@@ -1322,12 +1406,24 @@ struct JsonRoll {
     /// consumers see the same dependency graph the TUI draws.
     deps: Vec<u32>,
     dependants: Vec<u32>,
+    /// The `[package]` version at this roll's tip. `null` in repos with no
+    /// `Cargo.toml`, which is the same absence the tables render as a dash.
+    version: Option<String>,
+    /// Subset of `deps` whose current tip this roll has not integrated — the
+    /// ancestry check behind the TUI's `⚠ reintegrate` marker, exposed so a
+    /// script deciding whether to merge a batch of dependent rolls can check
+    /// each one is caught up with a still-moving dependency before doing so,
+    /// rather than inferring it from `state` (which only answers whether the
+    /// dependency has graduated, not whether it has moved since).
+    stale_deps: Vec<u32>,
 }
 
-fn rolls_for_json(rolls: Vec<branches::RollInfo>) -> Vec<JsonRoll> {
+fn rolls_for_json(config: &Config, rolls: Vec<branches::RollInfo>) -> Vec<JsonRoll> {
+    let (versions, _) = version_column(config, &rolls);
     rolls
         .into_iter()
         .map(|r| JsonRoll {
+            version: versions.get(&r.branch).cloned(),
             branch: r.branch,
             number: r.number,
             state: r.state.label().to_string(),
@@ -1335,6 +1431,7 @@ fn rolls_for_json(rolls: Vec<branches::RollInfo>) -> Vec<JsonRoll> {
             is_current: r.is_current,
             deps: r.deps,
             dependants: r.dependents,
+            stale_deps: r.stale_deps,
         })
         .collect()
 }
