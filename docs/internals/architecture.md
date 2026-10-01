@@ -21,7 +21,7 @@ src/
     clean.rs
   tui/
     mod.rs             terminal enter/exit, and suspend/resume for lazygit
-    rolls.rs           the rolls view: state, event loop, table, modals
+    rolls.rs           the rolls view: state, event loop, table, modals, keymap
     output.rs          background jobs and the floating output panel
   core/
     mod.rs
@@ -35,10 +35,16 @@ src/
     version.rs         version gate and release tags
 ```
 
-Two notes on that layout:
+Three notes on that layout:
 
 - There is one TUI view, not one per command. `rf status` and `rf list` are the
   same screen with different defaults; `tui::rolls` serves both.
+- The keymap is declared once, in `tui::rolls::BINDINGS`. The status bar renders
+  the entries carrying a `hint`; `?` fuzzy-searches all of them and runs the
+  selected one by *replaying its keystrokes* through the ordinary key handler.
+  A new key is a row there plus an arm in `handle_browsing` — never a hint
+  string written out by hand, which is what the four-line status bar used to
+  require and what kept falling out of date.
 - `core` returns data and never prints. The single exception is child-process
   output, which is why `core::proc` exists: it routes a subprocess's stdio to the
   terminal for the CLI and to `tui::output`'s panel for the TUI, chosen by a
