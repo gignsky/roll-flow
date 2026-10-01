@@ -66,7 +66,19 @@ fn main() -> Result<()> {
                 }
             }
         }
-        Cmd::Verify { dry_run, bump, yes } => cmd_verify(dry_run, bump, yes)?,
+        Cmd::Verify {
+            dry_run,
+            bump,
+            yes,
+            all,
+            state,
+        } => {
+            if all {
+                cmd_verify_all(state)?
+            } else {
+                cmd_verify(dry_run, bump, yes)?
+            }
+        }
         Cmd::Graduate {
             dry_run,
             force,
@@ -357,6 +369,70 @@ fn cmd_verify(dry_run: bool, bump: Option<BumpLevel>, yes: bool) -> Result<()> {
         "Verification passed: {} -> {}",
         outcome.source, outcome.target
     );
+    Ok(())
+}
+
+/// `rf verify --all [--state <set>]` — verify every roll in the set in turn.
+///
+/// A thin renderer over `ops::verify_many`, which owns the switch-and-return
+/// discipline; the TUI's `[V]` sits on the same routine so the two agree on
+/// every rule. No bump offer: a bump is a commit on one branch, and this pass
+/// walks many.
+fn cmd_verify_all(set: branches::VerifySet) -> Result<()> {
+    let config = Config::load()?;
+    let rolls = branches::list_rolls(&config)?;
+    let selected = set.select(&rolls);
+    if selected.is_empty() {
+        println!("no rolls to verify ({})", set.label());
+        return Ok(());
+    }
+    println!(
+        "Verifying {} roll{} ({})",
+        selected.len(),
+        if selected.len() == 1 { "" } else { "s" },
+        set.label()
+    );
+
+    let results = ops::verify_many(&config, &selected)?;
+    let mut failed = Vec::new();
+    let mut passed = 0;
+    let mut skipped = 0;
+    for result in &results {
+        println!("\n── {} ──", result.branch);
+        if let Some(outcome) = &result.outcome {
+            if outcome.diverged_note {
+                println!(
+                    "note: '{}' has commits not in '{}'; graduation/promotion will create a --no-ff merge",
+                    outcome.target, outcome.source
+                );
+            }
+            render_version_check(&outcome.version, &outcome.source, &outcome.target);
+            render_gate_notices(&outcome.gate_notices);
+            render_gate_notices(&outcome.host_notices);
+            render_host_results(&outcome.host_results);
+        }
+        match &result.verdict {
+            ops::VerifyVerdict::Passed => {
+                passed += 1;
+                println!("PASSED");
+            }
+            ops::VerifyVerdict::Failed(why) => {
+                failed.push(result.branch.clone());
+                println!("FAILED: {why}");
+            }
+            ops::VerifyVerdict::Skipped(why) => {
+                skipped += 1;
+                println!("skipped: {why}");
+            }
+        }
+    }
+    println!(
+        "\n{passed} passed, {} failed, {skipped} skipped",
+        failed.len()
+    );
+    if !failed.is_empty() {
+        bail!("verification failed for: {}", failed.join(", "));
+    }
     Ok(())
 }
 
