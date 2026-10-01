@@ -390,6 +390,32 @@ impl std::fmt::Display for MergeConflict {
 
 impl std::error::Error for MergeConflict {}
 
+/// A conflict `rf verify` predicted from a trial merge, before any merge ran.
+///
+/// The sibling of [`MergeConflict`]: same report, but nothing was attempted,
+/// aborted, or checked out, so there is nothing to say about where the user is
+/// now. Typed for the same reason — the CLI renders the report and the ways
+/// forward rather than a flat string.
+#[derive(Debug)]
+pub(crate) struct PredictedConflict {
+    pub report: ConflictReport,
+}
+
+impl std::fmt::Display for PredictedConflict {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let n = self.report.conflicts.len();
+        write!(
+            f,
+            "merging '{}' into '{}' would conflict in {n} file{}",
+            self.report.source,
+            self.report.target,
+            if n == 1 { "" } else { "s" },
+        )
+    }
+}
+
+impl std::error::Error for PredictedConflict {}
+
 impl ConflictReport {
     pub fn is_empty(&self) -> bool {
         self.conflicts.is_empty()
@@ -499,41 +525,67 @@ fn parse_target_log(out: &str) -> Vec<TargetLogEntry> {
 /// this runs on an already-failing path — a diagnosis that cannot be made
 /// must not hide the merge failure it was diagnosing.
 fn diagnose_conflicts(repo: &Path, source: &str, target: &str) -> ConflictReport {
-    let mut report = ConflictReport {
+    let paths: Vec<String> = git::capture_git(repo, &["diff", "--name-only", "--diff-filter=U"])
+        .map(|out| {
+            out.lines()
+                .map(str::trim)
+                .filter(|p| !p.is_empty())
+                .map(String::from)
+                .collect()
+        })
+        .unwrap_or_default();
+    attribute_conflicts(repo, source, target, &paths)
+}
+
+/// Attribute each conflicted path to what changed it on the target's
+/// first-parent line since the merge base.
+///
+/// Shared by the two places a conflict is found: [`diagnose_conflicts`], which
+/// reads the paths off a merge that just stopped, and [`verify`], which gets
+/// them from a trial merge in the object store before any merge is attempted.
+/// One attribution means the two describe the same conflict the same way.
+/// Best-effort for the same reason as the diagnosis: a path whose history
+/// cannot be read is reported with no culprits rather than as an error.
+fn attribute_conflicts(
+    repo: &Path,
+    source: &str,
+    target: &str,
+    paths: &[String],
+) -> ConflictReport {
+    let base = git::merge_base(repo, source, target).ok();
+    let conflicts = paths
+        .iter()
+        .map(|path| {
+            let culprits = match &base {
+                Some(base) => {
+                    let range = format!("{base}..{target}");
+                    git::capture_git(
+                        repo,
+                        &[
+                            "log",
+                            "--first-parent",
+                            "--format=%H%x09%P%x09%s",
+                            &range,
+                            "--",
+                            path,
+                        ],
+                    )
+                    .map(|out| attribute_culprits(&parse_target_log(&out), source))
+                    .unwrap_or_default()
+                }
+                None => Vec::new(),
+            };
+            Conflict {
+                path: path.clone(),
+                culprits,
+            }
+        })
+        .collect();
+    ConflictReport {
         source: source.to_string(),
         target: target.to_string(),
-        conflicts: Vec::new(),
-    };
-    let Ok(paths) = git::capture_git(repo, &["diff", "--name-only", "--diff-filter=U"]) else {
-        return report;
-    };
-    let base = git::merge_base(repo, source, target).ok();
-    for path in paths.lines().map(str::trim).filter(|p| !p.is_empty()) {
-        let culprits = match &base {
-            Some(base) => {
-                let range = format!("{base}..{target}");
-                git::capture_git(
-                    repo,
-                    &[
-                        "log",
-                        "--first-parent",
-                        "--format=%H%x09%P%x09%s",
-                        &range,
-                        "--",
-                        path,
-                    ],
-                )
-                .map(|out| attribute_culprits(&parse_target_log(&out), source))
-                .unwrap_or_default()
-            }
-            None => Vec::new(),
-        };
-        report.conflicts.push(Conflict {
-            path: path.to_string(),
-            culprits,
-        });
+        conflicts,
     }
-    report
 }
 
 /// Re-run a conflicting merge and *leave it* in the working tree.
@@ -1305,10 +1357,13 @@ pub(crate) struct VerifyOutcome {
     /// Crate-version comparison of source against target. `NotApplicable` when
     /// the repo has no `Cargo.toml` or the gate is disabled.
     pub version: VersionCheck,
-    /// What the eventual `--no-ff` merge would do. Conflicts only reach the
-    /// caller under `--dry-run`; otherwise `verify` fails on them before any
-    /// gate runs.
-    pub merge_preview: git::MergePreview,
+    /// Conflicts the eventual `--no-ff` merge would hit. Only ever `Some`
+    /// under `--dry-run`: a real run fails with [`PredictedConflict`] instead,
+    /// before any gate runs.
+    pub conflicts: Option<ConflictReport>,
+    /// Set when the trial merge could not be run (git older than 2.38), with
+    /// git's reason. Not a failure: the real merge still stops on a conflict.
+    pub conflict_check_skipped: Option<String>,
 }
 
 pub(crate) fn verify(config: &Config, dry_run: bool) -> Result<VerifyOutcome> {
@@ -1349,14 +1404,22 @@ pub(crate) fn verify(config: &Config, dry_run: bool) -> Result<VerifyOutcome> {
     // tree we are about to gate is left untouched. Checked before the version
     // gate and the gates: a conflict means graduate/promote would stop at the
     // merge however the gates come out, so there is no point running them.
-    let merge_preview = if diverged_note {
+    let preview = if diverged_note {
         git::preview_merge(&config.repo_root, &target, &source)?
     } else {
         git::MergePreview::Clean
     };
-    if !dry_run {
-        if let git::MergePreview::Conflicts(paths) = &merge_preview {
-            bail!(merge_conflict_error(&source, &target, paths));
+    let mut conflicts = None;
+    let mut conflict_check_skipped = None;
+    match preview {
+        git::MergePreview::Clean => {}
+        git::MergePreview::Unavailable(why) => conflict_check_skipped = Some(why),
+        git::MergePreview::Conflicts(paths) => {
+            let report = attribute_conflicts(&config.repo_root, &source, &target, &paths);
+            if !dry_run {
+                return Err(anyhow::Error::new(PredictedConflict { report }));
+            }
+            conflicts = Some(report);
         }
     }
 
@@ -1391,26 +1454,9 @@ pub(crate) fn verify(config: &Config, dry_run: bool) -> Result<VerifyOutcome> {
         host_notices: host_report.notices,
         failed_hosts,
         version,
-        merge_preview,
+        conflicts,
+        conflict_check_skipped,
     })
-}
-
-/// The error `rf verify` raises when merging `source` into `target` would
-/// conflict, with the fix spelled out: settle it on the source branch, where
-/// the work belongs, so the graduation/promotion merge itself stays clean.
-pub(crate) fn merge_conflict_error(source: &str, target: &str, paths: &[String]) -> String {
-    let mut msg = format!(
-        "merging '{source}' into '{target}' would conflict in {} file{}:\n",
-        paths.len(),
-        if paths.len() == 1 { "" } else { "s" }
-    );
-    for path in paths {
-        msg.push_str(&format!("  {path}\n"));
-    }
-    msg.push_str(&format!(
-        "resolve it on '{source}' first: `git merge {target}`, fix the conflicts, commit, then re-run `rf verify`"
-    ));
-    msg
 }
 
 // ── graduate ────────────────────────────────────────────────────────────────

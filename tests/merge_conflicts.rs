@@ -49,9 +49,19 @@ fn verify_fails_when_graduation_would_conflict() {
         combined.contains("shared.txt"),
         "expected the path: {combined}"
     );
+    // Attributed to the roll that brought the change in, with the same fix
+    // `rf graduate` would recommend.
+    assert!(
+        combined.contains("it came in with roll/1-0611-first"),
+        "expected the culprit roll: {combined}"
+    );
+    assert!(
+        combined.contains("rf integrate roll/1-0611-first"),
+        "expected integrate advice: {combined}"
+    );
     assert!(
         combined.contains("git merge rolling"),
-        "expected resolution advice: {combined}"
+        "expected the manual fallback: {combined}"
     );
 
     assert_eq!(sb.current_branch(), before);
@@ -76,8 +86,14 @@ fn verify_dry_run_warns_about_a_conflict_but_passes() {
 fn verify_passes_once_the_conflict_is_resolved_on_the_roll() {
     let sb = conflicting_rolls();
 
-    let (merged, _, _) = sb.git_try(&["merge", "--no-edit", "rolling"]);
-    assert!(!merged, "the setup should conflict");
+    // The recommended fix: integrate the culprit, which reproduces the
+    // conflict on this roll to be resolved here.
+    let out = sb.rf(&["integrate", "roll/1-0611-first"]);
+    assert!(
+        !out.success,
+        "the integrate should conflict: {}",
+        out.combined()
+    );
     sb.write("shared.txt", "both\n");
     sb.git(&["add", "shared.txt"]);
     sb.git(&["commit", "--no-edit"]);
@@ -113,7 +129,9 @@ fn verify_fails_when_promotion_would_conflict() {
     let combined = out.combined();
     assert!(
         combined.contains("merging 'rolling' into 'main' would conflict")
-            && combined.contains("shared.txt"),
+            && combined.contains("shared.txt")
+            && combined.contains("direct stable edit")
+            && !combined.contains("rf integrate"),
         "expected a promotion conflict report: {combined}"
     );
     assert_eq!(sb.current_branch(), "rolling");

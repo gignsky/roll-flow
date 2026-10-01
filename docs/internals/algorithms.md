@@ -114,6 +114,25 @@ clean by the time anyone acts on it; a merge that failed with no conflicted
 paths keeps the plain error. Diagnosis never errors: it runs on a failing path
 and must not hide the failure it explains.
 
+### Predicting it in `rf verify`
+
+`rf verify` finds the same conflict *before* any merge, with a trial merge in the
+object store: `git merge-tree --write-tree --name-only --no-messages -z <target>
+<source>` (`git::preview_merge`). Exit 0 is clean, 1 is conflicted, and anything
+else — git older than 2.38, which lacks `--write-tree` — is reported as a
+skipped check, never a failure, since the real merge still stops on a conflict.
+Nothing is checked out, staged, or left behind but unreachable objects for `git
+gc`, so it is safe on the tree verify is about to gate.
+
+The paths go through the same attribution as above (`attribute_conflicts`, which
+`diagnose_conflicts` also calls), so verify and graduate describe one conflict
+identically. It runs only for a diverged pair — a fast-forwardable target cannot
+conflict — and before the version gate and the configured gates, since a merge
+that will stop makes their result moot. A real run fails with a typed
+`ops::PredictedConflict`; `--dry-run` reports it as a warning. Verify prints the
+fix (`rf integrate <culprit>` on a roll, else merging the target into the
+source) but never runs it: it vouches for a merge, it does not start one.
+
 ## Merge commit message format
 
 Graduation:
