@@ -13,7 +13,7 @@
 //! aside to make room for it.
 
 use std::collections::HashMap;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use anyhow::{anyhow, bail, Result};
 use crossterm::event::{self, Event, KeyCode, KeyEventKind};
@@ -203,6 +203,12 @@ enum Mode {
         /// The roll branch an action targets (graduate); `None` for repo-wide
         /// ops (promote / update).
         target: Option<String>,
+        /// For `[m]` on a roll row: the rolls that graduated ahead of it and
+        /// would land on stable with it. Read once when the modal opens — it
+        /// costs git calls, and a draw must not — and empty for every other
+        /// action. The modal states them because advancing stable to one roll's
+        /// graduation commit is not what "promote this roll" sounds like.
+        carried: Vec<String>,
     },
     /// Read-only drill-down for a single roll: its identity plus its dependency
     /// rows (issue #61). A snapshot of the selected roll is captured on open so
@@ -229,6 +235,15 @@ enum Mode {
     /// opened, so the previews it shows and the bump it applies agree.
     Bump {
         current: Semver,
+    },
+    /// `PP`: confirm pushing every branch that needs it.
+    ///
+    /// Its own variant rather than a `Confirm` action, for the same reason
+    /// `Delete` is: the answer carries a list of resolved [`SyncTarget`]s that
+    /// `Action` cannot hold, and a key that writes to several remote refs at
+    /// once has to show which ones before it does.
+    PushAll {
+        plan: PushAllPlan,
     },
     /// `?`: the searchable keymap. Holds the filter text and the cursor's
     /// position in the *filtered* list, which is why editing the query resets
@@ -419,14 +434,25 @@ pub(crate) fn initial_selection(bases: &[BaseBranch], rolls: &[RollInfo]) -> Opt
     Some(0)
 }
 
-/// One dependency row rendered in the [`Mode::Detail`] view. `is_blocker` marks
-/// a dep that holds the roll back — one that is not yet graduated/promoted.
+/// One dependency row rendered in the [`Mode::Detail`] view.
+///
+/// `is_blocker` and `needs_reintegration` answer different questions and are
+/// **not** mutually exclusive. `is_blocker` mirrors [`RollState::Blocked`]'s
+/// own rule: only an `Active`/`Blocked` dep actually gates graduation (the
+/// ordering constraint). `needs_reintegration` comes from
+/// [`RollInfo::stale_deps`] — a direct ancestry check against the dep's
+/// *current* tip — so it fires whenever the dep has moved since it was
+/// integrated, whatever its state: a still-`Active` dep that keeps gaining
+/// commits is just as stale as a `Diverged` one that graduated and then moved.
+/// A roll can therefore be both blocked on a dependency *and* behind its
+/// latest commits at the same time.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct DepRow {
     pub number: u32,
     pub branch: String,
     pub state: RollState,
     pub is_blocker: bool,
+    pub needs_reintegration: bool,
 }
 
 /// Owns everything needed to render and to *reload* after an action.
@@ -462,6 +488,9 @@ struct StatusApp {
     /// True after a bare `g`, waiting to see whether the next key makes it `gg`.
     /// `g` has no action of its own, so this needs no timeout.
     pending_g: bool,
+    /// When a bare `P` was pressed, waiting to see whether it becomes `PP`.
+    /// Unlike `pending_g` this *is* timed — see [`PUSH_CHORD_WINDOW`].
+    pending_push: Option<Instant>,
 }
 
 /// Entry point. Takes ownership of the data so the app can rebuild it after an
@@ -521,6 +550,126 @@ pub(crate) fn prunable_count(rolls: &[RollInfo]) -> usize {
         .iter()
         .filter(|r| matches!(r.state, RollState::Promoted))
         .count()
+}
+
+/// How long a lone `P` is held before it is taken to be a single-branch push.
+///
+/// `PP` cannot be resolved the way `gg` is — `g` does nothing on its own, so a
+/// pending `g` can wait forever for the next key, while a lone `P` has to fire
+/// by itself. So this is a real timeout: long enough that a deliberate double
+/// tap lands inside it, short enough that the ordinary `[P]` does not feel
+/// stuck. The push it starts takes seconds, so the delay is lost in the noise.
+pub(crate) const PUSH_CHORD_WINDOW: Duration = Duration::from_millis(400);
+
+/// What the key following a bare `P` makes of it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum PushChord {
+    /// A second `P`: push every branch that needs it.
+    All,
+    /// Anything else: the single-branch push the first `P` already meant.
+    Single,
+}
+
+/// Decide a pending `P` from the key that followed it.
+///
+/// Only a second `P` completes the chord; every other key — including `Esc` —
+/// falls back to the single push rather than cancelling. The first `P` is taken
+/// as the user's decision to push the selected branch, so nothing here can turn
+/// it into a no-op; the chord only ever widens what gets pushed.
+pub(crate) fn push_chord_key(code: KeyCode) -> PushChord {
+    match code {
+        KeyCode::Char('P') => PushChord::All,
+        _ => PushChord::Single,
+    }
+}
+
+/// One branch `PP` will push.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct PushItem {
+    pub target: SyncTarget,
+    /// True when the branch has no upstream yet, so this push *creates* the ref
+    /// on the remote rather than advancing one. Called out separately in the
+    /// modal because they are different acts.
+    pub creates: bool,
+}
+
+/// A branch `PP` deliberately leaves for a `[P]` of its own, and why.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct PushSkip {
+    pub branch: String,
+    pub reason: String,
+}
+
+/// What `PP` would do: the branches it pushes, and the ones it declines to.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub(crate) struct PushAllPlan {
+    pub items: Vec<PushItem>,
+    pub skipped: Vec<PushSkip>,
+}
+
+/// Plan a `PP` over every row in the table, in the order they are listed.
+///
+/// The selection rule is the point of this function, and it is deliberately
+/// narrow: **every push `PP` performs is one `[P]` would have performed without
+/// a prompt.** A branch ahead of its upstream fast-forwards it; a branch with no
+/// upstream is created and tracked, which cannot lose anything. Everything else
+/// is listed as skipped with the key to press instead:
+///
+/// - behind or diverged — pushing needs a force, and forcing is a per-branch
+///   decision behind its own y/N. A bulk key must never be the thing that
+///   overwrites a remote ref, so these are never in `items` even though they are
+///   exactly the branches whose sync column looks unfinished.
+/// - `gone` — the upstream was deleted, most likely by `rf prune` or
+///   `rf clean --with-remote`. Pushing would *resurrect* a branch someone
+///   retired on purpose, so re-creating it stays an explicit `[P]` on the row.
+///
+/// A branch with no local copy, or one in sync, is not mentioned at all: there
+/// is nothing to push and nothing to explain. So is one absent from `tracking`,
+/// which is the same state the sync column renders as `—`.
+pub(crate) fn plan_push_all(
+    rows: &[(String, BranchLocation)],
+    current_branch: &str,
+    tracking: &HashMap<String, git::LocalBranch>,
+) -> PushAllPlan {
+    let mut plan = PushAllPlan::default();
+    for (branch, location) in rows {
+        if !matches!(location, BranchLocation::Local | BranchLocation::Both) {
+            continue;
+        }
+        let target = SyncTarget::resolve(
+            branch,
+            current_branch,
+            location.clone(),
+            tracking.get(branch),
+        );
+        let mut skip = |reason: String| {
+            plan.skipped.push(PushSkip {
+                branch: branch.clone(),
+                reason,
+            })
+        };
+        match target.track {
+            None | Some(TrackState::InSync) => {}
+            Some(TrackState::Ahead(_)) => plan.items.push(PushItem {
+                target,
+                creates: false,
+            }),
+            Some(TrackState::NoUpstream) => plan.items.push(PushItem {
+                target,
+                creates: true,
+            }),
+            Some(TrackState::Behind(n)) => {
+                skip(format!("behind by {n} — [p] to pull, then [P] to force"))
+            }
+            Some(TrackState::Diverged { ahead, behind }) => skip(format!(
+                "diverged ↑{ahead}↓{behind} — [P] on the row to force"
+            )),
+            Some(TrackState::Gone) => {
+                skip("upstream deleted — [P] on the row to re-create it".to_string())
+            }
+        }
+    }
+    plan
 }
 
 /// The roll states `[t]` tidies, which are `rf tidy --state`'s default. The TUI
@@ -646,6 +795,20 @@ pub(crate) const BINDINGS: &[Binding] = &[
         group: "sync",
         hint: None,
         replay: &[KeyCode::Char('P')],
+    },
+    Binding {
+        keys: "PP",
+        // "all" earns its place: it is the word someone types looking for this,
+        // and the search is a subsequence match — a label without it returns no
+        // hits for "push all".
+        label: "push all branches that need it",
+        group: "sync",
+        hint: None,
+        // Two keystrokes, replayed back to back. The second `P` lands inside
+        // `PUSH_CHORD_WINDOW`, so the chord completes exactly as typing it
+        // would — the same trick `gg` relies on, and the reason `replay` is a
+        // slice rather than a single key.
+        replay: &[KeyCode::Char('P'), KeyCode::Char('P')],
     },
     Binding {
         keys: "f",
@@ -935,10 +1098,15 @@ fn push_version_check(lines: &mut Vec<String>, check: &VersionCheck, source: &st
 /// Build the dependency rows to show in the detail view for `selected`.
 ///
 /// Each number in `selected.deps` is looked up in `all` to recover the
-/// dependency's branch and state. A dep is flagged as a *blocker* when it is not
-/// yet graduated/promoted (state is `Active`/`Blocked`/`Diverged`) — those are
-/// what actually hold the roll back. Unknown dep numbers (not present in `all`)
-/// are skipped. The empty result means "no dependencies / not blocked".
+/// dependency's branch and state. A dep is flagged as a *blocker* when it has
+/// not yet graduated (state is `Active`/`Blocked`) — those are what actually
+/// hold the roll back, matching the same rule `list_rolls` uses to set
+/// `RollState::Blocked`. `needs_reintegration` is a separate, ancestry-based
+/// question answered by `selected.stale_deps`: has the dependency's branch
+/// moved since `selected` integrated it, whatever its state — so a dep can be
+/// both a blocker *and* stale at once (still active, and already moved again).
+/// Unknown dep numbers (not present in `all`) are skipped. The empty result
+/// means "no dependencies / not blocked".
 pub(crate) fn dep_rows(selected: &RollInfo, all: &[RollInfo]) -> Vec<DepRow> {
     selected
         .deps
@@ -948,7 +1116,8 @@ pub(crate) fn dep_rows(selected: &RollInfo, all: &[RollInfo]) -> Vec<DepRow> {
             number: dep.number,
             branch: dep.branch.clone(),
             state: dep.state.clone(),
-            is_blocker: !matches!(dep.state, RollState::Graduated | RollState::Promoted),
+            is_blocker: matches!(dep.state, RollState::Active | RollState::Blocked),
+            needs_reintegration: selected.stale_deps.contains(&dep.number),
         })
         .collect()
 }
@@ -963,23 +1132,29 @@ pub(crate) fn dep_rows(selected: &RollInfo, all: &[RollInfo]) -> Vec<DepRow> {
 /// `all`) are skipped, mirroring [`dep_rows`].
 ///
 /// A row's `is_blocker` here is repurposed to mean "this dependent is still
-/// gated by the target" — true while `target` has not yet graduated/promoted,
-/// since until then the dependent cannot advance past it. The detail view does
-/// not render a per-row blocker marker for dependents, so this flag is purely
-/// informational, but it keeps the field meaningful and testable. A roll is
-/// never its own dependent, even if a self-referential entry somehow appears.
+/// gated by the target" — true while `target` is `Active`/`Blocked`, mirroring
+/// [`dep_rows`]'s rule, since until it graduates the dependent cannot advance
+/// past it. `needs_reintegration` is the mirror image of `dep_rows`' version:
+/// it reads each dependent's *own* `stale_deps` (not `target`'s state), since
+/// whether a given dependent's copy of `target` is stale depends on when that
+/// dependent last integrated it, not on what `target` is doing now. The detail
+/// view does not render a per-row marker for dependents, so both flags are
+/// purely informational here, but they keep the fields meaningful and
+/// testable. A roll is never its own dependent, even if a self-referential
+/// entry somehow appears.
 pub(crate) fn dependent_rows(target: &RollInfo, all: &[RollInfo]) -> Vec<DepRow> {
-    let target_gates = !matches!(target.state, RollState::Graduated | RollState::Promoted);
+    let target_gates = matches!(target.state, RollState::Active | RollState::Blocked);
     target
         .dependents
         .iter()
         .filter(|num| **num != target.number)
         .filter_map(|num| all.iter().find(|r| r.number == *num))
-        .map(|dep| DepRow {
-            number: dep.number,
-            branch: dep.branch.clone(),
-            state: dep.state.clone(),
+        .map(|dependent| DepRow {
+            number: dependent.number,
+            branch: dependent.branch.clone(),
+            state: dependent.state.clone(),
             is_blocker: target_gates,
+            needs_reintegration: dependent.stale_deps.contains(&target.number),
         })
         .collect()
 }
@@ -1036,6 +1211,32 @@ pub(crate) fn promote_target_for(
             sel.state.label()
         )),
     }
+}
+
+/// The branch `[I]` would merge into the current one, or the reason it cannot.
+///
+/// Mirrors `integrate_target_for`, but the source is always the rolling branch
+/// rather than the row under the cursor — rolling isn't a roll, so it never has
+/// a row to select. This is the recovery path for a roll that fails to merge
+/// into rolling at graduation time: bring rolling into the roll here instead,
+/// resolve whatever conflicts graduation would have hit, then graduate
+/// normally. Because rolling already contains every graduated roll, the same
+/// merge picks all of them up as dependencies (method 2 in
+/// `core::dependencies`) in one step.
+pub(crate) fn integrate_rolling_target_for(
+    current_branch: &str,
+    roll_prefix: &str,
+    rolling_branch: &str,
+) -> Result<String, String> {
+    if !current_branch.starts_with(roll_prefix) {
+        return Err(format!(
+            "'{current_branch}' is not a roll branch — integrate merges into a roll"
+        ));
+    }
+    if current_branch == rolling_branch {
+        return Err(format!("'{rolling_branch}' is already the current branch"));
+    }
+    Ok(rolling_branch.to_string())
 }
 
 /// The roll `[i]` would merge into the current branch, or the reason it cannot.
@@ -1274,6 +1475,7 @@ impl StatusApp {
             job: None,
             panel: None,
             pending_g: false,
+            pending_push: None,
         }
     }
 
@@ -1283,6 +1485,7 @@ impl StatusApp {
             // Before reading input, so a job that finished during the poll is
             // reflected in this frame rather than the next one.
             self.poll_job()?;
+            self.resolve_lapsed_push();
 
             if event::poll(Duration::from_millis(50))? {
                 if let Event::Key(key) = event::read()? {
@@ -1291,6 +1494,8 @@ impl StatusApp {
                     }
                     if matches!(self.mode, Mode::Confirm { .. }) {
                         self.handle_confirm(key.code);
+                    } else if matches!(self.mode, Mode::PushAll { .. }) {
+                        self.handle_push_all(key.code);
                     } else if matches!(self.mode, Mode::ForcePush { .. }) {
                         self.handle_force_push(key.code);
                     } else if matches!(self.mode, Mode::Bump { .. }) {
@@ -1389,6 +1594,21 @@ impl StatusApp {
             return Ok(false);
         }
 
+        // `PP` pushes every branch that needs it. The first key after a bare `P`
+        // always resolves the chord and does nothing else: a second `P` makes it
+        // the bulk push, anything else falls back to the single-branch `[P]` the
+        // user has already committed to. That key is consumed rather than also
+        // acted on, because resolving may open the force-push modal or start a
+        // job — applying a browsing binding to a screen that just moved is worse
+        // than a keystroke the user can simply repeat.
+        if self.pending_push.take().is_some() {
+            match push_chord_key(code) {
+                PushChord::All => self.start_push_all(),
+                PushChord::Single => self.start_push(),
+            }
+            return Ok(false);
+        }
+
         match code {
             KeyCode::Char('q') => return Ok(true),
             // `esc` dismisses the output panel when one is up, and only quits
@@ -1435,11 +1655,12 @@ impl StatusApp {
                 }
             }
             KeyCode::Char('p') => self.start_pull(),
-            KeyCode::Char('P') => self.start_push(),
+            KeyCode::Char('P') => self.arm_push(),
             KeyCode::Char('f') => self.start_fetch(),
             KeyCode::Char('v') => self.start_verify(),
             KeyCode::Char('G') => self.request(Action::Graduate),
             KeyCode::Char('i') => self.request_integrate(),
+            KeyCode::Char('I') => self.request_integrate_rolling(),
             KeyCode::Char('b') => self.request_bump(),
             KeyCode::Char('m') => self.request(Action::Promote),
             KeyCode::Char('u') => self.request(Action::Update),
@@ -1513,10 +1734,25 @@ impl StatusApp {
     fn handle_confirm(&mut self, code: KeyCode) {
         match code {
             KeyCode::Char('y') | KeyCode::Char('Y') => {
-                if let Mode::Confirm { action, target } =
+                if let Mode::Confirm { action, target, .. } =
                     std::mem::replace(&mut self.mode, Mode::Browsing)
                 {
                     self.execute(action, target);
+                }
+            }
+            KeyCode::Char('n') | KeyCode::Char('N') | KeyCode::Esc => {
+                self.mode = Mode::Browsing;
+            }
+            _ => {}
+        }
+    }
+
+    /// Answer the `PP` modal. Only an explicit `y` pushes.
+    fn handle_push_all(&mut self, code: KeyCode) {
+        match code {
+            KeyCode::Char('y') | KeyCode::Char('Y') => {
+                if let Mode::PushAll { plan } = std::mem::replace(&mut self.mode, Mode::Browsing) {
+                    self.push_all_job(plan);
                 }
             }
             KeyCode::Char('n') | KeyCode::Char('N') | KeyCode::Esc => {
@@ -1591,8 +1827,18 @@ impl StatusApp {
             Action::Promote => promote_target_for(selected, &self.rolls).unwrap_or(None),
             _ => None,
         };
+        let carried = match (action, &target) {
+            (Action::Promote, Some(roll)) => carried_by_promoting(&self.config, roll),
+            _ => Vec::new(),
+        };
         match validation {
-            Ok(()) => self.mode = Mode::Confirm { action, target },
+            Ok(()) => {
+                self.mode = Mode::Confirm {
+                    action,
+                    target,
+                    carried,
+                }
+            }
             Err(msg) => self.message = Some(msg),
         }
     }
@@ -1626,6 +1872,31 @@ impl StatusApp {
                 self.mode = Mode::Confirm {
                     action: Action::Integrate,
                     target: Some(branch),
+                    carried: Vec::new(),
+                }
+            }
+            Err(msg) => self.message = Some(msg),
+        }
+    }
+
+    /// `[I]` — merge the rolling branch into the checked-out roll.
+    ///
+    /// Needs no selection, unlike `[i]`: the source is always rolling, which
+    /// isn't a roll row to point the cursor at.
+    fn request_integrate_rolling(&mut self) {
+        if self.busy() {
+            return;
+        }
+        match integrate_rolling_target_for(
+            &self.current_branch,
+            &self.config.roll_prefix,
+            &self.config.rolling_branch,
+        ) {
+            Ok(branch) => {
+                self.mode = Mode::Confirm {
+                    action: Action::Integrate,
+                    target: Some(branch),
+                    carried: Vec::new(),
                 }
             }
             Err(msg) => self.message = Some(msg),
@@ -1885,6 +2156,119 @@ impl StatusApp {
         self.push_job(target, false);
     }
 
+    /// `[P]` — arm the push chord. The push itself does not start until the
+    /// chord resolves, in [`Self::handle_browsing`] or
+    /// [`Self::resolve_lapsed_push`].
+    ///
+    /// The busy check happens here rather than only at the far end so that a `P`
+    /// during a running job is refused the instant it is pressed, as every other
+    /// mutating key is, instead of after the window.
+    fn arm_push(&mut self) {
+        if self.busy() {
+            return;
+        }
+        self.pending_push = Some(Instant::now());
+        self.message = Some("P again to push every branch that needs it".to_string());
+    }
+
+    /// Fire a pending `P` that nothing followed: the chord window lapsed, so it
+    /// was a single-branch push after all. Called once per loop iteration,
+    /// before the frame is drawn.
+    fn resolve_lapsed_push(&mut self) {
+        let lapsed = self
+            .pending_push
+            .is_some_and(|armed| armed.elapsed() >= PUSH_CHORD_WINDOW);
+        if lapsed {
+            self.pending_push = None;
+            self.message = None;
+            self.start_push();
+        }
+    }
+
+    /// `PP` — plan a push of every branch that needs one and open its modal.
+    ///
+    /// Nothing is pushed here. The plan is resolved from the tracking data the
+    /// view already loaded, so the modal states exactly what the job will do.
+    fn start_push_all(&mut self) {
+        if self.busy() {
+            return;
+        }
+        let rows: Vec<(String, BranchLocation)> = self
+            .bases
+            .iter()
+            .map(|b| (b.branch.clone(), b.location.clone()))
+            .chain(
+                self.rolls
+                    .iter()
+                    .map(|r| (r.branch.clone(), r.location.clone())),
+            )
+            .collect();
+        let plan = plan_push_all(&rows, &self.current_branch, &self.tracking);
+        if plan.items.is_empty() {
+            self.message = Some(match plan.skipped.len() {
+                0 => "nothing to push — every branch is in sync".to_string(),
+                n => format!(
+                    "nothing to push without a force — {n} branch{} need{} a [P] of its own",
+                    if n == 1 { "" } else { "es" },
+                    if n == 1 { "s" } else { "" }
+                ),
+            });
+            return;
+        }
+        self.mode = Mode::PushAll { plan };
+    }
+
+    /// Push every branch in the plan, in table order, reporting each one.
+    ///
+    /// One job rather than one per branch: they share a panel and a reload, and
+    /// a half-finished sweep is easier to read as a single log. A branch that
+    /// fails does not stop the sweep — the remaining branches are independent
+    /// refs, and stopping would leave the user guessing which were reached.
+    /// `force` is not a parameter and never will be: see [`plan_push_all`].
+    fn push_all_job(&mut self, plan: PushAllPlan) {
+        let repo = self.config.repo_root.clone();
+        let title = format!("git push ×{}", plan.items.len());
+        self.start_job(title, move || {
+            let mut lines = Vec::new();
+            let mut failed = 0;
+            for item in &plan.items {
+                let target = &item.target;
+                match sync::run_push(&repo, target, false) {
+                    Ok(PushOutcome::Pushed) if item.creates => lines.push(format!(
+                        "Pushed '{}' to {} (new, now tracking it)",
+                        target.branch, target.remote
+                    )),
+                    Ok(PushOutcome::Pushed) => {
+                        lines.push(format!("Pushed '{}' to {}", target.branch, target.remote))
+                    }
+                    // The plan said this was a fast-forward, so a refusal means
+                    // the remote moved since the table was loaded. Reported, not
+                    // retried with a force: that decision belongs to `[P]` on
+                    // the row, behind its own y/N.
+                    Ok(PushOutcome::Rejected { .. }) => {
+                        failed += 1;
+                        lines.push(format!(
+                            "'{}' was rejected by {} — press [P] on the row to force it",
+                            target.branch, target.remote
+                        ));
+                    }
+                    Err(err) => {
+                        failed += 1;
+                        lines.push(format!("'{}' failed: {}", target.branch, sync_error(err)));
+                    }
+                }
+            }
+            push_push_skips(&mut lines, &plan.skipped);
+            if failed > 0 {
+                lines.push(format!(
+                    "{failed} of {} branches were not pushed",
+                    plan.items.len()
+                ));
+            }
+            Ok(JobDone::lines(lines))
+        });
+    }
+
     /// Run one push attempt. On a non-fast-forward refusal the job finishes
     /// *successfully* carrying a [`Followup::OfferForcePush`] — the refusal is an
     /// expected answer to be acted on, not an error to report and stop at.
@@ -2089,15 +2473,22 @@ impl StatusApp {
         }
 
         match &self.mode {
-            Mode::Confirm { action, target } => {
+            Mode::Confirm {
+                action,
+                target,
+                carried,
+            } => {
                 render_modal(
                     f,
                     area,
                     &self.config,
-                    *action,
-                    target.as_deref(),
-                    &self.rolls,
-                    &self.current_branch,
+                    &ConfirmModal {
+                        action: *action,
+                        target: target.as_deref(),
+                        carried,
+                        rolls: &self.rolls,
+                        current_branch: &self.current_branch,
+                    },
                 );
             }
             Mode::Detail { roll, ahead_behind } => {
@@ -2109,13 +2500,14 @@ impl StatusApp {
             Mode::ForcePush { branch, remote } => {
                 render_force_push_modal(f, area, branch, remote, self.tracking.get(branch))
             }
+            Mode::PushAll { plan } => render_push_all_modal(f, area, plan),
             Mode::Help { query, cursor } => render_help(f, area, query, *cursor),
             Mode::Browsing => {}
         }
     }
 
     fn render_header(&self, f: &mut Frame, area: Rect) {
-        let mut spans = vec![
+        let spans = vec![
             Span::styled("Branch: ", Style::default().add_modifier(Modifier::BOLD)),
             Span::raw(self.current_branch.as_str()),
             Span::raw("   Rolling: "),
@@ -2129,20 +2521,20 @@ impl StatusApp {
                 Style::default().fg(Color::Green),
             ),
         ];
-        // Only when the repo has one. Without this, `[b]` would be a key whose
-        // whole effect is a line in a dismissable panel.
-        if let Some(v) = self.version {
-            spans.push(Span::raw("   Version: "));
-            spans.push(Span::styled(
-                v.to_string(),
+        // The corner names the binary that is running, not the checked-out
+        // branch's manifest. The two used to be conflated, and the corner would
+        // change on every `[space]` — in a repo that *is* roll-flow it read as
+        // the roll's dev version, in any other repo as whatever that repo ships.
+        // Neither is what "which rf is this" asks. The per-branch versions have
+        // their own column; the bump modal shows the manifest it will raise.
+        let block = Block::bordered().title(" roll-flow ").title_top(
+            Line::from(Span::styled(
+                format!(" rf v{} ", env!("CARGO_PKG_VERSION")),
                 Style::default().fg(Color::Magenta),
-            ));
-        }
-        let header_line = Line::from(spans);
-        f.render_widget(
-            Paragraph::new(header_line).block(Block::bordered().title(" roll-flow ")),
-            area,
+            ))
+            .right_aligned(),
         );
+        f.render_widget(Paragraph::new(Line::from(spans)).block(block), area);
     }
 
     fn render_table(&mut self, f: &mut Frame, area: Rect) {
@@ -2438,13 +2830,16 @@ fn run_op(config: &Config, action: Action, target: Option<&str>) -> Result<Vec<S
             // Tagging is on; the version gate hard-fails here rather than
             // prompting, since the TUI has no place to offer a bump — the
             // error names the `rf promote --bump` fix.
-            let o = ops::promote(config, &promote_target, false, &force, true)?;
+            let o = ops::promote(config, &promote_target, false, &force, true, None)?;
             for step in &o.steps {
                 push_gate_notices(&mut lines, &step.gate_notices);
                 push_gate_notices(&mut lines, &step.host_notices);
                 push_host_results(&mut lines, &step.host_results);
                 let what = step.roll.as_deref().unwrap_or(&o.rolling);
                 lines.push(format!("Promoted '{}' into '{}'", what, o.stable));
+                for carried in &step.carried {
+                    lines.push(format!("  also landed: {carried}"));
+                }
                 if let Some(line) = step.tag.describe() {
                     lines.push(line);
                 }
@@ -2722,16 +3117,31 @@ fn plural(n: u32) -> &'static str {
     }
 }
 
-/// Render the centered confirmation popup for a pending action.
-fn render_modal(
-    f: &mut Frame,
-    area: Rect,
-    config: &Config,
+/// Everything the confirm modal reads, gathered so the renderer takes one
+/// parameter per *thing* rather than one per field.
+struct ConfirmModal<'a> {
     action: Action,
-    target: Option<&str>,
-    rolls: &[RollInfo],
-    current_branch: &str,
-) {
+    /// The roll a roll-scoped action targets; `None` for the repo-wide shapes.
+    target: Option<&'a str>,
+    /// See [`Mode::Confirm`]'s field of the same name.
+    carried: &'a [String],
+    rolls: &'a [RollInfo],
+    current_branch: &'a str,
+}
+
+/// Render the centered confirmation popup for a pending action.
+///
+/// `carried` is non-empty only for `[m]` on a roll row, and the modal then grows
+/// to list those rolls: the merge lands them on stable too, and the confirmation
+/// is the last place the user can see that before it happens.
+fn render_modal(f: &mut Frame, area: Rect, config: &Config, modal: &ConfirmModal) {
+    let ConfirmModal {
+        action,
+        target,
+        carried,
+        rolls,
+        current_branch,
+    } = *modal;
     let prompt = match action {
         Action::Graduate => format!(
             "Graduate {} into {}?",
@@ -2777,14 +3187,45 @@ fn render_modal(
     };
     let hint = "[y] confirm    [n] cancel";
 
-    let width = (prompt.chars().count().max(hint.len()) as u16) + 4;
-    let modal = centered_rect(area, width, 4);
+    let mut lines = vec![Line::from(prompt)];
+    if !carried.is_empty() {
+        let yellow = Style::default().fg(Color::Yellow);
+        lines.push(Line::from(Span::styled(
+            "also lands, in graduation order:",
+            yellow,
+        )));
+        for roll in carried {
+            lines.push(Line::from(Span::styled(roll.clone(), yellow)));
+        }
+    }
+    lines.push(Line::from(hint));
+
+    let width = lines.iter().map(|l| l.width()).max().unwrap_or(20) as u16 + 4;
+    let modal = centered_rect(area, width, lines.len() as u16 + 2);
 
     f.render_widget(Clear, modal);
-    let body = Paragraph::new(vec![Line::from(prompt), Line::from(hint)])
+    let body = Paragraph::new(lines)
         .alignment(Alignment::Center)
         .block(Block::bordered().title(" confirm "));
     f.render_widget(body, modal);
+}
+
+/// The rolls that `[m]` on `roll` would land on stable besides `roll` itself.
+///
+/// Best-effort: a planning failure yields an empty list rather than an error.
+/// The keypress opens a confirmation, and `ops::promote` reports the real
+/// problem a moment later if there is one — refusing to draw the modal because
+/// the disclosure could not be computed would be the worse trade.
+fn carried_by_promoting(config: &Config, roll: &str) -> Vec<String> {
+    ops::preview_roll_promotion(config, &[roll.to_string()])
+        .map(|preview| {
+            preview
+                .steps
+                .into_iter()
+                .flat_map(|step| step.carried)
+                .collect()
+        })
+        .unwrap_or_default()
 }
 
 /// Render the centered delete popup. Its shape follows `preview.prompt`, and
@@ -2867,6 +3308,89 @@ fn render_delete_modal(f: &mut Frame, area: Rect, config: &Config, preview: &Del
         .alignment(Alignment::Center)
         .block(Block::bordered().border_style(red).title(title));
     f.render_widget(body, modal);
+}
+
+/// How many branches the `PP` modal lists before it summarises the rest. Chosen
+/// so the modal still fits an 80×24 terminal once the skip lines and the hint
+/// are added.
+const PUSH_ALL_LIST_LIMIT: usize = 8;
+
+/// Render the `PP` confirmation: what will be pushed, what will not, and why.
+///
+/// A bulk write to the remote has to be legible before it happens, so the
+/// branches are listed rather than counted — the count alone would not show that
+/// the one branch the user cared about is in the skipped half.
+fn render_push_all_modal(f: &mut Frame, area: Rect, plan: &PushAllPlan) {
+    let dim = Style::default().fg(Color::DarkGray);
+    let n = plan.items.len();
+    let mut lines = vec![Line::from(Span::styled(
+        format!(
+            "Push {n} branch{} to their remotes?",
+            if n == 1 { "" } else { "es" }
+        ),
+        Style::default().add_modifier(Modifier::BOLD),
+    ))];
+
+    for item in plan.items.iter().take(PUSH_ALL_LIST_LIMIT) {
+        let note = if item.creates {
+            "new on the remote".to_string()
+        } else {
+            match item.target.track {
+                Some(TrackState::Ahead(n)) => format!("↑{n}"),
+                // Unreachable via `plan_push_all`, which only ever queues the two
+                // states above; rendered rather than asserted so a future state
+                // shows up in the modal instead of panicking in a draw.
+                _ => String::new(),
+            }
+        };
+        lines.push(Line::from(vec![
+            Span::styled(item.target.branch.clone(), Style::default().fg(Color::Cyan)),
+            Span::raw("  "),
+            Span::styled(note, Style::default().fg(Color::Green)),
+        ]));
+    }
+    if n > PUSH_ALL_LIST_LIMIT {
+        lines.push(Line::from(Span::styled(
+            format!("… and {} more", n - PUSH_ALL_LIST_LIMIT),
+            dim,
+        )));
+    }
+
+    for skip in plan.skipped.iter().take(PUSH_ALL_LIST_LIMIT) {
+        lines.push(Line::from(Span::styled(
+            format!("skipped {}: {}", skip.branch, skip.reason),
+            Style::default().fg(Color::Yellow),
+        )));
+    }
+    if plan.skipped.len() > PUSH_ALL_LIST_LIMIT {
+        lines.push(Line::from(Span::styled(
+            format!(
+                "… and {} more skipped",
+                plan.skipped.len() - PUSH_ALL_LIST_LIMIT
+            ),
+            dim,
+        )));
+    }
+
+    lines.push(Line::from(Span::styled("[y] confirm    [n] cancel", dim)));
+
+    let width = lines.iter().map(|l| l.width()).max().unwrap_or(32) as u16 + 4;
+    let height = lines.len() as u16 + 2;
+    let modal = centered_rect(area, width.max(36), height);
+
+    f.render_widget(Clear, modal);
+    let body = Paragraph::new(lines)
+        .alignment(Alignment::Center)
+        .block(Block::bordered().title(" push all "));
+    f.render_widget(body, modal);
+}
+
+/// Append the skipped branches to a `PP` job's output, so the log says the same
+/// thing the modal did rather than silently omitting them.
+fn push_push_skips(lines: &mut Vec<String>, skipped: &[PushSkip]) {
+    for skip in skipped {
+        lines.push(format!("skipped '{}': {}", skip.branch, skip.reason));
+    }
 }
 
 /// Human wording for which copies a scope covers, used in the force-confirm
@@ -3060,20 +3584,23 @@ fn render_detail(
         )));
     } else {
         let blockers = rows.iter().filter(|r| r.is_blocker).count();
-        let header = if blockers > 0 {
-            format!("dependencies ({blockers} blocking):")
-        } else {
-            "dependencies (all graduated):".to_string()
+        let stale = rows.iter().filter(|r| r.needs_reintegration).count();
+        let header = match (blockers, stale) {
+            (0, 0) => "dependencies (all graduated):".to_string(),
+            (0, s) => format!("dependencies ({s} stale — reintegrate):"),
+            (b, 0) => format!("dependencies ({b} blocking):"),
+            (b, s) => format!("dependencies ({b} blocking, {s} stale):"),
         };
         lines.push(Line::from(Span::styled(
             header,
             Style::default().add_modifier(Modifier::BOLD),
         )));
         for r in &rows {
-            let (marker, marker_style) = if r.is_blocker {
-                ("⛔ blocker", Style::default().fg(Color::Red))
-            } else {
-                ("✓ ok", Style::default().fg(Color::Green))
+            let (marker, marker_style) = match (r.is_blocker, r.needs_reintegration) {
+                (true, true) => ("⛔ blocker, ⚠ stale", Style::default().fg(Color::Red)),
+                (true, false) => ("⛔ blocker", Style::default().fg(Color::Red)),
+                (false, true) => ("⚠ reintegrate", Style::default().fg(Color::Yellow)),
+                (false, false) => ("✓ ok", Style::default().fg(Color::Green)),
             };
             lines.push(Line::from(vec![
                 Span::raw(format!("  #{}  ", r.number)),
@@ -3215,6 +3742,7 @@ mod tests {
             is_current: false,
             deps: Vec::new(),
             dependents: Vec::new(),
+            stale_deps: Vec::new(),
             graduation_commit: None,
         }
     }
@@ -3337,6 +3865,7 @@ mod tests {
             is_current: false,
             deps: Vec::new(),
             dependents: Vec::new(),
+            stale_deps: Vec::new(),
             graduation_commit: None,
         }
     }
@@ -3369,6 +3898,163 @@ mod tests {
         assert_eq!(prunable_count(&with_promoted), 2);
         // Prune is repo-wide, so it validates with no selection.
         assert!(validate_action(Action::Prune, None, &with_promoted, "main", "roll/").is_ok());
+    }
+
+    /// A `git::LocalBranch` with the upstream fields `track_state` reads.
+    fn tracked(name: &str, track: &str) -> git::LocalBranch {
+        git::LocalBranch {
+            name: name.to_string(),
+            upstream: format!("origin/{name}"),
+            remote_name: "origin".to_string(),
+            track: track.to_string(),
+            worktree: String::new(),
+        }
+    }
+
+    /// A local branch that was never pushed: no upstream at all.
+    fn untracked(name: &str) -> git::LocalBranch {
+        git::LocalBranch {
+            name: name.to_string(),
+            upstream: String::new(),
+            remote_name: String::new(),
+            track: String::new(),
+            worktree: String::new(),
+        }
+    }
+
+    fn push_all_rows(names: &[&str]) -> Vec<(String, BranchLocation)> {
+        names
+            .iter()
+            .map(|n| (n.to_string(), BranchLocation::Both))
+            .collect()
+    }
+
+    #[test]
+    fn push_all_takes_only_the_branches_a_plain_push_would_carry() {
+        let mut tracking = HashMap::new();
+        tracking.insert("main".to_string(), tracked("main", ""));
+        tracking.insert("rolling".to_string(), tracked("rolling", "ahead 2"));
+        tracking.insert("roll/1-x".to_string(), untracked("roll/1-x"));
+        let rows = push_all_rows(&["main", "rolling", "roll/1-x"]);
+
+        let plan = plan_push_all(&rows, "rolling", &tracking);
+
+        // Ahead and never-pushed are both fast-forwards or creations; in-sync is
+        // not mentioned at all, because there is nothing to say about it.
+        let pushed: Vec<_> = plan
+            .items
+            .iter()
+            .map(|i| (i.target.branch.as_str(), i.creates))
+            .collect();
+        assert_eq!(pushed, vec![("rolling", false), ("roll/1-x", true)]);
+        assert!(plan.skipped.is_empty(), "{:?}", plan.skipped);
+    }
+
+    #[test]
+    fn push_all_never_queues_a_branch_that_would_need_a_force() {
+        let mut tracking = HashMap::new();
+        tracking.insert("behind".to_string(), tracked("behind", "behind 3"));
+        tracking.insert(
+            "diverged".to_string(),
+            tracked("diverged", "ahead 1, behind 2"),
+        );
+        let rows = push_all_rows(&["behind", "diverged"]);
+
+        let plan = plan_push_all(&rows, "main", &tracking);
+
+        // The whole safety argument for a bulk push key: it can only ever
+        // fast-forward. Forcing stays a per-branch decision behind its own y/N.
+        assert!(plan.items.is_empty(), "{:?}", plan.items);
+        let reasons: Vec<_> = plan
+            .skipped
+            .iter()
+            .map(|s| (s.branch.as_str(), s.reason.as_str()))
+            .collect();
+        assert_eq!(
+            reasons,
+            vec![
+                ("behind", "behind by 3 — [p] to pull, then [P] to force"),
+                ("diverged", "diverged ↑1↓2 — [P] on the row to force"),
+            ]
+        );
+    }
+
+    #[test]
+    fn push_all_does_not_resurrect_a_deleted_upstream() {
+        // `rf prune` and `rf clean --with-remote` delete branches on origin on
+        // purpose. A bulk push that re-created them would quietly undo that, so
+        // `gone` is reported and left for an explicit `[P]`.
+        let mut tracking = HashMap::new();
+        tracking.insert("roll/1-x".to_string(), tracked("roll/1-x", "gone"));
+        let plan = plan_push_all(&push_all_rows(&["roll/1-x"]), "main", &tracking);
+
+        assert!(plan.items.is_empty());
+        assert_eq!(plan.skipped.len(), 1);
+        assert!(
+            plan.skipped[0].reason.starts_with("upstream deleted"),
+            "{:?}",
+            plan.skipped[0]
+        );
+    }
+
+    #[test]
+    fn push_all_ignores_branches_with_nothing_local_to_push() {
+        let mut tracking = HashMap::new();
+        tracking.insert("roll/1-x".to_string(), tracked("roll/1-x", "ahead 1"));
+        // Remote-only: no local copy, so nothing to push even though the
+        // tracking map happens to carry an entry for the name.
+        let rows = vec![
+            ("roll/1-x".to_string(), BranchLocation::Remote),
+            // Local but absent from the tracking batch — the state the sync
+            // column renders as `—`. Unknown is not a reason to push.
+            ("roll/2-y".to_string(), BranchLocation::Local),
+        ];
+
+        let plan = plan_push_all(&rows, "main", &tracking);
+
+        assert!(plan.items.is_empty(), "{:?}", plan.items);
+        assert!(plan.skipped.is_empty(), "{:?}", plan.skipped);
+    }
+
+    #[test]
+    fn only_a_second_p_widens_a_push_and_nothing_cancels_one() {
+        assert_eq!(push_chord_key(KeyCode::Char('P')), PushChord::All);
+        // Lowercase `p` is pull, not push — it must not complete the chord.
+        // `Esc` resolves to the single push rather than cancelling: the first
+        // `P` was already a decision to push the selected branch.
+        for key in [
+            KeyCode::Char('p'),
+            KeyCode::Esc,
+            KeyCode::Char('q'),
+            KeyCode::Enter,
+            KeyCode::Down,
+        ] {
+            assert_eq!(push_chord_key(key), PushChord::Single, "{key:?}");
+        }
+    }
+
+    #[test]
+    fn the_push_all_modal_lists_both_halves_of_the_plan() {
+        let mut tracking = HashMap::new();
+        tracking.insert("rolling".to_string(), tracked("rolling", "ahead 2"));
+        tracking.insert("roll/1-x".to_string(), untracked("roll/1-x"));
+        tracking.insert("roll/2-y".to_string(), tracked("roll/2-y", "gone"));
+        let plan = plan_push_all(
+            &push_all_rows(&["rolling", "roll/1-x", "roll/2-y"]),
+            "main",
+            &tracking,
+        );
+
+        let out = draw(|f, area| render_push_all_modal(f, area, &plan));
+
+        assert!(out.contains("Push 2 branches to their remotes?"), "{out}");
+        assert!(out.contains("rolling"), "{out}");
+        assert!(out.contains("↑2"), "{out}");
+        assert!(out.contains("new on the remote"), "{out}");
+        // The skipped half is the reason this is a list and not a count: the
+        // branch the user cared about may be in it.
+        assert!(out.contains("skipped roll/2-y"), "{out}");
+        assert!(out.contains("[y] confirm"), "{out}");
     }
 
     #[test]
@@ -3655,7 +4341,7 @@ mod tests {
     }
 
     #[test]
-    fn dep_rows_flag_only_ungraduated_as_blockers() {
+    fn dep_rows_flag_blockers_and_staleness_independently() {
         let all = vec![
             roll_n(1, RollState::Graduated),
             roll_n(2, RollState::Active),
@@ -3664,22 +4350,42 @@ mod tests {
         ];
         let mut selected = roll_n(5, RollState::Blocked);
         selected.deps = vec![1, 2, 3, 4];
+        // Ancestry-based, independent of state: 2 (still active) and 3
+        // (diverged) have both moved since `selected` integrated them; 1 and 4
+        // have not.
+        selected.stale_deps = vec![2, 3];
 
         let rows = dep_rows(&selected, &all);
         assert_eq!(rows.len(), 4);
-        // Graduated / promoted deps are satisfied — not blockers.
-        assert!(!rows.iter().find(|r| r.number == 1).unwrap().is_blocker);
-        assert!(!rows.iter().find(|r| r.number == 4).unwrap().is_blocker);
-        // Active / diverged deps hold the roll back.
-        assert!(rows.iter().find(|r| r.number == 2).unwrap().is_blocker);
-        assert!(rows.iter().find(|r| r.number == 3).unwrap().is_blocker);
+        // Graduated / promoted deps are satisfied — not blockers, not stale.
+        let r1 = rows.iter().find(|r| r.number == 1).unwrap();
+        assert!(!r1.is_blocker && !r1.needs_reintegration);
+        let r4 = rows.iter().find(|r| r.number == 4).unwrap();
+        assert!(!r4.is_blocker && !r4.needs_reintegration);
+        // An active dep that has ALSO moved since integration is both a
+        // blocker (it hasn't graduated yet) and stale (reintegrating would
+        // pick up more) — exactly the case that matters before merging a
+        // batch of dependents against a still-moving dependency.
+        let r2 = rows.iter().find(|r| r.number == 2).unwrap();
+        assert!(r2.is_blocker && r2.needs_reintegration);
+        // A diverged dep already graduated — it is not a blocker, but it has
+        // moved on since `selected` integrated it and needs reintegrating.
+        let r3 = rows.iter().find(|r| r.number == 3).unwrap();
+        assert!(!r3.is_blocker && r3.needs_reintegration);
 
         let blockers: Vec<u32> = rows
             .iter()
             .filter(|r| r.is_blocker)
             .map(|r| r.number)
             .collect();
-        assert_eq!(blockers, vec![2, 3]);
+        assert_eq!(blockers, vec![2]);
+
+        let stale: Vec<u32> = rows
+            .iter()
+            .filter(|r| r.needs_reintegration)
+            .map(|r| r.number)
+            .collect();
+        assert_eq!(stale, vec![2, 3]);
     }
 
     #[test]
@@ -3799,6 +4505,48 @@ mod tests {
         assert_eq!(rows[0].state, RollState::Graduated);
         // A graduated target no longer gates anything.
         assert!(!rows[0].is_blocker);
+        assert!(!rows[0].needs_reintegration);
+    }
+
+    #[test]
+    fn dependent_rows_flag_reintegration_from_the_dependents_own_staleness() {
+        // `needs_reintegration` here reads the *dependent's* `stale_deps`, not
+        // `target`'s state — a dependent is stale as soon as the target moves
+        // past what it integrated, even while the target is still `Active` and
+        // therefore still gating it. This is roll/27's actual situation with
+        // its roll/26 dependency: roll/26 kept gaining commits without ever
+        // graduating, so roll/27 is both blocked on it and behind it.
+        let mut r27 = roll_n(27, RollState::Active);
+        r27.deps = vec![26];
+        r27.stale_deps = vec![26];
+        let mut target = roll_n(26, RollState::Active);
+        target.dependents = vec![27];
+        let all = vec![r27, target.clone()];
+
+        let rows = dependent_rows(&target, &all);
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].number, 27);
+        // Still active, so it still gates roll/27's graduation...
+        assert!(rows[0].is_blocker);
+        // ...but roll/27's copy is also stale, so it needs reintegrating too.
+        assert!(rows[0].needs_reintegration);
+    }
+
+    #[test]
+    fn dependent_rows_do_not_flag_reintegration_when_dependent_is_current() {
+        // A dependent that already has the target's latest tip (stale_deps
+        // does not name it) is not told to reintegrate, even if the target is
+        // still active and gating it.
+        let mut r27 = roll_n(27, RollState::Active);
+        r27.deps = vec![26];
+        let mut target = roll_n(26, RollState::Active);
+        target.dependents = vec![27];
+        let all = vec![r27, target.clone()];
+
+        let rows = dependent_rows(&target, &all);
+        assert_eq!(rows.len(), 1);
+        assert!(rows[0].is_blocker);
+        assert!(!rows[0].needs_reintegration);
     }
 
     #[test]
@@ -4259,6 +5007,23 @@ mod tests {
     }
 
     #[test]
+    fn the_search_finds_pp_and_offers_to_run_it() {
+        // The reason roll/8 had to be integrated here rather than merged at
+        // graduation: `PP` only exists as a key if it is a row in BINDINGS.
+        let hits = filter_bindings("push all");
+        let top = &BINDINGS[hits[0]];
+        assert_eq!(top.keys, "PP", "got {} instead", top.keys);
+        // Two keystrokes, so the chord completes when `?` replays them.
+        assert_eq!(
+            top.replay,
+            &[KeyCode::Char('P'), KeyCode::Char('P')],
+            "PP must replay as a chord"
+        );
+        // And it stays off the slim status bar.
+        assert!(top.hint.is_none());
+    }
+
+    #[test]
     fn every_binding_is_declared_once_and_can_be_run() {
         // The table is the only place keys are declared, so this is where a
         // doubled-up or unlabelled binding has to be caught.
@@ -4329,6 +5094,7 @@ mod tests {
             job: None,
             panel: None,
             pending_g: false,
+            pending_push: None,
         };
 
         let out = draw(|f, area| app.render_table(f, area));
@@ -4376,6 +5142,7 @@ mod tests {
             job: None,
             panel: None,
             pending_g: false,
+            pending_push: None,
         };
         let out = draw(|f, area| app.render_table(f, area));
 
@@ -4405,6 +5172,7 @@ mod tests {
             job: None,
             panel: None,
             pending_g: false,
+            pending_push: None,
         };
         let out = draw(|f, area| app.render_table(f, area));
         assert!(!out.contains("version"), "column shown anyway:\n{out}");
@@ -4446,6 +5214,7 @@ mod tests {
             job: None,
             panel: None,
             pending_g: false,
+            pending_push: None,
         };
         let out = draw(|f, area| app.render_table(f, area));
         let row = out
@@ -4588,17 +5357,46 @@ mod tests {
     }
 
     #[test]
-    fn the_header_shows_the_version_only_when_the_repo_has_one() {
+    fn the_header_names_the_running_binary_not_the_manifest() {
+        // Whatever the checked-out branch's Cargo.toml says — or whether there
+        // is one — the corner answers "which rf is this".
         let mut app = StatusApp::new(test_config(), "main".to_string(), Vec::new(), false);
-        app.version = Some(v(1, 2, 3));
+        let expected = format!("rf v{}", env!("CARGO_PKG_VERSION"));
+
+        app.version = Some(v(9, 9, 9));
         let with = draw(|f, area| app.render_header(f, area));
-        assert!(with.contains("Version: 1.2.3"), "{with}");
+        assert!(with.contains(&expected), "{with}");
+        assert!(
+            !with.contains("9.9.9"),
+            "manifest version leaked in:\n{with}"
+        );
 
         app.version = None;
         let without = draw(|f, area| app.render_header(f, area));
-        assert!(!without.contains("Version:"), "{without}");
-        // The rest of the header is unaffected either way.
+        assert!(without.contains(&expected), "{without}");
         assert!(without.contains("Branch: main"), "{without}");
+    }
+
+    #[test]
+    fn the_version_sits_in_the_top_right_corner_clear_of_the_branch_name() {
+        // The branch line grows with the branch name, so the version has to be
+        // somewhere that length cannot push it out of. Measured, not assumed.
+        let app = StatusApp::new(
+            test_config(),
+            "roll/12-0918-a-deliberately-long-slug".to_string(),
+            Vec::new(),
+            false,
+        );
+        let out = draw(|f, area| app.render_header(f, area));
+        let top = out.lines().next().expect("a top border row");
+        let at = top
+            .find("rf v")
+            .unwrap_or_else(|| panic!("no version:\n{out}"));
+        assert!(at > top.chars().count() / 2, "not right-aligned:\n{out}");
+        assert!(
+            out.contains("roll/12-0918-a-deliberately-long-slug"),
+            "{out}"
+        );
     }
 
     #[test]
@@ -4735,6 +5533,33 @@ mod tests {
     }
 
     #[test]
+    fn integrate_rolling_merges_rolling_into_the_checked_out_roll() {
+        assert_eq!(
+            integrate_rolling_target_for("roll/2-0102-beta", "roll/", "rolling"),
+            Ok("rolling".to_string())
+        );
+    }
+
+    #[test]
+    fn integrate_rolling_needs_a_roll_branch_checked_out() {
+        for head in ["main", "rolling", "feature/x"] {
+            let err = integrate_rolling_target_for(head, "roll/", "rolling")
+                .expect_err("{head} should be refused");
+            assert!(err.contains("not a roll branch"), "{head}: {err}");
+        }
+    }
+
+    #[test]
+    fn integrate_rolling_refuses_when_rolling_is_already_current() {
+        // Can't happen through the gate above since `rolling` doesn't start
+        // with the roll prefix, but a custom prefix could make it ambiguous —
+        // this keeps the self-merge refusal explicit either way.
+        let err = integrate_rolling_target_for("rolling", "", "rolling")
+            .expect_err("self-merge should be refused");
+        assert!(err.contains("already the current branch"), "{err}");
+    }
+
+    #[test]
     fn validate_action_gates_integrate_the_same_way() {
         // The single validation entry point must agree with the helper, or the
         // key and the modal could disagree about what is allowed.
@@ -4764,16 +5589,53 @@ mod tests {
                 f,
                 area,
                 &cfg,
-                Action::Integrate,
-                Some("roll/1-0101-alpha"),
-                &[],
-                "roll/2-0102-beta",
+                &ConfirmModal {
+                    action: Action::Integrate,
+                    target: Some("roll/1-0101-alpha"),
+                    carried: &[],
+                    rolls: &[],
+                    current_branch: "roll/2-0102-beta",
+                },
             )
         });
         assert!(
             out.contains("Integrate roll/1-0101-alpha into roll/2-0102-beta?"),
             "{out}"
         );
+    }
+
+    #[test]
+    fn the_promote_modal_lists_the_rolls_a_roll_promotion_would_carry() {
+        // `[m]` on one roll advances stable to that roll's graduation commit, so
+        // earlier graduations land too. The modal is the last place the user can
+        // see that before the merge, so it has to name them.
+        let cfg = config("main", "rolling");
+        let carried = vec![
+            "roll/4-0918-version-corner".to_string(),
+            "roll/7-0918-verify-button".to_string(),
+        ];
+        let out = draw(|f, area| {
+            render_modal(
+                f,
+                area,
+                &cfg,
+                &ConfirmModal {
+                    action: Action::Promote,
+                    target: Some("roll/8-0918-help-menu"),
+                    carried: &carried,
+                    rolls: &[],
+                    current_branch: "rolling",
+                },
+            )
+        });
+        assert!(
+            out.contains("Promote roll/8-0918-help-menu into main?"),
+            "{out}"
+        );
+        assert!(out.contains("also lands"), "{out}");
+        for roll in &carried {
+            assert!(out.contains(roll.as_str()), "{roll} missing from:\n{out}");
+        }
     }
 
     #[test]
@@ -4786,14 +5648,39 @@ mod tests {
             roll_n(2, RollState::Promoted),
         ];
 
-        let tidy = draw(|f, area| render_modal(f, area, &cfg, Action::Tidy, None, &rolls, "main"));
+        let tidy = draw(|f, area| {
+            render_modal(
+                f,
+                area,
+                &cfg,
+                &ConfirmModal {
+                    action: Action::Tidy,
+                    target: None,
+                    carried: &[],
+                    rolls: &rolls,
+                    current_branch: "main",
+                },
+            )
+        });
         assert!(
             tidy.contains("Delete 2 local graduated/promoted roll branches (local only)?"),
             "{tidy}"
         );
 
-        let prune =
-            draw(|f, area| render_modal(f, area, &cfg, Action::Prune, None, &rolls, "main"));
+        let prune = draw(|f, area| {
+            render_modal(
+                f,
+                area,
+                &cfg,
+                &ConfirmModal {
+                    action: Action::Prune,
+                    target: None,
+                    carried: &[],
+                    rolls: &rolls,
+                    current_branch: "main",
+                },
+            )
+        });
         assert!(
             prune.contains("Delete 1 promoted roll branch (local + origin)?"),
             "{prune}"
@@ -4846,11 +5733,12 @@ mod tests {
             job: None,
             panel: None,
             pending_g: false,
+            pending_push: None,
         };
 
-        // Tall enough for the header, three table rows and the four-line status
+        // Tall enough for the header, three table rows and the five-line status
         // bar, and wide enough for the sync column.
-        let mut term = Terminal::new(TestBackend::new(80, 14)).unwrap();
+        let mut term = Terminal::new(TestBackend::new(80, 15)).unwrap();
         term.draw(|f| app.render(f)).unwrap();
         let line = |row: u16| -> String {
             (0..80)
