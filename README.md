@@ -132,11 +132,13 @@ cargo test
   from every remote and deletes there only with `--with-remote`; `rf tidy` (and
   the TUI's `[t]`), which fetches but only ever deletes locally; the confirmed
   release-tag push at the end of `rf promote`; and the TUI's `[p]`/`[P]`/`[f]`,
-  which pull, push and fetch the selected branch
-- no daemon; `rf` only ever runs when invoked. The `status`/`list` TUI drives
-  the workflow (`i` integrate, `I` integrate rolling, `v` verify, `G` graduate, `m` promote, `u`
-  update, `x` prune, `t` tidy, `d` delete, `b` bump the version) and syncs the
-  selected branch (`p` pull, `P` push, `f` fetch, `gg` lazygit). The status bar
-  carries only the basics; `?` opens a fuzzy-searchable list of every key, and
-  enter runs the one under the cursor. A force _push_ is available there behind
-  a confirmation; every other forced operation stays CLI-only by design
+  which pull, push and fetch the selected branch, plus `PP`, which pushes every
+  branch that can be fast-forwarded
+- no daemon; `rf` only ever runs when invoked. The `status`/`list` TUI drives the
+  workflow (`i` integrate, `I` integrate rolling, `v` verify, `G` graduate, `m`
+  promote, `u` update, `x` prune, `t` tidy, `d` delete, `b` bump the version) and
+  syncs the selected branch (`p` pull, `P` push, `PP` push every branch that
+  needs it, `f` fetch, `gg` lazygit). The status bar carries only the basics;
+  `?` opens a fuzzy-searchable list of every key, and enter runs the one under
+  the cursor. A force *push* is available there behind a confirmation; every
+  other forced operation stays CLI-only by design
