@@ -119,7 +119,7 @@ fn print_rolls_table(rolls: &[RollInfo], show_deps: bool) {
         let deps_col = if show_deps {
             format!(
                 "  {:<dep_w$}  {}",
-                branches::format_roll_numbers(&roll.deps),
+                branches::format_deps_with_staleness(&roll.deps, &roll.stale_deps),
                 branches::format_roll_numbers(&roll.dependents),
             )
         } else {
@@ -141,6 +141,9 @@ fn print_rolls_table(rolls: &[RollInfo], show_deps: bool) {
     println!("  loc: L=local  R=remote  B=both");
     if show_deps {
         println!("  deps: rolls this one integrated  |  dependants: rolls that integrated it");
+        println!(
+            "  ⚠ after a dep number: it has moved since this roll integrated it — reintegrate"
+        );
     }
 }
 

@@ -15,7 +15,7 @@
 use std::collections::HashMap;
 use std::time::{Duration, Instant};
 
-use anyhow::{anyhow, Result};
+use anyhow::{anyhow, bail, Result};
 use crossterm::event::{self, Event, KeyCode, KeyEventKind};
 use ratatui::{
     layout::{Alignment, Constraint, Layout, Rect},
@@ -32,7 +32,7 @@ use crate::core::{
     git::{self, TrackState},
     ops,
     sync::{self, PullPlan, PushOutcome, SyncTarget},
-    version::{self, BumpLevel, Semver},
+    version::{self, BumpLevel, Semver, VersionCheck, VersionStatus},
 };
 
 /// A workflow operation reachable from the view. Navigation, quit and refresh
@@ -203,6 +203,12 @@ enum Mode {
         /// The roll branch an action targets (graduate); `None` for repo-wide
         /// ops (promote / update).
         target: Option<String>,
+        /// For `[m]` on a roll row: the rolls that graduated ahead of it and
+        /// would land on stable with it. Read once when the modal opens — it
+        /// costs git calls, and a draw must not — and empty for every other
+        /// action. The modal states them because advancing stable to one roll's
+        /// graduation commit is not what "promote this roll" sounds like.
+        carried: Vec<String>,
     },
     /// Read-only drill-down for a single roll: its identity plus its dependency
     /// rows (issue #61). A snapshot of the selected roll is captured on open so
@@ -428,14 +434,25 @@ pub(crate) fn initial_selection(bases: &[BaseBranch], rolls: &[RollInfo]) -> Opt
     Some(0)
 }
 
-/// One dependency row rendered in the [`Mode::Detail`] view. `is_blocker` marks
-/// a dep that holds the roll back — one that is not yet graduated/promoted.
+/// One dependency row rendered in the [`Mode::Detail`] view.
+///
+/// `is_blocker` and `needs_reintegration` answer different questions and are
+/// **not** mutually exclusive. `is_blocker` mirrors [`RollState::Blocked`]'s
+/// own rule: only an `Active`/`Blocked` dep actually gates graduation (the
+/// ordering constraint). `needs_reintegration` comes from
+/// [`RollInfo::stale_deps`] — a direct ancestry check against the dep's
+/// *current* tip — so it fires whenever the dep has moved since it was
+/// integrated, whatever its state: a still-`Active` dep that keeps gaining
+/// commits is just as stale as a `Diverged` one that graduated and then moved.
+/// A roll can therefore be both blocked on a dependency *and* behind its
+/// latest commits at the same time.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct DepRow {
     pub number: u32,
     pub branch: String,
     pub state: RollState,
     pub is_blocker: bool,
+    pub needs_reintegration: bool,
 }
 
 /// Owns everything needed to render and to *reload* after an action.
@@ -818,6 +835,13 @@ pub(crate) const BINDINGS: &[Binding] = &[
         replay: &[KeyCode::Char('i')],
     },
     Binding {
+        keys: "v",
+        label: "verify the checked-out branch",
+        group: "roll",
+        hint: None,
+        replay: &[KeyCode::Char('v')],
+    },
+    Binding {
         keys: "G",
         label: "graduate the selected roll into rolling",
         group: "roll",
@@ -1026,13 +1050,58 @@ pub(crate) fn handle_help_key(
     }
 }
 
+/// The route `[v]` would check, as `(source, target)`, or `None` when the
+/// checked-out branch is not on one.
+///
+/// Verify reads HEAD rather than the row under the cursor, for the same reason
+/// `[b]` does: the gates run in the working tree, so the branch they judge is
+/// the checked-out one whatever the cursor is on. Deferring to
+/// [`ops::infer_route`] keeps the TUI and `rf verify` agreeing on what a branch
+/// tier means — there is one definition of the route, not two.
+pub(crate) fn verify_route_for(config: &Config, current_branch: &str) -> Option<(String, String)> {
+    match ops::infer_route(config, current_branch)? {
+        ops::Route::Graduate { roll } => Some((roll, config.rolling_branch.clone())),
+        ops::Route::Promote => Some((config.rolling_branch.clone(), config.stable_branch.clone())),
+    }
+}
+
+/// Render a version check the way `main.rs` prints it, so the TUI and the CLI
+/// report the same comparison in the same words.
+fn push_version_check(lines: &mut Vec<String>, check: &VersionCheck, source: &str, target: &str) {
+    let verdict = match check.status {
+        VersionStatus::Ok => "OK",
+        VersionStatus::Unchanged => "UNCHANGED",
+        VersionStatus::Lower => "LOWER",
+        VersionStatus::Unreadable => "UNREADABLE",
+        // Repos with no `Cargo.toml`, and repos with the gate switched off, have
+        // nothing to say here — the same silence `rf verify` keeps.
+        VersionStatus::NotApplicable => return,
+    };
+    let head = check
+        .head
+        .map(|v| v.to_string())
+        .unwrap_or_else(|| "<unreadable>".to_string());
+    let base = check
+        .base
+        .map(|v| v.to_string())
+        .unwrap_or_else(|| "none".to_string());
+    lines.push(format!(
+        "Version: {head} on '{source}' (base '{target}' {base}) {verdict}"
+    ));
+}
+
 /// Build the dependency rows to show in the detail view for `selected`.
 ///
 /// Each number in `selected.deps` is looked up in `all` to recover the
-/// dependency's branch and state. A dep is flagged as a *blocker* when it is not
-/// yet graduated/promoted (state is `Active`/`Blocked`/`Diverged`) — those are
-/// what actually hold the roll back. Unknown dep numbers (not present in `all`)
-/// are skipped. The empty result means "no dependencies / not blocked".
+/// dependency's branch and state. A dep is flagged as a *blocker* when it has
+/// not yet graduated (state is `Active`/`Blocked`) — those are what actually
+/// hold the roll back, matching the same rule `list_rolls` uses to set
+/// `RollState::Blocked`. `needs_reintegration` is a separate, ancestry-based
+/// question answered by `selected.stale_deps`: has the dependency's branch
+/// moved since `selected` integrated it, whatever its state — so a dep can be
+/// both a blocker *and* stale at once (still active, and already moved again).
+/// Unknown dep numbers (not present in `all`) are skipped. The empty result
+/// means "no dependencies / not blocked".
 pub(crate) fn dep_rows(selected: &RollInfo, all: &[RollInfo]) -> Vec<DepRow> {
     selected
         .deps
@@ -1042,7 +1111,8 @@ pub(crate) fn dep_rows(selected: &RollInfo, all: &[RollInfo]) -> Vec<DepRow> {
             number: dep.number,
             branch: dep.branch.clone(),
             state: dep.state.clone(),
-            is_blocker: !matches!(dep.state, RollState::Graduated | RollState::Promoted),
+            is_blocker: matches!(dep.state, RollState::Active | RollState::Blocked),
+            needs_reintegration: selected.stale_deps.contains(&dep.number),
         })
         .collect()
 }
@@ -1057,23 +1127,29 @@ pub(crate) fn dep_rows(selected: &RollInfo, all: &[RollInfo]) -> Vec<DepRow> {
 /// `all`) are skipped, mirroring [`dep_rows`].
 ///
 /// A row's `is_blocker` here is repurposed to mean "this dependent is still
-/// gated by the target" — true while `target` has not yet graduated/promoted,
-/// since until then the dependent cannot advance past it. The detail view does
-/// not render a per-row blocker marker for dependents, so this flag is purely
-/// informational, but it keeps the field meaningful and testable. A roll is
-/// never its own dependent, even if a self-referential entry somehow appears.
+/// gated by the target" — true while `target` is `Active`/`Blocked`, mirroring
+/// [`dep_rows`]'s rule, since until it graduates the dependent cannot advance
+/// past it. `needs_reintegration` is the mirror image of `dep_rows`' version:
+/// it reads each dependent's *own* `stale_deps` (not `target`'s state), since
+/// whether a given dependent's copy of `target` is stale depends on when that
+/// dependent last integrated it, not on what `target` is doing now. The detail
+/// view does not render a per-row marker for dependents, so both flags are
+/// purely informational here, but they keep the fields meaningful and
+/// testable. A roll is never its own dependent, even if a self-referential
+/// entry somehow appears.
 pub(crate) fn dependent_rows(target: &RollInfo, all: &[RollInfo]) -> Vec<DepRow> {
-    let target_gates = !matches!(target.state, RollState::Graduated | RollState::Promoted);
+    let target_gates = matches!(target.state, RollState::Active | RollState::Blocked);
     target
         .dependents
         .iter()
         .filter(|num| **num != target.number)
         .filter_map(|num| all.iter().find(|r| r.number == *num))
-        .map(|dep| DepRow {
-            number: dep.number,
-            branch: dep.branch.clone(),
-            state: dep.state.clone(),
+        .map(|dependent| DepRow {
+            number: dependent.number,
+            branch: dependent.branch.clone(),
+            state: dependent.state.clone(),
             is_blocker: target_gates,
+            needs_reintegration: dependent.stale_deps.contains(&target.number),
         })
         .collect()
 }
@@ -1130,6 +1206,32 @@ pub(crate) fn promote_target_for(
             sel.state.label()
         )),
     }
+}
+
+/// The branch `[I]` would merge into the current one, or the reason it cannot.
+///
+/// Mirrors `integrate_target_for`, but the source is always the rolling branch
+/// rather than the row under the cursor — rolling isn't a roll, so it never has
+/// a row to select. This is the recovery path for a roll that fails to merge
+/// into rolling at graduation time: bring rolling into the roll here instead,
+/// resolve whatever conflicts graduation would have hit, then graduate
+/// normally. Because rolling already contains every graduated roll, the same
+/// merge picks all of them up as dependencies (method 2 in
+/// `core::dependencies`) in one step.
+pub(crate) fn integrate_rolling_target_for(
+    current_branch: &str,
+    roll_prefix: &str,
+    rolling_branch: &str,
+) -> Result<String, String> {
+    if !current_branch.starts_with(roll_prefix) {
+        return Err(format!(
+            "'{current_branch}' is not a roll branch — integrate merges into a roll"
+        ));
+    }
+    if current_branch == rolling_branch {
+        return Err(format!("'{rolling_branch}' is already the current branch"));
+    }
+    Ok(rolling_branch.to_string())
 }
 
 /// The roll `[i]` would merge into the current branch, or the reason it cannot.
@@ -1548,8 +1650,10 @@ impl StatusApp {
             KeyCode::Char('p') => self.start_pull(),
             KeyCode::Char('P') => self.arm_push(),
             KeyCode::Char('f') => self.start_fetch(),
+            KeyCode::Char('v') => self.start_verify(),
             KeyCode::Char('G') => self.request(Action::Graduate),
             KeyCode::Char('i') => self.request_integrate(),
+            KeyCode::Char('I') => self.request_integrate_rolling(),
             KeyCode::Char('b') => self.request_bump(),
             KeyCode::Char('m') => self.request(Action::Promote),
             KeyCode::Char('u') => self.request(Action::Update),
@@ -1623,7 +1727,7 @@ impl StatusApp {
     fn handle_confirm(&mut self, code: KeyCode) {
         match code {
             KeyCode::Char('y') | KeyCode::Char('Y') => {
-                if let Mode::Confirm { action, target } =
+                if let Mode::Confirm { action, target, .. } =
                     std::mem::replace(&mut self.mode, Mode::Browsing)
                 {
                     self.execute(action, target);
@@ -1716,8 +1820,18 @@ impl StatusApp {
             Action::Promote => promote_target_for(selected, &self.rolls).unwrap_or(None),
             _ => None,
         };
+        let carried = match (action, &target) {
+            (Action::Promote, Some(roll)) => carried_by_promoting(&self.config, roll),
+            _ => Vec::new(),
+        };
         match validation {
-            Ok(()) => self.mode = Mode::Confirm { action, target },
+            Ok(()) => {
+                self.mode = Mode::Confirm {
+                    action,
+                    target,
+                    carried,
+                }
+            }
             Err(msg) => self.message = Some(msg),
         }
     }
@@ -1751,6 +1865,31 @@ impl StatusApp {
                 self.mode = Mode::Confirm {
                     action: Action::Integrate,
                     target: Some(branch),
+                    carried: Vec::new(),
+                }
+            }
+            Err(msg) => self.message = Some(msg),
+        }
+    }
+
+    /// `[I]` — merge the rolling branch into the checked-out roll.
+    ///
+    /// Needs no selection, unlike `[i]`: the source is always rolling, which
+    /// isn't a roll row to point the cursor at.
+    fn request_integrate_rolling(&mut self) {
+        if self.busy() {
+            return;
+        }
+        match integrate_rolling_target_for(
+            &self.current_branch,
+            &self.config.roll_prefix,
+            &self.config.rolling_branch,
+        ) {
+            Ok(branch) => {
+                self.mode = Mode::Confirm {
+                    action: Action::Integrate,
+                    target: Some(branch),
+                    carried: Vec::new(),
                 }
             }
             Err(msg) => self.message = Some(msg),
@@ -2167,6 +2306,32 @@ impl StatusApp {
         });
     }
 
+    /// `[v]` — check whether the checked-out branch could graduate or promote,
+    /// running the configured gates.
+    ///
+    /// Not an [`Action`] and deliberately not behind the confirm modal: that
+    /// modal exists for the ops that mutate the repo, and verify is the one key
+    /// whose entire output is a verdict. The route is resolved here rather than
+    /// inside the job so the panel title names it before the gates start — on a
+    /// repo with `cargo test` gates that is the difference between a title the
+    /// user can trust and several silent minutes.
+    fn start_verify(&mut self) {
+        if self.busy() {
+            return;
+        }
+        let Some((source, target)) = verify_route_for(&self.config, &self.current_branch) else {
+            self.message = Some(format!(
+                "'{}' is not promotable — check out {} or a {}branch to verify",
+                self.current_branch, self.config.rolling_branch, self.config.roll_prefix
+            ));
+            return;
+        };
+        let config = self.config.clone();
+        self.start_job(format!("rf verify {source} → {target}"), move || {
+            Ok(JobDone::lines(run_verify(&config)?))
+        });
+    }
+
     /// `gg` — hand the terminal to lazygit, then take it back.
     ///
     /// The one action that still suspends: lazygit is a full-screen application
@@ -2300,15 +2465,22 @@ impl StatusApp {
         }
 
         match &self.mode {
-            Mode::Confirm { action, target } => {
+            Mode::Confirm {
+                action,
+                target,
+                carried,
+            } => {
                 render_modal(
                     f,
                     area,
                     &self.config,
-                    *action,
-                    target.as_deref(),
-                    &self.rolls,
-                    &self.current_branch,
+                    &ConfirmModal {
+                        action: *action,
+                        target: target.as_deref(),
+                        carried,
+                        rolls: &self.rolls,
+                        current_branch: &self.current_branch,
+                    },
                 );
             }
             Mode::Detail { roll, ahead_behind } => {
@@ -2327,7 +2499,7 @@ impl StatusApp {
     }
 
     fn render_header(&self, f: &mut Frame, area: Rect) {
-        let mut spans = vec![
+        let spans = vec![
             Span::styled("Branch: ", Style::default().add_modifier(Modifier::BOLD)),
             Span::raw(self.current_branch.as_str()),
             Span::raw("   Rolling: "),
@@ -2341,20 +2513,20 @@ impl StatusApp {
                 Style::default().fg(Color::Green),
             ),
         ];
-        // Only when the repo has one. Without this, `[b]` would be a key whose
-        // whole effect is a line in a dismissable panel.
-        if let Some(v) = self.version {
-            spans.push(Span::raw("   Version: "));
-            spans.push(Span::styled(
-                v.to_string(),
+        // The corner names the binary that is running, not the checked-out
+        // branch's manifest. The two used to be conflated, and the corner would
+        // change on every `[space]` — in a repo that *is* roll-flow it read as
+        // the roll's dev version, in any other repo as whatever that repo ships.
+        // Neither is what "which rf is this" asks. The per-branch versions have
+        // their own column; the bump modal shows the manifest it will raise.
+        let block = Block::bordered().title(" roll-flow ").title_top(
+            Line::from(Span::styled(
+                format!(" rf v{} ", env!("CARGO_PKG_VERSION")),
                 Style::default().fg(Color::Magenta),
-            ));
-        }
-        let header_line = Line::from(spans);
-        f.render_widget(
-            Paragraph::new(header_line).block(Block::bordered().title(" roll-flow ")),
-            area,
+            ))
+            .right_aligned(),
         );
+        f.render_widget(Paragraph::new(Line::from(spans)).block(block), area);
     }
 
     fn render_table(&mut self, f: &mut Frame, area: Rect) {
@@ -2530,6 +2702,62 @@ fn run_delete(
     Ok(render_prune_outcome(&plan, &results))
 }
 
+/// Run `ops::verify` and render its outcome, mirroring `main.rs`'s `cmd_verify`
+/// line for line — the same checks in the same order, so a verdict in the panel
+/// and a verdict in the terminal never disagree.
+///
+/// Two deliberate differences, both because this is the TUI:
+///
+/// - no version *bump*. `cmd_verify` offers one before the gates run; here the
+///   gate failure points at `[b]`, which is the key that already does it and the
+///   only place a bump commit is written from.
+/// - nothing is forced and nothing is dry-run. `[v]` has no flags to carry.
+///
+/// A failed host or an unsatisfied version gate is an `Err`, not a line: the
+/// panel marks a failed job, and a verdict that reads as "done" when it is
+/// really "blocked" is the one outcome worth being loud about. Everything the
+/// gates printed is already in the panel either way, streamed as they ran.
+fn run_verify(config: &Config) -> Result<Vec<String>> {
+    ops::ensure_clean_state(config)?;
+    let outcome = ops::verify(config, false)?;
+
+    let mut lines = Vec::new();
+    if outcome.diverged_note {
+        lines.push(format!(
+            "note: '{}' has commits not in '{}'; graduation/promotion will create a --no-ff merge",
+            outcome.target, outcome.source
+        ));
+    }
+    push_version_check(
+        &mut lines,
+        &outcome.version,
+        &outcome.source,
+        &outcome.target,
+    );
+    push_gate_notices(&mut lines, &outcome.gate_notices);
+    push_gate_notices(&mut lines, &outcome.host_notices);
+    push_host_results(&mut lines, &outcome.host_results);
+
+    if !outcome.failed_hosts.is_empty() {
+        bail!(
+            "host verification failed: {}",
+            outcome.failed_hosts.join(", ")
+        );
+    }
+    if !outcome.version.is_satisfied() {
+        return Err(anyhow!(
+            "{}\npress [b] to bump the version on '{}'",
+            ops::version_gate_error(&outcome.version, &outcome.source, &outcome.target),
+            outcome.source
+        ));
+    }
+    lines.push(format!(
+        "Verification passed: {} -> {}",
+        outcome.source, outcome.target
+    ));
+    Ok(lines)
+}
+
 /// Drive a workflow operation through `core::ops`, rendering its structured
 /// outcome into printable lines. Never runs dry and never forces.
 fn run_op(config: &Config, action: Action, target: Option<&str>) -> Result<Vec<String>> {
@@ -2562,13 +2790,16 @@ fn run_op(config: &Config, action: Action, target: Option<&str>) -> Result<Vec<S
             // Tagging is on; the version gate hard-fails here rather than
             // prompting, since the TUI has no place to offer a bump — the
             // error names the `rf promote --bump` fix.
-            let o = ops::promote(config, &promote_target, false, &force, true)?;
+            let o = ops::promote(config, &promote_target, false, &force, true, None)?;
             for step in &o.steps {
                 push_gate_notices(&mut lines, &step.gate_notices);
                 push_gate_notices(&mut lines, &step.host_notices);
                 push_host_results(&mut lines, &step.host_results);
                 let what = step.roll.as_deref().unwrap_or(&o.rolling);
                 lines.push(format!("Promoted '{}' into '{}'", what, o.stable));
+                for carried in &step.carried {
+                    lines.push(format!("  also landed: {carried}"));
+                }
                 if let Some(line) = step.tag.describe() {
                     lines.push(line);
                 }
@@ -2797,16 +3028,31 @@ fn plural(n: u32) -> &'static str {
     }
 }
 
-/// Render the centered confirmation popup for a pending action.
-fn render_modal(
-    f: &mut Frame,
-    area: Rect,
-    config: &Config,
+/// Everything the confirm modal reads, gathered so the renderer takes one
+/// parameter per *thing* rather than one per field.
+struct ConfirmModal<'a> {
     action: Action,
-    target: Option<&str>,
-    rolls: &[RollInfo],
-    current_branch: &str,
-) {
+    /// The roll a roll-scoped action targets; `None` for the repo-wide shapes.
+    target: Option<&'a str>,
+    /// See [`Mode::Confirm`]'s field of the same name.
+    carried: &'a [String],
+    rolls: &'a [RollInfo],
+    current_branch: &'a str,
+}
+
+/// Render the centered confirmation popup for a pending action.
+///
+/// `carried` is non-empty only for `[m]` on a roll row, and the modal then grows
+/// to list those rolls: the merge lands them on stable too, and the confirmation
+/// is the last place the user can see that before it happens.
+fn render_modal(f: &mut Frame, area: Rect, config: &Config, modal: &ConfirmModal) {
+    let ConfirmModal {
+        action,
+        target,
+        carried,
+        rolls,
+        current_branch,
+    } = *modal;
     let prompt = match action {
         Action::Graduate => format!(
             "Graduate {} into {}?",
@@ -2852,14 +3098,45 @@ fn render_modal(
     };
     let hint = "[y] confirm    [n] cancel";
 
-    let width = (prompt.chars().count().max(hint.len()) as u16) + 4;
-    let modal = centered_rect(area, width, 4);
+    let mut lines = vec![Line::from(prompt)];
+    if !carried.is_empty() {
+        let yellow = Style::default().fg(Color::Yellow);
+        lines.push(Line::from(Span::styled(
+            "also lands, in graduation order:",
+            yellow,
+        )));
+        for roll in carried {
+            lines.push(Line::from(Span::styled(roll.clone(), yellow)));
+        }
+    }
+    lines.push(Line::from(hint));
+
+    let width = lines.iter().map(|l| l.width()).max().unwrap_or(20) as u16 + 4;
+    let modal = centered_rect(area, width, lines.len() as u16 + 2);
 
     f.render_widget(Clear, modal);
-    let body = Paragraph::new(vec![Line::from(prompt), Line::from(hint)])
+    let body = Paragraph::new(lines)
         .alignment(Alignment::Center)
         .block(Block::bordered().title(" confirm "));
     f.render_widget(body, modal);
+}
+
+/// The rolls that `[m]` on `roll` would land on stable besides `roll` itself.
+///
+/// Best-effort: a planning failure yields an empty list rather than an error.
+/// The keypress opens a confirmation, and `ops::promote` reports the real
+/// problem a moment later if there is one — refusing to draw the modal because
+/// the disclosure could not be computed would be the worse trade.
+fn carried_by_promoting(config: &Config, roll: &str) -> Vec<String> {
+    ops::preview_roll_promotion(config, &[roll.to_string()])
+        .map(|preview| {
+            preview
+                .steps
+                .into_iter()
+                .flat_map(|step| step.carried)
+                .collect()
+        })
+        .unwrap_or_default()
 }
 
 /// Render the centered delete popup. Its shape follows `preview.prompt`, and
@@ -3218,20 +3495,23 @@ fn render_detail(
         )));
     } else {
         let blockers = rows.iter().filter(|r| r.is_blocker).count();
-        let header = if blockers > 0 {
-            format!("dependencies ({blockers} blocking):")
-        } else {
-            "dependencies (all graduated):".to_string()
+        let stale = rows.iter().filter(|r| r.needs_reintegration).count();
+        let header = match (blockers, stale) {
+            (0, 0) => "dependencies (all graduated):".to_string(),
+            (0, s) => format!("dependencies ({s} stale — reintegrate):"),
+            (b, 0) => format!("dependencies ({b} blocking):"),
+            (b, s) => format!("dependencies ({b} blocking, {s} stale):"),
         };
         lines.push(Line::from(Span::styled(
             header,
             Style::default().add_modifier(Modifier::BOLD),
         )));
         for r in &rows {
-            let (marker, marker_style) = if r.is_blocker {
-                ("⛔ blocker", Style::default().fg(Color::Red))
-            } else {
-                ("✓ ok", Style::default().fg(Color::Green))
+            let (marker, marker_style) = match (r.is_blocker, r.needs_reintegration) {
+                (true, true) => ("⛔ blocker, ⚠ stale", Style::default().fg(Color::Red)),
+                (true, false) => ("⛔ blocker", Style::default().fg(Color::Red)),
+                (false, true) => ("⚠ reintegrate", Style::default().fg(Color::Yellow)),
+                (false, false) => ("✓ ok", Style::default().fg(Color::Green)),
             };
             lines.push(Line::from(vec![
                 Span::raw(format!("  #{}  ", r.number)),
@@ -3373,6 +3653,7 @@ mod tests {
             is_current: false,
             deps: Vec::new(),
             dependents: Vec::new(),
+            stale_deps: Vec::new(),
             graduation_commit: None,
         }
     }
@@ -3494,6 +3775,7 @@ mod tests {
             is_current: false,
             deps: Vec::new(),
             dependents: Vec::new(),
+            stale_deps: Vec::new(),
             graduation_commit: None,
         }
     }
@@ -3859,6 +4141,54 @@ mod tests {
     }
 
     #[test]
+    fn verify_reads_head_and_resolves_the_route_from_its_tier() {
+        let cfg = config("main", "rolling");
+
+        // A roll branch checks its graduation into rolling...
+        assert_eq!(
+            verify_route_for(&cfg, "roll/4-0918-x"),
+            Some(("roll/4-0918-x".to_string(), "rolling".to_string()))
+        );
+        // ...and rolling checks its promotion to stable.
+        assert_eq!(
+            verify_route_for(&cfg, "rolling"),
+            Some(("rolling".to_string(), "main".to_string()))
+        );
+        // Stable itself has nowhere to go, and neither does anything off the
+        // tiers — `[v]` says so rather than guessing a route.
+        assert_eq!(verify_route_for(&cfg, "main"), None);
+        assert_eq!(verify_route_for(&cfg, "feature/whatever"), None);
+    }
+
+    #[test]
+    fn the_version_line_matches_the_one_the_cli_prints() {
+        let check = |status, head: Option<Semver>, base: Option<Semver>| {
+            let mut lines = Vec::new();
+            push_version_check(
+                &mut lines,
+                &VersionCheck { head, base, status },
+                "rolling",
+                "main",
+            );
+            lines
+        };
+
+        assert_eq!(
+            check(VersionStatus::Unchanged, Some(v(0, 2, 3)), Some(v(0, 2, 3))),
+            vec!["Version: 0.2.3 on 'rolling' (base 'main' 0.2.3) UNCHANGED"]
+        );
+        // A repo with no `Cargo.toml` says nothing at all, rather than reporting
+        // a comparison it did not make.
+        assert!(check(VersionStatus::NotApplicable, None, None).is_empty());
+        // And an unreadable version still reports both sides, naming which one
+        // could not be read.
+        assert_eq!(
+            check(VersionStatus::Unreadable, None, Some(v(1, 0, 0))),
+            vec!["Version: <unreadable> on 'rolling' (base 'main' 1.0.0) UNREADABLE"]
+        );
+    }
+
+    #[test]
     fn promote_valid_when_a_graduated_roll_exists() {
         let none = vec![roll(RollState::Active, BranchLocation::Local)];
         assert!(!can_promote(&none));
@@ -3921,7 +4251,7 @@ mod tests {
     }
 
     #[test]
-    fn dep_rows_flag_only_ungraduated_as_blockers() {
+    fn dep_rows_flag_blockers_and_staleness_independently() {
         let all = vec![
             roll_n(1, RollState::Graduated),
             roll_n(2, RollState::Active),
@@ -3930,22 +4260,42 @@ mod tests {
         ];
         let mut selected = roll_n(5, RollState::Blocked);
         selected.deps = vec![1, 2, 3, 4];
+        // Ancestry-based, independent of state: 2 (still active) and 3
+        // (diverged) have both moved since `selected` integrated them; 1 and 4
+        // have not.
+        selected.stale_deps = vec![2, 3];
 
         let rows = dep_rows(&selected, &all);
         assert_eq!(rows.len(), 4);
-        // Graduated / promoted deps are satisfied — not blockers.
-        assert!(!rows.iter().find(|r| r.number == 1).unwrap().is_blocker);
-        assert!(!rows.iter().find(|r| r.number == 4).unwrap().is_blocker);
-        // Active / diverged deps hold the roll back.
-        assert!(rows.iter().find(|r| r.number == 2).unwrap().is_blocker);
-        assert!(rows.iter().find(|r| r.number == 3).unwrap().is_blocker);
+        // Graduated / promoted deps are satisfied — not blockers, not stale.
+        let r1 = rows.iter().find(|r| r.number == 1).unwrap();
+        assert!(!r1.is_blocker && !r1.needs_reintegration);
+        let r4 = rows.iter().find(|r| r.number == 4).unwrap();
+        assert!(!r4.is_blocker && !r4.needs_reintegration);
+        // An active dep that has ALSO moved since integration is both a
+        // blocker (it hasn't graduated yet) and stale (reintegrating would
+        // pick up more) — exactly the case that matters before merging a
+        // batch of dependents against a still-moving dependency.
+        let r2 = rows.iter().find(|r| r.number == 2).unwrap();
+        assert!(r2.is_blocker && r2.needs_reintegration);
+        // A diverged dep already graduated — it is not a blocker, but it has
+        // moved on since `selected` integrated it and needs reintegrating.
+        let r3 = rows.iter().find(|r| r.number == 3).unwrap();
+        assert!(!r3.is_blocker && r3.needs_reintegration);
 
         let blockers: Vec<u32> = rows
             .iter()
             .filter(|r| r.is_blocker)
             .map(|r| r.number)
             .collect();
-        assert_eq!(blockers, vec![2, 3]);
+        assert_eq!(blockers, vec![2]);
+
+        let stale: Vec<u32> = rows
+            .iter()
+            .filter(|r| r.needs_reintegration)
+            .map(|r| r.number)
+            .collect();
+        assert_eq!(stale, vec![2, 3]);
     }
 
     #[test]
@@ -4065,6 +4415,48 @@ mod tests {
         assert_eq!(rows[0].state, RollState::Graduated);
         // A graduated target no longer gates anything.
         assert!(!rows[0].is_blocker);
+        assert!(!rows[0].needs_reintegration);
+    }
+
+    #[test]
+    fn dependent_rows_flag_reintegration_from_the_dependents_own_staleness() {
+        // `needs_reintegration` here reads the *dependent's* `stale_deps`, not
+        // `target`'s state — a dependent is stale as soon as the target moves
+        // past what it integrated, even while the target is still `Active` and
+        // therefore still gating it. This is roll/27's actual situation with
+        // its roll/26 dependency: roll/26 kept gaining commits without ever
+        // graduating, so roll/27 is both blocked on it and behind it.
+        let mut r27 = roll_n(27, RollState::Active);
+        r27.deps = vec![26];
+        r27.stale_deps = vec![26];
+        let mut target = roll_n(26, RollState::Active);
+        target.dependents = vec![27];
+        let all = vec![r27, target.clone()];
+
+        let rows = dependent_rows(&target, &all);
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].number, 27);
+        // Still active, so it still gates roll/27's graduation...
+        assert!(rows[0].is_blocker);
+        // ...but roll/27's copy is also stale, so it needs reintegrating too.
+        assert!(rows[0].needs_reintegration);
+    }
+
+    #[test]
+    fn dependent_rows_do_not_flag_reintegration_when_dependent_is_current() {
+        // A dependent that already has the target's latest tip (stale_deps
+        // does not name it) is not told to reintegrate, even if the target is
+        // still active and gating it.
+        let mut r27 = roll_n(27, RollState::Active);
+        r27.deps = vec![26];
+        let mut target = roll_n(26, RollState::Active);
+        target.dependents = vec![27];
+        let all = vec![r27, target.clone()];
+
+        let rows = dependent_rows(&target, &all);
+        assert_eq!(rows.len(), 1);
+        assert!(rows[0].is_blocker);
+        assert!(!rows[0].needs_reintegration);
     }
 
     #[test]
@@ -4795,17 +5187,46 @@ mod tests {
     }
 
     #[test]
-    fn the_header_shows_the_version_only_when_the_repo_has_one() {
+    fn the_header_names_the_running_binary_not_the_manifest() {
+        // Whatever the checked-out branch's Cargo.toml says — or whether there
+        // is one — the corner answers "which rf is this".
         let mut app = StatusApp::new(test_config(), "main".to_string(), Vec::new(), false);
-        app.version = Some(v(1, 2, 3));
+        let expected = format!("rf v{}", env!("CARGO_PKG_VERSION"));
+
+        app.version = Some(v(9, 9, 9));
         let with = draw(|f, area| app.render_header(f, area));
-        assert!(with.contains("Version: 1.2.3"), "{with}");
+        assert!(with.contains(&expected), "{with}");
+        assert!(
+            !with.contains("9.9.9"),
+            "manifest version leaked in:\n{with}"
+        );
 
         app.version = None;
         let without = draw(|f, area| app.render_header(f, area));
-        assert!(!without.contains("Version:"), "{without}");
-        // The rest of the header is unaffected either way.
+        assert!(without.contains(&expected), "{without}");
         assert!(without.contains("Branch: main"), "{without}");
+    }
+
+    #[test]
+    fn the_version_sits_in_the_top_right_corner_clear_of_the_branch_name() {
+        // The branch line grows with the branch name, so the version has to be
+        // somewhere that length cannot push it out of. Measured, not assumed.
+        let app = StatusApp::new(
+            test_config(),
+            "roll/12-0918-a-deliberately-long-slug".to_string(),
+            Vec::new(),
+            false,
+        );
+        let out = draw(|f, area| app.render_header(f, area));
+        let top = out.lines().next().expect("a top border row");
+        let at = top
+            .find("rf v")
+            .unwrap_or_else(|| panic!("no version:\n{out}"));
+        assert!(at > top.chars().count() / 2, "not right-aligned:\n{out}");
+        assert!(
+            out.contains("roll/12-0918-a-deliberately-long-slug"),
+            "{out}"
+        );
     }
 
     #[test]
@@ -4942,6 +5363,33 @@ mod tests {
     }
 
     #[test]
+    fn integrate_rolling_merges_rolling_into_the_checked_out_roll() {
+        assert_eq!(
+            integrate_rolling_target_for("roll/2-0102-beta", "roll/", "rolling"),
+            Ok("rolling".to_string())
+        );
+    }
+
+    #[test]
+    fn integrate_rolling_needs_a_roll_branch_checked_out() {
+        for head in ["main", "rolling", "feature/x"] {
+            let err = integrate_rolling_target_for(head, "roll/", "rolling")
+                .expect_err("{head} should be refused");
+            assert!(err.contains("not a roll branch"), "{head}: {err}");
+        }
+    }
+
+    #[test]
+    fn integrate_rolling_refuses_when_rolling_is_already_current() {
+        // Can't happen through the gate above since `rolling` doesn't start
+        // with the roll prefix, but a custom prefix could make it ambiguous —
+        // this keeps the self-merge refusal explicit either way.
+        let err = integrate_rolling_target_for("rolling", "", "rolling")
+            .expect_err("self-merge should be refused");
+        assert!(err.contains("already the current branch"), "{err}");
+    }
+
+    #[test]
     fn validate_action_gates_integrate_the_same_way() {
         // The single validation entry point must agree with the helper, or the
         // key and the modal could disagree about what is allowed.
@@ -4971,16 +5419,53 @@ mod tests {
                 f,
                 area,
                 &cfg,
-                Action::Integrate,
-                Some("roll/1-0101-alpha"),
-                &[],
-                "roll/2-0102-beta",
+                &ConfirmModal {
+                    action: Action::Integrate,
+                    target: Some("roll/1-0101-alpha"),
+                    carried: &[],
+                    rolls: &[],
+                    current_branch: "roll/2-0102-beta",
+                },
             )
         });
         assert!(
             out.contains("Integrate roll/1-0101-alpha into roll/2-0102-beta?"),
             "{out}"
         );
+    }
+
+    #[test]
+    fn the_promote_modal_lists_the_rolls_a_roll_promotion_would_carry() {
+        // `[m]` on one roll advances stable to that roll's graduation commit, so
+        // earlier graduations land too. The modal is the last place the user can
+        // see that before the merge, so it has to name them.
+        let cfg = config("main", "rolling");
+        let carried = vec![
+            "roll/4-0918-version-corner".to_string(),
+            "roll/7-0918-verify-button".to_string(),
+        ];
+        let out = draw(|f, area| {
+            render_modal(
+                f,
+                area,
+                &cfg,
+                &ConfirmModal {
+                    action: Action::Promote,
+                    target: Some("roll/8-0918-help-menu"),
+                    carried: &carried,
+                    rolls: &[],
+                    current_branch: "rolling",
+                },
+            )
+        });
+        assert!(
+            out.contains("Promote roll/8-0918-help-menu into main?"),
+            "{out}"
+        );
+        assert!(out.contains("also lands"), "{out}");
+        for roll in &carried {
+            assert!(out.contains(roll.as_str()), "{roll} missing from:\n{out}");
+        }
     }
 
     #[test]
@@ -4993,14 +5478,39 @@ mod tests {
             roll_n(2, RollState::Promoted),
         ];
 
-        let tidy = draw(|f, area| render_modal(f, area, &cfg, Action::Tidy, None, &rolls, "main"));
+        let tidy = draw(|f, area| {
+            render_modal(
+                f,
+                area,
+                &cfg,
+                &ConfirmModal {
+                    action: Action::Tidy,
+                    target: None,
+                    carried: &[],
+                    rolls: &rolls,
+                    current_branch: "main",
+                },
+            )
+        });
         assert!(
             tidy.contains("Delete 2 local graduated/promoted roll branches (local only)?"),
             "{tidy}"
         );
 
-        let prune =
-            draw(|f, area| render_modal(f, area, &cfg, Action::Prune, None, &rolls, "main"));
+        let prune = draw(|f, area| {
+            render_modal(
+                f,
+                area,
+                &cfg,
+                &ConfirmModal {
+                    action: Action::Prune,
+                    target: None,
+                    carried: &[],
+                    rolls: &rolls,
+                    current_branch: "main",
+                },
+            )
+        });
         assert!(
             prune.contains("Delete 1 promoted roll branch (local + origin)?"),
             "{prune}"
@@ -5055,9 +5565,9 @@ mod tests {
             pending_push: None,
         };
 
-        // Tall enough for the header, three table rows and the four-line status
+        // Tall enough for the header, three table rows and the five-line status
         // bar, and wide enough for the sync column.
-        let mut term = Terminal::new(TestBackend::new(80, 14)).unwrap();
+        let mut term = Terminal::new(TestBackend::new(80, 15)).unwrap();
         term.draw(|f| app.render(f)).unwrap();
         let line = |row: u16| -> String {
             (0..80)

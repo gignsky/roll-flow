@@ -11,9 +11,22 @@ Runs as a full-screen TUI by default; `--no-tui` prints a plain table instead an
 The table carries a `deps` column (roll numbers this roll integrated) and a
 `dependants` column (roll numbers that integrated it) — `--no-deps` hides both.
 They are shown whatever the roll's state, so a roll that has already graduated
-still reports what it depends on and what depends on it. Press `[enter]` on a
-roll for the detail overlay, which breaks the same two relationships out with
-per-dependency blocker markers.
+still reports what it depends on and what depends on it. A dep number in the
+plain table gets a trailing `⚠` when that dependency's branch has moved since
+this roll integrated it — `26⚠` — so a stale copy is visible without opening
+the detail view, which matters before reintegrating or merging a batch of
+dependent rolls against a dependency that is still gaining commits. `--json`
+carries the same signal as `stale_deps`, a subset of `deps`.
+
+Press `[enter]` on a roll for the detail overlay, which breaks the same two
+relationships out with per-dependency markers, and the two are independent —
+a dep can be both at once: `⛔ blocker` for a dep that has not graduated yet
+(it gates this roll's graduation), and `⚠ reintegrate` for one whose branch
+has moved since this roll integrated it (the same `⚠` as the plain table),
+whatever its own state — a dependency does not need to have graduated and
+diverged to be stale; it only needs to have kept moving after it was
+integrated. See
+[divergence after integration](../internals/algorithms.md#dependency-detection-coredependenciesrs).
 
 The TUI table pins the stable and rolling branches above the rolls, so `[space]`
 switches to them the same way it switches to a roll. A base branch that exists
@@ -153,12 +166,47 @@ other key inside that window resolves it as the single push straight away — th
 key is consumed rather than also acted on, so press it again once the push has
 started.
 
+## Verifying
+
+`[v]` runs [`verify`](verify.md) on the **checked-out** branch — not the row
+under the cursor, because the gates run in the working tree, so the branch they
+judge is whichever one is checked out. The route comes from that branch's tier
+and is named in the panel title before the gates start:
+
+| checked out | `[v]` checks |
+|---|---|
+| a `roll/*` branch | `roll/N-… → rolling` |
+| the rolling branch | `rolling → main` |
+| anything else | nothing — it says to check out a roll or rolling first |
+
+It is the one action key with no confirmation modal, because it is the one that
+changes nothing: the modal is for the ops that write to the repo. It reports the
+same checks as `rf verify`, in the same words — divergence note, version
+comparison, gate notices, per-host results, verdict.
+
+The one thing it will not do is bump the version. `rf verify` offers one; here a
+failed version gate points at `[b]` instead, which is the key that already writes
+that commit. A failed host or an unsatisfied gate marks the panel as failed
+rather than passing quietly.
+
 ## Bumping the version
 
 `[b]` raises the `[package]` version in `Cargo.toml` on the **checked-out**
 branch — not the row under the cursor, because a bump is a commit and has to land
-on the branch the merge will be made from. The header carries the current version
-so the effect is visible without opening anything.
+on the branch the merge will be made from. The bump modal shows the version it
+will raise, so the effect is visible before confirming.
+
+The header's top-right corner names the **binary that is running** — `rf v0.2.4`
+— not the checked-out branch's manifest. The two used to be conflated, and the
+corner changed on every `[space]`: in this repo it read as a roll's dev version,
+in any other repo as whatever that repo ships, and neither answers "which rf is
+this". Per-branch versions have their own table column.
+
+```text
+┌ roll-flow ───────────────────────────────────────── rf v0.2.4 ┐
+│Branch: roll/4-0918-x   Rolling: rolling   Stable: main        │
+└───────────────────────────────────────────────────────────────┘
+```
 
 ```text
 ┌ bump version ────────────────────────┐

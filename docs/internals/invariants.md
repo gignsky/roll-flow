@@ -10,16 +10,49 @@ long list — that keeps two rolls adding rules in different areas from collidin
 - `main` only receives merges from `rolling`, never directly from roll branches.
   Per-roll promotion does not weaken this: it merges a graduation *commit* that
   lives on rolling, which is why stable's history stays a prefix of rolling's
-  rather than a divergent line.
+  rather than a divergent line. When a per-roll step has to bump the version,
+  the bump goes *inside* that merge commit, never as a commit beside it — and
+  stable is then merged back into rolling so the tiers do not silently diverge
+  (the same reintegration a landed hotfix performs).
+- A per-roll promotion that would land rolls the user did not name must say
+  which, and get an answer, *before* it merges — `rf promote --roll` prompts
+  (`--yes` accepts, unattended fails) and the TUI's `[m]` lists them in its
+  confirmation. Carrying earlier graduations is inherent to advancing stable to a
+  graduation commit; landing them silently is not, and any new promotion entry
+  point inherits the disclosure, not just the merge.
 - A roll is "graduated" if a merge commit exists on the rolling branch whose subject
-  matches `Merge branch 'roll/N-...'` OR `Graduate roll/N-...`. Both formats must be
-  checked everywhere graduation is tested.
+  names it as the merge *source* — `Merge branch 'roll/N-...'`, `Graduate roll/N-...`,
+  a GitHub `Merge pull request` subject, or a hand-written one a conflicted merge
+  left behind. Every shape must be checked everywhere graduation is tested, which
+  is why there is exactly one reader of merge subjects,
+  `branches::extract_graduated_branch`, and why new callers must go through it
+  rather than matching a prefix themselves. A single missed shape costs the roll
+  its dependency, its graduated state *and* its graduation commit at once, since
+  all three are read from that one function.
+- **Source, never target.** A subject's ` into ` clause names where the merge
+  landed, and must never be read as a branch that graduated. Misreading it marks
+  an unmerged roll as graduated — strictly worse than failing to notice a real
+  one, which is why the clause is cut before any shape is matched.
 
 ## Rolls and branch resolution
 
 - Roll numbers are monotonically increasing; detect from local + remote branches combined.
 - Branch resolution always tries local first, then `origin/<branch>` as fallback.
   Functions that need the ref string should return `Option<String>` (null = doesn't exist).
+- A dependency that has not graduated (`RollState::Active`/`Blocked`) is a real
+  `⛔ blocker` — the ordering constraint. Whether it has also *moved* since the
+  dependent integrated it is a separate question, answered by an ancestry check
+  (`RollInfo::stale_deps`), not by `RollState`: an `Active` dependency that
+  keeps gaining commits is exactly as stale as a `Diverged` one that graduated
+  and then moved, and either must be surfaced as needing reintegration
+  (`⚠ reintegrate` in `tui::rolls::dep_rows`/`dependent_rows`, the same `⚠` in
+  the plain table and `stale_deps` in `--json`). The two signals are not
+  mutually exclusive and must not be conflated into one marker: a dependency
+  can be both an active blocker and stale at once, and collapsing that to
+  "blocked" alone hides the staleness, while gating the reintegration notice on
+  `RollState::Diverged` alone misses every dependency that is stale while still
+  active — exactly the case that matters before merging a batch of dependent
+  rolls against a dependency someone keeps pushing to.
 
 ## Verification
 
