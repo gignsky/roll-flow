@@ -24,6 +24,11 @@ fn dependants(sb: &Sandbox, branch: &str) -> Vec<u64> {
     numbers(sb, branch, "dependants")
 }
 
+/// Reported `stale_deps` for a roll branch, from `rf list --json`.
+fn stale_deps(sb: &Sandbox, branch: &str) -> Vec<u64> {
+    numbers(sb, branch, "stale_deps")
+}
+
 fn numbers(sb: &Sandbox, branch: &str, field: &str) -> Vec<u64> {
     let json = sb.list_json();
     let roll = json
@@ -211,4 +216,58 @@ fn status_table_shows_both_columns_by_default() {
         "--no-deps should hide the columns: {}",
         out.combined()
     );
+}
+
+/// `stale_deps` must be an ancestry check, not a `RollState` lookup: a
+/// dependency that keeps gaining commits is stale whether or not it has ever
+/// graduated. This is the scenario that matters before merging a batch of
+/// dependent rolls against a dependency someone keeps pushing to.
+#[test]
+fn stale_deps_empty_right_after_integration() {
+    let sb = sandbox_with_integration();
+    assert!(stale_deps(&sb, "roll/2-0612-beta").is_empty());
+}
+
+#[test]
+fn active_dependency_that_keeps_moving_is_reported_stale() {
+    let sb = sandbox_with_integration();
+
+    // roll/1 gains a commit beta never picked up, and never graduates — it
+    // stays `active`. Staleness must not depend on that state transition.
+    sb.git(&["checkout", "roll/1-0611-alpha"]);
+    sb.commit_file("alpha2.txt", "a2\n", "more alpha work");
+    sb.git(&["checkout", "rolling"]);
+
+    assert_eq!(
+        sb.roll_state("roll/1-0611-alpha").as_deref(),
+        Some("active")
+    );
+    assert_eq!(stale_deps(&sb, "roll/2-0612-beta"), vec![1]);
+
+    // Visible from the plain table too, not just --json.
+    let out = sb.rf(&["list", "--no-tui", "--deps"]);
+    assert!(out.success, "list: {}", out.combined());
+    assert!(
+        out.stdout.contains("1⚠"),
+        "a stale dep should carry a ⚠ marker: {}",
+        out.combined()
+    );
+}
+
+#[test]
+fn reintegrating_clears_staleness() {
+    let sb = sandbox_with_integration();
+
+    sb.git(&["checkout", "roll/1-0611-alpha"]);
+    sb.commit_file("alpha2.txt", "a2\n", "more alpha work");
+    sb.git(&["checkout", "roll/2-0612-beta"]);
+    let out = sb.rf(&["integrate", "roll/1-0611-alpha"]);
+    assert!(
+        out.success,
+        "re-integrate alpha into beta: {}",
+        out.combined()
+    );
+    sb.git(&["checkout", "rolling"]);
+
+    assert!(stale_deps(&sb, "roll/2-0612-beta").is_empty());
 }
