@@ -437,8 +437,21 @@ fn scan_promoted(repo: &Path, stable_ref: &str) -> HashSet<String> {
     promoted
 }
 
-/// Extract the *source* branch name from a merge subject line. Handles the three
-/// shapes a roll lands through, plus subjects a human typed:
+/// The ref to read a branch's file content at: its own tip when there is a
+/// local copy, `origin/<branch>` when the branch only exists on the remote.
+///
+/// The same local-first order as [`git::resolve_branch`], in one place, because
+/// the TUI table and both plain tables all have to agree about which commit a
+/// branch's version was read from.
+pub fn content_ref(branch: &str, location: &BranchLocation) -> String {
+    match location {
+        BranchLocation::Remote => format!("origin/{branch}"),
+        _ => branch.to_string(),
+    }
+}
+
+/// Extract the branch name from a graduation subject line. Handles the three
+/// merge-subject shapes a roll can land through:
 /// - `Merge branch 'roll/N-...'[ into ...]` — a local `git merge --no-ff`.
 /// - `Graduate roll/N-... [...]` — an `rf graduate` structured merge.
 /// - `Merge pull request #M from OWNER/roll/N-...` — a GitHub PR merge, which is
