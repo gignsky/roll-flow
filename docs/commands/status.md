@@ -11,13 +11,22 @@ Runs as a full-screen TUI by default; `--no-tui` prints a plain table instead an
 The table carries a `deps` column (roll numbers this roll integrated) and a
 `dependants` column (roll numbers that integrated it) — `--no-deps` hides both.
 They are shown whatever the roll's state, so a roll that has already graduated
-still reports what it depends on and what depends on it. Press `[enter]` on a
-roll for the detail overlay, which breaks the same two relationships out with
-per-dependency markers: `⛔ blocker` for a dep that has not graduated yet (it
-gates this roll's graduation), and `⚠ reintegrate` for one that already
-graduated but has gained commits since this roll integrated it — it is not
-blocking anything, but this roll's copy of it is stale (see
-[divergence after integration](../internals/algorithms.md#dependency-detection-coredependenciesrs)).
+still reports what it depends on and what depends on it. A dep number in the
+plain table gets a trailing `⚠` when that dependency's branch has moved since
+this roll integrated it — `26⚠` — so a stale copy is visible without opening
+the detail view, which matters before reintegrating or merging a batch of
+dependent rolls against a dependency that is still gaining commits. `--json`
+carries the same signal as `stale_deps`, a subset of `deps`.
+
+Press `[enter]` on a roll for the detail overlay, which breaks the same two
+relationships out with per-dependency markers, and the two are independent —
+a dep can be both at once: `⛔ blocker` for a dep that has not graduated yet
+(it gates this roll's graduation), and `⚠ reintegrate` for one whose branch
+has moved since this roll integrated it (the same `⚠` as the plain table),
+whatever its own state — a dependency does not need to have graduated and
+diverged to be stale; it only needs to have kept moving after it was
+integrated. See
+[divergence after integration](../internals/algorithms.md#dependency-detection-coredependenciesrs).
 
 The TUI table pins the stable and rolling branches above the rolls, so `[space]`
 switches to them the same way it switches to a roll. A base branch that exists

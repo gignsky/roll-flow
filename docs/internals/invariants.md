@@ -38,16 +38,21 @@ long list — that keeps two rolls adding rules in different areas from collidin
 
 - Roll numbers are monotonically increasing; detect from local + remote branches combined.
 - Branch resolution always tries local first, then `origin/<branch>` as fallback.
-- A `Diverged` dependency (one that graduated, then gained commits the dependent
-  never integrated) is never reported as a `⛔ blocker` — it does not gate the
-  dependent's graduation, since the ordering constraint was satisfied the moment
-  it first graduated. It must still be surfaced, distinctly, as needing
-  reintegration (`⚠ reintegrate` in the detail view's `dep_rows`/
-  `dependent_rows`), so a roll that integrated it notices the drift instead of
-  reading it as a satisfied, unremarkable dependency. Conflating the two markers
-  is a correctness bug, not a cosmetic one: it either falsely claims graduation
-  is blocked, or silently drops the notice that a reintegration is worth doing.
   Functions that need the ref string should return `Option<String>` (null = doesn't exist).
+- A dependency that has not graduated (`RollState::Active`/`Blocked`) is a real
+  `⛔ blocker` — the ordering constraint. Whether it has also *moved* since the
+  dependent integrated it is a separate question, answered by an ancestry check
+  (`RollInfo::stale_deps`), not by `RollState`: an `Active` dependency that
+  keeps gaining commits is exactly as stale as a `Diverged` one that graduated
+  and then moved, and either must be surfaced as needing reintegration
+  (`⚠ reintegrate` in `tui::rolls::dep_rows`/`dependent_rows`, the same `⚠` in
+  the plain table and `stale_deps` in `--json`). The two signals are not
+  mutually exclusive and must not be conflated into one marker: a dependency
+  can be both an active blocker and stale at once, and collapsing that to
+  "blocked" alone hides the staleness, while gating the reintegration notice on
+  `RollState::Diverged` alone misses every dependency that is stale while still
+  active — exactly the case that matters before merging a batch of dependent
+  rolls against a dependency someone keeps pushing to.
 
 ## Verification
 
