@@ -5127,6 +5127,7 @@ mod tests {
             job: None,
             panel: None,
             pending_g: false,
+            pending_push: None,
         };
         let out = draw(|f, area| app.render_table(f, area));
 
@@ -5156,6 +5157,7 @@ mod tests {
             job: None,
             panel: None,
             pending_g: false,
+            pending_push: None,
         };
         let out = draw(|f, area| app.render_table(f, area));
         assert!(!out.contains("version"), "column shown anyway:\n{out}");
