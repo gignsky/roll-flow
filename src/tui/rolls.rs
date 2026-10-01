@@ -651,6 +651,32 @@ pub(crate) fn promote_target_for(
     }
 }
 
+/// The branch `[I]` would merge into the current one, or the reason it cannot.
+///
+/// Mirrors `integrate_target_for`, but the source is always the rolling branch
+/// rather than the row under the cursor — rolling isn't a roll, so it never has
+/// a row to select. This is the recovery path for a roll that fails to merge
+/// into rolling at graduation time: bring rolling into the roll here instead,
+/// resolve whatever conflicts graduation would have hit, then graduate
+/// normally. Because rolling already contains every graduated roll, the same
+/// merge picks all of them up as dependencies (method 2 in
+/// `core::dependencies`) in one step.
+pub(crate) fn integrate_rolling_target_for(
+    current_branch: &str,
+    roll_prefix: &str,
+    rolling_branch: &str,
+) -> Result<String, String> {
+    if !current_branch.starts_with(roll_prefix) {
+        return Err(format!(
+            "'{current_branch}' is not a roll branch — integrate merges into a roll"
+        ));
+    }
+    if current_branch == rolling_branch {
+        return Err(format!("'{rolling_branch}' is already the current branch"));
+    }
+    Ok(rolling_branch.to_string())
+}
+
 /// The roll `[i]` would merge into the current branch, or the reason it cannot.
 ///
 /// Unlike every other action, integration reads *two* rows: the source is the one
@@ -1044,6 +1070,7 @@ impl StatusApp {
             KeyCode::Char('f') => self.start_fetch(),
             KeyCode::Char('G') => self.request(Action::Graduate),
             KeyCode::Char('i') => self.request_integrate(),
+            KeyCode::Char('I') => self.request_integrate_rolling(),
             KeyCode::Char('b') => self.request_bump(),
             KeyCode::Char('m') => self.request(Action::Promote),
             KeyCode::Char('u') => self.request(Action::Update),
@@ -1201,6 +1228,30 @@ impl StatusApp {
             &self.current_branch,
             &self.config.roll_prefix,
             self.selected_roll(),
+        ) {
+            Ok(branch) => {
+                self.mode = Mode::Confirm {
+                    action: Action::Integrate,
+                    target: Some(branch),
+                    carried: Vec::new(),
+                }
+            }
+            Err(msg) => self.message = Some(msg),
+        }
+    }
+
+    /// `[I]` — merge the rolling branch into the checked-out roll.
+    ///
+    /// Needs no selection, unlike `[i]`: the source is always rolling, which
+    /// isn't a roll row to point the cursor at.
+    fn request_integrate_rolling(&mut self) {
+        if self.busy() {
+            return;
+        }
+        match integrate_rolling_target_for(
+            &self.current_branch,
+            &self.config.roll_prefix,
+            &self.config.rolling_branch,
         ) {
             Ok(branch) => {
                 self.mode = Mode::Confirm {
@@ -1627,8 +1678,8 @@ impl StatusApp {
         let chunks = Layout::vertical([
             Constraint::Length(3),
             Constraint::Min(3),
-            // One message line plus four hint lines.
-            Constraint::Length(5),
+            // One message line plus five hint lines.
+            Constraint::Length(6),
         ])
         .split(area);
 
@@ -1833,11 +1884,13 @@ impl StatusApp {
         // 80 columns, and `Paragraph` truncates rather than wrapping — the roll
         // lifecycle first, then what removes things plus the panel's own keys.
         let roll_line =
-            Line::from(" [c]reate   [i]ntegrate   [G]raduate   [m] promote   [u]pdate   [b]ump");
-        let extra_line =
-            Line::from(" [d]elete   [x] prune   [t]idy   [PgUp/PgDn/End] scroll output");
+            Line::from(" [c]reate   [i]ntegrate   [I] rolling   [G]raduate   [m] promote");
+        let more_line = Line::from(" [u]pdate   [b]ump   [d]elete   [x] prune   [t]idy");
+        let extra_line = Line::from(" [PgUp/PgDn/End] scroll output");
         f.render_widget(
-            Paragraph::new(vec![msg_line, nav_line, sync_line, roll_line, extra_line]),
+            Paragraph::new(vec![
+                msg_line, nav_line, sync_line, roll_line, more_line, extra_line,
+            ]),
             area,
         );
     }
@@ -3432,6 +3485,7 @@ mod tests {
             "[esc] close output",
             "[c]reate",
             "[i]ntegrate",
+            "[I] rolling",
             "[G]raduate",
             "[m] promote",
             "[u]pdate",
@@ -3449,7 +3503,7 @@ mod tests {
         // than that and the last binding silently disappears.
         let app = StatusApp::new(test_config(), "main".to_string(), Vec::new(), false);
         let out = draw(|f, area| {
-            let chunks = Layout::vertical([Constraint::Length(5)]).split(area);
+            let chunks = Layout::vertical([Constraint::Length(6)]).split(area);
             app.render_status_bar(f, chunks[0])
         });
         assert!(
@@ -3833,6 +3887,33 @@ mod tests {
     }
 
     #[test]
+    fn integrate_rolling_merges_rolling_into_the_checked_out_roll() {
+        assert_eq!(
+            integrate_rolling_target_for("roll/2-0102-beta", "roll/", "rolling"),
+            Ok("rolling".to_string())
+        );
+    }
+
+    #[test]
+    fn integrate_rolling_needs_a_roll_branch_checked_out() {
+        for head in ["main", "rolling", "feature/x"] {
+            let err = integrate_rolling_target_for(head, "roll/", "rolling")
+                .expect_err("{head} should be refused");
+            assert!(err.contains("not a roll branch"), "{head}: {err}");
+        }
+    }
+
+    #[test]
+    fn integrate_rolling_refuses_when_rolling_is_already_current() {
+        // Can't happen through the gate above since `rolling` doesn't start
+        // with the roll prefix, but a custom prefix could make it ambiguous —
+        // this keeps the self-merge refusal explicit either way.
+        let err = integrate_rolling_target_for("rolling", "", "rolling")
+            .expect_err("self-merge should be refused");
+        assert!(err.contains("already the current branch"), "{err}");
+    }
+
+    #[test]
     fn validate_action_gates_integrate_the_same_way() {
         // The single validation entry point must agree with the helper, or the
         // key and the modal could disagree about what is allowed.
@@ -4007,9 +4088,9 @@ mod tests {
             pending_g: false,
         };
 
-        // Tall enough for the header, three table rows and the four-line status
+        // Tall enough for the header, three table rows and the five-line status
         // bar, and wide enough for the sync column.
-        let mut term = Terminal::new(TestBackend::new(80, 14)).unwrap();
+        let mut term = Terminal::new(TestBackend::new(80, 15)).unwrap();
         term.draw(|f| app.render(f)).unwrap();
         let line = |row: u16| -> String {
             (0..80)
