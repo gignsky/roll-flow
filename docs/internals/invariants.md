@@ -170,6 +170,19 @@ long list — that keeps two rolls adding rules in different areas from collidin
   stray cherry-pick). Read-only and cheap, so it runs first — before
   `strip_dev_version` can silently erase the evidence, and before a full gate
   run wastes time only to fail on something else, or not fail at all.
+- The dev-marker strip `ops::graduate` commits on the roll branch is rolled
+  back (`ops::rollback_branch`, a `git reset --hard` or `update-ref` back to
+  the pre-strip SHA, whichever the roll being checked out allows) if the gates
+  or the merge fail afterward. The strip has to happen *before* those — it is
+  the thing that keeps a roll's own marker from conflicting with wherever
+  rolling has moved to since the roll branched — but a failure downstream of
+  it must not leave a stray commit behind on a roll that never actually
+  graduated. Without the rollback, a failed `rf graduate` looks like "the
+  version got reverted" instead of "graduation failed," because the only
+  visible trace of the attempt is the version disappearing. Both a failing
+  gate and a real merge conflict on some unrelated file go through the same
+  rollback — "something after the strip failed" is the condition, not which
+  particular step.
 - A `-roll<N>` dev version must never reach `rolling` or the stable branch, and
   is refused **before** the numbers are compared, not by them. `0.2.5-roll9` is
   numerically above `0.2.4`, so a comparison alone would promote it — and then

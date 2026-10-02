@@ -626,3 +626,105 @@ fn promote_fallthrough_to_graduate_also_strips_the_dev_marker() {
     assert_eq!(sb.cargo_version_at(&branch), "0.0.1");
     assert_eq!(sb.cargo_version_at("rolling"), "0.0.1");
 }
+
+#[test]
+fn a_failing_gate_after_the_strip_restores_the_roll_s_dev_marker() {
+    // The dev-marker strip has to land on the roll *before* the gates and the
+    // merge run (so a rolling branch that has moved since doesn't conflict
+    // with the roll's own marker on the same Cargo.toml line). But if the
+    // gates fail afterward, the roll must come back exactly as it was — not
+    // left with a stray "dropped the dev marker" commit on a roll that never
+    // actually graduated.
+    let sb = Sandbox::cargo();
+    sb.init();
+    sb.set_graduate_gates(&["false"]);
+    let out = sb.create_roll("solo", "0611");
+    assert!(out.success, "{}", out.combined());
+    let branch = sb.current_branch();
+    assert_eq!(sb.cargo_version_at("HEAD"), "0.0.1-roll1");
+    sb.commit_file("work.txt", "work\n", "work");
+    let before = sb.rev("HEAD");
+
+    let out = sb.rf(&["graduate"]);
+    assert!(!out.success, "the gate should fail: {}", out.combined());
+
+    assert_eq!(sb.current_branch(), branch);
+    assert_eq!(
+        sb.rev("HEAD"),
+        before,
+        "the strip commit must be rolled back"
+    );
+    assert_eq!(sb.cargo_version_at("HEAD"), "0.0.1-roll1");
+}
+
+#[test]
+fn a_merge_conflict_after_the_strip_restores_the_roll_s_dev_marker() {
+    // Same rollback, triggered by an actual merge conflict (on an unrelated
+    // file) instead of a gate failure — both are "something after the strip
+    // failed" and must be handled the same way.
+    let sb = Sandbox::cargo();
+    sb.init();
+    sb.git(&["checkout", "rolling"]);
+    let out = sb.create_roll("conflict", "0611");
+    assert!(out.success, "{}", out.combined());
+    let branch = sb.current_branch();
+    assert_eq!(sb.cargo_version_at("HEAD"), "0.0.1-roll1");
+    sb.commit_file("clash.txt", "roll side\n", "roll edit");
+    let before = sb.rev("HEAD");
+
+    sb.git(&["checkout", "rolling"]);
+    sb.commit_file("clash.txt", "rolling side\n", "rolling edit");
+    sb.git(&["checkout", &branch]);
+
+    let out = sb.rf(&["graduate"]);
+    assert!(
+        !out.success,
+        "conflicting graduation should fail: {}",
+        out.combined()
+    );
+
+    assert_eq!(sb.current_branch(), branch);
+    assert_eq!(
+        sb.rev("HEAD"),
+        before,
+        "the strip commit must be rolled back"
+    );
+    assert_eq!(sb.cargo_version_at("HEAD"), "0.0.1-roll1");
+    let leftover: Vec<String> = sb
+        .git(&["status", "--porcelain"])
+        .lines()
+        .filter(|l| !l.ends_with(".roll-flow.toml"))
+        .map(String::from)
+        .collect();
+    assert!(leftover.is_empty(), "working tree not clean: {leftover:?}");
+}
+
+#[test]
+fn graduating_past_an_advanced_rolling_branch_does_not_conflict_on_the_marker() {
+    // The scenario the rollback exists to make safe to attempt: rolling moved
+    // (here, simulating another roll's bump) since this roll branched, so the
+    // roll's own `-rollN` marker and rolling's new version touch the same
+    // Cargo.toml line. Stripping before the merge keeps that from becoming a
+    // real conflict, so graduation just succeeds.
+    let sb = Sandbox::cargo();
+    sb.init();
+    let out = sb.create_roll("solo", "0611");
+    assert!(out.success, "{}", out.combined());
+    let branch = sb.current_branch();
+    assert_eq!(sb.cargo_version_at("HEAD"), "0.0.1-roll1");
+    sb.commit_file("work.txt", "work\n", "work");
+
+    sb.git(&["checkout", "rolling"]);
+    sb.write_cargo_version("0.0.2");
+    sb.git(&["add", "Cargo.toml"]);
+    sb.git(&["commit", "-m", "simulate an independent bump on rolling"]);
+    sb.git(&["checkout", &branch]);
+
+    let out = sb.rf(&["graduate"]);
+    assert!(
+        out.success,
+        "graduate should not conflict: {}",
+        out.combined()
+    );
+    assert_eq!(sb.cargo_version_at("rolling"), "0.0.2");
+}

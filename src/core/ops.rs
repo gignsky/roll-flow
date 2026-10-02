@@ -1375,19 +1375,11 @@ pub(crate) fn graduate(
         MergeState::Diverged | MergeState::FastForwardable => {}
     }
 
-    // Before the gates, which run `cargo update --workspace --locked`: the
-    // strip rewrites `Cargo.lock`, and that gate fails against a stale one.
-    // Skipped on a dry run, which must leave no commit behind — so a dry run
-    // reports what the gates would say about the *unstripped* version.
-    let dropped_dev_marker = if dry_run {
-        None
-    } else {
-        drop_dev_marker_on_branch(config, roll)?
-    };
-
-    let report = run_gates(repo, &config.roll_to_rolling_gates, dry_run, force)?;
-
     if dry_run {
+        // A preview must not commit, so the marker is left alone and the
+        // gates report on the *unstripped* version — the honest answer for a
+        // run that changes nothing.
+        let report = run_gates(repo, &config.roll_to_rolling_gates, dry_run, force)?;
         return Ok(GraduateOutcome {
             roll: roll.to_string(),
             rolling: rolling.clone(),
@@ -1397,9 +1389,40 @@ pub(crate) fn graduate(
         });
     }
 
-    let subject = format!("Graduate {roll} into {rolling}");
-    let body = force.trailer(&report.bypassed);
-    run_merge(repo, roll, rolling, &subject, body.as_deref())?;
+    // The strip has to land on `roll` *before* the merge is attempted: if
+    // `rolling` has moved since the roll branched (another roll's bump, say),
+    // the roll's own `-rollN` line and rolling's new one touch the same spot
+    // in `Cargo.toml`, which `git merge` reads as a real conflict — stripping
+    // first (back to exactly what the roll branched from) makes that line
+    // match the merge base, so the merge takes rolling's version cleanly
+    // instead of colliding with it.
+    //
+    // That commit has to be undone if anything after it fails, though: a gate
+    // failure or (for some unrelated file) a real merge conflict must leave
+    // the roll exactly as it was, not a half-graduated roll with a stray
+    // "dropped the dev marker" commit and no merge to show for it — the bug
+    // this rollback exists to close.
+    let before_strip = git::rev_parse(repo, roll)?;
+    let dropped_dev_marker = drop_dev_marker_on_branch(config, roll)?;
+
+    let outcome = (|| -> Result<GateReport> {
+        let report = run_gates(repo, &config.roll_to_rolling_gates, dry_run, force)?;
+        let subject = format!("Graduate {roll} into {rolling}");
+        let body = force.trailer(&report.bypassed);
+        run_merge(repo, roll, rolling, &subject, body.as_deref())?;
+        Ok(report)
+    })();
+
+    let report = match outcome {
+        Ok(report) => report,
+        Err(err) => {
+            if dropped_dev_marker.is_some() {
+                rollback_branch(repo, roll, &before_strip)?;
+            }
+            return Err(err);
+        }
+    };
+
     Ok(GraduateOutcome {
         roll: roll.to_string(),
         rolling: rolling.clone(),
@@ -1424,6 +1447,23 @@ fn drop_dev_marker_on_branch(config: &Config, branch: &str) -> Result<Option<Sem
         format!("dropped '{branch}'s dev marker, but checking out '{original}' again failed")
     })?;
     dropped
+}
+
+/// Move `branch` back to `sha`, used to undo [`drop_dev_marker_on_branch`]
+/// when something after it fails. `branch` may or may not be the one
+/// currently checked out — the CLI's `rf graduate` runs from it, but the
+/// TUI's `[g]` can name a roll while sitting on a different branch — so a
+/// plain `git reset` only works in the first case; `update-ref` moves the
+/// branch without touching the working tree when it isn't checked out at all.
+fn rollback_branch(repo: &Path, branch: &str, sha: &str) -> Result<()> {
+    if git::current_branch(repo)? == branch {
+        git::run_git(repo, &["reset", "--hard", sha])
+    } else {
+        git::run_git(repo, &["update-ref", &format!("refs/heads/{branch}"), sha])
+    }
+    .with_context(|| {
+        format!("failed to roll back '{branch}' to {sha} after dropping its dev marker")
+    })
 }
 
 // ── promote ─────────────────────────────────────────────────────────────────
