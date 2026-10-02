@@ -1376,9 +1376,11 @@ pub(crate) fn graduate(
     }
 
     if dry_run {
-        // A preview must not commit, so the marker is left alone and the
-        // gates report on the *unstripped* version — the honest answer for a
-        // run that changes nothing.
+        // A preview must not commit (so the marker is left alone and the
+        // gates report on the *unstripped* version) and `run_gates` doesn't
+        // execute anything in dry-run mode regardless — just previews the
+        // commands — so there is nothing here that depends on which branch
+        // happens to be checked out.
         let report = run_gates(repo, &config.roll_to_rolling_gates, dry_run, force)?;
         return Ok(GraduateOutcome {
             roll: roll.to_string(),
@@ -1389,6 +1391,17 @@ pub(crate) fn graduate(
         });
     }
 
+    // The gates run real shell commands against the working tree, so they
+    // must see `roll`'s own content — not whatever happened to be checked out
+    // when this was called. The TUI's `[G]` can graduate a roll while sitting
+    // on a different branch entirely (it doesn't require the selected row to
+    // be the current one), which otherwise means the gates silently validate
+    // the wrong tree. Checking `roll` out here, before anything else mutates
+    // it, is what fixes that.
+    let true_original = git::current_branch(repo)?;
+    git::run_git(repo, &["checkout", roll])
+        .with_context(|| format!("failed to check out '{roll}' to graduate it"))?;
+
     // The strip has to land on `roll` *before* the merge is attempted: if
     // `rolling` has moved since the roll branched (another roll's bump, say),
     // the roll's own `-rollN` line and rolling's new one touch the same spot
@@ -1396,32 +1409,49 @@ pub(crate) fn graduate(
     // first (back to exactly what the roll branched from) makes that line
     // match the merge base, so the merge takes rolling's version cleanly
     // instead of colliding with it.
-    //
-    // That commit has to be undone if anything after it fails, though: a gate
-    // failure or (for some unrelated file) a real merge conflict must leave
-    // the roll exactly as it was, not a half-graduated roll with a stray
-    // "dropped the dev marker" commit and no merge to show for it — the bug
-    // this rollback exists to close.
     let before_strip = git::rev_parse(repo, roll)?;
-    let dropped_dev_marker = drop_dev_marker_on_branch(config, roll)?;
+    let dropped_dev_marker = strip_dev_version(config, roll)?;
 
-    let outcome = (|| -> Result<GateReport> {
-        let report = run_gates(repo, &config.roll_to_rolling_gates, dry_run, force)?;
-        let subject = format!("Graduate {roll} into {rolling}");
-        let body = force.trailer(&report.bypassed);
-        run_merge(repo, roll, rolling, &subject, body.as_deref())?;
-        Ok(report)
-    })();
+    // `merge_gated` stages the merge, runs the gates against *that* staged
+    // result (exactly what the commit will carry, not just `roll` in
+    // isolation), and only commits if they pass — capturing `roll` as its own
+    // "original" to restore to, since that's what's checked out above.
+    let subject = format!("Graduate {roll} into {rolling}");
+    let merge_outcome = merge_gated(repo, roll, rolling, &subject, None, || {
+        run_gates(repo, &config.roll_to_rolling_gates, dry_run, force)
+    });
 
-    let report = match outcome {
+    // Anything that fails here — a gate, or a real merge conflict on some
+    // other file — must undo the strip too: a roll left with its marker gone
+    // but nothing actually graduated reads as "the version got reverted"
+    // rather than "graduation failed". `merge_gated` has already aborted the
+    // merge and returned us to `roll` by the time it reports an error, so a
+    // plain reset is all that's needed.
+    let report = match merge_outcome {
         Ok(report) => report,
         Err(err) => {
-            if dropped_dev_marker.is_some() {
-                rollback_branch(repo, roll, &before_strip)?;
-            }
+            git::run_git(repo, &["reset", "--hard", &before_strip]).with_context(|| {
+                format!("failed to roll back '{roll}' after a failed graduation")
+            })?;
+            git::run_git(repo, &["checkout", &true_original]).with_context(|| {
+                format!(
+                    "rolled back '{roll}' after a failed graduation, \
+                     but checking out '{true_original}' again failed"
+                )
+            })?;
             return Err(err);
         }
     };
+
+    if let Some(trailer) = force.trailer(&report.bypassed) {
+        append_commit_trailer(repo, rolling, &trailer)?;
+    }
+
+    git::run_git(repo, &["checkout", &true_original]).with_context(|| {
+        format!(
+            "graduated '{roll}' into '{rolling}', but checking out '{true_original}' again failed"
+        )
+    })?;
 
     Ok(GraduateOutcome {
         roll: roll.to_string(),
@@ -1429,40 +1459,6 @@ pub(crate) fn graduate(
         dry_run: false,
         gate_notices: report.notices,
         dropped_dev_marker,
-    })
-}
-
-/// Check out `branch`, drop its dev marker if it has one, and return to
-/// whatever was checked out before — isolated from `run_merge`'s own checkout
-/// dance because the strip must land *on `branch`* specifically, and a caller
-/// (the TUI's `[g]`) may be sitting on a different branch entirely when it
-/// names one to graduate.
-fn drop_dev_marker_on_branch(config: &Config, branch: &str) -> Result<Option<Semver>> {
-    let repo = &config.repo_root;
-    let original = git::current_branch(repo)?;
-    git::run_git(repo, &["checkout", branch])
-        .with_context(|| format!("failed to check out '{branch}' to drop its dev marker"))?;
-    let dropped = strip_dev_version(config, branch);
-    git::run_git(repo, &["checkout", &original]).with_context(|| {
-        format!("dropped '{branch}'s dev marker, but checking out '{original}' again failed")
-    })?;
-    dropped
-}
-
-/// Move `branch` back to `sha`, used to undo [`drop_dev_marker_on_branch`]
-/// when something after it fails. `branch` may or may not be the one
-/// currently checked out — the CLI's `rf graduate` runs from it, but the
-/// TUI's `[g]` can name a roll while sitting on a different branch — so a
-/// plain `git reset` only works in the first case; `update-ref` moves the
-/// branch without touching the working tree when it isn't checked out at all.
-fn rollback_branch(repo: &Path, branch: &str, sha: &str) -> Result<()> {
-    if git::current_branch(repo)? == branch {
-        git::run_git(repo, &["reset", "--hard", sha])
-    } else {
-        git::run_git(repo, &["update-ref", &format!("refs/heads/{branch}"), sha])
-    }
-    .with_context(|| {
-        format!("failed to roll back '{branch}' to {sha} after dropping its dev marker")
     })
 }
 
@@ -2839,7 +2835,7 @@ pub(crate) fn promotion_readiness(
 
 #[cfg(test)]
 mod tests {
-    use super::{decide_copies, Containment, CopyFacts, PruneScope, SkipReason};
+    use super::*;
 
     /// A scope covering both copies, with `force` under test.
     fn both(force: bool) -> PruneScope {
@@ -3012,5 +3008,84 @@ mod tests {
         // stale ref there would delete the last copy of them.
         assert!(!Containment::Stable.needs_fetch());
         assert!(Containment::Recoverable.needs_fetch());
+    }
+
+    fn test_config(repo_root: std::path::PathBuf, rolling: &str, stable: &str) -> Config {
+        Config {
+            config_version: 1,
+            repo_root,
+            rolling_branch: rolling.to_string(),
+            stable_branch: stable.to_string(),
+            roll_prefix: "roll/".to_string(),
+            mode: Default::default(),
+            username: String::new(),
+            hosts: Vec::new(),
+            host_active: Default::default(),
+            version_gate: true,
+            tag_on_promote: true,
+            push_tag: true,
+            dev_versions: true,
+            roll_to_rolling_gates: Vec::new(),
+            rolling_to_main_gates: Vec::new(),
+            host_gates: Vec::new(),
+            clean_protect: Vec::new(),
+            pull_mode: Default::default(),
+            lazygit_command: "lazygit".to_string(),
+        }
+    }
+
+    /// A throwaway git repo with a `rolling` branch and a roll forked from it
+    /// that adds a file only the roll has. Leaves `rolling` checked out.
+    fn sandbox_with_roll_checked_out_elsewhere() -> tempfile::TempDir {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let repo = dir.path();
+        let git = |args: &[&str]| {
+            let status = std::process::Command::new("git")
+                .args(args)
+                .current_dir(repo)
+                .status()
+                .expect("run git");
+            assert!(status.success(), "git {args:?} failed");
+        };
+        git(&["init", "-q", "-b", "main"]);
+        git(&["config", "user.email", "t@t.com"]);
+        git(&["config", "user.name", "tester"]);
+        std::fs::write(repo.join("base.txt"), "base\n").expect("write base.txt");
+        git(&["add", "base.txt"]);
+        git(&["commit", "-q", "-m", "base"]);
+        git(&["branch", "rolling"]);
+        git(&["checkout", "-q", "-b", "roll/1-0101-x"]);
+        std::fs::write(repo.join("roll-only.txt"), "only on the roll\n")
+            .expect("write roll-only.txt");
+        git(&["add", "roll-only.txt"]);
+        git(&["commit", "-q", "-m", "roll work"]);
+        git(&["checkout", "-q", "rolling"]);
+        dir
+    }
+
+    #[test]
+    fn graduate_runs_gates_against_the_roll_not_whatever_is_checked_out() {
+        // The TUI's `[G]` can graduate a roll while a different branch is
+        // checked out — it doesn't require the selected row to be the one
+        // currently checked out. The gates run real shell commands against
+        // the working tree, so they must validate the roll's own content
+        // (merged into rolling), not whatever happened to be checked out when
+        // graduate was called.
+        let dir = sandbox_with_roll_checked_out_elsewhere();
+        let mut cfg = test_config(dir.path().to_path_buf(), "rolling", "main");
+        // Only present on the roll (and so in the staged merge result) — this
+        // fails if the gate runs against `rolling` as it is right now.
+        cfg.roll_to_rolling_gates = vec!["test -f roll-only.txt".to_string()];
+
+        assert_eq!(git::current_branch(&cfg.repo_root).unwrap(), "rolling");
+
+        let force = ForceOpts::new(false, None).unwrap();
+        let outcome = graduate(&cfg, "roll/1-0101-x", false, &force)
+            .expect("the gate should see the roll's own content, merged in");
+        assert!(!outcome.dry_run);
+
+        // Restored to whatever was checked out before the call.
+        assert_eq!(git::current_branch(&cfg.repo_root).unwrap(), "rolling");
+        assert!(dir.path().join("roll-only.txt").exists());
     }
 }
