@@ -100,7 +100,7 @@ fn main() -> Result<()> {
                 cmd_list_text(no_tui, deps)?;
             }
         }
-        Cmd::Update { dry_run } => cmd_update(dry_run)?,
+        Cmd::Update { roll, dry_run } => cmd_update(roll, dry_run)?,
         Cmd::Prune {
             dry_run,
             local,
@@ -732,7 +732,9 @@ fn offer_update(config: &Config, yes: bool) -> Result<()> {
             config.stable_branch
         ),
     )? {
-        cli::Confirm::Yes => print_update(ops::update(config, false)?),
+        cli::Confirm::Yes => {
+            print_update(ops::update(config, &ops::UpdateTarget::AllActive, false)?)
+        }
         cli::Confirm::Declined => {}
         cli::Confirm::Unattended => {
             println!(
@@ -883,9 +885,14 @@ fn cmd_list_json() -> Result<()> {
     Ok(())
 }
 
-fn cmd_update(dry_run: bool) -> Result<()> {
+fn cmd_update(rolls: Vec<String>, dry_run: bool) -> Result<()> {
     let config = Config::load()?;
-    print_update(ops::update(&config, dry_run)?);
+    let target = if rolls.is_empty() {
+        ops::UpdateTarget::AllActive
+    } else {
+        ops::UpdateTarget::Rolls(rolls)
+    };
+    print_update(ops::update(&config, &target, dry_run)?);
     Ok(())
 }
 
