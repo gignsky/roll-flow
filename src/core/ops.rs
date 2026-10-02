@@ -1123,7 +1123,7 @@ pub(crate) fn strip_dev_version(config: &Config, reason: &str) -> Result<Option<
 /// disabled, the branch isn't a roll, or it carries no dev marker at all.
 ///
 /// Reads `branch`'s own committed `Cargo.toml` via `git show` rather than the
-/// working tree: callers (the TUI's `[g]` in particular) name a roll that need
+/// working tree: callers (the TUI's `[G]` in particular) name a roll that need
 /// not be the one currently checked out.
 fn check_dev_marker_ownership(config: &Config, branch: &str) -> Result<()> {
     if !config.dev_versions {
@@ -1338,7 +1338,7 @@ pub(crate) struct GraduateOutcome {
 }
 
 /// Graduate `roll` into the rolling branch with a structured `--no-ff` merge.
-/// Shared by `rf graduate`, the `rf promote` fall-through, and the TUI's `[g]`.
+/// Shared by `rf graduate`, the `rf promote` fall-through, and the TUI's `[G]`.
 pub(crate) fn graduate(
     config: &Config,
     roll: &str,

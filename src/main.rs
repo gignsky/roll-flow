@@ -573,7 +573,7 @@ fn cmd_graduate(dry_run: bool, force: bool, reason: Option<String>) -> Result<()
     }
     // `ops::graduate` checks the dev marker belongs to this roll, strips it
     // ahead of the gates, and reports what it dropped — shared with the
-    // `rf promote` fall-through and the TUI's `[g]`, so this is just the CLI
+    // `rf promote` fall-through and the TUI's `[G]`, so this is just the CLI
     // wrapper now.
     let outcome = ops::graduate(&config, &current, dry_run, &force)?;
     print_graduate(&outcome);
