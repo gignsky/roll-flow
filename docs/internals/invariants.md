@@ -145,13 +145,31 @@ long list — that keeps two rolls adding rules in different areas from collidin
   one side, change the other. `src/core/version.rs` records which rule mirrors
   which workflow.
 - Any version *rewrite* must be committed **before** the configured gates run,
-  never after: it rewrites `Cargo.lock`, and `rolling_to_main_gates` contains
-  `cargo update --workspace --locked`, which fails on a stale lockfile. This is
-  why the bump is a CLI-level step in `main.rs` rather than part of
-  `ops::promote`, and why `rf graduate` strips the dev marker at the same level
-  rather than inside `ops::graduate`. Both go through
-  `ops::commit_version_change`, which is the one place the write, the lockfile
-  refresh and the commit happen in that order.
+  never after: it rewrites `Cargo.lock`, and `rolling_to_main_gates`/
+  `roll_to_rolling_gates` contain `cargo update --workspace --locked`, which
+  fails on a stale lockfile. This is why the bump is a CLI-level step in
+  `main.rs` rather than part of `ops::promote` — a per-roll step has to land it
+  *inside* the merge, which only `ops::promote` can do (see
+  [algorithms.md](algorithms.md)'s "Graduate/promote flow" section) — while
+  `rf graduate` strips the dev marker *inside* `ops::graduate` itself, since
+  graduation is
+  always the same shape (strip, then merge) regardless of caller. Every path
+  that reaches `ops::graduate` reaches this strip: `rf graduate`, the
+  `rf promote` fall-through, and the TUI's `[g]`. Centralizing it there is
+  deliberate — it used to live in the CLI's `cmd_graduate` only, which meant
+  the other two callers merged a roll into rolling with its dev marker still
+  attached, a real gap closed by moving it into the one function all three
+  share. All version writes still go through `ops::commit_version_change`,
+  which is the one place the write, the lockfile refresh and the commit happen
+  in that order.
+- `ops::graduate` checks **before** anything else, including the merge-state
+  classification and the gates, that a dev marker the roll carries is its own
+  (`ops::check_dev_marker_ownership`): a roll should only ever wear its own
+  `-roll<N>`, and one naming a different roll means the version history was
+  mixed with another roll's somewhere upstream (an `[i]` integrate merge, a
+  stray cherry-pick). Read-only and cheap, so it runs first — before
+  `strip_dev_version` can silently erase the evidence, and before a full gate
+  run wastes time only to fail on something else, or not fail at all.
 - A `-roll<N>` dev version must never reach `rolling` or the stable branch, and
   is refused **before** the numbers are compared, not by them. `0.2.5-roll9` is
   numerically above `0.2.4`, so a comparison alone would promote it — and then
