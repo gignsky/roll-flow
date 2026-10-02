@@ -1083,6 +1083,48 @@ pub(crate) fn strip_dev_version(config: &Config, reason: &str) -> Result<Option<
     Ok(Some(next))
 }
 
+/// Fail fast if the checked-out roll branch's Cargo.toml carries another
+/// roll's dev marker.
+///
+/// A roll should only ever wear its own `-roll<N>` marker — `apply_dev_version`
+/// writes it using the branch's own number, never another's — so one that
+/// doesn't match means the version history was scrambled somewhere else (an
+/// `[i]` integrate merge carrying in the other roll's marker commit, a stray
+/// cherry-pick), and `strip_dev_version` would otherwise erase that evidence
+/// silently on the next graduate. Checked first, before the configured gates
+/// run `cargo test` and the rest: cheap, and failing in milliseconds beats
+/// failing after a full build only to blame something else.
+///
+/// `Ok(())` when there is nothing to check: no Cargo.toml, dev versions are
+/// disabled, the branch isn't a roll, or it carries no dev marker at all.
+///
+/// Reads `branch`'s own committed `Cargo.toml` via `git show` rather than the
+/// working tree: callers (the TUI's `[g]` in particular) name a roll that need
+/// not be the one currently checked out.
+fn check_dev_marker_ownership(config: &Config, branch: &str) -> Result<()> {
+    if !config.dev_versions {
+        return Ok(());
+    }
+    let Some(number) = branches::parse_roll_number(branch, &config.roll_prefix) else {
+        return Ok(());
+    };
+    let Some(text) = git::show_file_at_ref(&config.repo_root, branch, version::VERSION_FILE)?
+    else {
+        return Ok(());
+    };
+    let Some(current) = version::parse_version(&text) else {
+        return Ok(());
+    };
+    match current.dev_roll {
+        Some(owner) if owner != number => bail!(
+            "Cargo.toml version ({current}) on '{branch}' carries roll {owner}'s dev marker, \
+             not its own (roll {number}); the version history has been mixed with another \
+             roll's and needs a manual fix before this can continue"
+        ),
+        _ => Ok(()),
+    }
+}
+
 /// Best-effort `Cargo.lock` refresh after a version rewrite.
 ///
 /// A workspace member's own version appears in the lockfile, so it goes stale
@@ -1220,13 +1262,17 @@ pub(crate) fn verify(config: &Config, dry_run: bool) -> Result<VerifyOutcome> {
         MergeState::FastForwardable => {}
     }
 
-    // Checked before the gates so an unbumped version fails in milliseconds
-    // rather than after a full `cargo test` run. Only the promotion route
-    // carries the bump requirement — graduating a roll into rolling is
-    // deliberately out of scope, matching what `rf promote` enforces.
+    // Checked before the gates so a version problem fails in milliseconds
+    // rather than after a full `cargo test` run. The promotion route carries
+    // the bump requirement; graduating a roll into rolling has no bump
+    // requirement (deliberately, matching what `rf promote` enforces) but
+    // still checks the dev marker it does carry is actually this roll's own.
     let version = match route {
         Route::Promote => version_check(config, &source, &target)?,
-        Route::Graduate { .. } => VersionCheck::not_applicable(),
+        Route::Graduate { .. } => {
+            check_dev_marker_ownership(config, &source)?;
+            VersionCheck::not_applicable()
+        }
     };
 
     let report = run_gates(
@@ -1262,10 +1308,13 @@ pub(crate) struct GraduateOutcome {
     pub rolling: String,
     pub dry_run: bool,
     pub gate_notices: Vec<GateNotice>,
+    /// The version the roll's dev marker was dropped to, if it had one.
+    /// `None` on a dry run, which leaves no commit behind.
+    pub dropped_dev_marker: Option<Semver>,
 }
 
 /// Graduate `roll` into the rolling branch with a structured `--no-ff` merge.
-/// Shared by `rf graduate` and the `rf promote` fall-through.
+/// Shared by `rf graduate`, the `rf promote` fall-through, and the TUI's `[g]`.
 pub(crate) fn graduate(
     config: &Config,
     roll: &str,
@@ -1280,6 +1329,12 @@ pub(crate) fn graduate(
             config.stable_branch
         );
     }
+
+    // Cheap and read-only, so it runs before anything else: a dev marker that
+    // belongs to a different roll means the version history was scrambled
+    // somewhere upstream, and that is worth failing on before the classify
+    // checks below or (far more expensive) the gates run `cargo test`.
+    check_dev_marker_ownership(config, roll)?;
 
     let rolling = &config.rolling_branch;
     let rolling_ref = ensure_local_target(config, rolling, dry_run)?;
@@ -1296,6 +1351,16 @@ pub(crate) fn graduate(
         MergeState::Diverged | MergeState::FastForwardable => {}
     }
 
+    // Before the gates, which run `cargo update --workspace --locked`: the
+    // strip rewrites `Cargo.lock`, and that gate fails against a stale one.
+    // Skipped on a dry run, which must leave no commit behind — so a dry run
+    // reports what the gates would say about the *unstripped* version.
+    let dropped_dev_marker = if dry_run {
+        None
+    } else {
+        drop_dev_marker_on_branch(config, roll)?
+    };
+
     let report = run_gates(repo, &config.roll_to_rolling_gates, dry_run, force)?;
 
     if dry_run {
@@ -1304,6 +1369,7 @@ pub(crate) fn graduate(
             rolling: rolling.clone(),
             dry_run: true,
             gate_notices: report.notices,
+            dropped_dev_marker: None,
         });
     }
 
@@ -1315,7 +1381,25 @@ pub(crate) fn graduate(
         rolling: rolling.clone(),
         dry_run: false,
         gate_notices: report.notices,
+        dropped_dev_marker,
     })
+}
+
+/// Check out `branch`, drop its dev marker if it has one, and return to
+/// whatever was checked out before — isolated from `run_merge`'s own checkout
+/// dance because the strip must land *on `branch`* specifically, and a caller
+/// (the TUI's `[g]`) may be sitting on a different branch entirely when it
+/// names one to graduate.
+fn drop_dev_marker_on_branch(config: &Config, branch: &str) -> Result<Option<Semver>> {
+    let repo = &config.repo_root;
+    let original = git::current_branch(repo)?;
+    git::run_git(repo, &["checkout", branch])
+        .with_context(|| format!("failed to check out '{branch}' to drop its dev marker"))?;
+    let dropped = strip_dev_version(config, branch);
+    git::run_git(repo, &["checkout", &original]).with_context(|| {
+        format!("dropped '{branch}'s dev marker, but checking out '{original}' again failed")
+    })?;
+    dropped
 }
 
 // ── promote ─────────────────────────────────────────────────────────────────

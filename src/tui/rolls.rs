@@ -2808,6 +2808,9 @@ fn run_op(config: &Config, action: Action, target: Option<&str>) -> Result<Vec<S
             let roll = target.ok_or_else(|| anyhow!("no roll selected"))?;
             ops::ensure_clean_state(config)?;
             let o = ops::graduate(config, roll, false, &force)?;
+            if let Some(released) = o.dropped_dev_marker {
+                lines.push(format!("dropped the dev marker; version is now {released}"));
+            }
             push_gate_notices(&mut lines, &o.gate_notices);
             lines.push(format!("Graduated '{}' into '{}'", o.roll, o.rolling));
         }

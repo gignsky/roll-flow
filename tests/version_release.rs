@@ -543,3 +543,86 @@ fn verify_marks_a_roll_that_was_created_without_the_marker() {
     assert!(out.success, "{}", out.combined());
     assert_eq!(sb.rev("HEAD"), before);
 }
+
+#[test]
+fn graduate_refuses_a_dev_marker_that_belongs_to_another_roll() {
+    // A roll should only ever wear its own `-roll<N>` marker. One naming a
+    // different roll (here, simulating a scrambled version history) must stop
+    // graduation before anything else, rather than being silently stripped as
+    // if it had been legitimate.
+    let sb = Sandbox::cargo();
+    sb.init();
+    sb.create_roll("alpha", "0611"); // takes roll number 1
+    sb.git(&["checkout", "rolling"]);
+
+    let out = sb.create_roll("beta", "0612");
+    assert!(out.success, "create beta: {}", out.combined());
+    assert_eq!(sb.cargo_version_at("HEAD"), "0.0.1-roll2");
+
+    sb.write_cargo_version("0.0.1-roll1");
+    sb.git(&["add", "Cargo.toml"]);
+    sb.git(&["commit", "-m", "oops: wrong roll's marker"]);
+    sb.commit_file("work.txt", "work\n", "beta work");
+
+    let out = sb.rf(&["graduate"]);
+    assert!(
+        !out.success,
+        "graduate must refuse a foreign dev marker: {}",
+        out.combined()
+    );
+    assert!(
+        out.combined().contains("roll 1's dev marker"),
+        "{}",
+        out.combined()
+    );
+
+    // Nothing was touched: still on beta, still carrying the foreign marker.
+    assert_eq!(sb.current_branch(), "roll/2-0612-beta");
+    assert_eq!(sb.cargo_version_at("HEAD"), "0.0.1-roll1");
+}
+
+#[test]
+fn graduate_dry_run_also_catches_a_foreign_dev_marker() {
+    // The check is read-only, so a preview catches it too rather than only
+    // discovering it on a real run.
+    let sb = Sandbox::cargo();
+    sb.init();
+    sb.create_roll("alpha", "0611");
+    sb.git(&["checkout", "rolling"]);
+    sb.create_roll("beta", "0612");
+    sb.write_cargo_version("0.0.1-roll1");
+    sb.git(&["add", "Cargo.toml"]);
+    sb.git(&["commit", "-m", "oops: wrong roll's marker"]);
+
+    let out = sb.rf(&["graduate", "--dry-run"]);
+    assert!(!out.success, "{}", out.combined());
+    assert!(
+        out.combined().contains("roll 1's dev marker"),
+        "{}",
+        out.combined()
+    );
+}
+
+#[test]
+fn promote_fallthrough_to_graduate_also_strips_the_dev_marker() {
+    // `rf promote` run from a roll branch redirects to graduate — a second
+    // path into the same merge, distinct from `rf graduate` itself. Both must
+    // strip the marker before merging into rolling, not just the first one.
+    let sb = Sandbox::cargo();
+    sb.init();
+    let out = sb.create_roll("solo", "0611");
+    assert!(out.success, "{}", out.combined());
+    let branch = sb.current_branch();
+    assert_eq!(sb.cargo_version_at("HEAD"), "0.0.1-roll1");
+    sb.commit_file("work.txt", "work\n", "work");
+
+    let out = sb.rf(&["promote"]);
+    assert!(out.success, "promote fall-through: {}", out.combined());
+    assert!(
+        out.combined().contains("dropped the dev marker"),
+        "{}",
+        out.combined()
+    );
+    assert_eq!(sb.cargo_version_at(&branch), "0.0.1");
+    assert_eq!(sb.cargo_version_at("rolling"), "0.0.1");
+}

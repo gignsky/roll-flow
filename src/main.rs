@@ -573,20 +573,10 @@ fn cmd_graduate(dry_run: bool, force: bool, reason: Option<String>) -> Result<()
             config.stable_branch
         );
     }
-    // Before `ops::graduate`, which runs the gates and then merges: the strip
-    // rewrites `Cargo.lock`, and `roll_to_rolling_gates` contains
-    // `cargo update --workspace --locked`, which fails against a stale one.
-    // Same sequencing, and the same reason, as `resolve_version_gate`.
-    //
-    // Skipped on a dry run, which must leave no commit behind — so a dry run
-    // reports what the gates would say about the *unstripped* version. That is
-    // the honest answer for a preview that changes nothing.
-    if !dry_run {
-        if let Some(released) = ops::strip_dev_version(&config, &current)? {
-            println!("dropped the dev marker; version is now {released}");
-        }
-    }
-
+    // `ops::graduate` checks the dev marker belongs to this roll, strips it
+    // ahead of the gates, and reports what it dropped — shared with the
+    // `rf promote` fall-through and the TUI's `[g]`, so this is just the CLI
+    // wrapper now.
     let outcome = ops::graduate(&config, &current, dry_run, &force)?;
     print_graduate(&outcome);
     Ok(())
@@ -844,6 +834,9 @@ fn offer_step_tag_pushes(config: &Config, outcome: &ops::PromoteOutcome, yes: bo
 }
 
 fn print_graduate(outcome: &ops::GraduateOutcome) {
+    if let Some(released) = outcome.dropped_dev_marker {
+        println!("dropped the dev marker; version is now {released}");
+    }
     render_gate_notices(&outcome.gate_notices);
     if outcome.dry_run {
         println!(
