@@ -45,9 +45,11 @@ pub fn exit(mut terminal: Tui) -> Result<()> {
 /// is idempotent).
 ///
 /// Ops no longer use this — their output streams into
-/// [`super::tui::output::Panel`] instead. It exists for `gg`, which launches
-/// lazygit: a full-screen application has to own the terminal outright, and
-/// there is nothing to stream.
+/// [`super::tui::output::Panel`] instead. It exists for `gg` and `[B]`, which
+/// launch lazygit and bacon: a full-screen application has to own the terminal
+/// outright, and there is nothing to stream. Both reach it through
+/// `rolls::StatusApp::hand_over_terminal`, so the suspend/resume pair is
+/// bracketed in one place rather than once per tool.
 pub fn suspend(terminal: &mut Tui) -> Result<()> {
     disable_raw_mode()?;
     execute!(

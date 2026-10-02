@@ -11,6 +11,9 @@
 //! `gg` to hand the terminal to lazygit itself. The keymap is deliberately
 //! lazygit's rather than one of our own — `[G]raduate` and `[m] promote` moved
 //! aside to make room for it.
+//!
+//! `[B]` hands the terminal to bacon the same way. Both go through
+//! [`StatusApp::hand_over_terminal`], the one place anything suspends the TUI.
 
 use std::collections::HashMap;
 use std::time::{Duration, Instant};
@@ -817,12 +820,26 @@ pub(crate) const BINDINGS: &[Binding] = &[
         hint: None,
         replay: &[KeyCode::Char('f')],
     },
+    // lazygit and bacon are not roll operations at all — they are other
+    // people's TUIs that this one steps aside for. Their own group, so `?`
+    // lists them together and a search for "sync" or "roll" does not turn up
+    // a key that touches neither.
     Binding {
         keys: "gg",
         label: "hand the terminal to lazygit",
-        group: "sync",
+        group: "tools",
         hint: None,
         replay: &[KeyCode::Char('g'), KeyCode::Char('g')],
+    },
+    Binding {
+        keys: "B",
+        // "watch" earns its place the way "all" does on `PP`: the search is a
+        // subsequence match, and someone looking for a background cargo check
+        // types what it does, not the name of the program that does it.
+        label: "hand the terminal to bacon (watch and recheck)",
+        group: "tools",
+        hint: None,
+        replay: &[KeyCode::Char('B')],
     },
     Binding {
         keys: "c",
@@ -1661,6 +1678,10 @@ impl StatusApp {
             KeyCode::Char('i') => self.request_integrate(),
             KeyCode::Char('I') => self.request_integrate_rolling(),
             KeyCode::Char('b') => self.request_bump(),
+            // Shift-b, beside the bump it has nothing to do with. `gg`'s
+            // doubled letter is not available: a bare `b` already acts, so a
+            // `bb` chord would make every version bump wait out a timeout.
+            KeyCode::Char('B') => self.launch_bacon(terminal)?,
             KeyCode::Char('m') => self.request(Action::Promote),
             KeyCode::Char('u') => self.request(Action::Update),
             KeyCode::Char('x') => self.request(Action::Prune),
@@ -2338,43 +2359,86 @@ impl StatusApp {
         });
     }
 
-    /// `gg` — hand the terminal to lazygit, then take it back.
+    /// Hand the terminal to an external full-screen application, then take it
+    /// back.
     ///
-    /// The one action that still suspends: lazygit is a full-screen application
-    /// and owns the terminal outright, so there is nothing to stream into a
-    /// panel. The list reloads afterwards because anything at all may have
-    /// happened inside it.
-    fn launch_lazygit(&mut self, terminal: &mut super::Tui) -> Result<()> {
+    /// These are the only actions that still suspend. Ops stream into
+    /// [`output::Panel`] instead, but lazygit and bacon draw their own
+    /// full-screen UI and own the terminal outright, so there is nothing to
+    /// stream — see [`super::suspend`]. There is one implementation rather
+    /// than one per tool because every part of this is the same for both and
+    /// easy to get subtly wrong twice: [`super::resume`] has to run on the
+    /// failure path too or a missing binary leaves the screen wrecked, a
+    /// non-zero exit is a message while a failed spawn is a panel,
+    /// and the panel has to name the config key that overrides the command.
+    /// The list reloads afterwards because anything at all may have happened
+    /// inside.
+    ///
+    /// `command` is owned rather than borrowed from `self.config`: the `&mut
+    /// self` here would otherwise conflict with it for the whole call.
+    fn hand_over_terminal(
+        &mut self,
+        terminal: &mut super::Tui,
+        command: String,
+        config_key: &str,
+        configure: impl FnOnce(&mut std::process::Command),
+    ) -> Result<()> {
         if self.busy() {
             return Ok(());
         }
+        let mut child = std::process::Command::new(&command);
+        configure(&mut child);
+
         super::suspend(terminal)?;
-        let spawned = std::process::Command::new(&self.config.lazygit_command)
-            .arg("-p")
-            .arg(&self.config.repo_root)
-            .status();
+        let spawned = child.status();
         super::resume(terminal)?;
 
         match spawned {
             Ok(status) if status.success() => self.message = None,
-            Ok(status) => {
-                self.message = Some(format!(
-                    "{} exited with {status}",
-                    self.config.lazygit_command
-                ))
-            }
+            Ok(status) => self.message = Some(format!("{command} exited with {status}")),
             // A missing binary is the common case and deserves the actionable
             // message rather than a raw io error.
             Err(err) => {
-                let mut panel = output::Panel::new(self.config.lazygit_command.clone());
+                let mut panel = output::Panel::new(command.clone());
                 panel.fail(vec![
-                    format!("could not run '{}': {err}", self.config.lazygit_command),
-                    "set lazygit_command in .roll-flow.toml to override".to_string(),
+                    format!("could not run '{command}': {err}"),
+                    format!("set {config_key} in .roll-flow.toml to override"),
                 ]);
                 self.panel = Some(panel);
             }
         }
         self.reload()
+    }
+
+    /// `gg` — hand the terminal to lazygit.
+    fn launch_lazygit(&mut self, terminal: &mut super::Tui) -> Result<()> {
+        let command = self.config.lazygit_command.clone();
+        let repo_root = self.config.repo_root.clone();
+        self.hand_over_terminal(terminal, command, "lazygit_command", |child| {
+            child.arg("-p").arg(repo_root);
+        })
+    }
+
+    /// `[B]` — hand the terminal to bacon.
+    ///
+    /// Launched by `current_dir` rather than a path flag, which is the one way
+    /// this differs from lazygit's `-p`: bacon's positional argument is a *job*
+    /// name (`check`, `clippy`, `test`), so a repo path passed there would be
+    /// read as a job that does not exist. Setting the working directory is what
+    /// running `bacon` by hand in the repo does anyway, and it needs no
+    /// agreement with bacon about which flag names a path.
+    ///
+    /// No roll-flow state is involved: bacon watches the worktree and reruns
+    /// cargo, so it is a dev-loop key that happens to live on this screen
+    /// because this screen is where the user already is. The `reload` the
+    /// hand-over does on the way out is still right — bacon can be left
+    /// running across a `git` command typed in its shell-out.
+    fn launch_bacon(&mut self, terminal: &mut super::Tui) -> Result<()> {
+        let command = self.config.bacon_command.clone();
+        let repo_root = self.config.repo_root.clone();
+        self.hand_over_terminal(terminal, command, "bacon_command", |child| {
+            child.current_dir(repo_root);
+        })
     }
 
     /// Move the output panel's scrollback, if one is up.
@@ -3754,6 +3818,7 @@ mod tests {
             clean_protect: Vec::new(),
             pull_mode: Default::default(),
             lazygit_command: "lazygit".to_string(),
+            bacon_command: "bacon".to_string(),
         }
     }
 
@@ -4089,13 +4154,25 @@ mod tests {
         assert_eq!(matched_keys("prune")[0], "x");
         assert_eq!(matched_keys("lazygit")[0], "gg");
         assert_eq!(matched_keys("bump")[0], "b");
+        // bacon by name, and by what it does — someone after a background
+        // cargo check does not necessarily know the program's name, and `b`
+        // sits one letter away from both queries.
+        assert_eq!(matched_keys("bacon")[0], "B");
+        assert_eq!(matched_keys("watch")[0], "B");
         // By the key itself, which is the other way people search.
         assert_eq!(matched_keys("gg")[0], "gg");
         // A group name lists the whole group, and nothing outside it.
         let sync = matched_keys("sync");
         assert!(sync.len() >= 4, "{sync:?}");
-        for keys in ["p", "P", "f", "gg"] {
+        for keys in ["p", "P", "PP", "f"] {
             assert!(sync.contains(&keys), "{keys} missing from {sync:?}");
+        }
+        // The two terminal hand-overs are their own group, so neither answers a
+        // search for the git keys it sits nowhere near.
+        assert!(!sync.contains(&"gg"), "gg is not a sync key: {sync:?}");
+        let tools = matched_keys("tools");
+        for keys in ["gg", "B"] {
+            assert!(tools.contains(&keys), "{keys} missing from {tools:?}");
         }
         // An empty query is everything, in table order.
         assert_eq!(matched_keys("").len(), BINDINGS.len());
@@ -4897,6 +4974,7 @@ mod tests {
             clean_protect: Vec::new(),
             pull_mode: Default::default(),
             lazygit_command: "lazygit".to_string(),
+            bacon_command: "bacon".to_string(),
         }
     }
 

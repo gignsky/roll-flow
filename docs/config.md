@@ -18,6 +18,7 @@ rolling_to_main_gates = []
 clean_protect = []
 pull_mode = "ff-only"
 lazygit_command = "lazygit"
+bacon_command = "bacon"
 ```
 
 Gate entries are shell commands run in repo root. Any failure blocks verify/promote.
@@ -41,6 +42,11 @@ refspec, which can only ever fast-forward. See [`status`](commands/status.md).
 `<command> -p <repo_root>`. Defaults to `lazygit` on `PATH`; point it at a
 wrapper, a flake app, or an absolute path if a bare `lazygit` is not what you
 want.
+
+`bacon_command` is the same for the TUI's `[B]`, except that it is run with no
+arguments in `repo_root` rather than given a path flag — bacon's positional
+argument is a job name, not a path. Defaults to `bacon` on `PATH`. See
+[`status`](commands/status.md#gg-and-b--hand-over-the-terminal).
 
 Keys added after a config was written default as above, so an older
 `.roll-flow.toml` keeps loading. Note that TOML puts every bare key *before* the

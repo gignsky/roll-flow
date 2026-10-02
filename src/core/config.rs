@@ -147,6 +147,12 @@ pub struct Config {
     /// `lazygit` on `PATH`.
     #[serde(default = "default_lazygit")]
     pub lazygit_command: String,
+    /// The command the TUI's `[B]` binding launches, run in `repo_root`.
+    /// Overridable for the same reasons as [`Self::lazygit_command`] — a
+    /// wrapper, a flake app, or an absolute path instead of a bare `bacon` on
+    /// `PATH`.
+    #[serde(default = "default_bacon")]
+    pub bacon_command: String,
 }
 
 impl Config {
@@ -226,6 +232,7 @@ impl Config {
             clean_protect: vec![],
             pull_mode: PullMode::default(),
             lazygit_command: default_lazygit(),
+            bacon_command: default_bacon(),
         })
     }
 
@@ -287,6 +294,10 @@ fn default_config_version() -> u32 {
 
 fn default_lazygit() -> String {
     "lazygit".to_string()
+}
+
+fn default_bacon() -> String {
+    "bacon".to_string()
 }
 
 fn default_true() -> bool {
@@ -396,7 +407,7 @@ fn parse_nix_string_value(content: &str, key: &str) -> Option<String> {
 mod tests {
     use std::path::PathBuf;
 
-    use super::{default_lazygit, Config, PullMode};
+    use super::{default_bacon, default_lazygit, Config, PullMode};
 
     #[test]
     fn overrides_hosts_and_prefix() {
@@ -419,6 +430,7 @@ mod tests {
             clean_protect: vec![],
             pull_mode: PullMode::default(),
             lazygit_command: default_lazygit(),
+            bacon_command: default_bacon(),
         };
         let updated = cfg.with_overrides(
             Some("rolling".to_string()),
@@ -454,6 +466,7 @@ mod tests {
             clean_protect: vec![],
             pull_mode: PullMode::default(),
             lazygit_command: default_lazygit(),
+            bacon_command: default_bacon(),
         };
         let rendered = cfg.to_toml_string().expect("render");
         assert!(
@@ -484,6 +497,7 @@ mod tests {
         assert!(parsed.clean_protect.is_empty());
         assert_eq!(parsed.pull_mode, PullMode::FfOnly);
         assert_eq!(parsed.lazygit_command, "lazygit");
+        assert_eq!(parsed.bacon_command, "bacon");
     }
 
     #[test]

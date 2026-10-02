@@ -95,7 +95,7 @@ The full list:
 | `q` | quit |
 | `p` / `P` / `f` | pull / push / fetch the selected branch |
 | `PP` | [push every branch that needs it](#pp--push-everything-that-needs-it) |
-| `gg` | lazygit |
+| `gg` / `B` | [lazygit / bacon](#gg-and-b--hand-over-the-terminal) |
 | `c` / `i` | create a roll / integrate one into the checked-out roll |
 | `G` / `m` / `u` | graduate / promote / update from stable |
 | `b` | bump the version |
@@ -124,9 +124,24 @@ command has finished. `PageUp`/`PageDown` scroll its scrollback and `End` return
 to following new output. Only one command runs at a time; a second action while
 one is in flight is refused rather than queued.
 
-`gg` is the exception: lazygit is full-screen and owns the terminal, so `rf`
-suspends, hands it over, and redraws when lazygit exits. Set `lazygit_command` in
-`.roll-flow.toml` to point at something other than a bare `lazygit` on `PATH`.
+## `gg` and `B` — hand over the terminal
+
+`gg` and `B` are the exceptions to the output panel: lazygit and bacon draw
+their own full-screen UI and own the terminal outright, so there is nothing to
+stream. `rf` suspends, hands the terminal over, and redraws when the tool
+exits — then reloads the list, because anything at all may have happened
+inside. Only one of the two is a git tool, which is why they are their own
+`tools` group in `?` rather than sitting under `sync` or `roll`.
+
+`B` is shift-`b`, beside the `b` that bumps the version and unrelated to it.
+`gg`'s doubled letter was not available: a bare `b` already does something, so
+a `bb` chord would make every version bump wait out a timeout first.
+
+Set `lazygit_command` or `bacon_command` in `.roll-flow.toml` to point at
+something other than a bare `lazygit`/`bacon` on `PATH`. lazygit is launched as
+`<command> -p <repo_root>`; bacon is launched with no arguments in `repo_root`,
+because bacon's positional argument is a job name (`check`, `clippy`, `test`)
+and a path passed there would be read as a job that does not exist.
 
 ## Pulling and pushing
 
