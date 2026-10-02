@@ -217,6 +217,65 @@ fn run_merge(
     Ok(())
 }
 
+/// Like [`run_merge`], but for merging stable *into* an active roll that may
+/// carry a dev-version marker — [`ops::update`]'s merge, and the one
+/// `rf promote --roll --yes` offers to run on every other active roll.
+///
+/// A dev marker rewrites the same `Cargo.toml` line stable's own version bump
+/// just moved: base `0.0.1`, the roll's side `0.0.1-roll2`, stable's side
+/// `0.0.2` — both sides touched the one line, so a plain merge conflicts on it
+/// every time stable has bumped since the roll branched. Stripping the marker
+/// before the merge makes the roll's side match the merge base exactly, so the
+/// merge takes stable's version cleanly instead of colliding with it;
+/// reapplying the same roll number afterward re-stamps it against the base
+/// stable just brought in.
+fn run_merge_preserving_dev_marker(
+    config: &Config,
+    source: &str,
+    target: &str,
+    subject: &str,
+    body: Option<&str>,
+) -> Result<()> {
+    let repo = &config.repo_root;
+    let original = git::current_branch(repo)?;
+
+    git::run_git(repo, &["checkout", target])
+        .with_context(|| format!("failed to check out '{target}'"))?;
+
+    let dev_roll = version::read_version(repo)?.and_then(|v| v.dev_roll);
+    if dev_roll.is_some() {
+        strip_dev_version(config, target)?;
+    }
+
+    let mut merge_args = vec!["merge", "--no-ff", "--no-edit", "-m", subject];
+    if let Some(body) = body {
+        merge_args.push("-m");
+        merge_args.push(body);
+    }
+    merge_args.push(source);
+
+    if let Err(merge_err) = git::run_git(repo, &merge_args) {
+        let _ = git::run_git(repo, &["merge", "--abort"]);
+        let _ = git::run_git(repo, &["checkout", &original]);
+        bail!(
+            "merge of '{source}' into '{target}' failed (likely conflicts); \
+             the merge was aborted and you are back on '{original}'. \
+             Resolve manually: git checkout {target} && git merge --no-ff {source} ({merge_err})"
+        );
+    }
+
+    if let Some(number) = dev_roll {
+        if config.dev_versions {
+            apply_dev_version(config, number)?;
+        }
+    }
+
+    git::run_git(repo, &["checkout", &original]).with_context(|| {
+        format!("the merge into '{target}' succeeded, but checking out '{original}' again failed")
+    })?;
+    Ok(())
+}
+
 /// Stage a `--no-ff` merge of `source` into `target` without committing it,
 /// hand the resulting worktree to `run_step`, and commit only if that closure
 /// succeeds.
@@ -1934,7 +1993,7 @@ pub(crate) fn update(config: &Config, dry_run: bool) -> Result<UpdateOutcome> {
         let subject = format!("Update {} from {stable}", roll.branch);
         let body = format!("Brought in: {behind} commits since {before}");
 
-        run_merge(repo, stable, &roll.branch, &subject, Some(&body))?;
+        run_merge_preserving_dev_marker(config, stable, &roll.branch, &subject, Some(&body))?;
         items.push(UpdateItem::Updated {
             roll: roll.branch.clone(),
         });
