@@ -340,11 +340,9 @@ fn cmd_verify(dry_run: bool, bump: Option<BumpLevel>, yes: bool) -> Result<()> {
     // below and for the same reason — it is a commit that touches Cargo.lock,
     // so it has to land before the `--locked` gates run. A dry run leaves it.
     let current = git::current_branch(&config.repo_root)?;
-    if !dry_run && config.dev_versions {
-        if let Some(number) = branches::parse_roll_number(&current, &config.roll_prefix) {
-            if let Some(dev) = ops::apply_dev_version(&config, number)? {
-                println!("version marked {dev}");
-            }
+    if !dry_run {
+        if let Some(dev) = ops::apply_dev_version_for_branch(&config, &current)? {
+            println!("version marked {dev}");
         }
     }
 

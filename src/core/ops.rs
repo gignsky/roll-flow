@@ -1063,6 +1063,30 @@ pub(crate) fn apply_dev_version(config: &Config, number: u32) -> Result<Option<S
     Ok(Some(next))
 }
 
+/// Apply `branch`'s own dev marker ahead of its gates, if it needs one —
+/// what `rf verify` does before the CLI's gates run.
+///
+/// Shared by `cmd_verify` (main.rs) and the TUI's `[v]`, so the two can't
+/// silently drift the way they once did: `run_verify` claimed to mirror
+/// `cmd_verify` "line for line" while actually missing this step entirely,
+/// because it was inlined separately in each caller instead of living here.
+///
+/// `Ok(None)` when there is nothing to apply: dev versions are disabled,
+/// `branch` isn't a roll, or (via [`apply_dev_version`]) the repo has no
+/// readable version or the branch already carries its own marker.
+pub(crate) fn apply_dev_version_for_branch(
+    config: &Config,
+    branch: &str,
+) -> Result<Option<Semver>> {
+    if !config.dev_versions {
+        return Ok(None);
+    }
+    let Some(number) = branches::parse_roll_number(branch, &config.roll_prefix) else {
+        return Ok(None);
+    };
+    apply_dev_version(config, number)
+}
+
 /// Strip the dev marker from the checked-out branch's version, returning the
 /// version it became. `Ok(None)` when there was no marker to strip.
 ///

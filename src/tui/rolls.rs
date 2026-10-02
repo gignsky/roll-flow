@@ -2753,15 +2753,27 @@ fn run_delete(
 ///   only place a bump commit is written from.
 /// - nothing is forced and nothing is dry-run. `[v]` has no flags to carry.
 ///
+/// The dev-marker *application* is not on that list and is not optional: it
+/// uses `ops::apply_dev_version_for_branch`, the same function `cmd_verify`
+/// calls, specifically so the two cannot drift apart on it again — this
+/// function used to claim the "line for line" mirror while actually omitting
+/// the marker step, since it was inlined separately in each caller instead of
+/// living in one shared place.
+///
 /// A failed host or an unsatisfied version gate is an `Err`, not a line: the
 /// panel marks a failed job, and a verdict that reads as "done" when it is
 /// really "blocked" is the one outcome worth being loud about. Everything the
 /// gates printed is already in the panel either way, streamed as they ran.
 fn run_verify(config: &Config) -> Result<Vec<String>> {
     ops::ensure_clean_state(config)?;
-    let outcome = ops::verify(config, false)?;
 
     let mut lines = Vec::new();
+    let current = git::current_branch(&config.repo_root)?;
+    if let Some(dev) = ops::apply_dev_version_for_branch(config, &current)? {
+        lines.push(format!("version marked {dev}"));
+    }
+
+    let outcome = ops::verify(config, false)?;
     if outcome.diverged_note {
         lines.push(format!(
             "note: '{}' has commits not in '{}'; graduation/promotion will create a --no-ff merge",
@@ -3772,6 +3784,66 @@ mod tests {
             pull_mode: Default::default(),
             lazygit_command: "lazygit".to_string(),
         }
+    }
+
+    /// A throwaway git repo on disk, with a Cargo.toml and a `rolling` branch
+    /// split off from `main`, so `run_verify`'s real git calls (merge-state
+    /// classification, the dev-marker commit) have something to act on. The
+    /// `tests/` integration suite can't reach `run_verify` directly — it only
+    /// drives the compiled binary — so this is the one way to exercise it.
+    fn sandbox_repo() -> tempfile::TempDir {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let repo = dir.path();
+        let git = |args: &[&str]| {
+            let status = std::process::Command::new("git")
+                .args(args)
+                .current_dir(repo)
+                .status()
+                .expect("run git");
+            assert!(status.success(), "git {args:?} failed");
+        };
+        git(&["init", "-q", "-b", "main"]);
+        git(&["config", "user.email", "t@t.com"]);
+        git(&["config", "user.name", "tester"]);
+        std::fs::write(
+            repo.join("Cargo.toml"),
+            "[package]\nname = \"fixture\"\nversion = \"0.0.1\"\nedition = \"2021\"\n",
+        )
+        .expect("write Cargo.toml");
+        git(&["add", "Cargo.toml"]);
+        git(&["commit", "-q", "-m", "add manifest"]);
+        git(&["branch", "rolling"]);
+        git(&["checkout", "-q", "-b", "roll/1-0101-late"]);
+        std::fs::write(repo.join("work.txt"), "w\n").expect("write work.txt");
+        git(&["add", "work.txt"]);
+        git(&["commit", "-q", "-m", "roll work"]);
+        dir
+    }
+
+    #[test]
+    fn run_verify_applies_the_dev_marker_like_cmd_verify_does() {
+        // Regression test: `run_verify`'s doc comment claims a "line for line"
+        // mirror of `cmd_verify`, but the dev-marker step was missing — a roll
+        // started without one (predating the feature, or `--no-dev-version`)
+        // never got marked from the TUI's `[v]`, only from `rf verify`.
+        let dir = sandbox_repo();
+        let mut cfg = config("main", "rolling");
+        cfg.repo_root = dir.path().to_path_buf();
+
+        let lines = run_verify(&cfg).expect("verify should pass with no gates configured");
+        assert!(
+            lines
+                .iter()
+                .any(|l| l.contains("version marked 0.0.1-roll1")),
+            "{lines:?}"
+        );
+
+        let cargo_toml =
+            std::fs::read_to_string(dir.path().join("Cargo.toml")).expect("read Cargo.toml");
+        assert!(
+            cargo_toml.contains("0.0.1-roll1"),
+            "marker not written: {cargo_toml}"
+        );
     }
 
     #[test]
