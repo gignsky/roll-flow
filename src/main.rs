@@ -101,7 +101,7 @@ fn main() -> Result<()> {
                 cmd_list_text(no_tui, deps)?;
             }
         }
-        Cmd::Update { dry_run } => cmd_update(dry_run)?,
+        Cmd::Update { roll, dry_run } => cmd_update(roll, dry_run)?,
         Cmd::Prune {
             dry_run,
             local,
@@ -774,7 +774,9 @@ fn offer_update(config: &Config, yes: bool) -> Result<()> {
             config.stable_branch
         ),
     )? {
-        cli::Confirm::Yes => print_update(ops::update(config, false)?),
+        cli::Confirm::Yes => {
+            print_update(ops::update(config, &ops::UpdateTarget::AllActive, false)?)
+        }
         cli::Confirm::Declined => {}
         cli::Confirm::Unattended => {
             println!(
@@ -848,13 +850,20 @@ fn offer_step_tag_pushes(config: &Config, outcome: &ops::PromoteOutcome, yes: bo
 
 fn print_graduate(outcome: &ops::GraduateOutcome) {
     render_gate_notices(&outcome.gate_notices);
-    if outcome.dry_run {
-        println!(
+    match (outcome.restored, outcome.dry_run) {
+        (true, true) => println!(
+            "Dry-run: would revert the revert, restoring '{}' on '{}'",
+            outcome.roll, outcome.rolling
+        ),
+        (true, false) => println!(
+            "Restored '{}' on '{}' (reverted the revert)",
+            outcome.roll, outcome.rolling
+        ),
+        (false, true) => println!(
             "Dry-run: would graduate '{}' into '{}' (--no-ff)",
             outcome.roll, outcome.rolling
-        );
-    } else {
-        println!("Graduated '{}' into '{}'", outcome.roll, outcome.rolling);
+        ),
+        (false, false) => println!("Graduated '{}' into '{}'", outcome.roll, outcome.rolling),
     }
 }
 
@@ -925,9 +934,14 @@ fn cmd_list_json() -> Result<()> {
     Ok(())
 }
 
-fn cmd_update(dry_run: bool) -> Result<()> {
+fn cmd_update(rolls: Vec<String>, dry_run: bool) -> Result<()> {
     let config = Config::load()?;
-    print_update(ops::update(&config, dry_run)?);
+    let target = if rolls.is_empty() {
+        ops::UpdateTarget::AllActive
+    } else {
+        ops::UpdateTarget::Rolls(rolls)
+    };
+    print_update(ops::update(&config, &target, dry_run)?);
     Ok(())
 }
 

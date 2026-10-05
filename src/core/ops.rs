@@ -1355,6 +1355,11 @@ pub(crate) struct GraduateOutcome {
     pub rolling: String,
     pub dry_run: bool,
     pub gate_notices: Vec<GateNotice>,
+    /// True when this graduation was *restored* by reverting a prior revert
+    /// of the roll's graduation merge, rather than landed by merging the roll
+    /// branch. See [`regraduate_reverted`] for why the two are not
+    /// interchangeable.
+    pub restored: bool,
 }
 
 /// Graduate `roll` into the rolling branch with a structured `--no-ff` merge.
@@ -1384,6 +1389,17 @@ pub(crate) fn graduate(
 
     let rolling = &config.rolling_branch;
     let rolling_ref = ensure_local_target(config, rolling, dry_run)?;
+
+    // A roll whose graduation was reverted on rolling needs a different
+    // remedy: its branch tip is still an ancestor of rolling either way (the
+    // revert added a commit on top; it removed nothing from history), so the
+    // ordinary merge below would see `MergeState::NothingToMerge` and bail
+    // with a confusing "already up to date" even though the content is
+    // visibly gone. Reverting the revert is what actually restores it.
+    if let Some(revert_hash) = branches::find_reverted_graduation(repo, roll, &rolling_ref) {
+        return regraduate_reverted(config, roll, rolling, &revert_hash, dry_run, force);
+    }
+
     match classify_merge(repo, roll, &rolling_ref)? {
         MergeState::TargetMissing => bail!(target_missing_error(config, rolling)),
         MergeState::UnrelatedHistories => {
@@ -1404,6 +1420,7 @@ pub(crate) fn graduate(
             rolling: rolling.clone(),
             dry_run: true,
             gate_notices: report.notices,
+            restored: false,
         });
     }
 
@@ -1483,7 +1500,70 @@ pub(crate) fn graduate(
         rolling: rolling.clone(),
         dry_run: false,
         gate_notices: report.notices,
+        restored: false,
     })
+}
+
+/// Restore a roll's graduation after it was reverted on rolling, by reverting
+/// the revert commit — the git-correct remedy, since an ordinary `--no-ff`
+/// re-merge of the roll branch cannot undo a revert (the branch's tip remains
+/// an ancestor of rolling either way, so the merge has nothing new to bring
+/// in; see [`branches::find_reverted_graduation`]). Runs the same
+/// `roll_to_rolling_gates` as an ordinary graduation, since this still lands
+/// roll content back onto rolling.
+fn regraduate_reverted(
+    config: &Config,
+    roll: &str,
+    rolling: &str,
+    revert_hash: &str,
+    dry_run: bool,
+    force: &ForceOpts,
+) -> Result<GraduateOutcome> {
+    let repo = &config.repo_root;
+    let report = run_gates(repo, &config.roll_to_rolling_gates, dry_run, force)?;
+
+    if dry_run {
+        return Ok(GraduateOutcome {
+            roll: roll.to_string(),
+            rolling: rolling.to_string(),
+            dry_run: true,
+            gate_notices: report.notices,
+            restored: true,
+        });
+    }
+
+    run_revert(repo, revert_hash, rolling)?;
+    Ok(GraduateOutcome {
+        roll: roll.to_string(),
+        rolling: rolling.to_string(),
+        dry_run: false,
+        gate_notices: report.notices,
+        restored: true,
+    })
+}
+
+/// Revert `commit` on `target`, mirroring [`run_merge`]'s checkout/abort/
+/// restore handling for the other kind of commit `rf graduate` can produce.
+fn run_revert(repo: &Path, commit: &str, target: &str) -> Result<()> {
+    let original = git::current_branch(repo)?;
+
+    git::run_git(repo, &["checkout", target])
+        .with_context(|| format!("failed to check out '{target}'"))?;
+
+    if let Err(revert_err) = git::run_git(repo, &["revert", "--no-edit", commit]) {
+        let _ = git::run_git(repo, &["revert", "--abort"]);
+        let _ = git::run_git(repo, &["checkout", &original]);
+        bail!(
+            "reverting '{commit}' on '{target}' failed (likely conflicts); \
+             the revert was aborted and you are back on '{original}'. \
+             Resolve manually: git checkout {target} && git revert {commit} ({revert_err})"
+        );
+    }
+
+    git::run_git(repo, &["checkout", &original]).with_context(|| {
+        format!("the revert on '{target}' succeeded, but checking out '{original}' again failed")
+    })?;
+    Ok(())
 }
 
 // ── promote ─────────────────────────────────────────────────────────────────
@@ -2103,22 +2183,76 @@ pub(crate) enum UpdateOutcome {
     },
 }
 
-pub(crate) fn update(config: &Config, dry_run: bool) -> Result<UpdateOutcome> {
+/// What `rf update` should bring up to date with stable.
+///
+/// [`AllActive`](UpdateTarget::AllActive) is the long-standing behaviour —
+/// every active local roll in one pass. [`Rolls`](UpdateTarget::Rolls) merges
+/// stable into only the named branches, so updating one roll from the TUI (or
+/// `rf update --roll`) does not also touch every other roll in progress.
+pub(crate) enum UpdateTarget {
+    AllActive,
+    Rolls(Vec<String>),
+}
+
+/// Whether `roll` is eligible for `rf update`: active (or blocked) and present
+/// locally. A graduated/promoted roll has nothing meaningful to merge stable
+/// into, and a remote-only roll has no local copy to merge into at all.
+fn is_update_candidate(roll: &branches::RollInfo) -> bool {
+    matches!(
+        roll.state,
+        branches::RollState::Active | branches::RollState::Blocked
+    ) && matches!(
+        roll.location,
+        branches::BranchLocation::Local | branches::BranchLocation::Both
+    )
+}
+
+/// Find `name` among `rolls` and confirm it is eligible for `rf update`.
+///
+/// Unlike [`UpdateTarget::AllActive`], where an ineligible roll is simply left
+/// out, a named roll that cannot be updated is an error — the caller asked for
+/// it explicitly, so the tool says why rather than silently doing nothing.
+fn resolve_update_target<'a>(
+    rolls: &'a [branches::RollInfo],
+    name: &str,
+) -> Result<&'a branches::RollInfo> {
+    let info = rolls
+        .iter()
+        .find(|r| r.branch == name)
+        .ok_or_else(|| anyhow!("'{name}' is not a known roll branch"))?;
+    if !matches!(
+        info.state,
+        branches::RollState::Active | branches::RollState::Blocked
+    ) {
+        bail!(
+            "'{name}' is {} — only active rolls can be updated",
+            info.state.label()
+        );
+    }
+    if !matches!(
+        info.location,
+        branches::BranchLocation::Local | branches::BranchLocation::Both
+    ) {
+        bail!("'{name}' exists only on origin — fetch it locally before updating");
+    }
+    Ok(info)
+}
+
+pub(crate) fn update(
+    config: &Config,
+    target: &UpdateTarget,
+    dry_run: bool,
+) -> Result<UpdateOutcome> {
     let repo = &config.repo_root;
     let rolls = branches::list_rolls(config)?;
 
-    let active: Vec<_> = rolls
-        .iter()
-        .filter(|r| {
-            matches!(
-                r.state,
-                branches::RollState::Active | branches::RollState::Blocked
-            ) && matches!(
-                r.location,
-                branches::BranchLocation::Local | branches::BranchLocation::Both
-            )
-        })
-        .collect();
+    let active: Vec<&branches::RollInfo> = match target {
+        UpdateTarget::AllActive => rolls.iter().filter(|r| is_update_candidate(r)).collect(),
+        UpdateTarget::Rolls(names) => names
+            .iter()
+            .map(|name| resolve_update_target(&rolls, name))
+            .collect::<Result<Vec<_>>>()?,
+    };
 
     if active.is_empty() {
         return Ok(UpdateOutcome::NoActiveRolls);

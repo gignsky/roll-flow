@@ -33,6 +33,17 @@ long list — that keeps two rolls adding rules in different areas from collidin
   landed, and must never be read as a branch that graduated. Misreading it marks
   an unmerged roll as graduated — strictly worse than failing to notice a real
   one, which is why the clause is cut before any shape is matched.
+- **A revert cannot be undone by re-merging.** Once a graduation (or
+  promotion) merge is reverted, the roll branch's own tip is still an
+  ancestor of the target either way — a revert adds a commit on top, it
+  removes nothing from history — so an ordinary `--no-ff` merge of the roll
+  has nothing new to bring in, regardless of whether the roll has gained
+  commits since. The only way to restore it is to revert the revert, which is
+  what `rf graduate`'s remedy for `RollState::Reverted` actually does (see
+  [Revert detection](algorithms.md#revert-detection-corebranchesrs)). Any new
+  code path that tries to "fix" a reverted roll by merging the branch again
+  will silently no-op, or hit `classify_merge`'s `NothingToMerge` and bail
+  with a misleading "already up to date".
 
 ## Rolls and branch resolution
 

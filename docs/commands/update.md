@@ -1,7 +1,7 @@
 # `update`
 
 ```text
-rf update [--dry-run]
+rf update [--roll <branch>]... [--dry-run]
 ```
 
 Merges the stable branch into every active local roll branch, bringing them all
