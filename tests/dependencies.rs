@@ -24,6 +24,11 @@ fn dependants(sb: &Sandbox, branch: &str) -> Vec<u64> {
     numbers(sb, branch, "dependants")
 }
 
+/// Reported `stale_deps` for a roll branch, from `rf list --json`.
+fn stale_deps(sb: &Sandbox, branch: &str) -> Vec<u64> {
+    numbers(sb, branch, "stale_deps")
+}
+
 fn numbers(sb: &Sandbox, branch: &str, field: &str) -> Vec<u64> {
     let json = sb.list_json();
     let roll = json
@@ -103,7 +108,7 @@ fn dependency_and_dependant_survive_promotion() {
     assert!(sb.rf(&["graduate"]).success, "graduate beta");
 
     sb.git(&["checkout", "rolling"]);
-    let out = sb.rf(&["promote"]);
+    let out = sb.rf(&["promote", "--yes"]);
     assert!(out.success, "promote: {}", out.combined());
 
     assert_eq!(
@@ -114,6 +119,85 @@ fn dependency_and_dependant_survive_promotion() {
     // this only holds because the scan is anchored at the graduation merge.
     assert_eq!(deps(&sb, "roll/2-0612-beta"), vec![1]);
     assert_eq!(dependants(&sb, "roll/1-0611-alpha"), vec![2]);
+}
+
+/// Integrating the rolling branch itself (`[I]` / `rf integrate rolling`) must
+/// surface every roll already graduated onto it as a dependency, even though
+/// the merge's own subject names rolling, not a roll — the gap this test
+/// guards against is `rf integrate rolling` reporting no new dependencies at
+/// all.
+#[test]
+fn integrating_rolling_reports_every_graduated_roll_as_a_dependency() {
+    let sb = Sandbox::plain();
+    sb.init();
+
+    sb.create_roll("alpha", "0611");
+    sb.commit_file("alpha.txt", "a\n", "alpha work");
+    assert!(sb.rf(&["graduate"]).success, "graduate alpha");
+
+    sb.git(&["checkout", "main"]);
+    sb.create_roll("beta", "0612");
+    sb.commit_file("beta.txt", "b\n", "beta work");
+    assert!(sb.rf(&["graduate"]).success, "graduate beta");
+
+    sb.git(&["checkout", "main"]);
+    sb.create_roll("gamma", "0613");
+    sb.commit_file("gamma.txt", "c\n", "gamma work");
+
+    // Bring rolling (with alpha and beta already graduated onto it) into
+    // gamma directly, the way `[I]` does.
+    let out = sb.rf(&["integrate", "rolling"]);
+    assert!(
+        out.success,
+        "integrate rolling into gamma: {}",
+        out.combined()
+    );
+
+    let mut got = deps(&sb, "roll/3-0613-gamma");
+    got.sort_unstable();
+    assert_eq!(got, vec![1, 2]);
+    assert_eq!(dependants(&sb, "roll/1-0611-alpha"), vec![3]);
+    assert_eq!(dependants(&sb, "roll/2-0612-beta"), vec![3]);
+}
+
+/// The false positive the ancestry fallback must not reintroduce: a roll that
+/// forks from stable *after* an old roll was promoted already has that roll's
+/// commits as ancestors through stable, with no `[I]` merge involved at all.
+/// A later, unrelated `[I]` merge on a *different* roll must not read that
+/// pre-existing ancestry as a dependency it just acquired — only graduations
+/// genuinely new to the merge's own `base..roll` range count.
+#[test]
+fn integrating_rolling_does_not_claim_a_dependency_already_baked_in_via_stable() {
+    let sb = Sandbox::plain();
+    sb.init();
+
+    sb.create_roll("alpha", "0611");
+    sb.commit_file("alpha.txt", "a\n", "alpha work");
+    assert!(sb.rf(&["graduate"]).success, "graduate alpha");
+    sb.git(&["checkout", "rolling"]);
+    assert!(
+        sb.rf(&["promote", "--yes"]).success,
+        "promote alpha to stable"
+    );
+
+    // beta forks from stable *after* the promotion, so alpha's commit is
+    // already its ancestor — unrelated to anything beta merges from rolling.
+    sb.git(&["checkout", "main"]);
+    sb.create_roll("beta", "0612");
+    sb.commit_file("beta.txt", "b\n", "beta work");
+
+    let out = sb.rf(&["integrate", "rolling"]);
+    assert!(
+        out.success,
+        "integrate rolling into beta: {}",
+        out.combined()
+    );
+
+    assert!(
+        deps(&sb, "roll/2-0612-beta").is_empty(),
+        "beta's ancestry already contains alpha via stable; the [I] merge introduced nothing new"
+    );
+    assert!(dependants(&sb, "roll/1-0611-alpha").is_empty());
 }
 
 #[test]
@@ -137,73 +221,56 @@ fn status_table_shows_both_columns_by_default() {
     );
 }
 
-// ── outdated ─────────────────────────────────────────────────────────────────
-
-/// `outdated` for a roll branch, from `rf list --json`.
-fn outdated(sb: &Sandbox, branch: &str) -> Vec<u64> {
-    numbers(sb, branch, "outdated")
+/// `stale_deps` must be an ancestry check, not a `RollState` lookup: a
+/// dependency that keeps gaining commits is stale whether or not it has ever
+/// graduated. This is the scenario that matters before merging a batch of
+/// dependent rolls against a dependency someone keeps pushing to.
+#[test]
+fn stale_deps_empty_right_after_integration() {
+    let sb = sandbox_with_integration();
+    assert!(stale_deps(&sb, "roll/2-0612-beta").is_empty());
 }
 
 #[test]
-fn a_dependency_that_moves_after_integration_marks_the_dependant_outdated() {
+fn active_dependency_that_keeps_moving_is_reported_stale() {
     let sb = sandbox_with_integration();
-    assert!(
-        outdated(&sb, "roll/2-0612-beta").is_empty(),
-        "fresh integration"
-    );
 
-    // Real work lands on alpha after beta integrated it.
+    // roll/1 gains a commit beta never picked up, and never graduates — it
+    // stays `active`. Staleness must not depend on that state transition.
     sb.git(&["checkout", "roll/1-0611-alpha"]);
-    sb.commit_file("alpha.txt", "a\nmore\n", "alpha follow-up");
+    sb.commit_file("alpha2.txt", "a2\n", "more alpha work");
+    sb.git(&["checkout", "rolling"]);
 
-    assert_eq!(outdated(&sb, "roll/2-0612-beta"), vec![1]);
     assert_eq!(
-        sb.roll_state("roll/2-0612-beta").as_deref(),
-        Some("⛔ blocked"),
-        "the lifecycle state is untouched; outdated is reported beside it"
+        sb.roll_state("roll/1-0611-alpha").as_deref(),
+        Some("active")
     );
-    let out = sb.rf(&["status", "--no-tui"]);
-    assert!(out.stdout.contains("⟳ ⛔ blocked"), "{}", out.combined());
+    assert_eq!(stale_deps(&sb, "roll/2-0612-beta"), vec![1]);
+
+    // Visible from the plain table too, not just --json.
+    let out = sb.rf(&["list", "--no-tui", "--deps"]);
+    assert!(out.success, "list: {}", out.combined());
     assert!(
-        out.stdout.contains("⟳ a dependency has changed"),
-        "{}",
+        out.stdout.contains("1⚠"),
+        "a stale dep should carry a ⚠ marker: {}",
         out.combined()
     );
-
-    // Re-integrating catches up, and the marker clears.
-    sb.git(&["checkout", "roll/2-0612-beta"]);
-    let out = sb.rf(&["integrate", "roll/1-0611-alpha"]);
-    assert!(out.success, "re-integrate: {}", out.combined());
-    assert!(
-        outdated(&sb, "roll/2-0612-beta").is_empty(),
-        "after re-integration"
-    );
 }
 
 #[test]
-fn a_version_only_change_on_a_dependency_does_not_outdate_anyone() {
-    // The dev-version marker and a bump touch the manifest and lockfile and
-    // nothing else; a dependant has not fallen behind any work.
-    let sb = Sandbox::cargo();
-    sb.init();
-
-    sb.create_roll("alpha", "0611");
-    sb.commit_file("alpha.txt", "a\n", "alpha work");
-    sb.git(&["checkout", "main"]);
-    sb.create_roll("beta", "0612");
-    let out = sb.rf(&["integrate", "roll/1-0611-alpha"]);
-    assert!(out.success, "integrate: {}", out.combined());
+fn reintegrating_clears_staleness() {
+    let sb = sandbox_with_integration();
 
     sb.git(&["checkout", "roll/1-0611-alpha"]);
-    sb.commit_cargo_version("0.0.2");
-
+    sb.commit_file("alpha2.txt", "a2\n", "more alpha work");
+    sb.git(&["checkout", "roll/2-0612-beta"]);
+    let out = sb.rf(&["integrate", "roll/1-0611-alpha"]);
     assert!(
-        outdated(&sb, "roll/2-0612-beta").is_empty(),
-        "a bump alone must not read as outdated: {:?}",
-        sb.list_json()
+        out.success,
+        "re-integrate alpha into beta: {}",
+        out.combined()
     );
+    sb.git(&["checkout", "rolling"]);
 
-    // But a bump *plus* real work does.
-    sb.commit_file("alpha.txt", "a\nb\n", "alpha work 2");
-    assert_eq!(outdated(&sb, "roll/2-0612-beta"), vec![1]);
+    assert!(stale_deps(&sb, "roll/2-0612-beta").is_empty());
 }

@@ -8,14 +8,44 @@ Shows current branch, tier, cleanliness, pending rolls, and promotion readiness.
 Runs as a full-screen TUI by default; `--no-tui` prints a plain table instead and
 `--json` emits machine-readable output.
 
+In a repo that has a `Cargo.toml`, the table carries a `version` column: the
+`[package]` version as it stands at each branch's tip — its own tip for a branch
+that exists locally, `origin/<branch>` for one that only exists on the remote.
+Repos without a manifest, which is every dotfiles repo, get no column at all,
+the same rule the header version follows. There is no flag for it.
+
+The cell shows the full version, dev marker included: a roll carrying one reads
+`0.2.4-roll9`, not `0.2.4`. The `#` column says which roll a row is, but not
+whether that roll's dev marker has actually been applied yet — a roll created
+before the marker existed, or with `--no-dev-version`, reads as a plain release
+version until its first `rf verify` (see [`verify`](verify.md)) — so the version
+cell is the only place that distinction is visible.
+
+All versions are read in a single `git cat-file --batch`, so the column costs one
+subprocess per reload rather than one per branch.
+
 The table carries a `deps` column (roll numbers this roll integrated) and a
 `dependants` column (roll numbers that integrated it) — `--no-deps` hides both.
 They are shown whatever the roll's state, so a roll that has already graduated
-still reports what it depends on and what depends on it. Press `[enter]` on a
-roll for the detail overlay, which follows the dependencies all the way down —
-roll 12 depends on 9, which depends on 8, which depends on 7 — one indented line
-per link, each with its state and a `⛔ blocker` / `✓ ok` marker. A roll reached
-twice (a diamond) is shown once more as `↑ shown above`.
+still reports what it depends on and what depends on it. A dep number in the
+plain table gets a trailing `⚠` when that dependency's branch has moved since
+this roll integrated it — `26⚠` — so a stale copy is visible without opening
+the detail view, which matters before reintegrating or merging a batch of
+dependent rolls against a dependency that is still gaining commits. `--json`
+carries the same signal as `stale_deps`, a subset of `deps`.
+
+Press `[enter]` on a roll for the detail overlay, which breaks the same two
+relationships out with per-dependency markers. Its dependency list follows the
+chain all the way down — roll 12 depends on 9, which depends on 8, which
+depends on 7 — one indented line per link; a roll reached twice (a diamond) is
+shown once more as `↑ shown above` and not expanded again. The two markers are
+independent — a dep can be both at once: `⛔ blocker` for a dep that has not
+graduated yet (it gates its parent's graduation), and `⚠ reintegrate` for one
+whose branch has moved since its parent integrated it (the same `⚠` as the
+plain table), whatever its own state — a dependency does not need to have
+graduated and diverged to be stale; it only needs to have kept moving after it
+was integrated. See
+[divergence after integration](../internals/algorithms.md#dependency-detection-coredependenciesrs).
 
 The overlay is a place to dig, not just read. `j`/`k` walk the linked rolls —
 every chain link, then the dependents — and `[enter]` (or `l`) opens the one
@@ -24,13 +54,8 @@ the path taken. `[backspace]` (or `h`) comes back up one level, and closes when
 there is nowhere further up, so the key never dead-ends; `[esc]` closes outright
 from any depth. Each pane is the same view the table's `[enter]` would open for
 that roll, divergence included, so digging from 12 to 7 shows exactly what
-selecting 7 would have.
-
-A `⟳` in front of a roll's state means a dependency has **changed since it was
-integrated** — real changes, not a version bump or the `-rollN` dev marker,
-which touch only version lines. The overlay names which dependencies moved and
-marks the link (`⟳ moved since integration`); `rf integrate` again to catch up,
-and the marker clears. `--json` reports the same list as `outdated`.
+selecting 7 would have. These keys belong to the overlay, not the table, so they
+are listed in its own footer rather than in the `?` keymap below.
 
 The TUI table pins the stable and rolling branches above the rolls, so `[space]`
 switches to them the same way it switches to a roll. A base branch that exists
@@ -84,6 +109,7 @@ The full list:
 | `?` | search every key |
 | `q` | quit |
 | `p` / `P` / `f` | pull / push / fetch the selected branch |
+| `PP` | [push every branch that needs it](#pp--push-everything-that-needs-it) |
 | `gg` | lazygit |
 | `c` / `i` | create a roll / integrate one into the checked-out roll |
 | `G` / `m` / `u` | graduate / promote / update from stable |
@@ -140,12 +166,76 @@ overwritten and asks. Only `y` proceeds, and it uses `--force-with-lease`, so a
 push someone else landed in the meantime is refused rather than clobbered. If git
 reports a stale lease, fetch with `[f]` and try again.
 
+### `PP` — push everything that needs it
+
+Double-tapping `P` pushes every branch in the table that is ahead of its
+upstream or has no upstream yet, in the order they are listed. A modal names
+them first, and only `y` proceeds.
+
+What it will **not** push is the point of the key:
+
+| sync state | `PP` |
+|---|---|
+| `↑2` ahead | pushed — a fast-forward |
+| `—` no upstream | pushed with `--set-upstream`; creates the branch on the remote |
+| `✓` in sync | not mentioned; there is nothing to push |
+| `↓1` behind, `↑2↓1` diverged | skipped, with the reason — pushing needs a force |
+| `gone` | skipped — the upstream was deleted on purpose |
+
+Every push `PP` performs is one `[P]` would have performed without asking
+anything. Forcing stays a per-branch decision behind its own red confirmation,
+so a bulk key can never be the thing that overwrites a remote ref; and a `gone`
+upstream is left alone so `PP` cannot resurrect a branch that
+[`prune`](prune.md) or [`clean`](clean.md) retired. Branches it skips are listed
+in the modal *and* in the output panel, so they are not silently dropped.
+
+Because `[P]` alone already pushes, the chord needs a timeout where `gg` does
+not: a lone `P` is held about 400 ms to see whether a second one follows. Any
+other key inside that window resolves it as the single push straight away — that
+key is consumed rather than also acted on, so press it again once the push has
+started.
+
+## Verifying
+
+`[v]` runs [`verify`](verify.md) on the **checked-out** branch — not the row
+under the cursor, because the gates run in the working tree, so the branch they
+judge is whichever one is checked out. The route comes from that branch's tier
+and is named in the panel title before the gates start:
+
+| checked out | `[v]` checks |
+|---|---|
+| a `roll/*` branch | `roll/N-… → rolling` |
+| the rolling branch | `rolling → main` |
+| anything else | nothing — it says to check out a roll or rolling first |
+
+It is the one action key with no confirmation modal, because it is the one that
+changes nothing: the modal is for the ops that write to the repo. It reports the
+same checks as `rf verify`, in the same words — divergence note, version
+comparison, gate notices, per-host results, verdict.
+
+The one thing it will not do is bump the version. `rf verify` offers one; here a
+failed version gate points at `[b]` instead, which is the key that already writes
+that commit. A failed host or an unsatisfied gate marks the panel as failed
+rather than passing quietly.
+
 ## Bumping the version
 
 `[b]` raises the `[package]` version in `Cargo.toml` on the **checked-out**
 branch — not the row under the cursor, because a bump is a commit and has to land
-on the branch the merge will be made from. The header carries the current version
-so the effect is visible without opening anything.
+on the branch the merge will be made from. The bump modal shows the version it
+will raise, so the effect is visible before confirming.
+
+The header's top-right corner names the **binary that is running** — `rf v0.2.4`
+— not the checked-out branch's manifest. The two used to be conflated, and the
+corner changed on every `[space]`: in this repo it read as a roll's dev version,
+in any other repo as whatever that repo ships, and neither answers "which rf is
+this". Per-branch versions have their own table column.
+
+```text
+┌ roll-flow ───────────────────────────────────────── rf v0.2.4 ┐
+│Branch: roll/4-0918-x   Rolling: rolling   Stable: main        │
+└───────────────────────────────────────────────────────────────┘
+```
 
 ```text
 ┌ bump version ────────────────────────┐

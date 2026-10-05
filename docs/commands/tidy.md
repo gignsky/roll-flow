@@ -1,7 +1,7 @@
 # `tidy`
 
 ```text
-rf tidy [--state <active|blocked|diverged|graduated|promoted|all>,...] [--dry-run] [--yes] [--force] [--no-fetch]
+rf tidy [--state <active|blocked|diverged|reverted|graduated|promoted|demoted|all>,...] [--dry-run] [--yes] [--force] [--no-fetch]
 ```
 
 Deletes **local** roll branches whose commits survive somewhere else, to clear
@@ -49,7 +49,10 @@ panel; clearing one of those still needs `rf tidy --force` from the CLI.
 
 `--state` selects by roll lifecycle state, and defaults to `graduated,promoted`
 — the rolls whose work is merged, where the local branch is pure clutter. Values
-may be repeated or comma-separated.
+may be repeated or comma-separated. `reverted` and `demoted` are not in that
+default set — they need attention (see [`list`](list.md)), not disk cleanup —
+but their branch tips are still structurally contained the same way a
+`diverged` one is, so naming them explicitly works like any other state.
 
 ```text
 rf tidy                                  # graduated + promoted
