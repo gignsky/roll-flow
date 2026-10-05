@@ -38,7 +38,7 @@ fn init_create_and_promote_flow() {
     assert_eq!(sb.current_branch(), "roll/1-0611-feature");
 
     sb.git(&["checkout", "rolling"]);
-    let out = sb.rf(&["promote"]);
+    let out = sb.rf(&["promote", "--yes"]);
     assert!(
         out.success,
         "promote rolling->main failed: {}",
@@ -416,6 +416,56 @@ fn update_skips_roll_already_up_to_date() {
     );
 
     assert_eq!(before, sb.rev(roll), "no new commit should be created");
+}
+
+#[test]
+fn update_with_roll_touches_only_the_named_branch() {
+    let sb = Sandbox::plain();
+    let out = sb.init();
+    assert!(out.success, "init failed: {}", out.combined());
+
+    let out = sb.create_roll("alpha", "0611");
+    assert!(out.success, "create failed: {}", out.combined());
+    sb.commit_file("alpha.txt", "a\n", "alpha work");
+
+    let out = sb.create_roll("beta", "0612");
+    assert!(out.success, "create failed: {}", out.combined());
+    sb.commit_file("beta.txt", "b\n", "beta work");
+
+    sb.git(&["checkout", "main"]);
+    sb.commit_file("stable.txt", "s\n", "advance stable");
+
+    let alpha = "roll/1-0611-alpha";
+    let beta = "roll/2-0612-beta";
+    let beta_before = sb.rev(beta);
+
+    let out = sb.rf(&["update", "--roll", alpha]);
+    assert!(out.success, "update failed: {}", out.combined());
+
+    assert!(
+        sb.is_ancestor("main", alpha),
+        "main should merge into alpha"
+    );
+    assert_eq!(
+        beta_before,
+        sb.rev(beta),
+        "beta was not named, so it should be untouched"
+    );
+}
+
+#[test]
+fn update_with_unknown_roll_errors() {
+    let sb = Sandbox::plain();
+    let out = sb.init();
+    assert!(out.success, "init failed: {}", out.combined());
+
+    let out = sb.rf(&["update", "--roll", "roll/99-0101-missing"]);
+    assert!(!out.success, "update should fail for an unknown roll");
+    assert!(
+        out.combined().contains("not a known roll branch"),
+        "unexpected: {}",
+        out.combined()
+    );
 }
 
 // ── #80: blocked-state derives from real integrations, not file overlap ───────
