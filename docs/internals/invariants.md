@@ -150,26 +150,16 @@ long list — that keeps two rolls adding rules in different areas from collidin
   fails on a stale lockfile. This is why the bump is a CLI-level step in
   `main.rs` rather than part of `ops::promote` — a per-roll step has to land it
   *inside* the merge, which only `ops::promote` can do (see
-  [algorithms.md](algorithms.md)'s "Graduate/promote flow" section) — while
-  `rf graduate` strips the dev marker *inside* `ops::graduate` itself, since
-  graduation is
-  always the same shape (strip, then merge) regardless of caller. Every path
-  that reaches `ops::graduate` reaches this strip: `rf graduate`, the
-  `rf promote` fall-through, and the TUI's `[G]`. Centralizing it there is
-  deliberate — it used to live in the CLI's `cmd_graduate` only, which meant
-  the other two callers merged a roll into rolling with its dev marker still
-  attached, a real gap closed by moving it into the one function all three
-  share. All version writes still go through `ops::commit_version_change`,
-  which is the one place the write, the lockfile refresh and the commit happen
-  in that order.
+  [algorithms.md](algorithms.md)'s "Graduate/promote flow" section). All
+  version writes go through `ops::commit_version_change`, which is the one
+  place the write, the lockfile refresh and the commit happen in that order.
 - `ops::graduate` checks **before** anything else, including the merge-state
   classification and the gates, that a dev marker the roll carries is its own
   (`ops::check_dev_marker_ownership`): a roll should only ever wear its own
   `-roll<N>`, and one naming a different roll means the version history was
   mixed with another roll's somewhere upstream (an `[i]` integrate merge, a
-  stray cherry-pick). Read-only and cheap, so it runs first — before
-  `strip_dev_version` can silently erase the evidence, and before a full gate
-  run wastes time only to fail on something else, or not fail at all.
+  stray cherry-pick). Read-only and cheap, so it runs first — a data-integrity
+  check, independent of the merge-conflict question below.
 - `ops::graduate` checks out `roll` itself before doing anything that mutates
   state or runs a gate, rather than operating on whatever happened to be
   checked out when it was called. The TUI's `[G]` can graduate any selected
@@ -182,18 +172,36 @@ long list — that keeps two rolls adding rules in different areas from collidin
   checked-out branch is restored at the very end, success or failure; for the
   CLI (which already requires being on the roll) this is a no-op, so the
   behavior there is unchanged.
-- The dev-marker strip `ops::graduate` commits on the roll branch (now
-  guaranteed to be checked out) is rolled back with a plain `git reset --hard`
-  to the pre-strip SHA if the gates or the merge fail afterward. The strip has
-  to happen *before* those — it is the thing that keeps a roll's own marker
-  from conflicting with wherever rolling has moved to since the roll branched
-  — but a failure downstream of it must not leave a stray commit behind on a
-  roll that never actually graduated. Without the rollback, a failed
-  `rf graduate` looks like "the version got reverted" instead of "graduation
-  failed," because the only visible trace of the attempt is the version
-  disappearing. Both a failing gate and a real merge conflict on some
-  unrelated file go through the same rollback — "something after the strip
-  failed" is the condition, not which particular step.
+- A roll's `-roll<N>` marker reaching `rolling` (via `rf graduate`) or getting
+  stale against an advanced stable (via `rf update`) is resolved at the git
+  level, not by `rf` committing a strip/reapply on either branch first. See
+  `src/core/merge_driver.rs` and `ops::ensure_version_merge_driver` (wired up
+  by `rf init`): `Cargo.toml` is attributed to a custom merge driver that
+  resolves the `version` line by keeping whichever side is being merged
+  *into*'s own marker (or none) and the higher of the two numbers — correct
+  for both directions, since "ours" is just whichever branch git has checked
+  out, decided by git itself rather than by which `rf` command is running.
+  This replaced an earlier design (strip the marker in a commit before
+  merging, roll it back if the gates or the merge failed afterward) that
+  worked but needed careful transactionality to avoid leaving a roll
+  half-graduated with its marker stripped and nothing to show for it; the
+  merge driver needs none of that, because nothing is committed to either
+  branch until the merge itself commits.
+- A git merge driver only fires when *both* sides changed the attributed line
+  — the case that would otherwise conflict. The far more common graduate case
+  is the opposite: rolling's own version is untouched, so only the roll
+  changed the line, and git resolves that *trivially* by taking the changed
+  side (the roll's marked value) without ever invoking any driver. `ops::graduate`
+  corrects this itself, inside `merge_gated`'s staged tree, before the gates
+  run (`reconcile_staged_version`): it reads both sides' version ahead of the
+  merge and rewrites `Cargo.toml` to the rule's answer if the merge didn't
+  already land there. This is why the fix exists in `ops::graduate` and not
+  purely in `.gitattributes` — the driver alone covers the conflicting case
+  but not the trivial one, and both have to resolve the same way for the
+  marker to never reach rolling. `rf update`'s direction doesn't need this:
+  its trivial case (stable hasn't touched the version, only the roll's own
+  marker has) already resolves correctly by git's own default of keeping the
+  side that changed, since that side is the roll.
 - A `-roll<N>` dev version must never reach `rolling` or the stable branch, and
   is refused **before** the numbers are compared, not by them. `0.2.5-roll9` is
   numerically above `0.2.4`, so a comparison alone would promote it — and then

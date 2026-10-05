@@ -33,32 +33,42 @@ roll's `Cargo.toml` should only ever read `-roll<N>` for its own number (what
 [`create`](create.md#dev-versions) and `rf verify` write). One that names a
 different roll means the version history got mixed with another roll's
 somewhere upstream (an `[i]` integrate merge, a stray cherry-pick), and
-graduation refuses rather than silently stripping evidence of that. This check
-is read-only and runs first because it is nearly free next to a full gate run.
+graduation refuses rather than silently papering over evidence of that. This
+check is read-only, independent of the rest of this section, and runs first
+because it is nearly free next to a full gate run.
 
-If the roll's `Cargo.toml` still carries its own `-roll<N>` dev marker, it is
-stripped in a commit on the roll branch **before** the gates run — the same
-sequencing the version bump uses, and for the same reason: it rewrites
-`Cargo.lock`, and `roll_to_rolling_gates` contains
-`cargo update --workspace --locked`, which fails against a stale one. This
-happens for every path that graduates a roll — `rf graduate` itself, the
-`rf promote` fall-through when run from a roll branch, and the TUI's `[G]` —
-since all three call the same `ops::graduate`. It also has to happen before the
-merge is attempted, not just the gates: if rolling has moved since the roll
-branched (another roll's version bump, say), the roll's own `-roll<N>` line and
-rolling's new one land on the same spot in `Cargo.toml`, and a roll that still
-carries its marker conflicts with that — stripping first makes the roll's line
-match the merge base, so the merge takes rolling's version instead of
-colliding with it.
+Merging a roll that still carries its `-roll<N>` marker into rolling is
+otherwise handled entirely at the git level, by a merge driver scoped to
+`Cargo.toml`'s `version` line — not by `rf` stripping or committing anything
+on the roll branch first. `rf init` wires this up (see [`init`](init.md)): it
+adds `Cargo.toml merge=rf-version` to `.gitattributes` and points
+`git config merge.rf-version.driver` at `rf` itself (the `__merge-driver-version`
+subcommand). The rule it applies, whenever a merge needs to reconcile the
+line: **keep whichever side is being merged *into* (`rolling`, which never
+carries a marker) — its own value if it has one, otherwise the higher of the
+two numbers.** For graduation that means rolling's own version always wins,
+untouched by whatever the roll's `Cargo.toml` said; the roll's marker simply
+never reaches rolling. The same driver, same rule, is what [`rf update`](update.md)
+relies on to keep a roll's marker while raising its base number — "ours" is
+whichever branch is checked out, so the one driver and rule cover both
+directions.
 
-That strip commit is rolled back if anything after it fails — a gate failure,
-or a real merge conflict on some other file. Without that, a failed graduation
-would leave a half-done result behind: a roll whose version marker is gone but
-that never actually graduated, which reads as "the version got reverted"
-rather than "graduation failed," since nothing else about the failure is
-visible on the roll branch itself. A failed `rf graduate` now leaves the roll
-exactly as it was before the attempt.
+A git merge driver only runs when both sides actually changed the line —
+that's when a plain text merge would otherwise conflict, which is exactly the
+case this exists for: rolling has moved since the roll branched (another
+roll's version bump, say), so the roll's `-roll<N>` line and rolling's new one
+land on the same spot and a plain merge would reject it. The far more common
+case is the opposite — rolling's own version hasn't moved at all, so only the
+roll changed the line — and git resolves *that* trivially by taking the
+changed side, with no driver involved. `rf graduate` corrects this case itself,
+inside the staged merge, before the gates run: it reads both sides' version
+ahead of the merge and, after staging, rewrites `Cargo.toml` (and refreshes
+`Cargo.lock`) to the same rule's answer if the merge didn't already land there
+on its own. Either way — driver-resolved or corrected in the staged tree —
+nothing is committed to the roll branch itself, and nothing needs rolling
+back: the merge either succeeds as one commit with the right version already
+in it, or it's aborted entirely and the roll is untouched, exactly as any
+other failed graduation.
 
-`--dry-run` leaves the marker alone, since a preview must not commit. So a dry
-run reports what the gates say about the *unstripped* version, which is the
-honest answer for a run that changes nothing.
+`--dry-run` doesn't stage a merge at all, so the gates report on the roll's
+branch exactly as it is — the honest answer for a run that changes nothing.

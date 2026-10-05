@@ -318,6 +318,19 @@ pub enum Cmd {
 
     /// Print program version.
     Version,
+
+    /// Internal: git merge driver for Cargo.toml's `version` line. Invoked by
+    /// git itself (wired up by `rf init` via `.gitattributes` and git config)
+    /// — never meant to be run by hand. Hidden from `--help`.
+    #[command(name = "__merge-driver-version", hide = true)]
+    MergeDriverVersion {
+        /// Git's `%O`: the common ancestor's content.
+        ancestor: std::path::PathBuf,
+        /// Git's `%A`: our side; also where the result must be written.
+        ours: std::path::PathBuf,
+        /// Git's `%B`: their side.
+        theirs: std::path::PathBuf,
+    },
 }
 
 /// The roll states `rf tidy --state` accepts.

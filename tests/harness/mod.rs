@@ -199,8 +199,24 @@ impl Sandbox {
 
     fn rf_at(&self, args: &[&str], env: &[(&str, &str)]) -> RfOutput {
         let exe = std::env::var("CARGO_BIN_EXE_rf").expect("CARGO_BIN_EXE_rf");
-        let mut cmd = Command::new(exe);
+        let mut cmd = Command::new(&exe);
         cmd.current_dir(self.path()).args(args);
+        // The compiled test binary is already named `rf` on disk (the crate's
+        // own `[[bin]] name`), so putting its directory first on `PATH` makes
+        // a bare `rf` lookup resolve to this exact binary — which is what the
+        // version merge driver's git config names (`rf __merge-driver-version
+        // ...`), since git looks that up on `PATH` itself when it shells out
+        // to run it mid-merge. Without this, every test that exercises a real
+        // merge through the driver would fail: `rf` wouldn't resolve to
+        // anything at all in a bare test environment.
+        if let Some(dir) = Path::new(&exe).parent() {
+            let path = std::env::var_os("PATH").unwrap_or_default();
+            let mut paths = vec![dir.to_path_buf()];
+            paths.extend(std::env::split_paths(&path));
+            if let Ok(joined) = std::env::join_paths(paths) {
+                cmd.env("PATH", joined);
+            }
+        }
         for (key, value) in env {
             cmd.env(key, value);
         }

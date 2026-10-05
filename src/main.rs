@@ -134,6 +134,14 @@ fn main() -> Result<()> {
             no_fetch,
         } => cli::clean::run(dry_run, yes, force, with_remote, no_fetch)?,
         Cmd::Version => println!("{}", env!("CARGO_PKG_VERSION")),
+        Cmd::MergeDriverVersion {
+            ancestor,
+            ours,
+            theirs,
+        } => {
+            let resolved = core::merge_driver::run(&ancestor, &ours, &theirs)?;
+            std::process::exit(if resolved { 0 } else { 1 });
+        }
     }
 
     Ok(())
@@ -162,6 +170,14 @@ fn cmd_init(
             &config.repo_root,
             &["branch", &config.rolling_branch, &config.stable_branch],
         )?;
+    }
+
+    // Runs on every `rf init`, independent of whether `.roll-flow.toml` itself
+    // needs updating: the git-config half of this is local to the clone (see
+    // `ops::ensure_version_merge_driver`), so a repo whose config is already
+    // up to date on a fresh clone still needs this wired up here.
+    if ops::ensure_version_merge_driver(&config)? {
+        println!("Configured the version merge driver for Cargo.toml");
     }
 
     // Resolve the workflow mode (issue #18): an explicit `--mode` always wins;
@@ -571,10 +587,9 @@ fn cmd_graduate(dry_run: bool, force: bool, reason: Option<String>) -> Result<()
             config.stable_branch
         );
     }
-    // `ops::graduate` checks the dev marker belongs to this roll, strips it
-    // ahead of the gates, and reports what it dropped — shared with the
-    // `rf promote` fall-through and the TUI's `[G]`, so this is just the CLI
-    // wrapper now.
+    // `ops::graduate` checks the dev marker belongs to this roll and runs the
+    // gates and merge — shared with the `rf promote` fall-through and the
+    // TUI's `[G]`, so this is just the CLI wrapper now.
     let outcome = ops::graduate(&config, &current, dry_run, &force)?;
     print_graduate(&outcome);
     Ok(())
@@ -832,9 +847,6 @@ fn offer_step_tag_pushes(config: &Config, outcome: &ops::PromoteOutcome, yes: bo
 }
 
 fn print_graduate(outcome: &ops::GraduateOutcome) {
-    if let Some(released) = outcome.dropped_dev_marker {
-        println!("dropped the dev marker; version is now {released}");
-    }
     render_gate_notices(&outcome.gate_notices);
     if outcome.dry_run {
         println!(
