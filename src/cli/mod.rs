@@ -201,8 +201,13 @@ pub enum Cmd {
         json: bool,
     },
 
-    /// Merge the stable branch into all active local roll branches.
+    /// Merge the stable branch into all active local roll branches, or into
+    /// just the named ones.
     Update {
+        /// Update only this roll branch. Repeatable; with no `--roll` given,
+        /// every active local roll is updated.
+        #[arg(long)]
+        roll: Vec<String>,
         #[arg(long)]
         dry_run: bool,
     },

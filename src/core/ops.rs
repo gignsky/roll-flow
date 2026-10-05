@@ -1889,22 +1889,76 @@ pub(crate) enum UpdateOutcome {
     },
 }
 
-pub(crate) fn update(config: &Config, dry_run: bool) -> Result<UpdateOutcome> {
+/// What `rf update` should bring up to date with stable.
+///
+/// [`AllActive`](UpdateTarget::AllActive) is the long-standing behaviour —
+/// every active local roll in one pass. [`Rolls`](UpdateTarget::Rolls) merges
+/// stable into only the named branches, so updating one roll from the TUI (or
+/// `rf update --roll`) does not also touch every other roll in progress.
+pub(crate) enum UpdateTarget {
+    AllActive,
+    Rolls(Vec<String>),
+}
+
+/// Whether `roll` is eligible for `rf update`: active (or blocked) and present
+/// locally. A graduated/promoted roll has nothing meaningful to merge stable
+/// into, and a remote-only roll has no local copy to merge into at all.
+fn is_update_candidate(roll: &branches::RollInfo) -> bool {
+    matches!(
+        roll.state,
+        branches::RollState::Active | branches::RollState::Blocked
+    ) && matches!(
+        roll.location,
+        branches::BranchLocation::Local | branches::BranchLocation::Both
+    )
+}
+
+/// Find `name` among `rolls` and confirm it is eligible for `rf update`.
+///
+/// Unlike [`UpdateTarget::AllActive`], where an ineligible roll is simply left
+/// out, a named roll that cannot be updated is an error — the caller asked for
+/// it explicitly, so the tool says why rather than silently doing nothing.
+fn resolve_update_target<'a>(
+    rolls: &'a [branches::RollInfo],
+    name: &str,
+) -> Result<&'a branches::RollInfo> {
+    let info = rolls
+        .iter()
+        .find(|r| r.branch == name)
+        .ok_or_else(|| anyhow!("'{name}' is not a known roll branch"))?;
+    if !matches!(
+        info.state,
+        branches::RollState::Active | branches::RollState::Blocked
+    ) {
+        bail!(
+            "'{name}' is {} — only active rolls can be updated",
+            info.state.label()
+        );
+    }
+    if !matches!(
+        info.location,
+        branches::BranchLocation::Local | branches::BranchLocation::Both
+    ) {
+        bail!("'{name}' exists only on origin — fetch it locally before updating");
+    }
+    Ok(info)
+}
+
+pub(crate) fn update(
+    config: &Config,
+    target: &UpdateTarget,
+    dry_run: bool,
+) -> Result<UpdateOutcome> {
     let repo = &config.repo_root;
     let rolls = branches::list_rolls(config)?;
 
-    let active: Vec<_> = rolls
-        .iter()
-        .filter(|r| {
-            matches!(
-                r.state,
-                branches::RollState::Active | branches::RollState::Blocked
-            ) && matches!(
-                r.location,
-                branches::BranchLocation::Local | branches::BranchLocation::Both
-            )
-        })
-        .collect();
+    let active: Vec<&branches::RollInfo> = match target {
+        UpdateTarget::AllActive => rolls.iter().filter(|r| is_update_candidate(r)).collect(),
+        UpdateTarget::Rolls(names) => names
+            .iter()
+            .map(|name| resolve_update_target(&rolls, name))
+            .collect::<Result<Vec<_>>>()?,
+    };
 
     if active.is_empty() {
         return Ok(UpdateOutcome::NoActiveRolls);

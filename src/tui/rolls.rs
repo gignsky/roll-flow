@@ -47,7 +47,8 @@ pub(crate) enum Action {
     Integrate,
     /// Promote the rolling branch into stable.
     Promote,
-    /// Update all active local rolls from stable.
+    /// Merge stable into the selected roll, or every active local roll when
+    /// none is selected.
     Update,
     /// Delete every promoted roll branch, locally and on origin.
     Prune,
@@ -865,7 +866,7 @@ pub(crate) const BINDINGS: &[Binding] = &[
     },
     Binding {
         keys: "u",
-        label: "update active rolls from stable",
+        label: "update the selected roll (or all) from stable",
         group: "roll",
         hint: None,
         replay: &[KeyCode::Char('u')],
@@ -1235,6 +1236,47 @@ pub(crate) fn promote_target_for(
     }
 }
 
+/// What `[u]` should update, given the current selection.
+///
+/// `Ok(None)` means every active local roll — the long-standing behaviour,
+/// used when nothing narrower is selected. `Ok(Some(branch))` means just that
+/// one roll, so updating a roll in progress no longer has to touch every other
+/// active roll at the same time.
+///
+/// Mirrors `promote_target_for`: a base-branch row or empty selection widens to
+/// the repo-wide shape, but a roll row that cannot be updated yields the reason
+/// rather than quietly widening past what the keystroke asked for.
+pub(crate) fn update_target_for(
+    selected: Option<&RollInfo>,
+    rolls: &[RollInfo],
+) -> Result<Option<String>, String> {
+    let Some(sel) = selected else {
+        return if can_update(rolls) {
+            Ok(None)
+        } else {
+            Err("no active local rolls to update".to_string())
+        };
+    };
+
+    match sel.state {
+        RollState::Active | RollState::Blocked => {
+            if matches!(sel.location, BranchLocation::Local | BranchLocation::Both) {
+                Ok(Some(sel.branch.clone()))
+            } else {
+                Err(format!(
+                    "'{}' exists only on origin — press [space] or [p] to get it locally first",
+                    sel.branch
+                ))
+            }
+        }
+        RollState::Graduated | RollState::Diverged | RollState::Promoted => Err(format!(
+            "{} is {} — only active rolls can be updated",
+            sel.branch,
+            sel.state.label()
+        )),
+    }
+}
+
 /// The branch `[I]` would merge into the current one, or the reason it cannot.
 ///
 /// Mirrors `integrate_target_for`, but the source is always the rolling branch
@@ -1321,13 +1363,7 @@ pub(crate) fn validate_action(
             integrate_target_for(current_branch, roll_prefix, selected).map(|_| ())
         }
         Action::Promote => promote_target_for(selected, rolls).map(|_| ()),
-        Action::Update => {
-            if can_update(rolls) {
-                Ok(())
-            } else {
-                Err("no active local rolls to update".to_string())
-            }
-        }
+        Action::Update => update_target_for(selected, rolls).map(|_| ()),
         Action::Prune => {
             if can_prune(rolls) {
                 Ok(())
@@ -1847,6 +1883,8 @@ impl StatusApp {
             }
             // `None` here means "the whole rolling branch", not "no target".
             Action::Promote => promote_target_for(selected, &self.rolls).unwrap_or(None),
+            // `None` here means "every active local roll", not "no target".
+            Action::Update => update_target_for(selected, &self.rolls).unwrap_or(None),
             _ => None,
         };
         let carried = match (action, &target) {
@@ -2868,28 +2906,36 @@ fn run_op(config: &Config, action: Action, target: Option<&str>) -> Result<Vec<S
                 lines.push(format!("skipped '{}': {}", skip.roll, skip.reason));
             }
         }
-        Action::Update => match ops::update(config, false)? {
-            ops::UpdateOutcome::NoActiveRolls => {
-                lines.push("no active local rolls to update".to_string());
-            }
-            ops::UpdateOutcome::Ran { stable, items } => {
-                for item in items {
-                    match item {
-                        ops::UpdateItem::AlreadyUpToDate { roll } => {
-                            lines.push(format!("'{roll}' is already up to date with '{stable}'"));
-                        }
-                        ops::UpdateItem::WouldMerge { roll, behind } => {
-                            lines.push(format!(
-                                "would merge '{stable}' into '{roll}' ({behind} ahead)"
-                            ));
-                        }
-                        ops::UpdateItem::Updated { roll } => {
-                            lines.push(format!("updated '{roll}' with '{stable}'"));
+        Action::Update => {
+            let update_target = match target {
+                Some(roll) => ops::UpdateTarget::Rolls(vec![roll.to_string()]),
+                None => ops::UpdateTarget::AllActive,
+            };
+            match ops::update(config, &update_target, false)? {
+                ops::UpdateOutcome::NoActiveRolls => {
+                    lines.push("no active local rolls to update".to_string());
+                }
+                ops::UpdateOutcome::Ran { stable, items } => {
+                    for item in items {
+                        match item {
+                            ops::UpdateItem::AlreadyUpToDate { roll } => {
+                                lines.push(format!(
+                                    "'{roll}' is already up to date with '{stable}'"
+                                ));
+                            }
+                            ops::UpdateItem::WouldMerge { roll, behind } => {
+                                lines.push(format!(
+                                    "would merge '{stable}' into '{roll}' ({behind} ahead)"
+                                ));
+                            }
+                            ops::UpdateItem::Updated { roll } => {
+                                lines.push(format!("updated '{roll}' with '{stable}'"));
+                            }
                         }
                     }
                 }
             }
-        },
+        }
         Action::Prune => {
             // The modal was the confirmation, so plan and apply run back to
             // back here. `PruneScope::both` never forces: a branch holding
@@ -3180,10 +3226,15 @@ fn render_modal(f: &mut Frame, area: Rect, config: &Config, modal: &ConfirmModal
                 config.rolling_branch, config.stable_branch
             ),
         },
-        Action::Update => format!(
-            "Update all active local rolls from {}?",
-            config.stable_branch
-        ),
+        // `target` is the selected roll when `[u]` was pressed on one, and
+        // `None` for every active local roll.
+        Action::Update => match target {
+            Some(roll) => format!("Update {} from {}?", roll, config.stable_branch),
+            None => format!(
+                "Update all active local rolls from {}?",
+                config.stable_branch
+            ),
+        },
         Action::Prune => {
             let n = prunable_count(rolls);
             format!(
@@ -4326,6 +4377,60 @@ mod tests {
             RollState::Graduated,
             BranchLocation::Both
         )]));
+    }
+
+    #[test]
+    fn update_target_is_the_selected_active_roll() {
+        let rolls = vec![roll_n(1, RollState::Active), roll_n(2, RollState::Blocked)];
+        assert_eq!(
+            update_target_for(Some(&rolls[0]), &rolls),
+            Ok(Some("roll/1-0101-x".to_string()))
+        );
+        assert_eq!(
+            update_target_for(Some(&rolls[1]), &rolls),
+            Ok(Some("roll/2-0101-x".to_string()))
+        );
+    }
+
+    #[test]
+    fn update_target_is_every_active_roll_without_one_selected() {
+        // A base-branch row resolves to `None` the same way an empty selection
+        // does, which is how `[u]` with nothing selected updates every active
+        // local roll.
+        let rolls = vec![roll_n(1, RollState::Active)];
+        assert_eq!(update_target_for(None, &rolls), Ok(None));
+    }
+
+    #[test]
+    fn update_target_refuses_a_roll_that_cannot_be_updated() {
+        let graduated = vec![roll(RollState::Graduated, BranchLocation::Both)];
+        let err = update_target_for(Some(&graduated[0]), &graduated)
+            .expect_err("graduated rolls should be refused");
+        assert!(
+            err.contains("roll/1-0101-x"),
+            "the message should name the roll: {err}"
+        );
+
+        let remote_only = vec![roll(RollState::Active, BranchLocation::Remote)];
+        let err = update_target_for(Some(&remote_only[0]), &remote_only)
+            .expect_err("remote-only rolls should be refused");
+        assert!(
+            err.contains("roll/1-0101-x"),
+            "the message should name the roll: {err}"
+        );
+    }
+
+    #[test]
+    fn update_target_refusal_does_not_widen_to_every_active_roll() {
+        // The dangerous failure mode: pressing [u] on a graduated roll must not
+        // fall back to updating every active roll, which is far more than was
+        // asked.
+        let rolls = vec![
+            roll_n(1, RollState::Graduated),
+            roll_n(2, RollState::Active),
+        ];
+        assert!(update_target_for(Some(&rolls[0]), &rolls).is_err());
+        assert!(validate_action(Action::Update, Some(&rolls[0]), &rolls, "main", "roll/").is_err());
     }
 
     #[test]
