@@ -329,10 +329,14 @@ pub enum TidyState {
     Blocked,
     /// Graduated, then took further commits.
     Diverged,
+    /// Graduated, then that merge was reverted on rolling.
+    Reverted,
     /// Merged to rolling.
     Graduated,
     /// Merged to the stable branch.
     Promoted,
+    /// Promoted, then that merge was reverted on the stable branch.
+    Demoted,
     /// Every state above.
     All,
 }
@@ -352,15 +356,19 @@ impl TidyState {
                 TidyState::Active => push(RollState::Active),
                 TidyState::Blocked => push(RollState::Blocked),
                 TidyState::Diverged => push(RollState::Diverged),
+                TidyState::Reverted => push(RollState::Reverted),
                 TidyState::Graduated => push(RollState::Graduated),
                 TidyState::Promoted => push(RollState::Promoted),
+                TidyState::Demoted => push(RollState::Demoted),
                 TidyState::All => {
                     for state in [
                         RollState::Active,
                         RollState::Blocked,
                         RollState::Diverged,
+                        RollState::Reverted,
                         RollState::Graduated,
                         RollState::Promoted,
+                        RollState::Demoted,
                     ] {
                         push(state);
                     }

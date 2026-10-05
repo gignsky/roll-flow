@@ -1136,6 +1136,11 @@ pub(crate) struct GraduateOutcome {
     pub rolling: String,
     pub dry_run: bool,
     pub gate_notices: Vec<GateNotice>,
+    /// True when this graduation was *restored* by reverting a prior revert
+    /// of the roll's graduation merge, rather than landed by merging the roll
+    /// branch. See [`regraduate_reverted`] for why the two are not
+    /// interchangeable.
+    pub restored: bool,
 }
 
 /// Graduate `roll` into the rolling branch with a structured `--no-ff` merge.
@@ -1157,6 +1162,17 @@ pub(crate) fn graduate(
 
     let rolling = &config.rolling_branch;
     let rolling_ref = ensure_local_target(config, rolling, dry_run)?;
+
+    // A roll whose graduation was reverted on rolling needs a different
+    // remedy: its branch tip is still an ancestor of rolling either way (the
+    // revert added a commit on top; it removed nothing from history), so the
+    // ordinary merge below would see `MergeState::NothingToMerge` and bail
+    // with a confusing "already up to date" even though the content is
+    // visibly gone. Reverting the revert is what actually restores it.
+    if let Some(revert_hash) = branches::find_reverted_graduation(repo, roll, &rolling_ref) {
+        return regraduate_reverted(config, roll, rolling, &revert_hash, dry_run, force);
+    }
+
     match classify_merge(repo, roll, &rolling_ref)? {
         MergeState::TargetMissing => bail!(target_missing_error(config, rolling)),
         MergeState::UnrelatedHistories => {
@@ -1178,6 +1194,7 @@ pub(crate) fn graduate(
             rolling: rolling.clone(),
             dry_run: true,
             gate_notices: report.notices,
+            restored: false,
         });
     }
 
@@ -1189,7 +1206,70 @@ pub(crate) fn graduate(
         rolling: rolling.clone(),
         dry_run: false,
         gate_notices: report.notices,
+        restored: false,
     })
+}
+
+/// Restore a roll's graduation after it was reverted on rolling, by reverting
+/// the revert commit — the git-correct remedy, since an ordinary `--no-ff`
+/// re-merge of the roll branch cannot undo a revert (the branch's tip remains
+/// an ancestor of rolling either way, so the merge has nothing new to bring
+/// in; see [`branches::find_reverted_graduation`]). Runs the same
+/// `roll_to_rolling_gates` as an ordinary graduation, since this still lands
+/// roll content back onto rolling.
+fn regraduate_reverted(
+    config: &Config,
+    roll: &str,
+    rolling: &str,
+    revert_hash: &str,
+    dry_run: bool,
+    force: &ForceOpts,
+) -> Result<GraduateOutcome> {
+    let repo = &config.repo_root;
+    let report = run_gates(repo, &config.roll_to_rolling_gates, dry_run, force)?;
+
+    if dry_run {
+        return Ok(GraduateOutcome {
+            roll: roll.to_string(),
+            rolling: rolling.to_string(),
+            dry_run: true,
+            gate_notices: report.notices,
+            restored: true,
+        });
+    }
+
+    run_revert(repo, revert_hash, rolling)?;
+    Ok(GraduateOutcome {
+        roll: roll.to_string(),
+        rolling: rolling.to_string(),
+        dry_run: false,
+        gate_notices: report.notices,
+        restored: true,
+    })
+}
+
+/// Revert `commit` on `target`, mirroring [`run_merge`]'s checkout/abort/
+/// restore handling for the other kind of commit `rf graduate` can produce.
+fn run_revert(repo: &Path, commit: &str, target: &str) -> Result<()> {
+    let original = git::current_branch(repo)?;
+
+    git::run_git(repo, &["checkout", target])
+        .with_context(|| format!("failed to check out '{target}'"))?;
+
+    if let Err(revert_err) = git::run_git(repo, &["revert", "--no-edit", commit]) {
+        let _ = git::run_git(repo, &["revert", "--abort"]);
+        let _ = git::run_git(repo, &["checkout", &original]);
+        bail!(
+            "reverting '{commit}' on '{target}' failed (likely conflicts); \
+             the revert was aborted and you are back on '{original}'. \
+             Resolve manually: git checkout {target} && git revert {commit} ({revert_err})"
+        );
+    }
+
+    git::run_git(repo, &["checkout", &original]).with_context(|| {
+        format!("the revert on '{target}' succeeded, but checking out '{original}' again failed")
+    })?;
+    Ok(())
 }
 
 // ── promote ─────────────────────────────────────────────────────────────────

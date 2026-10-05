@@ -150,6 +150,61 @@ graduated rolls whose changes are in this roll's baseline. This is a promotion o
 constraint (this roll can't go to main before those do), not a graduation blocker. The
 `--basic` flag skips Method 4.
 
+## Revert detection (`core/branches.rs`)
+
+A roll's graduation (or promotion) merge is a normal commit — someone can
+`git revert` it, and nothing about the merge itself prevents that. The
+revert leaves the merge subject right where it was, so the plain "is there a
+merge commit naming this branch" check that defines graduated/promoted still
+says yes. Revert detection is the second check layered on top, deciding
+whether that merge is *still in effect*.
+
+**The signal.** `git revert` always writes `This reverts commit <hash>.` into
+the new commit's body — not the subject, which survives even a conflicted
+revert's hand-edited subject the same way `extract_graduated_branch`'s
+leniency survives a hand-edited merge subject (the editor opens with the
+boilerplate line already there). `find_active_revert_in_range` scans a commit
+range for that line.
+
+**Chained, not single-level.** A revert can itself be reverted (un-reverting
+it), and that can be reverted again. `find_active_revert_in_range` walks the
+range oldest-first and tracks a `(current_hash, reverted)` pair: whenever a
+commit's body reverts `current_hash`, parity flips and `current_hash` becomes
+*that* commit — because a later revert-of-the-revert references the revert's
+own hash, not the original merge's. This is why `rf graduate`'s own remedy
+(below) correctly stops being "needed" once applied, and why a roll a user
+un-reverted by hand (no `rf` involved) reports `graduated` again too — both
+are exercised in `tests/revert_detection.rs`.
+
+**Graduation side — `RollState::Reverted`.** `check_reverted` /
+`find_reverted_graduation` run `find_active_revert_in_range` over
+`<graduation-commit>..<rolling>`. A hit means the roll is `⚠ diverged`'s
+sibling: `⛔ blocked`'s cousin, actually — dependants treat a `Reverted`
+dependency as still gating them (`dep_rows`/`dependent_rows`), the same as
+`Active`/`Blocked`, since its content is not really on rolling.
+
+The remedy is *not* re-running the ordinary merge. The roll branch's own tip
+remains an ancestor of rolling either way — a revert adds a commit on top, it
+removes nothing from history — so `classify_merge` sees
+`MergeState::NothingToMerge` and a plain re-merge has nothing new to bring in
+regardless of whether the roll gained commits since. The git-correct fix is
+to revert the revert, which is what a reverted roll's "re-graduation" actually
+is. `ops::graduate` detects this *before* `classify_merge` runs and routes to
+`regraduate_reverted`, which runs the same `roll_to_rolling_gates` as an
+ordinary graduation and then `git revert`s the revert commit instead of
+merging. `rf graduate` / the TUI's `[g]` need no awareness of this — both
+already call `ops::graduate` for every eligible state.
+
+**Promotion side — `RollState::Demoted`.** Detect-only, deliberately. The
+same remedy on stable would mean teaching the per-roll promotion pipeline
+(version gate, release tags, carried-rolls disclosure — see
+[Per-roll promotion](#per-roll-promotion)) a second kind of step, so
+`check_promotion_reverted` only reports the state; nothing reverts the revert
+automatically. It is also narrower in what it recognizes: `scan_promotion_commits`
+only matches the single-roll `Promote <roll> to <stable>` shape
+(`rf promote --roll`), not the multi-roll `Promote <rolling> to <stable>`
+shape — a revert of a bundled promotion is not attributed to any one roll.
+
 ## Graduate/promote flow (`cli/graduate.rs`, `cli/promote.rs`)
 
 Phases:
