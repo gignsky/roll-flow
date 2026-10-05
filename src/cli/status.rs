@@ -30,7 +30,7 @@ pub fn run(no_tui: bool, show_deps: bool) -> Result<()> {
     if rolls.is_empty() {
         println!("  (no roll branches found)");
     } else {
-        print_rolls_table(&rolls, show_deps);
+        print_rolls_table(&config, &rolls, show_deps);
     }
 
     Ok(())
@@ -69,7 +69,7 @@ fn print_current_roll_line(config: &Config, current_roll: &Option<String>) {
 
 // ── Roll table ────────────────────────────────────────────────────────────────
 
-fn print_rolls_table(rolls: &[RollInfo], show_deps: bool) {
+fn print_rolls_table(config: &Config, rolls: &[RollInfo], show_deps: bool) {
     // Compute column widths dynamically.
     let name_w = rolls
         .iter()
@@ -85,14 +85,36 @@ fn print_rolls_table(rolls: &[RollInfo], show_deps: bool) {
         .max(1);
     let state_w = "✓ graduated".len(); // longest label
     let (dep_w, dependant_w) = crate::dep_column_widths(rolls);
+    // Empty in a repo with no `Cargo.toml`, which drops the column entirely.
+    let (versions, ver_w) = crate::version_column(config, rolls);
+    // Padded only when the deps columns follow it. Like `dependants`, a last
+    // column is left unpadded so rows carry no trailing whitespace.
+    let version_col = |branch: &str| {
+        if versions.is_empty() {
+            return String::new();
+        }
+        let v = versions.get(branch).map(String::as_str).unwrap_or("—");
+        if show_deps {
+            format!("  {v:<ver_w$}")
+        } else {
+            format!("  {v}")
+        }
+    };
 
     // Header
     println!(
-        "  {num:>nw$}  {name:<ew$}  {loc:<3}  {state:<sw$}{deps_hdr}",
+        "  {num:>nw$}  {name:<ew$}  {loc:<3}  {state:<sw$}{ver_hdr}{deps_hdr}",
         num = "#",
         name = "roll",
         loc = "loc",
         state = "state",
+        ver_hdr = if versions.is_empty() {
+            String::new()
+        } else if show_deps {
+            format!("  {:<ver_w$}", crate::VERSION_HDR)
+        } else {
+            format!("  {}", crate::VERSION_HDR)
+        },
         deps_hdr = if show_deps {
             format!("  {:<dep_w$}  {}", crate::DEPS_HDR, crate::DEPENDANTS_HDR)
         } else {
@@ -103,10 +125,15 @@ fn print_rolls_table(rolls: &[RollInfo], show_deps: bool) {
         sw = state_w,
     );
     println!(
-        "  {sep_n}  {sep_e}  ───  {sep_s}{sep_d}",
+        "  {sep_n}  {sep_e}  ───  {sep_s}{sep_v}{sep_d}",
         sep_n = "─".repeat(num_w),
         sep_e = "─".repeat(name_w),
         sep_s = "─".repeat(state_w),
+        sep_v = if versions.is_empty() {
+            String::new()
+        } else {
+            format!("  {}", "─".repeat(ver_w))
+        },
         sep_d = if show_deps {
             format!("  {}  {}", "─".repeat(dep_w), "─".repeat(dependant_w))
         } else {
@@ -126,8 +153,9 @@ fn print_rolls_table(rolls: &[RollInfo], show_deps: bool) {
             String::new()
         };
         println!(
-            "{cur} {num:>nw$}  {name:<ew$}  {loc:<3}  {state:<sw$}{deps_col}",
+            "{cur} {num:>nw$}  {name:<ew$}  {loc:<3}  {state:<sw$}{ver_col}{deps_col}",
             cur = cur_marker,
+            ver_col = version_col(&roll.branch),
             num = roll.number,
             name = roll.branch,
             loc = location_symbol(&roll.location),

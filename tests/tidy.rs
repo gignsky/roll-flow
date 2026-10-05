@@ -31,7 +31,7 @@ fn promote_roll(sb: &Sandbox, slug: &str, date: &str) -> String {
     let branch = graduate_roll(sb, slug, date);
 
     sb.git(&["checkout", "rolling"]);
-    let out = sb.rf(&["promote"]);
+    let out = sb.rf(&["promote", "--yes"]);
     assert!(out.success, "promote failed: {}", out.combined());
 
     sb.git(&["checkout", "main"]);

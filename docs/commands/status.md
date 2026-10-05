@@ -8,6 +8,22 @@ Shows current branch, tier, cleanliness, pending rolls, and promotion readiness.
 Runs as a full-screen TUI by default; `--no-tui` prints a plain table instead and
 `--json` emits machine-readable output.
 
+In a repo that has a `Cargo.toml`, the table carries a `version` column: the
+`[package]` version as it stands at each branch's tip — its own tip for a branch
+that exists locally, `origin/<branch>` for one that only exists on the remote.
+Repos without a manifest, which is every dotfiles repo, get no column at all,
+the same rule the header version follows. There is no flag for it.
+
+The cell shows the full version, dev marker included: a roll carrying one reads
+`0.2.4-roll9`, not `0.2.4`. The `#` column says which roll a row is, but not
+whether that roll's dev marker has actually been applied yet — a roll created
+before the marker existed, or with `--no-dev-version`, reads as a plain release
+version until its first `rf verify` (see [`verify`](verify.md)) — so the version
+cell is the only place that distinction is visible.
+
+All versions are read in a single `git cat-file --batch`, so the column costs one
+subprocess per reload rather than one per branch.
+
 The table carries a `deps` column (roll numbers this roll integrated) and a
 `dependants` column (roll numbers that integrated it) — `--no-deps` hides both.
 They are shown whatever the roll's state, so a roll that has already graduated

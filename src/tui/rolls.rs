@@ -47,7 +47,8 @@ pub(crate) enum Action {
     Integrate,
     /// Promote the rolling branch into stable.
     Promote,
-    /// Update all active local rolls from stable.
+    /// Merge stable into the selected roll, or every active local roll when
+    /// none is selected.
     Update,
     /// Delete every promoted roll branch, locally and on origin.
     Prune,
@@ -475,6 +476,10 @@ struct StatusApp {
     /// Upstream tracking state per local branch, refreshed on reload. Sourced in
     /// one `for-each-ref` rather than an `ahead_behind` call per row.
     tracking: HashMap<String, git::LocalBranch>,
+    /// The `[package]` version at each visible branch's tip, refreshed on
+    /// reload. Sourced in one `cat-file --batch` rather than a `git show` per
+    /// row, the same reason `tracking` is one `for-each-ref`.
+    versions: HashMap<String, Semver>,
     /// The `[package]` version on the checked-out branch, refreshed on reload.
     /// `None` in repos with no `Cargo.toml`, where the header omits it and `[b]`
     /// refuses.
@@ -515,10 +520,14 @@ pub fn run(
 
 // ── Pure decision logic (unit-tested) ───────────────────────────────────────
 
-/// A roll can graduate only while it is active (or diverged and needs
-/// re-graduation). Graduated / promoted / blocked rolls cannot.
+/// A roll can graduate only while it is active, or needs re-graduation
+/// (diverged, or reverted on rolling). Graduated / promoted / blocked rolls
+/// cannot.
 pub(crate) fn can_graduate(state: &RollState) -> bool {
-    matches!(state, RollState::Active | RollState::Diverged)
+    matches!(
+        state,
+        RollState::Active | RollState::Diverged | RollState::Reverted
+    )
 }
 
 /// Promotion is offered when the rolling branch has something to carry to
@@ -865,7 +874,7 @@ pub(crate) const BINDINGS: &[Binding] = &[
     },
     Binding {
         keys: "u",
-        label: "update active rolls from stable",
+        label: "update the selected roll (or all) from stable",
         group: "roll",
         hint: None,
         replay: &[KeyCode::Char('u')],
@@ -1081,6 +1090,7 @@ fn push_version_check(lines: &mut Vec<String>, check: &VersionCheck, source: &st
         VersionStatus::Unchanged => "UNCHANGED",
         VersionStatus::Lower => "LOWER",
         VersionStatus::Unreadable => "UNREADABLE",
+        VersionStatus::DevVersion => "DEV",
         // Repos with no `Cargo.toml`, and repos with the gate switched off, have
         // nothing to say here — the same silence `rf verify` keeps.
         VersionStatus::NotApplicable => return,
@@ -1101,10 +1111,11 @@ fn push_version_check(lines: &mut Vec<String>, check: &VersionCheck, source: &st
 /// Build the dependency rows to show in the detail view for `selected`.
 ///
 /// Each number in `selected.deps` is looked up in `all` to recover the
-/// dependency's branch and state. A dep is flagged as a *blocker* when it has
-/// not yet graduated (state is `Active`/`Blocked`) — those are what actually
-/// hold the roll back, matching the same rule `list_rolls` uses to set
-/// `RollState::Blocked`. `needs_reintegration` is a separate, ancestry-based
+/// dependency's branch and state. A dep is flagged as a *blocker* when it is
+/// not currently graduated on rolling (state is `Active`/`Blocked`, or
+/// `Reverted` — graduated once, but that merge was since undone there) —
+/// those are what actually hold the roll back, matching the same states
+/// `promote_target_for` refuses to promote. `needs_reintegration` is a separate, ancestry-based
 /// question answered by `selected.stale_deps`: has the dependency's branch
 /// moved since `selected` integrated it, whatever its state — so a dep can be
 /// both a blocker *and* stale at once (still active, and already moved again).
@@ -1119,7 +1130,10 @@ pub(crate) fn dep_rows(selected: &RollInfo, all: &[RollInfo]) -> Vec<DepRow> {
             number: dep.number,
             branch: dep.branch.clone(),
             state: dep.state.clone(),
-            is_blocker: matches!(dep.state, RollState::Active | RollState::Blocked),
+            is_blocker: matches!(
+                dep.state,
+                RollState::Active | RollState::Blocked | RollState::Reverted
+            ),
             needs_reintegration: selected.stale_deps.contains(&dep.number),
         })
         .collect()
@@ -1135,9 +1149,10 @@ pub(crate) fn dep_rows(selected: &RollInfo, all: &[RollInfo]) -> Vec<DepRow> {
 /// `all`) are skipped, mirroring [`dep_rows`].
 ///
 /// A row's `is_blocker` here is repurposed to mean "this dependent is still
-/// gated by the target" — true while `target` is `Active`/`Blocked`, mirroring
-/// [`dep_rows`]'s rule, since until it graduates the dependent cannot advance
-/// past it. `needs_reintegration` is the mirror image of `dep_rows`' version:
+/// gated by the target" — true while `target` is `Active`/`Blocked`/`Reverted`,
+/// mirroring [`dep_rows`]'s rule, since until it graduates (or re-graduates)
+/// the dependent cannot advance past it. `needs_reintegration` is the mirror
+/// image of `dep_rows`' version:
 /// it reads each dependent's *own* `stale_deps` (not `target`'s state), since
 /// whether a given dependent's copy of `target` is stale depends on when that
 /// dependent last integrated it, not on what `target` is doing now. The detail
@@ -1146,7 +1161,10 @@ pub(crate) fn dep_rows(selected: &RollInfo, all: &[RollInfo]) -> Vec<DepRow> {
 /// testable. A roll is never its own dependent, even if a self-referential
 /// entry somehow appears.
 pub(crate) fn dependent_rows(target: &RollInfo, all: &[RollInfo]) -> Vec<DepRow> {
-    let target_gates = matches!(target.state, RollState::Active | RollState::Blocked);
+    let target_gates = matches!(
+        target.state,
+        RollState::Active | RollState::Blocked | RollState::Reverted
+    );
     target
         .dependents
         .iter()
@@ -1177,7 +1195,9 @@ fn state_color(state: &RollState) -> Color {
         RollState::Active => Color::Yellow,
         RollState::Graduated => Color::Green,
         RollState::Diverged => Color::Red,
+        RollState::Reverted => Color::LightRed,
         RollState::Promoted => Color::DarkGray,
+        RollState::Demoted => Color::Cyan,
         RollState::Blocked => Color::Magenta,
     }
 }
@@ -1208,8 +1228,62 @@ pub(crate) fn promote_target_for(
     match sel.state {
         RollState::Graduated | RollState::Diverged => Ok(Some(sel.branch.clone())),
         RollState::Promoted => Err(format!("{} is already promoted", sel.branch)),
+        RollState::Reverted => Err(format!(
+            "{} was reverted on rolling — graduate it again before promoting",
+            sel.branch
+        )),
+        RollState::Demoted => Err(format!(
+            "{} was promoted, but that promotion was reverted on the stable branch — \
+             re-promotion isn't automated yet; revert the revert manually",
+            sel.branch
+        )),
         RollState::Active | RollState::Blocked => Err(format!(
             "{} is {} — only graduated rolls can be promoted",
+            sel.branch,
+            sel.state.label()
+        )),
+    }
+}
+
+/// What `[u]` should update, given the current selection.
+///
+/// `Ok(None)` means every active local roll — the long-standing behaviour,
+/// used when nothing narrower is selected. `Ok(Some(branch))` means just that
+/// one roll, so updating a roll in progress no longer has to touch every other
+/// active roll at the same time.
+///
+/// Mirrors `promote_target_for`: a base-branch row or empty selection widens to
+/// the repo-wide shape, but a roll row that cannot be updated yields the reason
+/// rather than quietly widening past what the keystroke asked for.
+pub(crate) fn update_target_for(
+    selected: Option<&RollInfo>,
+    rolls: &[RollInfo],
+) -> Result<Option<String>, String> {
+    let Some(sel) = selected else {
+        return if can_update(rolls) {
+            Ok(None)
+        } else {
+            Err("no active local rolls to update".to_string())
+        };
+    };
+
+    match sel.state {
+        RollState::Active | RollState::Blocked => {
+            if matches!(sel.location, BranchLocation::Local | BranchLocation::Both) {
+                Ok(Some(sel.branch.clone()))
+            } else {
+                Err(format!(
+                    "'{}' exists only on origin — press [space] or [p] to get it locally first",
+                    sel.branch
+                ))
+            }
+        }
+        RollState::Graduated
+        | RollState::Diverged
+        | RollState::Reverted
+        | RollState::Promoted
+        | RollState::Demoted => Err(format!(
+            "{} is {} — only active rolls can be updated",
             sel.branch,
             sel.state.label()
         )),
@@ -1292,7 +1366,7 @@ pub(crate) fn validate_action(
                 Ok(())
             } else {
                 Err(format!(
-                    "{} is {} — only active or diverged rolls can graduate",
+                    "{} is {} — only active, diverged, or reverted rolls can graduate",
                     sel.branch,
                     sel.state.label()
                 ))
@@ -1302,13 +1376,7 @@ pub(crate) fn validate_action(
             integrate_target_for(current_branch, roll_prefix, selected).map(|_| ())
         }
         Action::Promote => promote_target_for(selected, rolls).map(|_| ()),
-        Action::Update => {
-            if can_update(rolls) {
-                Ok(())
-            } else {
-                Err("no active local rolls to update".to_string())
-            }
-        }
+        Action::Update => update_target_for(selected, rolls).map(|_| ()),
         Action::Prune => {
             if can_prune(rolls) {
                 Ok(())
@@ -1461,6 +1529,7 @@ impl StatusApp {
         let mut table = TableState::default();
         table.select(initial_selection(&bases, &rolls));
         let tracking = load_tracking(&config);
+        let versions = load_versions(&config, &bases, &rolls);
         let version = version::read_version(&config.repo_root).unwrap_or(None);
         Self {
             config,
@@ -1469,6 +1538,7 @@ impl StatusApp {
             rolls,
             show_deps,
             tracking,
+            versions,
             version,
             table,
             mode: Mode::Browsing,
@@ -1841,6 +1911,8 @@ impl StatusApp {
             }
             // `None` here means "the whole rolling branch", not "no target".
             Action::Promote => promote_target_for(selected, &self.rolls).unwrap_or(None),
+            // `None` here means "every active local roll", not "no target".
+            Action::Update => update_target_for(selected, &self.rolls).unwrap_or(None),
             _ => None,
         };
         let carried = match (action, &target) {
@@ -2497,9 +2569,12 @@ impl StatusApp {
             }
             lines.push("every culprit merged cleanly; retrying the graduation".to_string());
             let force = ops::ForceOpts::new(false, None)?;
-            let o = ops::graduate(&config, &source, false, &force)?;
+            let o = ops::graduate(&config, &source, false, &force, true)?;
             push_gate_notices(&mut lines, &o.gate_notices);
             lines.push(format!("Graduated '{}' into '{}'", o.roll, o.rolling));
+            if let Some(line) = o.tag.describe() {
+                lines.push(line);
+            }
             Ok(JobDone::lines(lines))
         });
     }
@@ -2546,6 +2621,7 @@ impl StatusApp {
         });
         self.rolls = branches::list_rolls(&self.config)?;
         self.tracking = load_tracking(&self.config);
+        self.versions = load_versions(&self.config, &self.bases, &self.rolls);
         // Read from the worktree, so a bump — or a branch switch that changes it —
         // shows in the header straight away.
         self.version = version::read_version(&self.config.repo_root).unwrap_or(None);
@@ -2663,6 +2739,23 @@ impl StatusApp {
             Constraint::Length(7),
             Constraint::Length(13),
         ];
+        // Present only in repos that have a `Cargo.toml`, the same rule the
+        // header version follows — so a dotfiles repo pays nothing for it.
+        // Sized to the longest cell on screen (a dev marker like `-roll10`
+        // makes this wider than a bare `12.34.5`), the same way `main.rs`'s
+        // `version_column` sizes the plain tables; `branch` is the Fill
+        // column that pays for it.
+        let show_versions = !self.versions.is_empty();
+        if show_versions {
+            let width = self
+                .versions
+                .values()
+                .map(|v| v.to_string().chars().count())
+                .max()
+                .unwrap_or(0)
+                .max("version".len());
+            col_constraints.push(Constraint::Length(width as u16));
+        }
         if self.show_deps {
             col_constraints.push(Constraint::Length(8));
             // Exactly the header width: the values are short comma lists, and
@@ -2679,6 +2772,9 @@ impl StatusApp {
             Cell::from("sync").style(bold),
             Cell::from("state").style(bold),
         ];
+        if show_versions {
+            header_cells.push(Cell::from("version").style(bold));
+        }
         if self.show_deps {
             header_cells
                 .push(Cell::from("deps").style(Style::default().add_modifier(Modifier::BOLD)));
@@ -2692,6 +2788,7 @@ impl StatusApp {
 
         let show_deps = self.show_deps;
         let tracking = &self.tracking;
+        let versions = &self.versions;
         // Base branches are pinned above the rolls: no number and no state, the
         // `state` column carrying their role instead.
         let mut rows: Vec<Row> = self
@@ -2716,6 +2813,12 @@ impl StatusApp {
                     Cell::from(sync_text).style(Style::default().fg(sync_color)),
                     Cell::from(base.role.label()).style(Style::default().fg(base.role.color())),
                 ];
+                if show_versions {
+                    cells.push(
+                        Cell::from(version_cell(versions.get(&base.branch).copied()))
+                            .style(base_style),
+                    );
+                }
                 if show_deps {
                     cells.push(Cell::from(""));
                     cells.push(Cell::from(""));
@@ -2743,6 +2846,11 @@ impl StatusApp {
                 Cell::from(sync_text).style(Style::default().fg(sync_color)),
                 Cell::from(roll.state.label()).style(Style::default().fg(row_state_color)),
             ];
+            if show_versions {
+                cells.push(
+                    Cell::from(version_cell(versions.get(&roll.branch).copied())).style(base_style),
+                );
+            }
             if show_deps {
                 cells.push(Cell::from(branches::format_roll_numbers(&roll.deps)));
                 cells.push(Cell::from(branches::format_roll_numbers(&roll.dependents)));
@@ -2867,12 +2975,26 @@ fn predicted_conflict_message(config: &Config, conflict: &ops::PredictedConflict
 ///   only place a bump commit is written from.
 /// - nothing is forced and nothing is dry-run. `[v]` has no flags to carry.
 ///
+/// The dev-marker *application* is not on that list and is not optional: it
+/// uses `ops::apply_dev_version_for_branch`, the same function `cmd_verify`
+/// calls, specifically so the two cannot drift apart on it again — this
+/// function used to claim the "line for line" mirror while actually omitting
+/// the marker step, since it was inlined separately in each caller instead of
+/// living in one shared place.
+///
 /// A failed host or an unsatisfied version gate is an `Err`, not a line: the
 /// panel marks a failed job, and a verdict that reads as "done" when it is
 /// really "blocked" is the one outcome worth being loud about. Everything the
 /// gates printed is already in the panel either way, streamed as they ran.
 fn run_verify(config: &Config) -> Result<Vec<String>> {
     ops::ensure_clean_state(config)?;
+
+    let mut lines = Vec::new();
+    let current = git::current_branch(&config.repo_root)?;
+    if let Some(dev) = ops::apply_dev_version_for_branch(config, &current)? {
+        lines.push(format!("version marked {dev}"));
+    }
+
     let outcome = match ops::verify(config, false) {
         Ok(outcome) => outcome,
         Err(err) => {
@@ -2880,8 +3002,6 @@ fn run_verify(config: &Config) -> Result<Vec<String>> {
             return Err(anyhow!(predicted_conflict_message(config, &conflict)));
         }
     };
-
-    let mut lines = Vec::new();
     if outcome.diverged_note {
         lines.push(format!(
             "note: '{}' has commits not in '{}'; graduation/promotion will create a --no-ff merge",
@@ -2927,9 +3047,19 @@ fn run_op(config: &Config, action: Action, target: Option<&str>) -> Result<Vec<S
         Action::Graduate => {
             let roll = target.ok_or_else(|| anyhow!("no roll selected"))?;
             ops::ensure_clean_state(config)?;
-            let o = ops::graduate(config, roll, false, &force)?;
+            let o = ops::graduate(config, roll, false, &force, true)?;
             push_gate_notices(&mut lines, &o.gate_notices);
-            lines.push(format!("Graduated '{}' into '{}'", o.roll, o.rolling));
+            if o.restored {
+                lines.push(format!(
+                    "Restored '{}' on '{}' (reverted the revert)",
+                    o.roll, o.rolling
+                ));
+            } else {
+                lines.push(format!("Graduated '{}' into '{}'", o.roll, o.rolling));
+            }
+            if let Some(line) = o.tag.describe() {
+                lines.push(line);
+            }
         }
         Action::Integrate => {
             let roll = target.ok_or_else(|| anyhow!("no roll selected"))?;
@@ -2968,28 +3098,36 @@ fn run_op(config: &Config, action: Action, target: Option<&str>) -> Result<Vec<S
                 lines.push(format!("skipped '{}': {}", skip.roll, skip.reason));
             }
         }
-        Action::Update => match ops::update(config, false)? {
-            ops::UpdateOutcome::NoActiveRolls => {
-                lines.push("no active local rolls to update".to_string());
-            }
-            ops::UpdateOutcome::Ran { stable, items } => {
-                for item in items {
-                    match item {
-                        ops::UpdateItem::AlreadyUpToDate { roll } => {
-                            lines.push(format!("'{roll}' is already up to date with '{stable}'"));
-                        }
-                        ops::UpdateItem::WouldMerge { roll, behind } => {
-                            lines.push(format!(
-                                "would merge '{stable}' into '{roll}' ({behind} ahead)"
-                            ));
-                        }
-                        ops::UpdateItem::Updated { roll } => {
-                            lines.push(format!("updated '{roll}' with '{stable}'"));
+        Action::Update => {
+            let update_target = match target {
+                Some(roll) => ops::UpdateTarget::Rolls(vec![roll.to_string()]),
+                None => ops::UpdateTarget::AllActive,
+            };
+            match ops::update(config, &update_target, false)? {
+                ops::UpdateOutcome::NoActiveRolls => {
+                    lines.push("no active local rolls to update".to_string());
+                }
+                ops::UpdateOutcome::Ran { stable, items } => {
+                    for item in items {
+                        match item {
+                            ops::UpdateItem::AlreadyUpToDate { roll } => {
+                                lines.push(format!(
+                                    "'{roll}' is already up to date with '{stable}'"
+                                ));
+                            }
+                            ops::UpdateItem::WouldMerge { roll, behind } => {
+                                lines.push(format!(
+                                    "would merge '{stable}' into '{roll}' ({behind} ahead)"
+                                ));
+                            }
+                            ops::UpdateItem::Updated { roll } => {
+                                lines.push(format!("updated '{roll}' with '{stable}'"));
+                            }
                         }
                     }
                 }
             }
-        },
+        }
         Action::Prune => {
             // The modal was the confirmation, so plan and apply run back to
             // back here. `PruneScope::both` never forces: a branch holding
@@ -3050,6 +3188,55 @@ fn load_tracking(config: &Config) -> HashMap<String, git::LocalBranch> {
     git::local_branch_details(&config.repo_root)
         .map(|branches| branches.into_iter().map(|b| (b.name.clone(), b)).collect())
         .unwrap_or_default()
+}
+
+/// Read the crate version at every branch on screen, keyed by branch name.
+///
+/// The refspec per row follows the same local-first order as
+/// `git::resolve_branch`: a branch with a local copy is read at its own tip, a
+/// remote-only one at `origin/<branch>`. One `cat-file --batch` covers the lot.
+///
+/// Degrades to an empty map rather than failing the reload — a missing version
+/// renders as a dash, and no repo should lose its table over a decoration. That
+/// also covers the ordinary case of a repo with no `Cargo.toml` at all, where
+/// the column simply never appears.
+fn load_versions(
+    config: &Config,
+    bases: &[BaseBranch],
+    rolls: &[RollInfo],
+) -> HashMap<String, Semver> {
+    let rows = bases
+        .iter()
+        .map(|b| (&b.branch, &b.location))
+        .chain(rolls.iter().map(|r| (&r.branch, &r.location)));
+    let refs: Vec<String> = rows
+        .map(|(branch, location)| branches::content_ref(branch, location))
+        .collect();
+
+    let by_ref = version::versions_at(&config.repo_root, &refs);
+    bases
+        .iter()
+        .map(|b| &b.branch)
+        .chain(rolls.iter().map(|r| &r.branch))
+        .zip(refs.iter())
+        .filter_map(|(branch, refspec)| Some((branch.clone(), *by_ref.get(refspec)?)))
+        .collect()
+}
+
+/// The version cell for `branch`: the full version through `Semver`'s
+/// `Display` — numbers plus a `-rollN` dev marker when the branch carries one
+/// — or a dash.
+///
+/// The `#` column also names the roll, but not whether its dev marker has
+/// actually been applied yet: a roll created before the marker existed, or
+/// with `--no-dev-version`, reads as a plain release version until its first
+/// `rf verify` (see `ops::apply_dev_version`). The version cell is the only
+/// place that distinction is visible.
+pub(crate) fn version_cell(version: Option<Semver>) -> String {
+    match version {
+        Some(v) => v.to_string(),
+        None => "—".to_string(),
+    }
 }
 
 /// The tracking state to show for `branch`, or `None` when it has no local copy
@@ -3356,10 +3543,15 @@ fn render_modal(f: &mut Frame, area: Rect, config: &Config, modal: &ConfirmModal
                 config.rolling_branch, config.stable_branch
             ),
         },
-        Action::Update => format!(
-            "Update all active local rolls from {}?",
-            config.stable_branch
-        ),
+        // `target` is the selected roll when `[u]` was pressed on one, and
+        // `None` for every active local roll.
+        Action::Update => match target {
+            Some(roll) => format!("Update {} from {}?", roll, config.stable_branch),
+            None => format!(
+                "Update all active local rolls from {}?",
+                config.stable_branch
+            ),
+        },
         Action::Prune => {
             let n = prunable_count(rolls);
             format!(
@@ -3953,7 +4145,9 @@ mod tests {
             host_active: Default::default(),
             version_gate: true,
             tag_on_promote: true,
+            tag_on_graduate: true,
             push_tag: true,
+            dev_versions: true,
             roll_to_rolling_gates: Vec::new(),
             rolling_to_main_gates: Vec::new(),
             host_gates: Vec::new(),
@@ -3961,6 +4155,66 @@ mod tests {
             pull_mode: Default::default(),
             lazygit_command: "lazygit".to_string(),
         }
+    }
+
+    /// A throwaway git repo on disk, with a Cargo.toml and a `rolling` branch
+    /// split off from `main`, so `run_verify`'s real git calls (merge-state
+    /// classification, the dev-marker commit) have something to act on. The
+    /// `tests/` integration suite can't reach `run_verify` directly — it only
+    /// drives the compiled binary — so this is the one way to exercise it.
+    fn sandbox_repo() -> tempfile::TempDir {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let repo = dir.path();
+        let git = |args: &[&str]| {
+            let status = std::process::Command::new("git")
+                .args(args)
+                .current_dir(repo)
+                .status()
+                .expect("run git");
+            assert!(status.success(), "git {args:?} failed");
+        };
+        git(&["init", "-q", "-b", "main"]);
+        git(&["config", "user.email", "t@t.com"]);
+        git(&["config", "user.name", "tester"]);
+        std::fs::write(
+            repo.join("Cargo.toml"),
+            "[package]\nname = \"fixture\"\nversion = \"0.0.1\"\nedition = \"2021\"\n",
+        )
+        .expect("write Cargo.toml");
+        git(&["add", "Cargo.toml"]);
+        git(&["commit", "-q", "-m", "add manifest"]);
+        git(&["branch", "rolling"]);
+        git(&["checkout", "-q", "-b", "roll/1-0101-late"]);
+        std::fs::write(repo.join("work.txt"), "w\n").expect("write work.txt");
+        git(&["add", "work.txt"]);
+        git(&["commit", "-q", "-m", "roll work"]);
+        dir
+    }
+
+    #[test]
+    fn run_verify_applies_the_dev_marker_like_cmd_verify_does() {
+        // Regression test: `run_verify`'s doc comment claims a "line for line"
+        // mirror of `cmd_verify`, but the dev-marker step was missing — a roll
+        // started without one (predating the feature, or `--no-dev-version`)
+        // never got marked from the TUI's `[v]`, only from `rf verify`.
+        let dir = sandbox_repo();
+        let mut cfg = config("main", "rolling");
+        cfg.repo_root = dir.path().to_path_buf();
+
+        let lines = run_verify(&cfg).expect("verify should pass with no gates configured");
+        assert!(
+            lines
+                .iter()
+                .any(|l| l.contains("version marked 0.0.1-roll1")),
+            "{lines:?}"
+        );
+
+        let cargo_toml =
+            std::fs::read_to_string(dir.path().join("Cargo.toml")).expect("read Cargo.toml");
+        assert!(
+            cargo_toml.contains("0.0.1-roll1"),
+            "marker not written: {cargo_toml}"
+        );
     }
 
     #[test]
@@ -4502,6 +4756,60 @@ mod tests {
             RollState::Graduated,
             BranchLocation::Both
         )]));
+    }
+
+    #[test]
+    fn update_target_is_the_selected_active_roll() {
+        let rolls = vec![roll_n(1, RollState::Active), roll_n(2, RollState::Blocked)];
+        assert_eq!(
+            update_target_for(Some(&rolls[0]), &rolls),
+            Ok(Some("roll/1-0101-x".to_string()))
+        );
+        assert_eq!(
+            update_target_for(Some(&rolls[1]), &rolls),
+            Ok(Some("roll/2-0101-x".to_string()))
+        );
+    }
+
+    #[test]
+    fn update_target_is_every_active_roll_without_one_selected() {
+        // A base-branch row resolves to `None` the same way an empty selection
+        // does, which is how `[u]` with nothing selected updates every active
+        // local roll.
+        let rolls = vec![roll_n(1, RollState::Active)];
+        assert_eq!(update_target_for(None, &rolls), Ok(None));
+    }
+
+    #[test]
+    fn update_target_refuses_a_roll_that_cannot_be_updated() {
+        let graduated = vec![roll(RollState::Graduated, BranchLocation::Both)];
+        let err = update_target_for(Some(&graduated[0]), &graduated)
+            .expect_err("graduated rolls should be refused");
+        assert!(
+            err.contains("roll/1-0101-x"),
+            "the message should name the roll: {err}"
+        );
+
+        let remote_only = vec![roll(RollState::Active, BranchLocation::Remote)];
+        let err = update_target_for(Some(&remote_only[0]), &remote_only)
+            .expect_err("remote-only rolls should be refused");
+        assert!(
+            err.contains("roll/1-0101-x"),
+            "the message should name the roll: {err}"
+        );
+    }
+
+    #[test]
+    fn update_target_refusal_does_not_widen_to_every_active_roll() {
+        // The dangerous failure mode: pressing [u] on a graduated roll must not
+        // fall back to updating every active roll, which is far more than was
+        // asked.
+        let rolls = vec![
+            roll_n(1, RollState::Graduated),
+            roll_n(2, RollState::Active),
+        ];
+        assert!(update_target_for(Some(&rolls[0]), &rolls).is_err());
+        assert!(validate_action(Action::Update, Some(&rolls[0]), &rolls, "main", "roll/").is_err());
     }
 
     #[test]
@@ -5096,7 +5404,9 @@ mod tests {
             host_active: Default::default(),
             version_gate: true,
             tag_on_promote: true,
+            tag_on_graduate: true,
             push_tag: true,
+            dev_versions: true,
             roll_to_rolling_gates: Vec::new(),
             rolling_to_main_gates: Vec::new(),
             host_gates: Vec::new(),
@@ -5277,6 +5587,7 @@ mod tests {
             rolls,
             show_deps: false,
             tracking,
+            versions: HashMap::new(),
             version: None,
             table: TableState::default(),
             mode: Mode::Browsing,
@@ -5309,6 +5620,82 @@ mod tests {
     }
 
     #[test]
+    fn the_version_column_shows_the_numbers_and_a_dash_when_absent() {
+        let mut rolls = vec![roll_n(1, RollState::Active), roll_n(2, RollState::Active)];
+        rolls[0].branch = "roll/1-0101-versioned".to_string();
+        rolls[1].branch = "roll/2-0102-bare".to_string();
+
+        let mut versions = HashMap::new();
+        versions.insert("roll/1-0101-versioned".to_string(), v(0, 12, 34));
+
+        let mut app = StatusApp {
+            config: test_config(),
+            current_branch: "main".to_string(),
+            bases: Vec::new(),
+            rolls,
+            show_deps: false,
+            tracking: HashMap::new(),
+            versions,
+            version: None,
+            table: TableState::default(),
+            mode: Mode::Browsing,
+            message: None,
+            job: None,
+            panel: None,
+            pending_g: false,
+            pending_push: None,
+        };
+        let out = draw(|f, area| app.render_table(f, area));
+
+        assert!(out.contains("version"), "no header:\n{out}");
+        assert!(out.contains("0.12.34"), "{out}");
+        // A branch whose ref carries no readable manifest gets a dash, the same
+        // vocabulary the sync column uses for "nothing to say".
+        assert!(out.contains("—"), "{out}");
+    }
+
+    #[test]
+    fn the_version_column_is_absent_in_a_repo_with_no_manifest() {
+        // The whole opt-in rule: no `Cargo.toml` anywhere, no column, no cost to
+        // the `branch` column. This is every dotfiles repo.
+        let mut app = StatusApp {
+            config: test_config(),
+            current_branch: "main".to_string(),
+            bases: Vec::new(),
+            rolls: vec![roll_n(1, RollState::Active)],
+            show_deps: false,
+            tracking: HashMap::new(),
+            versions: HashMap::new(),
+            version: None,
+            table: TableState::default(),
+            mode: Mode::Browsing,
+            message: None,
+            job: None,
+            panel: None,
+            pending_g: false,
+            pending_push: None,
+        };
+        let out = draw(|f, area| app.render_table(f, area));
+        assert!(!out.contains("version"), "column shown anyway:\n{out}");
+    }
+
+    #[test]
+    fn a_version_cell_shows_the_dev_suffix() {
+        // Through `Display`: the `#` column says which roll a row is, not
+        // whether that roll's dev marker has actually been applied yet, so the
+        // suffix has to show here.
+        assert_eq!(version_cell(Some(v(0, 2, 4))), "0.2.4");
+        assert_eq!(
+            version_cell(Some(Semver {
+                marker: crate::core::version::Marker::Roll(9),
+                ..v(0, 2, 4)
+            })),
+            "0.2.4-roll9"
+        );
+        assert_eq!(version_cell(None), "—");
+    }
+
+    #[test]
     fn a_branch_with_no_tracking_data_renders_a_dash_in_the_table() {
         // `load_tracking` degrades to an empty map when git fails, and the table
         // still has to draw. Every row shows a dash rather than a false ✓.
@@ -5320,6 +5707,7 @@ mod tests {
             rolls: vec![roll_n(1, RollState::Active)],
             show_deps: false,
             tracking: HashMap::new(),
+            versions: HashMap::new(),
             version: None,
             table: TableState::default(),
             mode: Mode::Browsing,
@@ -5383,6 +5771,7 @@ mod tests {
             major,
             minor,
             patch,
+            marker: crate::core::version::Marker::None,
         }
     }
 
@@ -5961,6 +6350,7 @@ mod tests {
             rolls: vec![roll_n(1, RollState::Active)],
             show_deps: false,
             tracking: HashMap::new(),
+            versions: HashMap::new(),
             version: None,
             table,
             mode: Mode::Browsing,

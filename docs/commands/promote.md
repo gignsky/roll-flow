@@ -1,7 +1,7 @@
 # `promote`
 
 ```text
-rf promote [--roll <branch>]... [--dry-run] [--force --reason <text>] [--bump <patch|minor|major>] [--no-tag] [--yes]
+rf promote [--roll <branch>]... [--dry-run] [--force --reason <text>] [--bump <patch|minor|major>] [--no-tag] [--final] [--yes]
 ```
 
 Merges rolling into the stable branch with `--no-ff` and a structured subject
@@ -14,6 +14,28 @@ promotion means a hotfix landed there since. There is no integrate option on
 this route (the source is a commit on rolling, not a branch to merge into); the
 choices are the by-hand commands or leaving the merge staged on stable for
 lazygit. `--force`/`--reason` behave the same way as for graduate.
+
+## Is this final?
+
+Before anything else — before the carried-rolls disclosure below, before the
+version gate, before any merge — `rf promote` asks whether this is a *final*
+promotion:
+
+```text
+Finalize this release? This drops the -dev marker before merging into 'main'. [y/N]
+```
+
+Declining cancels the command outright; nothing is touched. Confirming strips
+rolling's `-dev` marker back to a bare version (a `chore(release): finalize
+X.Y.Z for promotion` commit for the whole-branch route; folded into the staged
+merge tree alongside any bump for a `--roll` step, the same way that route
+already lands its bump) before the version gate runs — stable must never
+receive a `-dev` version. `--final` answers just this question, non-
+interactively, without also accepting the bump or tag-push prompts the way a
+blanket `--yes` does; an unattended run with neither fails rather than
+finalizing a release nobody confirmed. Only asked when `dev_versions` is on
+and the repo actually has a `Cargo.toml` to version — a dry run, or a repo
+without one, proceeds exactly as it always did.
 
 The gates run against the *staged merge result* rather than whatever was checked
 out, so what they check is what lands on stable. A gate that modifies tracked
@@ -58,18 +80,20 @@ Promotion also owns the release mechanics that previously only happened when you
 opened a PR — see
 [Versioning and release tags](../../README.md#versioning-and-release-tags):
 
-- refuses to promote unless `Cargo.toml`'s version is above the stable branch's,
-  offering to bump it (`--bump <patch|minor|major>` to skip the prompt, `--yes`
-  to take the patch default non-interactively). A `--roll` promotion merges a
-  commit that already exists on rolling, so there is no branch to land a bump
-  commit on ahead of the merge — instead the bump lands **inside the promotion
-  merge itself**: the manifest is raised in the staged tree before the gates
-  run, so what they check is what lands, and the one `--no-ff` merge commit
-  carries it. Stable then holds a commit rolling does not, so stable is merged
-  back into rolling afterwards (`Reintegrate main into develop (after per-roll
-  promotion)`) — without that, rolling's version would sit *below* stable's and
-  the next promotion would fail as LOWER. A graduation that already carried its
-  own bump is not bumped again
+- refuses to promote unless the *finalized* version (the one rolling will carry
+  once its `-dev` marker is dropped) is above the stable branch's, offering to
+  bump it (`--bump <patch|minor|major>` to skip the prompt, `--yes` to take the
+  patch default non-interactively). A `--roll` promotion merges a commit that
+  already exists on rolling, so there is no branch to land a bump commit on
+  ahead of the merge — instead the bump (and the marker strip, if one is
+  needed) lands **inside the promotion merge itself**: the manifest is raised
+  in the staged tree before the gates run, so what they check is what lands,
+  and the one `--no-ff` merge commit carries it. Stable then holds a commit
+  rolling does not, so stable is merged back into rolling afterwards
+  (`Reintegrate main into develop (after per-roll promotion)`) — without that,
+  rolling's version would sit *below* stable's and the next promotion would
+  fail as LOWER. A graduation that already carried its own bump is not bumped
+  again
 - after a `--roll` promotion, offers to merge stable into the active local rolls
   (`rf update`), since they now trail what landed; `--yes` accepts, and an
   unattended run is told the command instead

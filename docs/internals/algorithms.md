@@ -150,6 +150,61 @@ graduated rolls whose changes are in this roll's baseline. This is a promotion o
 constraint (this roll can't go to main before those do), not a graduation blocker. The
 `--basic` flag skips Method 4.
 
+## Revert detection (`core/branches.rs`)
+
+A roll's graduation (or promotion) merge is a normal commit — someone can
+`git revert` it, and nothing about the merge itself prevents that. The
+revert leaves the merge subject right where it was, so the plain "is there a
+merge commit naming this branch" check that defines graduated/promoted still
+says yes. Revert detection is the second check layered on top, deciding
+whether that merge is *still in effect*.
+
+**The signal.** `git revert` always writes `This reverts commit <hash>.` into
+the new commit's body — not the subject, which survives even a conflicted
+revert's hand-edited subject the same way `extract_graduated_branch`'s
+leniency survives a hand-edited merge subject (the editor opens with the
+boilerplate line already there). `find_active_revert_in_range` scans a commit
+range for that line.
+
+**Chained, not single-level.** A revert can itself be reverted (un-reverting
+it), and that can be reverted again. `find_active_revert_in_range` walks the
+range oldest-first and tracks a `(current_hash, reverted)` pair: whenever a
+commit's body reverts `current_hash`, parity flips and `current_hash` becomes
+*that* commit — because a later revert-of-the-revert references the revert's
+own hash, not the original merge's. This is why `rf graduate`'s own remedy
+(below) correctly stops being "needed" once applied, and why a roll a user
+un-reverted by hand (no `rf` involved) reports `graduated` again too — both
+are exercised in `tests/revert_detection.rs`.
+
+**Graduation side — `RollState::Reverted`.** `check_reverted` /
+`find_reverted_graduation` run `find_active_revert_in_range` over
+`<graduation-commit>..<rolling>`. A hit means the roll is `⚠ diverged`'s
+sibling: `⛔ blocked`'s cousin, actually — dependants treat a `Reverted`
+dependency as still gating them (`dep_rows`/`dependent_rows`), the same as
+`Active`/`Blocked`, since its content is not really on rolling.
+
+The remedy is *not* re-running the ordinary merge. The roll branch's own tip
+remains an ancestor of rolling either way — a revert adds a commit on top, it
+removes nothing from history — so `classify_merge` sees
+`MergeState::NothingToMerge` and a plain re-merge has nothing new to bring in
+regardless of whether the roll gained commits since. The git-correct fix is
+to revert the revert, which is what a reverted roll's "re-graduation" actually
+is. `ops::graduate` detects this *before* `classify_merge` runs and routes to
+`regraduate_reverted`, which runs the same `roll_to_rolling_gates` as an
+ordinary graduation and then `git revert`s the revert commit instead of
+merging. `rf graduate` / the TUI's `[g]` need no awareness of this — both
+already call `ops::graduate` for every eligible state.
+
+**Promotion side — `RollState::Demoted`.** Detect-only, deliberately. The
+same remedy on stable would mean teaching the per-roll promotion pipeline
+(version gate, release tags, carried-rolls disclosure — see
+[Per-roll promotion](#per-roll-promotion)) a second kind of step, so
+`check_promotion_reverted` only reports the state; nothing reverts the revert
+automatically. It is also narrower in what it recognizes: `scan_promotion_commits`
+only matches the single-roll `Promote <roll> to <stable>` shape
+(`rf promote --roll`), not the multi-roll `Promote <rolling> to <stable>`
+shape — a revert of a bundled promotion is not attributed to any one roll.
+
 ## Graduate/promote flow (`cli/graduate.rs`, `cli/promote.rs`)
 
 Phases:
@@ -241,9 +296,11 @@ those three shapes.
 When the repo has a `Cargo.toml`, `rf verify` and `rf promote` require the
 `[package]` version on the source branch to be strictly greater than the
 target's, and `rf promote` creates an annotated `vX.Y.Z` tag on the promotion
-merge commit (skipping an existing tag rather than erroring). Repos without a
+merge commit (skipping an existing tag rather than erroring); `rf graduate`
+creates the equivalent `v<X.Y.Z>-dev` tag on rolling's new tip. Repos without a
 `Cargo.toml` — including the dotfiles repo — get `VersionStatus::NotApplicable`
-and skip all of it. Configurable via `version_gate`, `tag_on_promote`, `push_tag`.
+and skip all of it. Configurable via `version_gate`, `tag_on_promote`,
+`tag_on_graduate`, `push_tag`, `dev_versions`.
 
 The gate and the tag are per promotion *step*, not per invocation: a per-roll
 promotion compares each roll's graduation commit against stable as that step is
@@ -257,6 +314,71 @@ gates and committed as part of the promotion merge (`run_promote_step`'s
 stable one commit ahead of rolling with a higher version, `ops::promote` then
 merges stable back into rolling, exactly as a landed hotfix does; otherwise the
 next whole-rolling promotion would read as LOWER.
+
+## Dev markers and finalizing a release (`core/version.rs`, `core/merge_driver.rs`)
+
+A `Semver` carries one of three `Marker`s: `Roll(n)` on a roll branch
+(`0.2.4-roll9`), `Dev` on rolling (`0.2.4-dev`, its steady state once
+`dev_versions` is on), or `None` on stable. `Marker`'s variants are declared in
+that order on purpose — `Roll(_) < Dev < None` is a derived `Ord`, so a release
+always outranks `-dev`, which always outranks any `-roll<N>` of the same
+numbers; reordering the variants would silently flip the promotion gate's
+sense. `Semver`'s own `Ord` is then also derived, comparing
+`(major, minor, patch, marker)` in that field order, so the numbers dominate
+the marker exactly as the gate needs.
+
+The merge driver (`core::merge_driver::resolve`, wired up by `rf init`) states
+one rule for every direction a `Cargo.toml` version line gets merged: **keep
+`ours`'s marker; take the higher of the two sides' numbers.** It is correct
+as-is for `[i]`/`[I]`/`rf update` (a roll's own `-roll<N>` is already set by
+`rf start`, so "ours" already carries the right marker going in). `ops::graduate`
+does **not** use it, though — the very first graduation ever, rolling has never
+worn `-dev`, so "keep ours's marker" would just carry `None` forward. Instead
+`ops::graduate` computes its own answer — the higher of the two numbers,
+unconditionally marked `-dev` (or bare, with `dev_versions` off) regardless of
+what either side's marker was — and forces it into the staged tree itself
+(`reconcile_staged_version`, the same fix that already exists for the far more
+common "only the roll changed the line" trivial case the driver never even
+sees). Once rolling has graduated once, its own `ours` marker *is* `-dev`, so
+the driver's generic rule and `ops::graduate`'s own computation agree from then
+on — the special-casing matters only for bootstrapping.
+
+A dev marker of either kind must never reach stable, and is refused **before**
+the numbers are compared, not by them: `0.2.5-roll9`/`0.2.5-dev` are
+numerically above `0.2.4`, so a comparison alone would promote them — and then
+tag them as-is. `VersionStatus::DevVersion` is this refusal. `rf verify` and a
+non-final `rf promote` hit it directly; a *final* `rf promote` avoids it by
+finalizing first (below), which is why `version::check_against` exists
+alongside `check` — it takes an already-resolved head rather than reading the
+branch fresh, so the gate can be run against the finalized value without
+pretending the raw commit says something it doesn't.
+
+**Finalizing.** `rf promote` asks "is this final?" before anything else
+(`confirm_final_promotion` in `main.rs`; `--final` answers just this question,
+`--yes` answers it along with everything else, an unattended run with neither
+fails). Declining aborts the whole command. Confirming doesn't itself write
+anything — it only permits `resolve_version_gate` to, which defers the actual
+strip until it knows a promotion will proceed: the finalized value (rolling's
+version with its marker dropped) is what the gate is evaluated against from the
+start, but the `chore(release): finalize X.Y.Z for promotion` commit that
+actually drops it is deferred until the function is past every early-return
+that doesn't promote (Lower, an unresolvable bump), landing either at the
+"already satisfied" return or immediately before the bump commit. A promotion
+that ultimately fails (no bump resolved, no `--force`) therefore never leaves
+rolling finalized with nothing to show for it, the same property `apply_version_bump`
+already had for the bump itself.
+
+A `--roll` step needs the same strip but has no branch to commit it on — it
+merges a commit that already exists on rolling — so `run_promote_step`
+generalizes the same staged-tree mechanism `in_merge_bump` already used for a
+numeric bump: `raw_head` (the graduation commit's own `Cargo.toml`, still
+`-dev`) and `finalized_head` (the same, marker dropped) are both read before
+the gate runs; the gate itself runs against `finalized_head` via
+`check_against`; and whatever must actually land — the bumped value if one was
+computed, otherwise the finalized one if that differs from `raw_head` — is
+written into the staged tree the same way a bump already was. A repo with
+`dev_versions` off, or a graduation that was already bare, computes no write at
+all and is byte-identical to before this existed.
 
 ## Per-roll promotion
 

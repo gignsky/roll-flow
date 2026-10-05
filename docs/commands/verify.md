@@ -13,6 +13,12 @@ Routes checked:
 - `roll/* -> rolling`
 - `rolling -> main`
 
+On a roll branch, `verify` also applies the roll's dev marker to `Cargo.toml` if
+it is missing (`0.2.4` → `0.2.4-roll9`, see [`create`](create.md#dev-versions))
+— so a roll created before the marker existed, or with `--no-dev-version`, is
+brought in line by its first verify. Idempotent, skipped by `--dry-run`, and
+off when `dev_versions = false`.
+
 Validation includes:
 
 - clean tree
@@ -27,9 +33,14 @@ Validation includes:
   as [`graduate`](graduate.md#when-the-merge-conflicts) recommends, or merging the
   target into the source. Under `--dry-run` it is a warning instead.
 - the version gate on the `rolling -> main` route (see
-  [Versioning and release tags](../../README.md#versioning-and-release-tags)).
-  When a bump is needed, `verify` offers one; `--bump <level>` applies it without
-  asking and `--yes` accepts the default (patch) non-interactively
+  [Versioning and release tags](../../README.md#versioning-and-release-tags)),
+  checked against the *finalized* (marker-stripped) version rolling would carry
+  once promoted. When a bump is needed, `verify` offers one; `--bump <level>`
+  applies it without asking and `--yes` accepts the default (patch)
+  non-interactively. Resolving a bump this way also finalizes rolling's
+  `-dev` marker first, the same way a confirmed `rf promote` does — `verify`
+  never asks "is this final?" itself, since a bump here is already an explicit,
+  opt-in action
 - configured gate command execution
 
 ## Example
