@@ -22,22 +22,26 @@ The base numbers are deliberately left alone, and that is what makes the rest
 work:
 
 ```text
-main @ 0.2.4  ──rf start──▶   roll/9 @ 0.2.4-roll9
-                ──rf graduate──▶  marker stripped, rolling @ 0.2.4
-                ──rf promote──▶   refused: unchanged from main
-                ──rf promote --bump patch──▶  main @ 0.2.5
+main @ 0.2.4  ──rf start──▶     roll/9 @ 0.2.4-roll9
+                ──rf graduate──▶  rolling @ 0.2.4-dev
+                ──rf promote──▶   "is this final?" [y/N]
+                                  N: cancelled, nothing touched
+                                  y, unchanged: refused, demands a real bump
+                ──rf promote --final --bump patch──▶  main @ 0.2.5
 ```
 
-[`graduate`](graduate.md) strips the marker back to exactly the version the roll
-branched from, so the promotion gate then reports `UNCHANGED` and demands a real
-bump. A `-roll<N>` version can never reach stable: [`verify`](verify.md) and
-[`promote`](promote.md) reject one outright rather than comparing it, because
-`0.2.5-roll9` *is* numerically above `0.2.4` and would otherwise promote — and
-be tagged `v0.2.5-roll9`.
+[`graduate`](graduate.md) swaps the roll's marker for rolling's own steady-state
+`-dev`, same numbers, so a *final* [`promote`](promote.md) — once the marker is
+stripped back to the version the roll branched from — reports `UNCHANGED` and
+demands a real bump. Either marker can never reach stable: `rf verify` and a
+non-final `rf promote` reject one outright rather than comparing it, because
+`0.2.5-roll9`/`0.2.5-dev` *are* numerically above `0.2.4` and would otherwise
+promote — and be tagged as-is.
 
 Bumping on the roll branch keeps the marker (`0.2.4-roll9` → `0.2.5-roll9`),
-raising the base that graduation strips back to. That is the other route to a
-promotable version.
+raising the base that graduation carries onto rolling's `-dev`. That is the
+other route to a promotable version, alongside bumping on rolling itself after
+graduating.
 
 Turn it off per repo with `dev_versions = false` in `.roll-flow.toml`, or per
 invocation with `--no-dev-version`. Repos with no `Cargo.toml` — every dotfiles

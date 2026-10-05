@@ -38,7 +38,7 @@ fn init_create_and_promote_flow() {
     assert_eq!(sb.current_branch(), "roll/1-0611-feature");
 
     sb.git(&["checkout", "rolling"]);
-    let out = sb.rf(&["promote"]);
+    let out = sb.rf(&["promote", "--yes"]);
     assert!(
         out.success,
         "promote rolling->main failed: {}",

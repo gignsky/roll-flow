@@ -2884,7 +2884,7 @@ fn run_op(config: &Config, action: Action, target: Option<&str>) -> Result<Vec<S
         Action::Graduate => {
             let roll = target.ok_or_else(|| anyhow!("no roll selected"))?;
             ops::ensure_clean_state(config)?;
-            let o = ops::graduate(config, roll, false, &force)?;
+            let o = ops::graduate(config, roll, false, &force, true)?;
             push_gate_notices(&mut lines, &o.gate_notices);
             if o.restored {
                 lines.push(format!(
@@ -2893,6 +2893,9 @@ fn run_op(config: &Config, action: Action, target: Option<&str>) -> Result<Vec<S
                 ));
             } else {
                 lines.push(format!("Graduated '{}' into '{}'", o.roll, o.rolling));
+            }
+            if let Some(line) = o.tag.describe() {
+                lines.push(line);
             }
         }
         Action::Integrate => {
@@ -3857,6 +3860,7 @@ mod tests {
             host_active: Default::default(),
             version_gate: true,
             tag_on_promote: true,
+            tag_on_graduate: true,
             push_tag: true,
             dev_versions: true,
             roll_to_rolling_gates: Vec::new(),
@@ -5115,6 +5119,7 @@ mod tests {
             host_active: Default::default(),
             version_gate: true,
             tag_on_promote: true,
+            tag_on_graduate: true,
             push_tag: true,
             dev_versions: true,
             roll_to_rolling_gates: Vec::new(),
@@ -5397,7 +5402,7 @@ mod tests {
         assert_eq!(version_cell(Some(v(0, 2, 4))), "0.2.4");
         assert_eq!(
             version_cell(Some(Semver {
-                dev_roll: Some(9),
+                marker: crate::core::version::Marker::Roll(9),
                 ..v(0, 2, 4)
             })),
             "0.2.4-roll9"
@@ -5481,7 +5486,7 @@ mod tests {
             major,
             minor,
             patch,
-            dev_roll: None,
+            marker: crate::core::version::Marker::None,
         }
     }
 

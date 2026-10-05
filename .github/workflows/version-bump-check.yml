@@ -30,13 +30,23 @@ jobs:
           echo "head (this PR)               = ${head_ver:-<none>}"
 
           # Mirrors VersionStatus::DevVersion in src/core/version.rs. A roll
-          # branch's Cargo.toml carries a `-roll<N>` marker that `rf graduate`
-          # strips; one reaching develop or main means the strip was skipped.
-          # This cannot be left to the comparison below: `sort -V` ranks
-          # "0.2.4-roll9" *above* "0.2.4", so a dev version would pass as a bump.
+          # branch's Cargo.toml carries a `-roll<N>` marker (stripped by
+          # `rf graduate`, which swaps it for rolling's own `-dev`), and
+          # rolling itself steadily carries `-dev` (stripped only by a
+          # *final* `rf promote`). Either marker reaching develop or main
+          # means the strip was skipped — e.g. merged through this PR's own
+          # "Merge" button instead of `rf graduate`/`rf promote`, bypassing
+          # the local version merge driver and finalize step entirely. This
+          # cannot be left to the comparison below: `sort -V` ranks
+          # "0.2.4-roll9"/"0.2.4-dev" *above* "0.2.4", so a dev version would
+          # pass as a bump.
           case "${head_ver}" in
             *-roll[0-9]*)
               echo "::error::Cargo.toml version (${head_ver}) still carries a roll's dev marker. Graduate the roll to strip it, or set it to a plain X.Y.Z."
+              exit 1
+              ;;
+            *-dev)
+              echo "::error::Cargo.toml version (${head_ver}) still carries rolling's -dev marker. Use 'rf promote' to finalize the release, or set it to a plain X.Y.Z."
               exit 1
               ;;
           esac

@@ -73,7 +73,9 @@ fn main() -> Result<()> {
             dry_run,
             force,
             reason,
-        } => cmd_graduate(dry_run, force, reason)?,
+            no_tag,
+            yes,
+        } => cmd_graduate(dry_run, force, reason, !no_tag, yes)?,
         Cmd::Promote {
             roll,
             dry_run,
@@ -81,8 +83,9 @@ fn main() -> Result<()> {
             reason,
             bump,
             no_tag,
+            finalize,
             yes,
-        } => cmd_promote(roll, dry_run, force, reason, bump, !no_tag, yes)?,
+        } => cmd_promote(roll, dry_run, force, reason, bump, !no_tag, finalize, yes)?,
         Cmd::Status {
             no_tui,
             no_deps,
@@ -444,8 +447,39 @@ fn resolve_version_gate(
         return Ok(());
     };
 
-    let check = ops::version_check(config, &source, &target_ref)?;
+    // A *final* promotion must land a bare version on stable, never `-dev` —
+    // so the gate below is run against the *finalized* value rolling will
+    // carry once the marker is stripped, not the raw `-dev` one still on
+    // disk: comparing the raw value would report `VersionStatus::DevVersion`
+    // on every single ordinary promotion, since rolling's steady state now
+    // always carries one. Nothing is written yet; the actual strip is only
+    // committed once this function has decided to proceed — either here, if
+    // the finalized value alone already satisfies the gate, or immediately
+    // before the bump below, so a promotion that ultimately fails (no bump
+    // resolved) doesn't leave rolling finalized with nothing to show for it.
+    let needs_finalize = config.dev_versions
+        && version::read_version(&config.repo_root)?.is_some_and(|v| v.has_marker());
+    let check = if !config.version_gate {
+        VersionCheck::not_applicable()
+    } else if config.dev_versions {
+        let finalized_head = version::read_version(&config.repo_root)?.map(|v| v.release());
+        version::check_against(&config.repo_root, finalized_head, &target_ref)?
+    } else {
+        ops::version_check(config, &source, &target_ref)?
+    };
+
+    let finalize_now = |dry_run: bool| -> Result<()> {
+        if !needs_finalize || dry_run {
+            return Ok(());
+        }
+        if let Some((from, to)) = ops::finalize_rolling(config)? {
+            println!("Finalized {from} -> {to} (chore(release) commit on '{source}')");
+        }
+        Ok(())
+    };
+
     if check.is_satisfied() {
+        finalize_now(dry_run)?;
         return Ok(());
     }
 
@@ -462,6 +496,9 @@ fn resolve_version_gate(
     println!("Version: {head} on '{source}' is unchanged from '{target}'; a bump is required");
 
     if dry_run {
+        if needs_finalize {
+            println!("Dry-run: would also finalize the release before bumping");
+        }
         println!("Dry-run: not bumping the version");
         return Ok(());
     }
@@ -492,9 +529,11 @@ fn resolve_version_gate(
         if forced {
             eprintln!("warning: version not bumped, continuing under --force");
         }
+        finalize_now(false)?;
         return Ok(());
     };
 
+    finalize_now(false)?;
     let (from, to) = ops::apply_version_bump(config, level, &source)?;
     println!("Bumped version {from} -> {to} (chore(release) commit on '{current}')");
     Ok(())
@@ -573,7 +612,13 @@ fn offer_tag_push(config: &Config, tag: &str, yes: bool) -> Result<()> {
     Ok(())
 }
 
-fn cmd_graduate(dry_run: bool, force: bool, reason: Option<String>) -> Result<()> {
+fn cmd_graduate(
+    dry_run: bool,
+    force: bool,
+    reason: Option<String>,
+    tag: bool,
+    yes: bool,
+) -> Result<()> {
     let force = ops::ForceOpts::new(force, reason)?;
     let config = Config::load()?;
     ops::ensure_clean_state(&config)?;
@@ -588,13 +633,17 @@ fn cmd_graduate(dry_run: bool, force: bool, reason: Option<String>) -> Result<()
         );
     }
     // `ops::graduate` checks the dev marker belongs to this roll and runs the
-    // gates and merge — shared with the `rf promote` fall-through and the
-    // TUI's `[G]`, so this is just the CLI wrapper now.
-    let outcome = ops::graduate(&config, &current, dry_run, &force)?;
+    // gates, merge, and dev-tag creation — shared with the `rf promote`
+    // fall-through and the TUI's `[G]`, so this is just the CLI wrapper now.
+    let outcome = ops::graduate(&config, &current, dry_run, &force, tag)?;
     print_graduate(&outcome);
+    if !dry_run {
+        offer_graduate_tag_push(&config, &outcome, yes)?;
+    }
     Ok(())
 }
 
+#[allow(clippy::too_many_arguments)]
 fn cmd_promote(
     rolls: Vec<String>,
     dry_run: bool,
@@ -602,6 +651,7 @@ fn cmd_promote(
     reason: Option<String>,
     bump: Option<BumpLevel>,
     tag: bool,
+    finalize: bool,
     yes: bool,
 ) -> Result<()> {
     let forced = force;
@@ -613,6 +663,9 @@ fn cmd_promote(
     // and deliberately works from any branch, rather than being redirected to
     // graduate because HEAD happens to sit on a roll.
     if !rolls.is_empty() {
+        if !confirm_final_promotion(&config, dry_run, finalize, yes)? {
+            return Ok(());
+        }
         // Advancing stable to a roll's graduation commit lands whatever
         // graduated ahead of it too (see `ops::PromoteTarget::Rolls`). That is
         // how the route keeps stable a prefix of rolling, but it is not what
@@ -666,10 +719,16 @@ fn cmd_promote(
                 "note: '{}' is a roll branch; graduating into '{}' — use rf graduate directly next time",
                 roll, config.rolling_branch
             );
-            let outcome = ops::graduate(&config, &roll, dry_run, &force)?;
+            let outcome = ops::graduate(&config, &roll, dry_run, &force, tag)?;
             print_graduate(&outcome);
+            if !dry_run {
+                offer_graduate_tag_push(&config, &outcome, yes)?;
+            }
         }
         Some(ops::Route::Promote) => {
+            if !confirm_final_promotion(&config, dry_run, finalize, yes)? {
+                return Ok(());
+            }
             // Resolved before `ops::promote` so the bump commit is part of what
             // gets merged, and so it precedes the `--locked` cargo gates.
             resolve_version_gate(&config, bump, yes, forced, dry_run)?;
@@ -688,6 +747,51 @@ fn cmd_promote(
         None => return Err(ops::not_promotable_error(&config, &current)),
     }
     Ok(())
+}
+
+/// Gate every real promotion on an explicit "is this final?" before anything
+/// is touched — declining aborts the whole command, landing nothing. Only
+/// meaningful when `dev_versions` is on *and* the repo actually has a
+/// `Cargo.toml` to version: a repo without one (the dotfiles repo this tool
+/// was built for) must remain entirely unaffected, matching every other
+/// version-related feature here, so it is checked explicitly rather than
+/// assumed from the config flag alone. A dry run changes nothing to gate
+/// either, and `--final` is its own dedicated escape hatch — the same shape
+/// `--bump <level>` already gives the bump prompt, so this question can be
+/// answered on its own without also accepting the tag-push prompt the way a
+/// blanket `--yes` does.
+///
+/// Unattended without `--final`/`--yes` fails rather than silently finalizing
+/// a release nobody confirmed — the same shape [`confirm_carried_rolls`] uses
+/// for its own irreversible-if-unnoticed default.
+fn confirm_final_promotion(
+    config: &Config,
+    dry_run: bool,
+    finalize: bool,
+    yes: bool,
+) -> Result<bool> {
+    let has_version = version::read_version(&config.repo_root)?.is_some();
+    if dry_run || !config.dev_versions || !has_version || finalize {
+        return Ok(true);
+    }
+    match cli::confirm(
+        yes,
+        &format!(
+            "Finalize this release? This drops the -dev marker before merging into '{}'. [y/N] ",
+            config.stable_branch
+        ),
+    )? {
+        cli::Confirm::Yes => Ok(true),
+        cli::Confirm::Declined => {
+            println!("Promotion cancelled; nothing was touched.");
+            Ok(false)
+        }
+        cli::Confirm::Unattended => bail!(
+            "promoting to '{}' finalizes the release (drops the -dev marker); \
+             re-run with --yes to confirm, or run interactively",
+            config.stable_branch
+        ),
+    }
 }
 
 /// Show the rolls a per-roll promotion would carry besides the ones named, and
@@ -865,6 +969,22 @@ fn print_graduate(outcome: &ops::GraduateOutcome) {
         ),
         (false, false) => println!("Graduated '{}' into '{}'", outcome.roll, outcome.rolling),
     }
+    if let Some(line) = outcome.tag.describe() {
+        println!("{line}");
+    }
+}
+
+/// Offer to push the dev tag a graduation just created, mirroring
+/// [`offer_step_tag_pushes`]'s shape one tier down.
+fn offer_graduate_tag_push(
+    config: &Config,
+    outcome: &ops::GraduateOutcome,
+    yes: bool,
+) -> Result<()> {
+    if let Some(tag) = outcome.tag.created_tag() {
+        offer_tag_push(config, tag, yes)?;
+    }
+    Ok(())
 }
 
 /// Render the roll-flow status lines that `ops::run_gates` collects instead of

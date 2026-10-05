@@ -9,19 +9,22 @@
 //! before a plain text merge ever gets a chance to see it as conflicting, for
 //! *every* merge that touches the file — not just the ones `rf` orchestrates.
 //!
-//! The rule, symmetric across both directions this project merges in:
+//! The rule, symmetric across every direction this project merges in:
 //!
-//! - `rf graduate` (roll merged into rolling; rolling is `ours`): rolling
-//!   never carries a marker, so the result is rolling's own version,
-//!   unaffected by whatever the roll's `Cargo.toml` said.
-//! - `rf update` (stable merged into a roll; the roll is `ours`): the roll's
-//!   marker is kept, and the numeric part becomes whichever side is higher —
-//!   in practice stable's, since that's the point of the merge.
+//! - `rf graduate` (roll merged into rolling; rolling is `ours`): rolling's own
+//!   `-dev` marker is kept, and the numeric part becomes whichever side is
+//!   higher — in practice the roll's, since that's the point of graduating.
+//! - `rf integrate`/`[i]`/`[I]` (another roll, or rolling, merged into a roll;
+//!   the roll is `ours`): the roll's own `-roll<N>` marker is kept, numbers
+//!   maxed the same way.
+//! - `rf update` (stable merged into a roll; the roll is `ours`): same rule
+//!   again — the roll's marker is kept, numeric part raised to stable's.
 //!
-//! Both are the same rule: **keep `ours`'s dev marker, if it has one; take the
-//! higher of the two sides' `X.Y.Z` numbers.** "Ours" is whichever branch is
-//! checked out when the merge runs, which git itself decides — this module
-//! never needs to know which `rf` command triggered it.
+//! All three are the same rule: **keep `ours`'s marker; take the higher of the
+//! two sides' `X.Y.Z` numbers.** "Ours" is whichever branch is checked out
+//! when the merge runs, which git itself decides — this module never needs to
+//! know which `rf` command triggered it, or which marker kind "ours" happens
+//! to carry.
 
 use std::fs;
 use std::path::Path;
@@ -31,13 +34,11 @@ use crate::core::version::{self, Semver};
 use crate::error::RfError;
 
 /// Resolve two sides of a version-line disagreement. See the module docs for
-/// the rule and why it's safe in both directions this project merges in.
+/// the rule and why it's safe in every direction this project merges in.
 pub fn resolve(ours: Semver, theirs: Semver) -> Semver {
-    let numeric = ours.released().max(theirs.released());
-    match ours.dev_roll {
-        Some(n) => numeric.as_dev(n),
-        None => numeric,
-    }
+    ours.release()
+        .max(theirs.release())
+        .with_marker(ours.marker)
 }
 
 /// Entry point for the `__merge-driver-version` subcommand.
@@ -129,9 +130,25 @@ mod tests {
     }
 
     #[test]
-    fn graduate_direction_drops_the_roll_s_marker() {
-        // ours = rolling (no marker), theirs = the roll being graduated.
-        assert_eq!(resolve(v("0.2.6"), v("0.2.5-roll10")), v("0.2.6"));
+    fn graduate_direction_keeps_rolling_s_dev_marker() {
+        // ours = rolling (its own -dev), theirs = the roll being graduated.
+        // The roll's -roll10 is dropped in favor of ours's -dev, numbers maxed.
+        assert_eq!(resolve(v("0.2.6-dev"), v("0.2.5-roll10")), v("0.2.6-dev"));
+        assert_eq!(resolve(v("0.2.5-dev"), v("0.2.6-roll10")), v("0.2.6-dev"));
+    }
+
+    #[test]
+    fn integrate_direction_keeps_the_roll_s_own_marker() {
+        // ours = the roll being integrated into, theirs = another roll (or
+        // rolling's -dev). The roll keeps its own number, not theirs.
+        assert_eq!(
+            resolve(v("0.2.5-roll33"), v("0.2.6-roll10")),
+            v("0.2.6-roll33")
+        );
+        assert_eq!(
+            resolve(v("0.2.5-roll33"), v("0.2.6-dev")),
+            v("0.2.6-roll33")
+        );
     }
 
     #[test]
@@ -150,5 +167,13 @@ mod tests {
         // The roll bumped its own base past stable's current tip; stable's
         // number must not regress it.
         assert_eq!(resolve(v("0.3.0-roll10"), v("0.2.6")), v("0.3.0-roll10"));
+    }
+
+    #[test]
+    fn finalizing_drops_the_dev_marker() {
+        // ours = stable (no marker), theirs = rolling's -dev, as happens if a
+        // bare merge ever reached this driver instead of going through
+        // `ops::finalize_rolling` first. Stable must never gain a marker.
+        assert_eq!(resolve(v("0.2.5"), v("0.2.6-dev")), v("0.2.6"));
     }
 }

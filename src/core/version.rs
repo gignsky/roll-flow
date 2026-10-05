@@ -5,11 +5,12 @@
 //!
 //! - `.github/workflows/version-bump-check.yml` — a promotion must raise the
 //!   version strictly above the branch it targets, and must not still carry a
-//!   roll's `-roll<N>` dev marker. That second rule needs its own check on both
-//!   sides: `sort -V` ranks `0.2.4-roll9` *above* `0.2.4`, and the derived
-//!   `Ord` here would too, so each side states the rule explicitly rather than
-//!   letting the comparison imply it — see [`VersionStatus::DevVersion`] and
-//!   the hand-written [`Ord`] impl for [`Semver`].
+//!   dev marker (a roll's `-roll<N>`, or rolling's own `-dev`). That second
+//!   rule needs its own check on both sides: `sort -V` ranks `0.2.4-roll9` and
+//!   `0.2.4-dev` *above* `0.2.4`, and the derived `Ord` here would too, so each
+//!   side states the rule explicitly rather than letting the comparison imply
+//!   it — see [`VersionStatus::DevVersion`] and the derived [`Ord`] impls for
+//!   [`Marker`] and [`Semver`].
 //! - `.github/workflows/tag-on-main.yml` — a version change on stable gets an
 //!   annotated `vX.Y.Z` tag, created idempotently.
 //! - `.github/workflows/release-check.yml` — the tag must match `Cargo.toml`.
@@ -30,64 +31,58 @@ pub const VERSION_FILE: &str = "Cargo.toml";
 
 // ── Semver ──────────────────────────────────────────────────────────────────
 
-/// A three-field version, optionally carrying the dev marker a roll branch
-/// wears: `0.2.4-roll9`.
+/// The pre-release marker a `Semver` carries: a roll branch's own `-roll<N>`,
+/// rolling's steady-state `-dev`, or no marker at all (a release version).
 ///
-/// The marker is a roll *number*, not a free-form pre-release string. That is
-/// narrower than semver allows and deliberately so: `-roll<N>` is the only
-/// pre-release this project produces, a number keeps the type `Copy` (a
-/// `String` here would ripple `.clone()` through every call site that passes a
-/// version by value), and it lets the marker be checked against the roll it
-/// claims to belong to. Any other suffix still fails to parse, exactly as
-/// before.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+/// Declared in this order — `Roll` first, `None` last — because `Ord` is
+/// derived and compares variants by declaration order: a release must outrank
+/// `-dev`, which must outrank any `-roll<N>` of the same numbers, matching
+/// semver's "a pre-release precedes the release it marks" rule twice over
+/// (roll precedes dev, dev precedes release). Reordering these variants
+/// silently flips the promotion gate's sense, so don't.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub enum Marker {
+    Roll(u32),
+    Dev,
+    None,
+}
+
+/// A three-field version, optionally carrying a [`Marker`]: `0.2.4-roll9` on a
+/// roll branch, `0.2.4-dev` on rolling, or bare `0.2.4` once promoted.
+///
+/// The marker is narrower than semver's pre-release syntax allows, and
+/// deliberately so: `-roll<N>`/`-dev` are the only pre-releases this project
+/// produces, and keeping the marker a small `Copy` enum (rather than a
+/// `String`) means `Semver` itself stays `Copy`, which ripples through every
+/// call site that passes a version by value. Any other suffix still fails to
+/// parse, exactly as before.
+///
+/// `Ord` is derived, comparing fields in declaration order — major, minor,
+/// patch, then [`Marker`] — so the numbers dominate the marker exactly as the
+/// promotion gate needs: `0.2.5-roll9 > 0.2.4`, but `0.2.4-dev < 0.2.4`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub struct Semver {
     pub major: u64,
     pub minor: u64,
     pub patch: u64,
-    /// `Some(n)` on a roll branch's dev version, `None` on a release version.
-    pub dev_roll: Option<u32>,
-}
-
-/// Ordering is hand-written because the derived one is *backwards* for the dev
-/// marker: `Option`'s derived `Ord` puts `None` below `Some`, which would make
-/// `0.2.4` sort below `0.2.4-roll9`. Semver says the opposite — a pre-release
-/// precedes its release — and the promotion gate is a `>` comparison, so
-/// getting this inverted would let a dev version promote over the release it
-/// was branched from.
-impl Ord for Semver {
-    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
-        (self.major, self.minor, self.patch)
-            .cmp(&(other.major, other.minor, other.patch))
-            .then_with(|| match (self.dev_roll, other.dev_roll) {
-                (None, None) => std::cmp::Ordering::Equal,
-                // A release outranks any dev version of the same numbers.
-                (None, Some(_)) => std::cmp::Ordering::Greater,
-                (Some(_), None) => std::cmp::Ordering::Less,
-                (Some(a), Some(b)) => a.cmp(&b),
-            })
-    }
-}
-
-impl PartialOrd for Semver {
-    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
-        Some(self.cmp(other))
-    }
+    pub marker: Marker,
 }
 
 impl Semver {
-    /// Parse `X.Y.Z`, or `X.Y.Z-roll<N>` for a roll branch's dev version.
+    /// Parse `X.Y.Z`, `X.Y.Z-roll<N>` (a roll branch's own dev version), or
+    /// `X.Y.Z-dev` (rolling's steady-state dev version).
     ///
     /// Every other pre-release/build suffix is rejected rather than silently
     /// dropped — quietly ignoring one could let a lower version read as higher.
     pub fn parse(raw: &str) -> Option<Semver> {
         let raw = raw.trim();
-        let (numbers, dev_roll) = match raw.split_once('-') {
+        let (numbers, marker) = match raw.split_once('-') {
+            Some((numbers, "dev")) => (numbers, Marker::Dev),
             Some((numbers, suffix)) => {
                 let n = suffix.strip_prefix("roll")?.parse().ok()?;
-                (numbers, Some(n))
+                (numbers, Marker::Roll(n))
             }
-            None => (raw, None),
+            None => (raw, Marker::None),
         };
         let mut parts = numbers.split('.');
         let major = parts.next()?.parse().ok()?;
@@ -100,39 +95,53 @@ impl Semver {
             major,
             minor,
             patch,
-            dev_roll,
+            marker,
         })
     }
 
-    /// True when this is a roll branch's dev version rather than a release.
-    pub fn is_dev(self) -> bool {
-        self.dev_roll.is_some()
+    /// True when this version carries any marker at all — a roll's own
+    /// `-roll<N>`, or rolling's `-dev` — rather than being a plain release.
+    pub fn has_marker(self) -> bool {
+        self.marker != Marker::None
     }
 
-    /// The same version with the dev marker removed — what graduation writes.
-    pub fn released(self) -> Semver {
+    /// The same version with its marker removed — what a final promotion
+    /// writes before merging into stable.
+    pub fn release(self) -> Semver {
         Semver {
-            dev_roll: None,
+            marker: Marker::None,
             ..self
         }
     }
 
     /// The same numbers marked as roll `n`'s dev version — what `rf start`
-    /// writes. The base numbers are deliberately left alone: graduation strips
-    /// the marker back to exactly the version the roll branched from, so the
-    /// promotion gate then reports `UNCHANGED` and demands a real bump.
-    pub fn as_dev(self, n: u32) -> Semver {
-        Semver {
-            dev_roll: Some(n),
-            ..self
-        }
+    /// writes. The base numbers are deliberately left alone: graduation moves
+    /// the marker to `-dev` without touching them, so the promotion gate then
+    /// reports `UNCHANGED` (once finalized) and demands a real bump.
+    pub fn as_roll(self, n: u32) -> Semver {
+        self.with_marker(Marker::Roll(n))
+    }
+
+    /// The same numbers marked as rolling's `-dev` version — what `rf
+    /// graduate` writes in place of the roll's own `-roll<N>`.
+    pub fn as_rolling_dev(self) -> Semver {
+        self.with_marker(Marker::Dev)
+    }
+
+    /// The same numbers with an arbitrary marker swapped in. The general form
+    /// behind [`as_roll`](Self::as_roll)/[`as_rolling_dev`](Self::as_rolling_dev)/
+    /// [`release`](Self::release), and what the merge driver's "keep ours's
+    /// marker, take the higher number" rule needs: it doesn't know in advance
+    /// which of the three it's keeping.
+    pub fn with_marker(self, marker: Marker) -> Semver {
+        Semver { marker, ..self }
     }
 
     /// The next version at `level`, zeroing the fields below it.
     ///
-    /// The dev marker is carried through: bumping on a roll branch raises the
-    /// base the graduation will strip back to, which is the other route to a
-    /// promotable version besides bumping on rolling afterwards.
+    /// The marker is carried through: bumping on a roll branch raises the
+    /// base graduation will carry onto rolling's `-dev`, which is the other
+    /// route to a promotable version besides bumping on rolling afterwards.
     pub fn bump(self, level: BumpLevel) -> Semver {
         match level {
             BumpLevel::Patch => Semver {
@@ -143,19 +152,19 @@ impl Semver {
                 major: self.major,
                 minor: self.minor + 1,
                 patch: 0,
-                dev_roll: self.dev_roll,
+                marker: self.marker,
             },
             BumpLevel::Major => Semver {
                 major: self.major + 1,
                 minor: 0,
                 patch: 0,
-                dev_roll: self.dev_roll,
+                marker: self.marker,
             },
         }
     }
 
-    /// The release tag for this version, e.g. `v0.1.3`. Matches the `v$crate`
-    /// form `tag-on-main.yml` builds.
+    /// The release tag for this version, e.g. `v0.1.3` or `v0.2.6-dev`.
+    /// Matches the `v$crate` form `tag-on-main.yml` builds.
     pub fn tag(self) -> String {
         format!("v{self}")
     }
@@ -164,9 +173,10 @@ impl Semver {
 impl fmt::Display for Semver {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(f, "{}.{}.{}", self.major, self.minor, self.patch)?;
-        match self.dev_roll {
-            Some(n) => write!(f, "-roll{n}"),
-            None => Ok(()),
+        match self.marker {
+            Marker::Roll(n) => write!(f, "-roll{n}"),
+            Marker::Dev => write!(f, "-dev"),
+            Marker::None => Ok(()),
         }
     }
 }
@@ -204,10 +214,11 @@ pub enum VersionStatus {
     Lower,
     /// A `Cargo.toml` exists but its version could not be read or parsed.
     Unreadable,
-    /// Source still carries a roll branch's `-roll<N>` dev marker. Its own
-    /// status rather than folded into `Unchanged`, because the fix is
-    /// different: strip the marker (which graduation does) rather than raise
-    /// the numbers.
+    /// Source still carries a dev marker — a roll's `-roll<N>`, or rolling's
+    /// own `-dev`. Its own status rather than folded into `Unchanged`,
+    /// because the fix is different: strip the marker (what `rf graduate`
+    /// does for a roll, and what a *final* `rf promote` does for rolling)
+    /// rather than raise the numbers.
     DevVersion,
     /// No `Cargo.toml` on either side, or the gate is disabled in config.
     NotApplicable,
@@ -299,9 +310,10 @@ pub fn check(repo: &Path, source_ref: &str, target_ref: &str) -> Result<VersionC
     let status = match (head, base) {
         // Checked ahead of the comparison: a dev version can be numerically
         // above its target and still must not promote — `0.2.5-roll9 > 0.2.4`
-        // is true, and shipping a `-roll9` version to stable (and tagging it
-        // `v0.2.5-roll9`) is exactly what this gate exists to stop.
-        (Some(h), _) if h.is_dev() => VersionStatus::DevVersion,
+        // is true, and shipping a `-roll9` (or un-finalized `-dev`) version to
+        // stable (and tagging it `v0.2.5-roll9`) is exactly what this gate
+        // exists to stop.
+        (Some(h), _) if h.has_marker() => VersionStatus::DevVersion,
         // A manifest added by this very branch is a bump from nothing.
         (Some(_), None) if base_text.is_none() => VersionStatus::Ok,
         (Some(h), Some(b)) if h > b => VersionStatus::Ok,
@@ -310,6 +322,41 @@ pub fn check(repo: &Path, source_ref: &str, target_ref: &str) -> Result<VersionC
         _ => VersionStatus::Unreadable,
     };
 
+    Ok(VersionCheck { head, base, status })
+}
+
+/// Like [`check`], but against an already-resolved `head` rather than reading
+/// `source_ref` fresh.
+///
+/// A per-roll promotion step needs to gate on the *finalized* (marker-
+/// stripped) version a graduation commit will carry once landed on stable,
+/// not the raw `-dev` value still sitting in that commit's `Cargo.toml` —
+/// `check` alone would report `DevVersion` on every single per-roll
+/// promotion step otherwise, since the raw value never actually reaches
+/// stable; finalizing is exactly what landing it does.
+///
+/// Kept as its own small function rather than `check` delegating to it: the
+/// two differ in exactly when `NotApplicable` fires (`check`'s source-missing
+/// case is about the raw file being absent, not a parse failure), and
+/// collapsing that distinction to save a few lines is not worth risking here.
+pub fn check_against(
+    repo: &Path,
+    head: Option<Semver>,
+    target_ref: &str,
+) -> Result<VersionCheck, RfError> {
+    let base_text = git::show_file_at_ref(repo, target_ref, VERSION_FILE)?;
+    if head.is_none() && base_text.is_none() {
+        return Ok(VersionCheck::not_applicable());
+    }
+    let base = base_text.as_deref().and_then(parse_version);
+    let status = match (head, base) {
+        (Some(h), _) if h.has_marker() => VersionStatus::DevVersion,
+        (Some(_), None) if base_text.is_none() => VersionStatus::Ok,
+        (Some(h), Some(b)) if h > b => VersionStatus::Ok,
+        (Some(h), Some(b)) if h == b => VersionStatus::Unchanged,
+        (Some(_), Some(_)) => VersionStatus::Lower,
+        _ => VersionStatus::Unreadable,
+    };
     Ok(VersionCheck { head, base, status })
 }
 
@@ -384,17 +431,17 @@ mod tests {
     use super::*;
 
     #[test]
-    fn a_dev_version_sorts_below_the_release_it_marks() {
-        let dev = Semver::parse("0.2.4-roll9").expect("dev version parses");
+    fn a_roll_version_sorts_below_the_release_it_marks() {
+        let dev = Semver::parse("0.2.4-roll9").expect("roll version parses");
         let release = Semver::parse("0.2.4").expect("release parses");
 
-        assert_eq!(dev.dev_roll, Some(9));
-        assert!(dev.is_dev());
-        assert!(!release.is_dev());
+        assert_eq!(dev.marker, Marker::Roll(9));
+        assert!(dev.has_marker());
+        assert!(!release.has_marker());
 
-        // The whole reason `Ord` is hand-written: the derived one puts `None`
-        // below `Some`, which would let a roll's dev version promote over the
-        // release it branched from.
+        // The whole reason `Marker`'s declaration order matters: the derived
+        // `Ord` would otherwise let a roll's dev version promote over the
+        // release it was branched from.
         assert!(dev < release, "{dev} !< {release}");
         assert!(release > dev);
         // And the numbers still dominate the marker.
@@ -403,21 +450,53 @@ mod tests {
     }
 
     #[test]
-    fn a_dev_version_round_trips_and_strips() {
+    fn a_dev_version_sorts_below_the_release_but_above_a_roll_of_the_same_numbers() {
+        let roll = Semver::parse("0.2.4-roll9").unwrap();
+        let dev = Semver::parse("0.2.4-dev").unwrap();
+        let release = Semver::parse("0.2.4").unwrap();
+
+        assert_eq!(dev.marker, Marker::Dev);
+        assert!(dev.has_marker());
+        assert!(roll < dev, "{roll} !< {dev}");
+        assert!(dev < release, "{dev} !< {release}");
+        // Numbers still dominate every marker kind.
+        assert!(Semver::parse("0.2.5-dev").unwrap() > release);
+        assert!(Semver::parse("0.2.3-dev").unwrap() < release);
+    }
+
+    #[test]
+    fn a_roll_version_round_trips_and_releases() {
         let dev = Semver::parse("1.10.3-roll42").unwrap();
         assert_eq!(dev.to_string(), "1.10.3-roll42");
-        assert_eq!(dev.released().to_string(), "1.10.3");
-        assert_eq!(Semver::parse("1.10.3").unwrap().as_dev(42), dev);
+        assert_eq!(dev.release().to_string(), "1.10.3");
+        assert_eq!(Semver::parse("1.10.3").unwrap().as_roll(42), dev);
 
         // A bump on a roll branch keeps the marker, raising the base that
-        // graduation will strip back to.
+        // graduation will carry onto rolling's `-dev`.
         assert_eq!(dev.bump(BumpLevel::Patch).to_string(), "1.10.4-roll42");
         assert_eq!(dev.bump(BumpLevel::Minor).to_string(), "1.11.0-roll42");
         assert_eq!(dev.bump(BumpLevel::Major).to_string(), "2.0.0-roll42");
     }
 
     #[test]
-    fn suffixes_that_are_not_roll_markers_are_still_rejected() {
+    fn a_dev_version_round_trips_and_releases() {
+        let dev = Semver::parse("1.10.3-dev").unwrap();
+        assert_eq!(dev.to_string(), "1.10.3-dev");
+        assert_eq!(dev.release().to_string(), "1.10.3");
+        assert_eq!(Semver::parse("1.10.3").unwrap().as_rolling_dev(), dev);
+        assert_eq!(dev.bump(BumpLevel::Patch).to_string(), "1.10.4-dev");
+    }
+
+    #[test]
+    fn with_marker_swaps_the_marker_only() {
+        let roll = Semver::parse("0.2.4-roll9").unwrap();
+        assert_eq!(roll.with_marker(Marker::Dev).to_string(), "0.2.4-dev");
+        assert_eq!(roll.with_marker(Marker::None).to_string(), "0.2.4");
+        assert_eq!(roll.with_marker(Marker::Roll(7)).to_string(), "0.2.4-roll7");
+    }
+
+    #[test]
+    fn suffixes_that_are_not_markers_are_still_rejected() {
         // Unchanged behaviour: anything this crate cannot represent exactly is
         // refused rather than silently dropped, since dropping it could let a
         // lower version read as higher.
@@ -426,6 +505,7 @@ mod tests {
             "0.2.4-roll",
             "0.2.4-rollx",
             "0.2.4-1",
+            "0.2.4-devel",
             "0.2.4+build",
         ] {
             assert_eq!(Semver::parse(raw), None, "{raw} should not parse");
@@ -440,7 +520,7 @@ mod tests {
                 major: 0,
                 minor: 1,
                 patch: 2,
-                dev_roll: None,
+                marker: Marker::None,
             })
         );
         assert!(Semver::parse("0.1.3").unwrap() > Semver::parse("0.1.2").unwrap());
@@ -467,6 +547,7 @@ mod tests {
     #[test]
     fn tag_matches_ci_format() {
         assert_eq!(Semver::parse("0.1.3").unwrap().tag(), "v0.1.3");
+        assert_eq!(Semver::parse("0.2.6-dev").unwrap().tag(), "v0.2.6-dev");
     }
 
     #[test]

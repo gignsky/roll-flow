@@ -1,7 +1,7 @@
 # `graduate`
 
 ```text
-rf graduate [--dry-run] [--force --reason <text>]
+rf graduate [--dry-run] [--force --reason <text>] [--no-tag] [--yes]
 ```
 
 Merges the current roll branch into rolling with `--no-ff` and a structured
@@ -44,14 +44,23 @@ on the roll branch first. `rf init` wires this up (see [`init`](init.md)): it
 adds `Cargo.toml merge=rf-version` to `.gitattributes` and points
 `git config merge.rf-version.driver` at `rf` itself (the `__merge-driver-version`
 subcommand). The rule it applies, whenever a merge needs to reconcile the
-line: **keep whichever side is being merged *into* (`rolling`, which never
-carries a marker) — its own value if it has one, otherwise the higher of the
-two numbers.** For graduation that means rolling's own version always wins,
-untouched by whatever the roll's `Cargo.toml` said; the roll's marker simply
-never reaches rolling. The same driver, same rule, is what [`rf update`](update.md)
-relies on to keep a roll's marker while raising its base number — "ours" is
-whichever branch is checked out, so the one driver and rule cover both
-directions.
+line: **keep whichever side is being merged *into*'s own marker — its own
+value if it has one, otherwise the higher of the two numbers.** The same
+driver, same rule, is what [`rf update`](update.md) relies on to keep a roll's
+marker while raising its base number, and what `[i]`/`[I]` rely on when
+integrating another roll or rolling into the current one — "ours" is whichever
+branch is checked out, so the one driver and rule cover every direction.
+
+Graduation is the one direction this generic rule alone cannot bootstrap,
+though: the very first graduation ever, rolling has never worn `-dev` before,
+so "keep ours's marker" would just carry `None` forward. `rf graduate`
+therefore computes its own result rather than deferring to the driver — the
+higher of the two sides' numbers, always marked `-dev` (or bare, if
+`dev_versions` is off) regardless of what either side's marker was — and
+forces it into the staged tree itself, the same way it already has to correct
+the trivial "only the roll changed the line" case below. Once bootstrapped,
+the driver's generic rule and `rf graduate`'s own computation agree, since
+rolling's `ours` marker is `-dev` from then on.
 
 A git merge driver only runs when both sides actually changed the line —
 that's when a plain text merge would otherwise conflict, which is exactly the
@@ -63,12 +72,21 @@ roll changed the line — and git resolves *that* trivially by taking the
 changed side, with no driver involved. `rf graduate` corrects this case itself,
 inside the staged merge, before the gates run: it reads both sides' version
 ahead of the merge and, after staging, rewrites `Cargo.toml` (and refreshes
-`Cargo.lock`) to the same rule's answer if the merge didn't already land there
-on its own. Either way — driver-resolved or corrected in the staged tree —
-nothing is committed to the roll branch itself, and nothing needs rolling
-back: the merge either succeeds as one commit with the right version already
-in it, or it's aborted entirely and the roll is untouched, exactly as any
-other failed graduation.
+`Cargo.lock`) to its own computed answer if the merge didn't already land
+there on its own. Either way — driver-resolved or corrected in the staged
+tree — nothing is committed to the roll branch itself, and nothing needs
+rolling back: the merge either succeeds as one commit with the right version
+already in it, or it's aborted entirely and the roll is untouched, exactly as
+any other failed graduation.
 
 `--dry-run` doesn't stage a merge at all, so the gates report on the roll's
 branch exactly as it is — the honest answer for a run that changes nothing.
+
+## Dev tag
+
+Once the merge lands, `rf graduate` offers an annotated `v<X.Y.Z>-dev` tag on
+rolling's new tip (`v0.2.6-dev`), the same idempotent shape `rf promote`'s own
+release tag uses — an existing tag is left alone rather than failing. Skip
+creating it with `--no-tag`, or disable the feature repo-wide with
+`tag_on_graduate = false`. Pushing it to `origin` is then offered the same way
+the release tag's push is, confirmed interactively or with `--yes`.

@@ -16,8 +16,8 @@ use std::process::Command;
 
 use anyhow::{anyhow, bail, Context, Result};
 
-use crate::core::version::{BumpLevel, Semver, VersionCheck, VersionStatus};
-use crate::core::{branches, config::Config, git, merge_driver, proc, version};
+use crate::core::version::{BumpLevel, Marker, Semver, VersionCheck, VersionStatus};
+use crate::core::{branches, config::Config, git, proc, version};
 
 /// Prefix for the hotfix tier. Parallel to `roll_prefix`, but fixed rather than
 /// configurable — hotfixes are a rarely-used sanctioned exception with their own
@@ -1013,10 +1013,35 @@ pub(crate) fn apply_version_bump(
     Ok((current, next))
 }
 
+/// Strip rolling's dev marker back to a bare release version, ahead of a
+/// *final* `rf promote`. Must run while rolling is checked out — the same
+/// precondition `apply_version_bump` relies on its caller to guarantee,
+/// since `resolve_version_gate` only calls this for `Route::Promote`, which
+/// `ops::infer_route` only returns when `current == config.rolling_branch`.
+///
+/// `Ok(None)` when there's nothing to strip: dev versions are off, there's no
+/// readable version, or it's already bare (a repeat `rf promote` after one
+/// that already finalized, say).
+pub(crate) fn finalize_rolling(config: &Config) -> Result<Option<(Semver, Semver)>> {
+    if !config.dev_versions {
+        return Ok(None);
+    }
+    let Some(current) = version::read_version(&config.repo_root)? else {
+        return Ok(None);
+    };
+    if !current.has_marker() {
+        return Ok(None);
+    }
+    let next = current.release();
+    let message = format!("chore(release): finalize {next} for promotion");
+    commit_version_change(config, next, &message)?;
+    Ok(Some((current, next)))
+}
+
 /// Write `next` into `Cargo.toml`, refresh the lockfile, and commit both.
 ///
 /// The shared body of [`apply_version_bump`], [`apply_dev_version`] and
-/// [`strip_dev_version`] — every path that rewrites the version does the same
+/// [`finalize_rolling`] — every path that rewrites the version does the same
 /// three things in the same order, and the lockfile refresh is the step that
 /// must not be forgotten: a workspace member's own version appears in
 /// `Cargo.lock`, and the configured `cargo update --workspace --locked` gate
@@ -1032,10 +1057,10 @@ fn commit_version_change(config: &Config, next: Semver, message: &str) -> Result
 /// Mark the checked-out roll branch's version as roll `number`'s dev version:
 /// `0.2.4` becomes `0.2.4-roll<number>`.
 ///
-/// The base numbers are left alone on purpose. Graduation strips the marker
-/// back to exactly the version the roll branched from, so the promotion gate
-/// then reports `UNCHANGED` and demands a real bump — which is the point of the
-/// whole mechanism.
+/// The base numbers are left alone on purpose. Graduation carries them onto
+/// rolling's `-dev` marker at exactly these numbers, so finalizing a promotion
+/// with nothing else bumped reports `UNCHANGED` and demands a real bump —
+/// which is the point of the whole mechanism.
 ///
 /// `Ok(None)` when the repo has no readable version, which is every repo
 /// without a `Cargo.toml`; marking is a convenience, never a precondition.
@@ -1043,10 +1068,10 @@ pub(crate) fn apply_dev_version(config: &Config, number: u32) -> Result<Option<S
     let Some(current) = version::read_version(&config.repo_root)? else {
         return Ok(None);
     };
-    if current.dev_roll == Some(number) {
+    if current.marker == Marker::Roll(number) {
         return Ok(None);
     }
-    let next = current.as_dev(number);
+    let next = current.as_roll(number);
     let message = format!("chore(version): mark {next} as roll {number}'s dev version");
     commit_version_change(config, next, &message)?;
     Ok(Some(next))
@@ -1083,8 +1108,8 @@ pub(crate) fn apply_dev_version_for_branch(
 /// writes it using the branch's own number, never another's — so one that
 /// doesn't match means the version history was scrambled somewhere else (an
 /// `[i]` integrate merge carrying in the other roll's marker commit, a stray
-/// cherry-pick), and `strip_dev_version` would otherwise erase that evidence
-/// silently on the next graduate. Checked first, before the configured gates
+/// cherry-pick), and graduating would otherwise silently carry the wrong
+/// roll's number onto rolling's `-dev`. Checked first, before the configured gates
 /// run `cargo test` and the rest: cheap, and failing in milliseconds beats
 /// failing after a full build only to blame something else.
 ///
@@ -1108,8 +1133,8 @@ fn check_dev_marker_ownership(config: &Config, branch: &str) -> Result<()> {
     let Some(current) = version::parse_version(&text) else {
         return Ok(());
     };
-    match current.dev_roll {
-        Some(owner) if owner != number => bail!(
+    match current.marker {
+        Marker::Roll(owner) if owner != number => bail!(
             "Cargo.toml version ({current}) on '{branch}' carries roll {owner}'s dev marker, \
              not its own (roll {number}); the version history has been mixed with another \
              roll's and needs a manual fix before this can continue"
@@ -1360,6 +1385,10 @@ pub(crate) struct GraduateOutcome {
     /// branch. See [`regraduate_reverted`] for why the two are not
     /// interchangeable.
     pub restored: bool,
+    /// What happened to the `v<version>` tag on rolling's new tip (normally
+    /// `v<X.Y.Z>-dev`). `TagOutcome::Skipped` for a reverted-graduation
+    /// restore, which has no merge of its own to resolve a version for.
+    pub tag: TagOutcome,
 }
 
 /// Graduate `roll` into the rolling branch with a structured `--no-ff` merge.
@@ -1369,6 +1398,7 @@ pub(crate) fn graduate(
     roll: &str,
     dry_run: bool,
     force: &ForceOpts,
+    tag: bool,
 ) -> Result<GraduateOutcome> {
     let repo = &config.repo_root;
     if branches::check_promoted(repo, roll, &config.stable_branch) {
@@ -1415,12 +1445,18 @@ pub(crate) fn graduate(
 
     if dry_run {
         let report = run_gates(repo, &config.roll_to_rolling_gates, dry_run, force)?;
+        let tag_outcome = if tag && config.tag_on_graduate && config.dev_versions {
+            TagOutcome::WouldCreateAfterBump
+        } else {
+            TagOutcome::Skipped
+        };
         return Ok(GraduateOutcome {
             roll: roll.to_string(),
             rolling: rolling.clone(),
             dry_run: true,
             gate_notices: report.notices,
             restored: false,
+            tag: tag_outcome,
         });
     }
 
@@ -1452,17 +1488,28 @@ pub(crate) fn graduate(
     let theirs_before = git::show_file_at_ref(repo, roll, version::VERSION_FILE)?
         .and_then(|t| version::parse_version(&t));
 
-    // `ours_before` is `None` when rolling has never had a `Cargo.toml` at
-    // all — the roll graduating is the one introducing it. There's no
-    // existing value on rolling's side to weigh against, but the roll's
-    // marker still means nothing once it's not a roll's own branch anymore,
-    // so it's dropped the same way: `released()` rather than `resolve()`,
-    // which needs both sides.
-    let resolved = match (ours_before, theirs_before) {
-        (Some(ours), Some(theirs)) => Some(merge_driver::resolve(ours, theirs)),
-        (None, Some(theirs)) => Some(theirs.released()),
-        _ => None,
-    };
+    // Deliberately *not* `merge_driver::resolve` (which keeps "ours's" own
+    // marker, whatever it already is) — that rule is right for `[i]`/`[I]`/
+    // `rf update`, where a roll's own `-roll<N>` is guaranteed already set by
+    // `rf start`, but wrong here on the very first graduation ever, when
+    // rolling has never worn `-dev` yet and "keep ours's marker" would just
+    // carry `None` forward. Graduating always *forces* the result to rolling's
+    // steady-state marker — `-dev` when the feature is on, bare otherwise —
+    // regardless of what either side's marker happened to be; only the
+    // numbers are maxed from both sides. `ours_before` is `None` only when
+    // rolling has never had a `Cargo.toml` at all (this graduation introduces
+    // it), in which case there's nothing on rolling's side to max against.
+    let resolved = theirs_before.map(|theirs| {
+        let numeric = match ours_before {
+            Some(ours) => ours.release().max(theirs.release()),
+            None => theirs.release(),
+        };
+        if config.dev_versions {
+            numeric.as_rolling_dev()
+        } else {
+            numeric
+        }
+    });
 
     let subject = format!("Graduate {roll} into {rolling}");
     let merge_outcome = merge_gated(repo, roll, rolling, &subject, None, || {
@@ -1495,13 +1542,38 @@ pub(crate) fn graduate(
         )
     })?;
 
+    let tag_outcome = tag_graduation(config, resolved, tag)?;
+
     Ok(GraduateOutcome {
         roll: roll.to_string(),
         rolling: rolling.clone(),
         dry_run: false,
         gate_notices: report.notices,
         restored: false,
+        tag: tag_outcome,
     })
+}
+
+/// Create the dev-version tag for a completed graduation (normally
+/// `v<X.Y.Z>-dev`), mirroring [`tag_release`]'s shape but tagging rolling's
+/// new tip rather than stable's.
+fn tag_graduation(config: &Config, resolved: Option<Semver>, enabled: bool) -> Result<TagOutcome> {
+    if !enabled || !config.tag_on_graduate || !config.dev_versions {
+        return Ok(TagOutcome::Skipped);
+    }
+    let Some(version) = resolved else {
+        return Ok(TagOutcome::Skipped);
+    };
+    let repo = &config.repo_root;
+    let tag = version.tag();
+    if git::tag_exists(repo, &tag) {
+        return Ok(TagOutcome::Existed { tag });
+    }
+    let sha = git::rev_parse(repo, &config.rolling_branch)?;
+    let message = format!("Graduation {tag}");
+    git::create_annotated_tag(repo, &tag, &message, &sha)
+        .with_context(|| format!("failed to create tag {tag}"))?;
+    Ok(TagOutcome::Created { tag, sha })
 }
 
 /// Restore a roll's graduation after it was reverted on rolling, by reverting
@@ -1529,6 +1601,7 @@ fn regraduate_reverted(
             dry_run: true,
             gate_notices: report.notices,
             restored: true,
+            tag: TagOutcome::Skipped,
         });
     }
 
@@ -1539,6 +1612,11 @@ fn regraduate_reverted(
         dry_run: false,
         gate_notices: report.notices,
         restored: true,
+        // Reverting the revert doesn't resolve a version the way a merge
+        // does — rolling's content (and its version) returns to whatever it
+        // was before the revert, which was already tagged (or not) the first
+        // time this roll graduated.
+        tag: TagOutcome::Skipped,
     })
 }
 
@@ -1975,7 +2053,22 @@ fn run_promote_step(
     // merge source, and the target is the *resolved* stable ref — which in
     // dry-run may be `origin/<stable>`, and which for a per-roll promotion has
     // already been advanced by the steps ahead of this one.
-    let mut version = version_check(config, &step.source, stable_ref)?;
+    //
+    // A graduation commit on rolling carries its `-dev` marker as a matter of
+    // course now, so the gate is run against the *finalized* value it will
+    // carry once landed — `version_check` against the raw commit would report
+    // `DevVersion` on every single per-roll promotion step otherwise, since
+    // that raw value never actually reaches stable. `raw_head` is kept
+    // alongside so the staged tree below can tell whether anything needs
+    // rewriting at all.
+    let raw_head = git::show_file_at_ref(repo, &step.source, version::VERSION_FILE)?
+        .and_then(|t| version::parse_version(&t));
+    let finalized_head = raw_head.map(|v| v.release());
+    let mut version = if config.version_gate {
+        version::check_against(repo, finalized_head, stable_ref)?
+    } else {
+        VersionCheck::not_applicable()
+    };
     let mut version_bypass = Vec::new();
 
     // An unchanged version with a bump level in hand is not a failure but a
@@ -1988,6 +2081,22 @@ fn run_promote_step(
         }
         _ => None,
     };
+
+    // Whatever must actually land in the staged `Cargo.toml`: the bumped value
+    // if one was just computed, otherwise the finalized one if that differs
+    // from what the commit itself carries (i.e. it still has a marker to
+    // drop). `None` when there is truly nothing to change — no marker, no
+    // bump — which keeps a repo with `dev_versions` off (or an
+    // already-bare graduation) byte-identical to before this existed.
+    let staged_write = in_merge_bump.map(|(_, next)| next).or_else(|| {
+        if dry_run {
+            return None;
+        }
+        match (raw_head, finalized_head) {
+            (Some(raw), Some(finalized)) if raw != finalized => Some(finalized),
+            _ => None,
+        }
+    });
 
     if !version.is_satisfied() && in_merge_bump.is_none() {
         // `--dry-run` previews rather than enforces, exactly as it does for the
@@ -2009,13 +2118,13 @@ fn run_promote_step(
     // Gates run against the staged merge result, so `report` is produced inside
     // `merge_gated`. In dry-run nothing is staged and nothing is merged.
     let run_checks = || -> Result<(GateReport, HostReport)> {
-        // The bump lands in the staged tree *before* the gates, so they check
-        // the manifest the merge commit will carry — and so `cargo update
-        // --locked` sees a lockfile that matches it. Staged, not left in the
-        // worktree: `merge_gated` refuses to commit unstaged tracked changes,
-        // precisely so a gate cannot smuggle edits past it, and this is not a
-        // gate's edit but part of what is being merged.
-        if let Some((_, next)) = in_merge_bump {
+        // The bump (and/or marker strip) lands in the staged tree *before* the
+        // gates, so they check the manifest the merge commit will carry — and
+        // so `cargo update --locked` sees a lockfile that matches it. Staged,
+        // not left in the worktree: `merge_gated` refuses to commit unstaged
+        // tracked changes, precisely so a gate cannot smuggle edits past it,
+        // and this is not a gate's edit but part of what is being merged.
+        if let Some(next) = staged_write {
             version::write_version(repo, next)?;
             refresh_lockfile(repo);
             // Only what exists: a manifest with no lockfile (fixture crates,
@@ -3181,6 +3290,7 @@ mod tests {
             host_active: Default::default(),
             version_gate: true,
             tag_on_promote: true,
+            tag_on_graduate: true,
             push_tag: true,
             dev_versions: true,
             roll_to_rolling_gates: Vec::new(),
@@ -3238,7 +3348,7 @@ mod tests {
         assert_eq!(git::current_branch(&cfg.repo_root).unwrap(), "rolling");
 
         let force = ForceOpts::new(false, None).unwrap();
-        let outcome = graduate(&cfg, "roll/1-0101-x", false, &force)
+        let outcome = graduate(&cfg, "roll/1-0101-x", false, &force, true)
             .expect("the gate should see the roll's own content, merged in");
         assert!(!outcome.dry_run);
 

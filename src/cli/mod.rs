@@ -151,6 +151,13 @@ pub enum Cmd {
         /// Justification recorded as `Force-Reason:` in the merge commit.
         #[arg(long)]
         reason: Option<String>,
+        /// Skip creating the `v<X.Y.Z>-dev` tag on rolling's new tip.
+        #[arg(long)]
+        no_tag: bool,
+        /// Answer yes to prompts (non-interactive): pushes the dev tag without
+        /// asking.
+        #[arg(long)]
+        yes: bool,
     },
 
     /// Promote rolling into the stable branch (--no-ff merge). On a roll
@@ -177,8 +184,15 @@ pub enum Cmd {
         /// Skip creating the vX.Y.Z release tag on the promotion merge commit.
         #[arg(long)]
         no_tag: bool,
-        /// Answer yes to prompts (non-interactive): applies the bump and pushes
-        /// the release tag without asking.
+        /// Answer yes to the "is this final?" prompt without also accepting
+        /// every other one (the bump level, the tag push): a dedicated escape
+        /// hatch for that question alone, the same way `--bump <level>`
+        /// already sidesteps the bump prompt specifically. `--yes` still
+        /// answers this too, alongside everything else.
+        #[arg(long = "final")]
+        finalize: bool,
+        /// Answer yes to prompts (non-interactive): finalizes the release,
+        /// applies the bump, and pushes the release tag without asking.
         #[arg(long)]
         yes: bool,
     },

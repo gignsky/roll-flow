@@ -26,7 +26,12 @@ Validation includes:
 - mergeability (common history, something new to merge; divergence is fine and
   only produces an informational note)
 - the version gate on the `rolling -> main` route (see
-  [Versioning and release tags](../../README.md#versioning-and-release-tags)).
-  When a bump is needed, `verify` offers one; `--bump <level>` applies it without
-  asking and `--yes` accepts the default (patch) non-interactively
+  [Versioning and release tags](../../README.md#versioning-and-release-tags)),
+  checked against the *finalized* (marker-stripped) version rolling would carry
+  once promoted. When a bump is needed, `verify` offers one; `--bump <level>`
+  applies it without asking and `--yes` accepts the default (patch)
+  non-interactively. Resolving a bump this way also finalizes rolling's
+  `-dev` marker first, the same way a confirmed `rf promote` does — `verify`
+  never asks "is this final?" itself, since a bump here is already an explicit,
+  opt-in action
 - configured gate command execution
