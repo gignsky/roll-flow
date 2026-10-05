@@ -1082,6 +1082,7 @@ fn push_version_check(lines: &mut Vec<String>, check: &VersionCheck, source: &st
         VersionStatus::Unchanged => "UNCHANGED",
         VersionStatus::Lower => "LOWER",
         VersionStatus::Unreadable => "UNREADABLE",
+        VersionStatus::DevVersion => "DEV",
         // Repos with no `Cargo.toml`, and repos with the gate switched off, have
         // nothing to say here — the same silence `rf verify` keeps.
         VersionStatus::NotApplicable => return,
@@ -2614,12 +2615,21 @@ impl StatusApp {
             Constraint::Length(13),
         ];
         // Present only in repos that have a `Cargo.toml`, the same rule the
-        // header version follows — so a dotfiles repo pays nothing for it. Wide
-        // enough for `12.34.5`; `branch` is the Fill column that pays for it,
-        // which is why the cell shows the numbers alone.
+        // header version follows — so a dotfiles repo pays nothing for it.
+        // Sized to the longest cell on screen (a dev marker like `-roll10`
+        // makes this wider than a bare `12.34.5`), the same way `main.rs`'s
+        // `version_column` sizes the plain tables; `branch` is the Fill
+        // column that pays for it.
         let show_versions = !self.versions.is_empty();
         if show_versions {
-            col_constraints.push(Constraint::Length(7));
+            let width = self
+                .versions
+                .values()
+                .map(|v| v.to_string().chars().count())
+                .max()
+                .unwrap_or(0)
+                .max("version".len());
+            col_constraints.push(Constraint::Length(width as u16));
         }
         if self.show_deps {
             col_constraints.push(Constraint::Length(8));
@@ -2808,15 +2818,27 @@ fn run_delete(
 ///   only place a bump commit is written from.
 /// - nothing is forced and nothing is dry-run. `[v]` has no flags to carry.
 ///
+/// The dev-marker *application* is not on that list and is not optional: it
+/// uses `ops::apply_dev_version_for_branch`, the same function `cmd_verify`
+/// calls, specifically so the two cannot drift apart on it again — this
+/// function used to claim the "line for line" mirror while actually omitting
+/// the marker step, since it was inlined separately in each caller instead of
+/// living in one shared place.
+///
 /// A failed host or an unsatisfied version gate is an `Err`, not a line: the
 /// panel marks a failed job, and a verdict that reads as "done" when it is
 /// really "blocked" is the one outcome worth being loud about. Everything the
 /// gates printed is already in the panel either way, streamed as they ran.
 fn run_verify(config: &Config) -> Result<Vec<String>> {
     ops::ensure_clean_state(config)?;
-    let outcome = ops::verify(config, false)?;
 
     let mut lines = Vec::new();
+    let current = git::current_branch(&config.repo_root)?;
+    if let Some(dev) = ops::apply_dev_version_for_branch(config, &current)? {
+        lines.push(format!("version marked {dev}"));
+    }
+
+    let outcome = ops::verify(config, false)?;
     if outcome.diverged_note {
         lines.push(format!(
             "note: '{}' has commits not in '{}'; graduation/promotion will create a --no-ff merge",
@@ -2862,7 +2884,7 @@ fn run_op(config: &Config, action: Action, target: Option<&str>) -> Result<Vec<S
         Action::Graduate => {
             let roll = target.ok_or_else(|| anyhow!("no roll selected"))?;
             ops::ensure_clean_state(config)?;
-            let o = ops::graduate(config, roll, false, &force)?;
+            let o = ops::graduate(config, roll, false, &force, true)?;
             push_gate_notices(&mut lines, &o.gate_notices);
             if o.restored {
                 lines.push(format!(
@@ -2871,6 +2893,9 @@ fn run_op(config: &Config, action: Action, target: Option<&str>) -> Result<Vec<S
                 ));
             } else {
                 lines.push(format!("Graduated '{}' into '{}'", o.roll, o.rolling));
+            }
+            if let Some(line) = o.tag.describe() {
+                lines.push(line);
             }
         }
         Action::Integrate => {
@@ -3035,15 +3060,18 @@ fn load_versions(
         .collect()
 }
 
-/// The version cell for `branch`: the three numbers, or a dash.
+/// The version cell for `branch`: the full version through `Semver`'s
+/// `Display` — numbers plus a `-rollN` dev marker when the branch carries one
+/// — or a dash.
 ///
-/// Deliberately formatted from the fields rather than through `Semver`'s
-/// `Display`. The table already carries a `#` column, so a `-rollN` dev suffix
-/// would be repeating what the row next door says — and it would cost four more
-/// columns out of `branch`, which is the one column with nothing to spare.
+/// The `#` column also names the roll, but not whether its dev marker has
+/// actually been applied yet: a roll created before the marker existed, or
+/// with `--no-dev-version`, reads as a plain release version until its first
+/// `rf verify` (see `ops::apply_dev_version`). The version cell is the only
+/// place that distinction is visible.
 pub(crate) fn version_cell(version: Option<Semver>) -> String {
     match version {
-        Some(v) => format!("{}.{}.{}", v.major, v.minor, v.patch),
+        Some(v) => v.to_string(),
         None => "—".to_string(),
     }
 }
@@ -3832,7 +3860,9 @@ mod tests {
             host_active: Default::default(),
             version_gate: true,
             tag_on_promote: true,
+            tag_on_graduate: true,
             push_tag: true,
+            dev_versions: true,
             roll_to_rolling_gates: Vec::new(),
             rolling_to_main_gates: Vec::new(),
             host_gates: Vec::new(),
@@ -3840,6 +3870,66 @@ mod tests {
             pull_mode: Default::default(),
             lazygit_command: "lazygit".to_string(),
         }
+    }
+
+    /// A throwaway git repo on disk, with a Cargo.toml and a `rolling` branch
+    /// split off from `main`, so `run_verify`'s real git calls (merge-state
+    /// classification, the dev-marker commit) have something to act on. The
+    /// `tests/` integration suite can't reach `run_verify` directly — it only
+    /// drives the compiled binary — so this is the one way to exercise it.
+    fn sandbox_repo() -> tempfile::TempDir {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let repo = dir.path();
+        let git = |args: &[&str]| {
+            let status = std::process::Command::new("git")
+                .args(args)
+                .current_dir(repo)
+                .status()
+                .expect("run git");
+            assert!(status.success(), "git {args:?} failed");
+        };
+        git(&["init", "-q", "-b", "main"]);
+        git(&["config", "user.email", "t@t.com"]);
+        git(&["config", "user.name", "tester"]);
+        std::fs::write(
+            repo.join("Cargo.toml"),
+            "[package]\nname = \"fixture\"\nversion = \"0.0.1\"\nedition = \"2021\"\n",
+        )
+        .expect("write Cargo.toml");
+        git(&["add", "Cargo.toml"]);
+        git(&["commit", "-q", "-m", "add manifest"]);
+        git(&["branch", "rolling"]);
+        git(&["checkout", "-q", "-b", "roll/1-0101-late"]);
+        std::fs::write(repo.join("work.txt"), "w\n").expect("write work.txt");
+        git(&["add", "work.txt"]);
+        git(&["commit", "-q", "-m", "roll work"]);
+        dir
+    }
+
+    #[test]
+    fn run_verify_applies_the_dev_marker_like_cmd_verify_does() {
+        // Regression test: `run_verify`'s doc comment claims a "line for line"
+        // mirror of `cmd_verify`, but the dev-marker step was missing — a roll
+        // started without one (predating the feature, or `--no-dev-version`)
+        // never got marked from the TUI's `[v]`, only from `rf verify`.
+        let dir = sandbox_repo();
+        let mut cfg = config("main", "rolling");
+        cfg.repo_root = dir.path().to_path_buf();
+
+        let lines = run_verify(&cfg).expect("verify should pass with no gates configured");
+        assert!(
+            lines
+                .iter()
+                .any(|l| l.contains("version marked 0.0.1-roll1")),
+            "{lines:?}"
+        );
+
+        let cargo_toml =
+            std::fs::read_to_string(dir.path().join("Cargo.toml")).expect("read Cargo.toml");
+        assert!(
+            cargo_toml.contains("0.0.1-roll1"),
+            "marker not written: {cargo_toml}"
+        );
     }
 
     #[test]
@@ -5029,7 +5119,9 @@ mod tests {
             host_active: Default::default(),
             version_gate: true,
             tag_on_promote: true,
+            tag_on_graduate: true,
             push_tag: true,
+            dev_versions: true,
             roll_to_rolling_gates: Vec::new(),
             rolling_to_main_gates: Vec::new(),
             host_gates: Vec::new(),
@@ -5303,11 +5395,18 @@ mod tests {
     }
 
     #[test]
-    fn a_version_cell_drops_any_dev_suffix() {
-        // Formatted from the fields, never through `Display`. The `#` column
-        // already says which roll this is, so a `-rollN` suffix would repeat it
-        // and cost four columns out of `branch`.
+    fn a_version_cell_shows_the_dev_suffix() {
+        // Through `Display`: the `#` column says which roll a row is, not
+        // whether that roll's dev marker has actually been applied yet, so the
+        // suffix has to show here.
         assert_eq!(version_cell(Some(v(0, 2, 4))), "0.2.4");
+        assert_eq!(
+            version_cell(Some(Semver {
+                marker: crate::core::version::Marker::Roll(9),
+                ..v(0, 2, 4)
+            })),
+            "0.2.4-roll9"
+        );
         assert_eq!(version_cell(None), "—");
     }
 
@@ -5387,6 +5486,7 @@ mod tests {
             major,
             minor,
             patch,
+            marker: crate::core::version::Marker::None,
         }
     }
 
