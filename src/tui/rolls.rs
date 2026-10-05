@@ -237,6 +237,14 @@ enum Mode {
     Bump {
         current: Semver,
     },
+    /// A graduation or promotion conflicted and was unwound. Offers the ways
+    /// forward; the diagnosis is in the panel underneath.
+    Conflict {
+        source: String,
+        target: String,
+        culprits: Vec<String>,
+        can_integrate: bool,
+    },
     /// `PP`: confirm pushing every branch that needs it.
     ///
     /// Its own variant rather than a `Confirm` action, for the same reason
@@ -1557,6 +1565,8 @@ impl StatusApp {
                     }
                     if matches!(self.mode, Mode::Confirm { .. }) {
                         self.handle_confirm(key.code);
+                    } else if matches!(self.mode, Mode::Conflict { .. }) {
+                        self.handle_conflict(key.code);
                     } else if matches!(self.mode, Mode::PushAll { .. }) {
                         self.handle_push_all(key.code);
                     } else if matches!(self.mode, Mode::ForcePush { .. }) {
@@ -1611,6 +1621,19 @@ impl StatusApp {
             }
             Some(Followup::OfferForcePush { branch, remote }) => {
                 self.mode = Mode::ForcePush { branch, remote };
+            }
+            Some(Followup::OfferConflictResolution {
+                source,
+                target,
+                culprits,
+                can_integrate,
+            }) => {
+                self.mode = Mode::Conflict {
+                    source,
+                    target,
+                    culprits,
+                    can_integrate,
+                };
             }
             None => {}
         }
@@ -2102,8 +2125,19 @@ impl StatusApp {
     fn execute(&mut self, action: Action, target: Option<String>) {
         let config = self.config.clone();
         let title = action.job_title(target.as_deref());
+        let current = self.current_branch.clone();
         self.start_job(title, move || {
-            Ok(JobDone::lines(run_op(&config, action, target.as_deref())?))
+            match run_op(&config, action, target.as_deref()) {
+                Ok(lines) => Ok(JobDone::lines(lines)),
+                // A conflict is an expected answer to act on, not an error to
+                // stop at — the same treatment a rejected push gets. The repo is
+                // already clean again; the panel carries the diagnosis and the
+                // follow-up modal carries the choices.
+                Err(err) => match err.downcast::<ops::MergeConflict>() {
+                    Ok(conflict) => Ok(conflict_job_done(&conflict, &current)),
+                    Err(err) => Err(err),
+                },
+            }
         });
     }
 
@@ -2481,6 +2515,91 @@ impl StatusApp {
         }
     }
 
+    /// Answer the conflict modal.
+    fn handle_conflict(&mut self, code: KeyCode) {
+        let Mode::Conflict { can_integrate, .. } = &self.mode else {
+            return;
+        };
+        match conflict_key(code, *can_integrate) {
+            ConflictOutcome::Ignore => {}
+            ConflictOutcome::Close => self.mode = Mode::Browsing,
+            ConflictOutcome::Integrate => {
+                let Mode::Conflict {
+                    source, culprits, ..
+                } = std::mem::replace(&mut self.mode, Mode::Browsing)
+                else {
+                    return;
+                };
+                self.integrate_culprits_job(source, culprits);
+            }
+            ConflictOutcome::Stage => {
+                let Mode::Conflict { source, target, .. } =
+                    std::mem::replace(&mut self.mode, Mode::Browsing)
+                else {
+                    return;
+                };
+                self.stage_conflict_job(source, target);
+            }
+        }
+    }
+
+    /// Integrate each culprit into the checked-out roll in turn, stopping at
+    /// the first one that conflicts — that conflict is now on the roll branch,
+    /// which is the point. When every culprit merges cleanly, the graduation
+    /// is retried on the spot, since nothing stands in its way any more.
+    fn integrate_culprits_job(&mut self, source: String, culprits: Vec<String>) {
+        let config = self.config.clone();
+        self.start_job(format!("rf integrate → {source}"), move || {
+            let mut lines = Vec::new();
+            for culprit in &culprits {
+                match ops::integrate(&config, culprit) {
+                    Ok(o) => lines.push(format!("Integrated '{}' into '{}'", o.branch, o.current)),
+                    Err(err) => {
+                        if git::ref_exists(&config.repo_root, "MERGE_HEAD") {
+                            lines.push(format!(
+                                "'{source}' is now mid-merge with '{culprit}': resolve the \
+                                 conflicts and commit (gg for lazygit, or git merge --abort), \
+                                 then [G]raduate again"
+                            ));
+                            return Ok(JobDone::lines(lines));
+                        }
+                        return Err(err);
+                    }
+                }
+            }
+            lines.push("every culprit merged cleanly; retrying the graduation".to_string());
+            let force = ops::ForceOpts::new(false, None)?;
+            let o = ops::graduate(&config, &source, false, &force, true)?;
+            push_gate_notices(&mut lines, &o.gate_notices);
+            lines.push(format!("Graduated '{}' into '{}'", o.roll, o.rolling));
+            if let Some(line) = o.tag.describe() {
+                lines.push(line);
+            }
+            Ok(JobDone::lines(lines))
+        });
+    }
+
+    /// Re-run the merge on the target and leave the conflict there. The one
+    /// job that leaves `MERGE_HEAD` behind on purpose — and only because the
+    /// user pressed the key that asks for exactly that.
+    fn stage_conflict_job(&mut self, source: String, target: String) {
+        let config = self.config.clone();
+        self.start_job(format!("git merge {source} (left for you)"), move || {
+            let lines = if ops::stage_conflict(&config, &source, &target)? {
+                vec![format!(
+                    "'{target}' is checked out mid-merge with '{source}': resolve the conflicts \
+                     and commit (gg for lazygit), or git merge --abort to back out"
+                )]
+            } else {
+                vec![format!(
+                    "the merge of '{source}' into '{target}' went through cleanly this time and \
+                     is committed"
+                )]
+            };
+            Ok(JobDone::lines(lines))
+        });
+    }
+
     /// Where `branch` currently exists, for a branch named by an open modal
     /// rather than by the selection.
     fn location_of(&self, branch: &str) -> BranchLocation {
@@ -2565,6 +2684,12 @@ impl StatusApp {
             Mode::ForcePush { branch, remote } => {
                 render_force_push_modal(f, area, branch, remote, self.tracking.get(branch))
             }
+            Mode::Conflict {
+                source,
+                target,
+                culprits,
+                can_integrate,
+            } => render_conflict_modal(f, area, source, target, culprits, *can_integrate),
             Mode::PushAll { plan } => render_push_all_modal(f, area, plan),
             Mode::Help { query, cursor } => render_help(f, area, query, *cursor),
             Mode::Browsing => {}
@@ -3143,6 +3268,128 @@ fn render_bump_modal(f: &mut Frame, area: Rect, current: Semver, branch: &str) {
 /// key in the view that can destroy commits on the remote. The counts come from
 /// the tracking batch, so the prompt says what would actually be overwritten
 /// rather than asking in the abstract.
+/// What a keypress in the conflict modal does.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ConflictOutcome {
+    Integrate,
+    Stage,
+    Close,
+    Ignore,
+}
+
+/// Decide the conflict modal's key. `[i]` is only live when the source is the
+/// checked-out roll — `ops::integrate` merges into HEAD, so offering it for
+/// any other row would integrate into the wrong branch. Enter is unbound on
+/// purpose: every choice here leaves something to resolve by hand.
+pub(crate) fn conflict_key(code: KeyCode, can_integrate: bool) -> ConflictOutcome {
+    match code {
+        KeyCode::Char('i') | KeyCode::Char('I') if can_integrate => ConflictOutcome::Integrate,
+        KeyCode::Char('m') | KeyCode::Char('M') => ConflictOutcome::Stage,
+        KeyCode::Char('n') | KeyCode::Char('N') | KeyCode::Esc => ConflictOutcome::Close,
+        _ => ConflictOutcome::Ignore,
+    }
+}
+
+/// Turn a diagnosed conflict into a finished job: the report as panel lines,
+/// plus the follow-up that opens the modal.
+fn conflict_job_done(conflict: &ops::MergeConflict, current_branch: &str) -> JobDone {
+    let report = &conflict.report;
+    let culprits = report.culprit_rolls();
+    let mut lines = vec![conflict.to_string(), String::new()];
+    lines.extend(report.render());
+    lines.push(String::new());
+    if culprits.is_empty() {
+        lines.push(format!(
+            "the conflicting change was made on '{}' directly, not by a roll",
+            report.target
+        ));
+    } else {
+        lines.push(format!(
+            "the conflicting change is already on '{}' — it came in with {}",
+            report.target,
+            culprits.join(", ")
+        ));
+    }
+    lines.push(format!(
+        "NOT merged: '{}' is unchanged and '{}' is clean",
+        report.target, conflict.original
+    ));
+    JobDone::with_next(
+        lines,
+        Followup::OfferConflictResolution {
+            source: report.source.clone(),
+            target: report.target.clone(),
+            can_integrate: report.source == current_branch && !culprits.is_empty(),
+            culprits,
+        },
+    )
+}
+
+/// Render the conflict modal: which rolls collided, and the keys that decide
+/// what happens next. Red border, like the delete modal — every choice here
+/// leaves a merge for the user to finish.
+fn render_conflict_modal(
+    f: &mut Frame,
+    area: Rect,
+    source: &str,
+    target: &str,
+    culprits: &[String],
+    can_integrate: bool,
+) {
+    let red = Style::default().fg(Color::Red);
+    let dim = Style::default().fg(Color::DarkGray);
+    let mut lines = vec![
+        Line::from(Span::styled(
+            format!("'{source}' conflicts with '{target}'"),
+            Style::default().add_modifier(Modifier::BOLD),
+        )),
+        Line::from(""),
+    ];
+    if culprits.is_empty() {
+        lines.push(Line::from(
+            "The other side was changed directly, not by a roll.",
+        ));
+    } else {
+        lines.push(Line::from(format!(
+            "Already on {target} via: {}",
+            culprits.join(", ")
+        )));
+    }
+    lines.push(Line::from(""));
+    if can_integrate {
+        lines.push(Line::from(Span::styled(
+            "[i] integrate them into this roll and resolve here   (recommended)",
+            Style::default().fg(Color::Yellow),
+        )));
+    } else if !culprits.is_empty() {
+        lines.push(Line::from(Span::styled(
+            format!("[space] switch to {source} first to integrate them here"),
+            dim,
+        )));
+    }
+    lines.push(Line::from(Span::styled(
+        format!("[m] redo the merge on {target} and leave it for lazygit"),
+        Style::default().fg(Color::Yellow),
+    )));
+    lines.push(Line::from(Span::styled(
+        "[n] nothing — the panel has the details",
+        Style::default().fg(Color::Yellow),
+    )));
+
+    let width = lines
+        .iter()
+        .map(|l| l.width())
+        .max()
+        .unwrap_or(40)
+        .clamp(32, 78) as u16;
+    let modal = centered_rect(area, width + 4, lines.len() as u16 + 2);
+    f.render_widget(Clear, modal);
+    let body = Paragraph::new(lines)
+        .alignment(Alignment::Left)
+        .block(Block::bordered().border_style(red).title(" conflict "));
+    f.render_widget(body, modal);
+}
+
 fn render_force_push_modal(
     f: &mut Frame,
     area: Rect,
@@ -5591,6 +5838,108 @@ mod tests {
         let without = draw(|f, area| app.render_header(f, area));
         assert!(without.contains(&expected), "{without}");
         assert!(without.contains("Branch: main"), "{without}");
+    }
+
+    #[test]
+    fn the_conflict_modal_only_offers_integrate_for_the_checked_out_roll() {
+        // `ops::integrate` merges into HEAD, so [i] for any other row would
+        // integrate into the wrong branch. The key is simply dead there.
+        assert_eq!(
+            conflict_key(KeyCode::Char('i'), true),
+            ConflictOutcome::Integrate
+        );
+        assert_eq!(
+            conflict_key(KeyCode::Char('i'), false),
+            ConflictOutcome::Ignore
+        );
+        assert_eq!(
+            conflict_key(KeyCode::Char('m'), false),
+            ConflictOutcome::Stage
+        );
+        for key in [KeyCode::Char('n'), KeyCode::Esc] {
+            assert_eq!(conflict_key(key, true), ConflictOutcome::Close);
+        }
+        // Enter is unbound: every choice leaves a merge to finish by hand.
+        assert_eq!(conflict_key(KeyCode::Enter, true), ConflictOutcome::Ignore);
+    }
+
+    #[test]
+    fn a_diagnosed_conflict_becomes_panel_lines_and_a_followup() {
+        let conflict = ops::MergeConflict {
+            report: ops::ConflictReport {
+                source: "roll/3-x".to_string(),
+                target: "rolling".to_string(),
+                conflicts: vec![ops::Conflict {
+                    path: "src/tui/rolls.rs".to_string(),
+                    culprits: vec![ops::Culprit {
+                        commit: "abcdef0123".to_string(),
+                        subject: "Graduate roll/8-y into rolling".to_string(),
+                        roll: Some("roll/8-y".to_string()),
+                    }],
+                }],
+            },
+            original: "roll/3-x".to_string(),
+        };
+
+        let done = conflict_job_done(&conflict, "roll/3-x");
+        let text = done.lines.join("\n");
+        assert!(text.contains("src/tui/rolls.rs"), "{text}");
+        assert!(text.contains("roll/8-y  (abcdef0"), "{text}");
+        assert!(text.contains("NOT merged"), "{text}");
+        match done.next {
+            Some(Followup::OfferConflictResolution {
+                culprits,
+                can_integrate,
+                ..
+            }) => {
+                assert_eq!(culprits, vec!["roll/8-y".to_string()]);
+                assert!(can_integrate, "source is checked out, so [i] must be live");
+            }
+            other => panic!("wrong followup: {other:?}"),
+        }
+
+        // Same conflict seen from a different checkout: no integrate offer.
+        let done = conflict_job_done(&conflict, "rolling");
+        assert!(matches!(
+            done.next,
+            Some(Followup::OfferConflictResolution {
+                can_integrate: false,
+                ..
+            })
+        ));
+    }
+
+    #[test]
+    fn the_conflict_modal_names_the_culprits_and_the_keys() {
+        let out = draw(|f, area| {
+            render_conflict_modal(
+                f,
+                area,
+                "roll/3-x",
+                "rolling",
+                &["roll/8-y".to_string()],
+                true,
+            )
+        });
+        assert!(out.contains("via: roll/8-y"), "{out}");
+        assert!(out.contains("[i] integrate"), "{out}");
+        assert!(out.contains("[m] redo the merge"), "{out}");
+
+        let elsewhere = draw(|f, area| {
+            render_conflict_modal(
+                f,
+                area,
+                "roll/3-x",
+                "rolling",
+                &["roll/8-y".to_string()],
+                false,
+            )
+        });
+        assert!(!elsewhere.contains("[i] integrate"), "{elsewhere}");
+        assert!(
+            elsewhere.contains("[space] switch to roll/3-x"),
+            "{elsewhere}"
+        );
     }
 
     #[test]
