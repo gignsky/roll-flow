@@ -1269,7 +1269,11 @@ pub(crate) fn update_target_for(
                 ))
             }
         }
-        RollState::Graduated | RollState::Diverged | RollState::Promoted => Err(format!(
+        RollState::Graduated
+        | RollState::Diverged
+        | RollState::Reverted
+        | RollState::Promoted
+        | RollState::Demoted => Err(format!(
             "{} is {} — only active rolls can be updated",
             sel.branch,
             sel.state.label()
