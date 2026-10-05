@@ -12,7 +12,9 @@ username = "gig"
 hosts = []
 version_gate = true
 tag_on_promote = true
+tag_on_graduate = true
 push_tag = true
+dev_versions = true
 roll_to_rolling_gates = []
 rolling_to_main_gates = []
 clean_protect = []
@@ -22,10 +24,10 @@ lazygit_command = "lazygit"
 
 Gate entries are shell commands run in repo root. Any failure blocks verify/promote.
 
-`version_gate`, `tag_on_promote`, and `push_tag` control the release behavior
-described in
-[Versioning and release tags](../README.md#versioning-and-release-tags). All three
-default to `true` and are inert in repos without a `Cargo.toml`.
+`version_gate`, `tag_on_promote`, `tag_on_graduate`, `push_tag`, and
+`dev_versions` control the release behavior described in
+[Versioning and release tags](../README.md#versioning-and-release-tags). All
+five default to `true` and are inert in repos without a `Cargo.toml`.
 
 `clean_protect` names branches [`rf clean`](commands/clean.md) must never delete,
 on top of the stable and rolling branches and each remote's default branch, which
