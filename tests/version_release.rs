@@ -31,8 +31,12 @@ fn promote_refuses_when_version_is_unchanged() {
     let sb = Sandbox::cargo();
     sb.init();
     graduate_one(&sb, "feature", "0611");
+    let tags_before = sb.tags();
 
-    let out = sb.rf(&["promote"]);
+    // `--final` answers only the finalize prompt, so the gate this test is
+    // actually about (the bump-vs-unchanged check, run against the now
+    // finalized bare version) is still reached and still refuses.
+    let out = sb.rf(&["promote", "--final"]);
     assert!(
         !out.success,
         "promote should refuse an unbumped version: {}",
@@ -43,12 +47,13 @@ fn promote_refuses_when_version_is_unchanged() {
         "error should name the unchanged version: {}",
         out.combined()
     );
-    // Nothing landed and nothing was tagged.
+    // Nothing landed and nothing new was tagged (graduate's own `-dev` tag
+    // from `graduate_one` above is unrelated to this refusal).
     assert!(
         !sb.has_commit_subject("main", "Promote"),
         "main must not carry a promotion"
     );
-    assert!(sb.tags().is_empty(), "no tag on a refused promote");
+    assert_eq!(sb.tags(), tags_before, "no new tag on a refused promote");
 }
 
 #[test]
@@ -62,6 +67,7 @@ fn promote_refuses_a_lower_version_even_with_bump_requested() {
     // Drop rolling's version below main's.
     sb.commit_cargo_version("0.0.9");
 
+    let tags_before = sb.tags();
     let out = sb.rf(&["promote", "--bump", "patch", "--yes"]);
     assert!(
         !out.success,
@@ -73,7 +79,7 @@ fn promote_refuses_a_lower_version_even_with_bump_requested() {
         "error should say the version is lower: {}",
         out.combined()
     );
-    assert!(sb.tags().is_empty(), "no tag on a refused promote");
+    assert_eq!(sb.tags(), tags_before, "no new tag on a refused promote");
 }
 
 #[test]
@@ -101,16 +107,35 @@ fn version_gate_can_be_disabled_in_config() {
     sb.init();
     sb.set_config_flag("version_gate", false);
     graduate_one(&sb, "feature", "0611");
+    let tags_before = sb.tags();
 
-    let out = sb.rf(&["promote"]);
+    let out = sb.rf(&["promote", "--yes"]);
     assert!(
         out.success,
         "promote should pass with the gate off: {}",
         out.combined()
     );
     assert!(sb.has_commit_subject("main", "Promote"));
-    // With no version comparison there is no version to tag.
-    assert!(sb.tags().is_empty(), "gate off means no release tag");
+    // With no version comparison there is no version to tag (the finalize
+    // step still ran, but it created a commit, not a tag — see
+    // `rolling_is_finalized_even_with_the_version_gate_off`).
+    assert_eq!(sb.tags(), tags_before, "gate off means no release tag");
+}
+
+#[test]
+fn rolling_is_finalized_even_with_the_version_gate_off() {
+    // `version_gate` only governs the bump requirement; the marker must still
+    // never reach stable, so finalizing is unconditional on `dev_versions`.
+    let sb = Sandbox::cargo();
+    sb.init();
+    sb.set_config_flag("version_gate", false);
+    graduate_one(&sb, "feature", "0611");
+    assert_eq!(sb.cargo_version_at("rolling"), "0.0.1-dev");
+
+    let out = sb.rf(&["promote", "--yes"]);
+    assert!(out.success, "promote failed: {}", out.combined());
+    assert_eq!(sb.cargo_version_at("rolling"), "0.0.1");
+    assert_eq!(sb.cargo_version_at("main"), "0.0.1");
 }
 
 #[test]
@@ -119,7 +144,16 @@ fn force_bypasses_the_version_gate_and_records_it() {
     sb.init();
     graduate_one(&sb, "feature", "0611");
 
-    let out = sb.rf(&["promote", "--force", "--reason", "hotfix already shipped"]);
+    // `--final` answers only the finalize prompt; `--yes` would also take the
+    // automatic patch-bump default, defeating the point of this test (forcing
+    // past a bump that was never resolved at all).
+    let out = sb.rf(&[
+        "promote",
+        "--force",
+        "--reason",
+        "hotfix already shipped",
+        "--final",
+    ]);
     assert!(out.success, "forced promote failed: {}", out.combined());
 
     let body = sb.git(&["log", "-1", "--format=%B", "main"]);
@@ -197,7 +231,7 @@ fn an_already_bumped_version_promotes_without_a_bump_commit() {
     // Bump by hand on rolling, the way a roll would normally carry one.
     sb.commit_cargo_version("0.2.0");
 
-    let out = sb.rf(&["promote"]);
+    let out = sb.rf(&["promote", "--yes"]);
     assert!(out.success, "promote failed: {}", out.combined());
     assert!(
         !sb.has_commit_subject("main", "chore(release)"),
@@ -211,11 +245,13 @@ fn an_already_bumped_version_promotes_without_a_bump_commit() {
 fn bump_is_refused_non_interactively_without_a_level() {
     // No tty, no --bump, no --yes: there is no safe default to pick, so the
     // command must fail with the fix spelled out rather than guessing.
+    // `--final` answers only the finalize prompt, so the gate this test is
+    // actually about (no bump level resolvable) is still reached.
     let sb = Sandbox::cargo();
     sb.init();
     graduate_one(&sb, "feature", "0611");
 
-    let out = sb.rf(&["promote"]);
+    let out = sb.rf(&["promote", "--final"]);
     assert!(!out.success);
     assert!(
         out.combined().contains("--bump"),
@@ -236,7 +272,9 @@ fn no_tag_skips_tagging_but_still_promotes() {
     assert!(out.success, "promote failed: {}", out.combined());
     assert!(sb.has_commit_subject("main", "Promote"));
     assert_eq!(sb.cargo_version_at("main"), "0.0.2");
-    assert!(sb.tags().is_empty(), "--no-tag must not create a tag");
+    // `--no-tag` governs this promotion's own release tag; `graduate_one`'s
+    // `-dev` tag on rolling is unrelated and still there.
+    assert!(!sb.tag_exists("v0.0.2"), "--no-tag must not create a tag");
 }
 
 #[test]
@@ -248,7 +286,10 @@ fn tag_on_promote_can_be_disabled_in_config() {
 
     let out = sb.rf(&["promote", "--bump", "patch", "--yes"]);
     assert!(out.success, "promote failed: {}", out.combined());
-    assert!(sb.tags().is_empty(), "tag_on_promote = false must not tag");
+    assert!(
+        !sb.tag_exists("v0.0.2"),
+        "tag_on_promote = false must not tag"
+    );
     // The version gate is still enforced.
     assert_eq!(sb.cargo_version_at("main"), "0.0.2");
 }
@@ -265,7 +306,7 @@ fn an_existing_tag_is_left_alone_rather_than_failing() {
     let preexisting = sb.rev("main");
     sb.git(&["tag", "-a", "v0.3.0", "-m", "made earlier", &preexisting]);
 
-    let out = sb.rf(&["promote"]);
+    let out = sb.rf(&["promote", "--final"]);
     assert!(
         out.success,
         "an existing tag must not fail the promote: {}",
@@ -290,7 +331,10 @@ fn a_local_promote_does_not_push_the_tag_unattended() {
     sb.git(&["push", "origin", "main"]);
     graduate_one(&sb, "feature", "0611");
 
-    let out = sb.rf(&["promote", "--bump", "patch"]);
+    // `--final` answers only the finalize prompt, leaving the tag-push offer
+    // below ungated (no tty, no `--yes`) so it still exercises the unattended
+    // skip this test is about.
+    let out = sb.rf(&["promote", "--bump", "patch", "--final"]);
     assert!(out.success, "promote failed: {}", out.combined());
     assert!(sb.tag_exists("v0.0.2"), "the tag is still created locally");
 
@@ -332,16 +376,17 @@ fn dry_run_neither_bumps_nor_tags_nor_merges() {
     sb.init();
     graduate_one(&sb, "feature", "0611");
     let before = sb.rev("main");
+    let tags_before = sb.tags();
 
     let out = sb.rf(&["promote", "--dry-run", "--bump", "patch", "--yes"]);
     assert!(out.success, "dry-run failed: {}", out.combined());
 
     assert_eq!(sb.rev("main"), before, "dry-run must not merge");
-    assert!(sb.tags().is_empty(), "dry-run must not tag");
+    assert_eq!(sb.tags(), tags_before, "dry-run must not tag");
     assert_eq!(
         sb.cargo_version_at("rolling"),
-        "0.0.1",
-        "dry-run must not bump"
+        "0.0.1-dev",
+        "dry-run must not bump or finalize"
     );
     assert!(
         out.combined().contains("Dry-run"),
@@ -397,10 +442,17 @@ fn verify_bumps_and_then_passes() {
     let sb = Sandbox::cargo();
     sb.init();
     graduate_one(&sb, "feature", "0611");
+    let tags_before = sb.tags();
 
     let out = sb.rf(&["verify", "--bump", "minor", "--yes"]);
     assert!(out.success, "verify failed: {}", out.combined());
+    // Verify also finalizes (strips `-dev`) before bumping, the same way it
+    // already committed a bare bump before this feature existed.
     assert_eq!(sb.cargo_version_at("rolling"), "0.1.0");
+    assert!(
+        sb.has_commit_subject("rolling", "chore(release): finalize 0.0.1 for promotion"),
+        "the finalize step should be committed on rolling"
+    );
     assert!(
         sb.has_commit_subject("rolling", "chore(release): bump version to 0.1.0"),
         "the bump should be committed on rolling"
@@ -411,7 +463,7 @@ fn verify_bumps_and_then_passes() {
         out.combined()
     );
     // Verify never merges or tags.
-    assert!(sb.tags().is_empty(), "verify must not tag");
+    assert_eq!(sb.tags(), tags_before, "verify must not tag");
     assert!(!sb.has_commit_subject("main", "Promote"));
 }
 
@@ -431,4 +483,270 @@ fn verify_on_a_roll_branch_ignores_the_version_gate() {
         "a roll branch should verify without a bump: {}",
         out.combined()
     );
+}
+
+// ── dev versions ────────────────────────────────────────────────────────────
+
+#[test]
+fn a_new_roll_is_marked_with_its_number_and_graduation_resolves_it() {
+    // The whole point of the marker: the checked-out version says which roll
+    // you are on. Graduating doesn't need to strip it with a commit anymore —
+    // `ops::graduate`'s own resolution (backed by the version merge driver for
+    // the conflicting case) swaps the roll's `-roll<N>` for rolling's own
+    // steady-state `-dev` marker as part of the ordinary graduation merge,
+    // regardless of what the roll's said. The roll's own branch keeps its
+    // marker; nothing rewrites it.
+    let sb = Sandbox::cargo();
+    sb.init();
+
+    let out = sb.create_roll("dev-marked", "0611");
+    assert!(out.success, "create failed: {}", out.combined());
+    let branch = sb.current_branch();
+    assert_eq!(sb.cargo_version_at("HEAD"), "0.0.1-roll1");
+    assert!(out.combined().contains("0.0.1-roll1"), "{}", out.combined());
+
+    sb.commit_file("work.txt", "work\n", "do the work");
+    let out = sb.rf(&["graduate"]);
+    assert!(out.success, "graduate failed: {}", out.combined());
+
+    // The roll branch itself is untouched; rolling's merge commit carries the
+    // roll's marker swapped for rolling's own `-dev`.
+    assert_eq!(sb.cargo_version_at(&branch), "0.0.1-roll1");
+    assert_eq!(sb.cargo_version_at("rolling"), "0.0.1-dev");
+
+    // And the gate then behaves exactly as it does without the marker, once
+    // finalized (`--final` reaches the bump gate without also pre-accepting
+    // a bump level the way `--yes` would).
+    sb.git(&["checkout", "rolling"]);
+    let out = sb.rf(&["promote", "--final"]);
+    assert!(
+        !out.success,
+        "promote should still demand a bump: {}",
+        out.combined()
+    );
+}
+
+#[test]
+fn a_dev_version_can_never_be_promoted() {
+    // Numerically above its target and still refused: `0.9.9-roll1 > 0.0.1`,
+    // but shipping a dev marker to stable — and tagging it `v0.9.9-roll1` —
+    // is what this gate exists to stop.
+    let sb = Sandbox::cargo();
+    sb.init();
+    graduate_one(&sb, "feature", "0611");
+
+    sb.write_cargo_version("0.9.9-roll1");
+    sb.git(&["add", "Cargo.toml"]);
+    sb.git(&["commit", "-m", "hand-written dev version on rolling"]);
+
+    let out = sb.rf(&["promote"]);
+    assert!(
+        !out.success,
+        "a dev version must not promote: {}",
+        out.combined()
+    );
+    assert!(
+        out.combined().contains("dev marker"),
+        "the error should name the fix: {}",
+        out.combined()
+    );
+}
+
+#[test]
+fn the_marker_can_be_declined_per_invocation() {
+    let sb = Sandbox::cargo();
+    sb.init();
+
+    let out = sb.rf(&["create", "plain", "--date", "0611", "--no-dev-version"]);
+    assert!(out.success, "create failed: {}", out.combined());
+    assert_eq!(sb.cargo_version_at("HEAD"), "0.0.1");
+}
+
+#[test]
+fn a_repo_without_a_manifest_is_untouched_by_the_marker() {
+    // The rule that keeps the dotfiles repo working: no `Cargo.toml`, nothing
+    // to mark, and no commit invented to say so.
+    let sb = Sandbox::plain();
+    sb.init();
+
+    let before = sb.rev("HEAD");
+    let out = sb.create_roll("no-manifest", "0611");
+    assert!(out.success, "create failed: {}", out.combined());
+    assert_eq!(sb.rev("HEAD"), before, "a commit was made anyway");
+    assert!(
+        !out.combined().contains("version marked"),
+        "{}",
+        out.combined()
+    );
+}
+
+#[test]
+fn verify_marks_a_roll_that_was_created_without_the_marker() {
+    // A roll that predates the feature, or was started with --no-dev-version,
+    // is brought in line by the first verify rather than needing a hand edit.
+    let sb = Sandbox::cargo();
+    sb.init();
+    let out = sb.rf(&["create", "late", "--date", "0611", "--no-dev-version"]);
+    assert!(out.success, "{}", out.combined());
+    assert_eq!(sb.cargo_version_at("HEAD"), "0.0.1");
+    sb.commit_file("work.txt", "work\n", "work");
+
+    let out = sb.rf(&["verify"]);
+    assert!(out.success, "verify failed: {}", out.combined());
+    assert_eq!(sb.cargo_version_at("HEAD"), "0.0.1-roll1");
+
+    // Idempotent: a second verify has nothing to mark and makes no commit.
+    let before = sb.rev("HEAD");
+    let out = sb.rf(&["verify"]);
+    assert!(out.success, "{}", out.combined());
+    assert_eq!(sb.rev("HEAD"), before);
+}
+
+#[test]
+fn graduate_refuses_a_dev_marker_that_belongs_to_another_roll() {
+    // A roll should only ever wear its own `-roll<N>` marker. One naming a
+    // different roll (here, simulating a scrambled version history) must stop
+    // graduation before anything else, rather than being silently stripped as
+    // if it had been legitimate.
+    let sb = Sandbox::cargo();
+    sb.init();
+    sb.create_roll("alpha", "0611"); // takes roll number 1
+    sb.git(&["checkout", "rolling"]);
+
+    let out = sb.create_roll("beta", "0612");
+    assert!(out.success, "create beta: {}", out.combined());
+    assert_eq!(sb.cargo_version_at("HEAD"), "0.0.1-roll2");
+
+    sb.write_cargo_version("0.0.1-roll1");
+    sb.git(&["add", "Cargo.toml"]);
+    sb.git(&["commit", "-m", "oops: wrong roll's marker"]);
+    sb.commit_file("work.txt", "work\n", "beta work");
+
+    let out = sb.rf(&["graduate"]);
+    assert!(
+        !out.success,
+        "graduate must refuse a foreign dev marker: {}",
+        out.combined()
+    );
+    assert!(
+        out.combined().contains("roll 1's dev marker"),
+        "{}",
+        out.combined()
+    );
+
+    // Nothing was touched: still on beta, still carrying the foreign marker.
+    assert_eq!(sb.current_branch(), "roll/2-0612-beta");
+    assert_eq!(sb.cargo_version_at("HEAD"), "0.0.1-roll1");
+}
+
+#[test]
+fn graduate_dry_run_also_catches_a_foreign_dev_marker() {
+    // The check is read-only, so a preview catches it too rather than only
+    // discovering it on a real run.
+    let sb = Sandbox::cargo();
+    sb.init();
+    sb.create_roll("alpha", "0611");
+    sb.git(&["checkout", "rolling"]);
+    sb.create_roll("beta", "0612");
+    sb.write_cargo_version("0.0.1-roll1");
+    sb.git(&["add", "Cargo.toml"]);
+    sb.git(&["commit", "-m", "oops: wrong roll's marker"]);
+
+    let out = sb.rf(&["graduate", "--dry-run"]);
+    assert!(!out.success, "{}", out.combined());
+    assert!(
+        out.combined().contains("roll 1's dev marker"),
+        "{}",
+        out.combined()
+    );
+}
+
+#[test]
+fn promote_fallthrough_to_graduate_resolves_the_dev_marker() {
+    // `rf promote` run from a roll branch redirects to graduate — a second
+    // path into the same merge, distinct from `rf graduate` itself. Both go
+    // through `ops::graduate`, so both get the version merge driver's
+    // resolution for free.
+    let sb = Sandbox::cargo();
+    sb.init();
+    let out = sb.create_roll("solo", "0611");
+    assert!(out.success, "{}", out.combined());
+    let branch = sb.current_branch();
+    assert_eq!(sb.cargo_version_at("HEAD"), "0.0.1-roll1");
+    sb.commit_file("work.txt", "work\n", "work");
+
+    let out = sb.rf(&["promote"]);
+    assert!(out.success, "promote fall-through: {}", out.combined());
+    assert_eq!(sb.cargo_version_at(&branch), "0.0.1-roll1");
+    assert_eq!(sb.cargo_version_at("rolling"), "0.0.1-dev");
+}
+
+#[test]
+fn a_real_merge_conflict_on_an_unrelated_file_still_fails_normally() {
+    // The version merge driver only resolves the version line; a genuine
+    // conflict elsewhere in the file (or in another file) must surface
+    // exactly as it would with no driver installed at all.
+    let sb = Sandbox::cargo();
+    sb.init();
+    sb.git(&["checkout", "rolling"]);
+    let out = sb.create_roll("conflict", "0611");
+    assert!(out.success, "{}", out.combined());
+    let branch = sb.current_branch();
+    sb.commit_file("clash.txt", "roll side\n", "roll edit");
+
+    sb.git(&["checkout", "rolling"]);
+    sb.commit_file("clash.txt", "rolling side\n", "rolling edit");
+    sb.git(&["checkout", &branch]);
+
+    let out = sb.rf(&["graduate"]);
+    assert!(
+        !out.success,
+        "conflicting graduation should fail: {}",
+        out.combined()
+    );
+    assert!(
+        out.combined().contains("aborted"),
+        "error should mention the abort: {}",
+        out.combined()
+    );
+
+    assert_eq!(sb.current_branch(), branch);
+    let leftover: Vec<String> = sb
+        .git(&["status", "--porcelain"])
+        .lines()
+        .filter(|l| !l.ends_with(".roll-flow.toml") && !l.ends_with(".gitattributes"))
+        .map(String::from)
+        .collect();
+    assert!(leftover.is_empty(), "working tree not clean: {leftover:?}");
+}
+
+#[test]
+fn graduating_past_an_advanced_rolling_branch_does_not_conflict_on_the_marker() {
+    // The scenario the version merge driver exists for: rolling moved (here,
+    // simulating another roll's bump) since this roll branched, so the roll's
+    // own `-rollN` marker and rolling's new version touch the same Cargo.toml
+    // line. Without the driver this is a real conflict; with it, graduation
+    // just succeeds, and rolling ends up with the higher of the two numbers,
+    // wearing its own `-dev` marker rather than the roll's.
+    let sb = Sandbox::cargo();
+    sb.init();
+    let out = sb.create_roll("solo", "0611");
+    assert!(out.success, "{}", out.combined());
+    let branch = sb.current_branch();
+    assert_eq!(sb.cargo_version_at("HEAD"), "0.0.1-roll1");
+    sb.commit_file("work.txt", "work\n", "work");
+
+    sb.git(&["checkout", "rolling"]);
+    sb.write_cargo_version("0.0.2");
+    sb.git(&["add", "Cargo.toml"]);
+    sb.git(&["commit", "-m", "simulate an independent bump on rolling"]);
+    sb.git(&["checkout", &branch]);
+
+    let out = sb.rf(&["graduate"]);
+    assert!(
+        out.success,
+        "graduate should not conflict: {}",
+        out.combined()
+    );
+    assert_eq!(sb.cargo_version_at("rolling"), "0.0.2-dev");
 }

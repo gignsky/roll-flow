@@ -41,17 +41,17 @@ Run:
 
 ```text
 rf init [--rolling-branch <name>] [--stable-branch <name>] [--roll-prefix <prefix>] [--username <user>] [--hosts <h1,h2>] [--mode <manage|assist>] [--force] [--yes]
-rf create <slug> [--date MMDD] [--dry-run]            (alias: rf start)
+rf create <slug> [--date MMDD] [--dry-run] [--no-dev-version]  (alias: rf start)
 rf integrate <branch>
 rf hotfix [<slug>] [--date MMDD] [--land] [--dry-run]
 rf verify [--dry-run] [--bump <patch|minor|major>] [--yes]
-rf graduate [--dry-run] [--force --reason <text>]
-rf promote [--roll <branch>]... [--dry-run] [--force --reason <text>] [--bump <patch|minor|major>] [--no-tag] [--yes]
+rf graduate [--dry-run] [--force --reason <text>] [--no-tag] [--yes]
+rf promote [--roll <branch>]... [--dry-run] [--force --reason <text>] [--bump <patch|minor|major>] [--no-tag] [--final] [--yes]
 rf status [--no-tui] [--no-deps] [--json]
 rf list [--no-tui] [--deps] [--json]
-rf update [--dry-run]
+rf update [--roll <branch>]... [--dry-run]
 rf prune [--dry-run] [--local | --remote] [--yes] [--force] [--no-fetch]
-rf tidy [--state <active|blocked|diverged|graduated|promoted|all>,...] [--dry-run] [--yes] [--force] [--no-fetch]
+rf tidy [--state <active|blocked|diverged|reverted|graduated|promoted|demoted|all>,...] [--dry-run] [--yes] [--force] [--no-fetch]
 rf delete <branch> [--dry-run] [--local | --remote] [--yes] [--force] [--no-fetch]
 rf clean [--dry-run] [--yes] [--force] [--with-remote] [--no-fetch]
 rf version
@@ -97,23 +97,44 @@ equivalent:
   the target is always a hard error. The bump is applied before the configured
   gates run, because it rewrites `Cargo.lock` and the gates include
   `cargo update --workspace --locked`. The TUI's `[b]` applies the same bump on
-  demand, ahead of needing it — see
-  [`status`](docs/commands/status.md#bumping-the-version).
-- **Release tag** — a successful `rf promote` creates an annotated `vX.Y.Z` tag
-  on the promotion merge commit, with the promoted rolls listed in the tag body.
-  The subject matches the one `.github/workflows/tag-on-main.yml` writes, and,
-  like that workflow, an existing tag is left alone rather than treated as an
-  error.
-- **Pushing the tag** — `rf promote` then asks before running
+  demand, ahead of needing it — see [`status`](docs/commands/status.md#bumping-the-version).
+- **Dev versions** — a version carries one of three markers as it moves through
+  the pipeline: a roll's own `-roll<N>` (`0.2.4` → `0.2.4-roll9`, written by
+  `rf start`), rolling's steady-state `-dev` (`rf graduate` swaps the roll's
+  marker for this, same numbers), or no marker at all (`rf promote` strips it
+  once a promotion is confirmed *final* — see below). Either marker is refused
+  outright by `rf verify` and a non-final `rf promote` rather than compared,
+  since `0.2.5-roll9`/`0.2.5-dev` are numerically above `0.2.4` and would
+  otherwise promote and be tagged as-is. Off per repo with
+  `dev_versions = false`, or per run with `--no-dev-version` at `rf start` —
+  see [`create`](docs/commands/create.md#dev-versions).
+- **Graduation tag** — `rf graduate` creates an annotated `v<X.Y.Z>-dev` tag on
+  rolling's new tip (e.g. `v0.2.6-dev`), the same idempotent shape as the
+  release tag below. Off with `tag_on_graduate = false` or `--no-tag`.
+- **Final promotion** — `rf promote` asks "is this final?" before touching
+  anything; declining cancels the command outright. Confirming strips rolling's
+  `-dev` marker back to a bare version (committing
+  `chore(release): finalize X.Y.Z for promotion`) before the version gate and
+  merge run, so stable only ever receives a plain `X.Y.Z`. `--final` answers
+  just this question non-interactively, without also accepting the bump or
+  tag-push prompts the way a blanket `--yes` does — the same relationship
+  `--bump <level>` already has with `--yes` for the bump prompt specifically.
+- **Release tag** — a successful `rf promote` creates an annotated `vX.Y.Z` tag on
+  the promotion merge commit, with the promoted rolls listed in the tag body. The
+  subject matches the one `.github/workflows/tag-on-main.yml` writes, and, like
+  that workflow, an existing tag is left alone rather than treated as an error.
+- **Pushing the tag** — `rf graduate`/`rf promote` then ask before running
   `git push origin <tag>`. It never happens without confirmation or `--yes`.
 
 A `--roll` promotion is several merges, so it gates and tags each one as it is
-reached. Only the whole-branch route offers a bump, since only it merges a
-branch a bump commit could land on.
+reached, finalizing each graduation commit's `-dev` marker in the staged merge
+tree as it goes. Only the whole-branch route offers a bump, since only it
+merges a branch a bump commit could land on.
 
 Repos without a `Cargo.toml` — including the dotfiles repo roll-flow was built
-for — skip all of this silently. `version_gate`, `tag_on_promote`, and
-`push_tag` in [docs/config.md](docs/config.md) turn each piece off.
+for — skip all of this silently. `version_gate`, `tag_on_promote`,
+`tag_on_graduate`, and `push_tag` in [docs/config.md](docs/config.md) turn each
+piece off.
 
 See [CONTRIBUTING.md](CONTRIBUTING.md) for how this repo uses roll-flow on
 itself, and [CLAUDE.md](CLAUDE.md) for the internal domain model.

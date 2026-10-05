@@ -10,10 +10,16 @@ long list — that keeps two rolls adding rules in different areas from collidin
 - `main` only receives merges from `rolling`, never directly from roll branches.
   Per-roll promotion does not weaken this: it merges a graduation *commit* that
   lives on rolling, which is why stable's history stays a prefix of rolling's
-  rather than a divergent line. When a per-roll step has to bump the version,
-  the bump goes *inside* that merge commit, never as a commit beside it — and
-  stable is then merged back into rolling so the tiers do not silently diverge
-  (the same reintegration a landed hotfix performs).
+  rather than a divergent line. When a per-roll step has to bump the version
+  (or finalize rolling's `-dev` marker), that goes *inside* that merge commit,
+  never as a commit beside it — and stable is then merged back into rolling so
+  the tiers do not silently diverge (the same reintegration a landed hotfix
+  performs).
+- A promotion is *final* or it doesn't happen — there is no in-between state on
+  stable. `rf promote` asks before touching anything (`confirm_final_promotion`),
+  and declining lands nothing at all; there is no "promote but keep the `-dev`
+  marker" path. See "Versioning and release tags" below for what finalizing
+  actually does.
 - A per-roll promotion that would land rolls the user did not name must say
   which, and get an answer, *before* it merges — `rf promote --roll` prompts
   (`--yes` accepts, unattended fails) and the TUI's `[m]` lists them in its
@@ -33,6 +39,17 @@ long list — that keeps two rolls adding rules in different areas from collidin
   landed, and must never be read as a branch that graduated. Misreading it marks
   an unmerged roll as graduated — strictly worse than failing to notice a real
   one, which is why the clause is cut before any shape is matched.
+- **A revert cannot be undone by re-merging.** Once a graduation (or
+  promotion) merge is reverted, the roll branch's own tip is still an
+  ancestor of the target either way — a revert adds a commit on top, it
+  removes nothing from history — so an ordinary `--no-ff` merge of the roll
+  has nothing new to bring in, regardless of whether the roll has gained
+  commits since. The only way to restore it is to revert the revert, which is
+  what `rf graduate`'s remedy for `RollState::Reverted` actually does (see
+  [Revert detection](algorithms.md#revert-detection-corebranchesrs)). Any new
+  code path that tries to "fix" a reverted roll by merging the branch again
+  will silently no-op, or hit `classify_merge`'s `NothingToMerge` and bail
+  with a misleading "already up to date".
 
 ## Rolls and branch resolution
 
@@ -144,10 +161,107 @@ long list — that keeps two rolls adding rules in different areas from collidin
   `version-bump-check.yml`, `tag-on-main.yml`, `release-check.yml`. When changing
   one side, change the other. `src/core/version.rs` records which rule mirrors
   which workflow.
-- A version bump must be committed **before** the configured gates run, never
-  after: it rewrites `Cargo.lock`, and `rolling_to_main_gates` contains
-  `cargo update --workspace --locked`, which fails on a stale lockfile. This is
-  why the bump is a CLI-level step in `main.rs` rather than part of `ops::promote`.
+- Any version *rewrite* must be committed **before** the configured gates run,
+  never after: it rewrites `Cargo.lock`, and `rolling_to_main_gates`/
+  `roll_to_rolling_gates` contain `cargo update --workspace --locked`, which
+  fails on a stale lockfile. This is why the bump is a CLI-level step in
+  `main.rs` rather than part of `ops::promote` — a per-roll step has to land it
+  *inside* the merge, which only `ops::promote` can do (see
+  [algorithms.md](algorithms.md)'s "Graduate/promote flow" section). All
+  version writes go through `ops::commit_version_change`, which is the one
+  place the write, the lockfile refresh and the commit happen in that order.
+- `ops::graduate` checks **before** anything else, including the merge-state
+  classification and the gates, that a dev marker the roll carries is its own
+  (`ops::check_dev_marker_ownership`): a roll should only ever wear its own
+  `-roll<N>`, and one naming a different roll means the version history was
+  mixed with another roll's somewhere upstream (an `[i]` integrate merge, a
+  stray cherry-pick). Read-only and cheap, so it runs first — a data-integrity
+  check, independent of the merge-conflict question below.
+- `ops::graduate` checks out `roll` itself before doing anything that mutates
+  state or runs a gate, rather than operating on whatever happened to be
+  checked out when it was called. The TUI's `[G]` can graduate any selected
+  row regardless of which branch is currently checked out (`validate_action`
+  only checks the roll's state, not whether it's the current branch), and the
+  gates run real shell commands against the working tree — so without this,
+  they would silently validate the wrong tree. `merge_gated` then stages the
+  actual merge and runs the gates against *that* result, not `roll` in
+  isolation, which is the content that will actually land. The original
+  checked-out branch is restored at the very end, success or failure; for the
+  CLI (which already requires being on the roll) this is a no-op, so the
+  behavior there is unchanged.
+- A roll's `-roll<N>` marker reaching `rolling` (via `rf graduate`), rolling's
+  own `-dev` marker reaching `stable` (via a *final* `rf promote`), or either
+  getting stale against an advanced target (via `rf update`/`[i]`/`[I]`) is
+  resolved at the git level, not by `rf` committing a strip/reapply on either
+  branch first. See `src/core/merge_driver.rs` and
+  `ops::ensure_version_merge_driver` (wired up by `rf init`): `Cargo.toml` is
+  attributed to a custom merge driver that resolves the `version` line by
+  keeping whichever side is being merged *into*'s own marker and the higher of
+  the two numbers — "ours" is just whichever branch git has checked out,
+  decided by git itself rather than by which `rf` command is running. This
+  replaced an earlier design (strip the marker in a commit before merging,
+  roll it back if the gates or the merge failed afterward) that worked but
+  needed careful transactionality to avoid leaving a roll half-graduated with
+  its marker stripped and nothing to show for it; the merge driver needs none
+  of that, because nothing is committed to either branch until the merge
+  itself commits. The driver's generic rule is correct as-is for `[i]`/`[I]`/
+  `rf update`, where "ours" (a roll) already carries its own right marker from
+  `rf start` — but not for graduation, see below.
+- `ops::graduate` does not delegate to the merge driver's generic rule, because
+  "keep ours's marker" is wrong on the very first graduation ever: rolling has
+  never worn `-dev` before that point, so "keep ours's marker" would just carry
+  `None` forward forever. Graduation instead *forces* its own result —
+  unconditionally `-dev` (or bare, with `dev_versions` off) at the higher of
+  the two sides' numbers, regardless of what either side's marker was — the
+  same answer the generic rule converges on anyway once rolling has graduated
+  once and its own `-dev` is already in place, but correct from the very first
+  graduation too.
+- A git merge driver only fires when *both* sides changed the attributed line
+  — the case that would otherwise conflict. The far more common graduate case
+  is the opposite: rolling's own version is untouched, so only the roll
+  changed the line, and git resolves that *trivially* by taking the changed
+  side (the roll's marked value) without ever invoking any driver. `ops::graduate`
+  corrects this itself, inside `merge_gated`'s staged tree, before the gates
+  run (`reconcile_staged_version`): it reads both sides' version ahead of the
+  merge and rewrites `Cargo.toml` to its own computed answer (above) if the
+  merge didn't already land there. This is why the fix exists in `ops::graduate`
+  and not purely in `.gitattributes` — the driver alone covers the conflicting
+  case but not the trivial one, and both have to resolve the same way for the
+  marker to never reach rolling wrong. `rf update`'s direction doesn't need
+  this: its trivial case (stable hasn't touched the version, only the roll's
+  own marker has) already resolves correctly by git's own default of keeping
+  the side that changed, since that side is the roll.
+- A dev marker of either kind — a roll's `-roll<N>` or rolling's own `-dev` —
+  must never reach the stable branch, and is refused **before** the numbers
+  are compared, not by them. `0.2.5-roll9`/`0.2.5-dev` are numerically above
+  `0.2.4`, so a comparison alone would promote them — and then tag them as-is.
+  Both sides state the rule separately for the same reason: `sort -V` ranks
+  either suffix *above* the bare version, and so would a derived `Ord` on the
+  numbers alone, which is why `Marker`'s declaration order (`Roll(_)`, `Dev`,
+  `None`) is what `Semver`'s derived `Ord` actually depends on. A non-final
+  `rf promote`/`rf verify` hits this directly (`VersionStatus::DevVersion`); a
+  *final* `rf promote` avoids it by finalizing (stripping the marker) before
+  the gate runs at all — see "Finalizing" below.
+- The dev marker is a `Marker` — a roll *number*, rolling's `-dev`, or none —
+  not a free-form pre-release string. It keeps `Semver` `Copy`, and any other
+  suffix still fails to parse rather than being silently dropped — dropping one
+  could let a lower version read as higher.
+- **Finalizing is a gate, not a silent side effect.** `rf promote` asks "is
+  this final?" before touching anything (`confirm_final_promotion`); declining
+  aborts the whole command. `--final` answers just this question — `--yes`
+  also answers it, along with the bump and tag-push prompts, which is why
+  `--final` exists as its own flag (the same relationship `--bump <level>`
+  already has with `--yes` for the bump prompt specifically): a scenario like
+  "finalize non-interactively but still let the tag-push prompt behave
+  unattended" needs the two kept separate. Once confirmed, the actual
+  `chore(release): finalize X.Y.Z for promotion` commit is deferred until
+  `resolve_version_gate` is past every early-return that doesn't promote
+  (`Lower`, an unresolvable bump) — the same reason the bump commit itself is
+  deferred — so a promotion that ultimately fails never leaves rolling
+  finalized with nothing landed. A `--roll` step has no branch to commit this
+  on, so it lands in the **staged merge tree** instead, the same mechanism
+  (and the same spot) `in_merge_bump` already used for a numeric bump — see
+  [algorithms.md](algorithms.md#dev-markers-and-finalizing-a-release-coreversionrs-coremerge_driverrs).
 
 ## `rf clean`
 

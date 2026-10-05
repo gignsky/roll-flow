@@ -114,7 +114,7 @@
         '';
       };
 
-      homeManagerModules.roll-flow = import ./modules/home-manager/roll-flow.nix;
-      nixosModules.roll-flow = import ./modules/nixos/roll-flow.nix;
+      # homeManagerModules.roll-flow = import ./modules/home-manager/roll-flow.nix;
+      # nixosModules.roll-flow = import ./modules/nixos/roll-flow.nix;
     };
 }
