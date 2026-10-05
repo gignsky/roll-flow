@@ -808,13 +808,20 @@ fn offer_step_tag_pushes(config: &Config, outcome: &ops::PromoteOutcome, yes: bo
 
 fn print_graduate(outcome: &ops::GraduateOutcome) {
     render_gate_notices(&outcome.gate_notices);
-    if outcome.dry_run {
-        println!(
+    match (outcome.restored, outcome.dry_run) {
+        (true, true) => println!(
+            "Dry-run: would revert the revert, restoring '{}' on '{}'",
+            outcome.roll, outcome.rolling
+        ),
+        (true, false) => println!(
+            "Restored '{}' on '{}' (reverted the revert)",
+            outcome.roll, outcome.rolling
+        ),
+        (false, true) => println!(
             "Dry-run: would graduate '{}' into '{}' (--no-ff)",
             outcome.roll, outcome.rolling
-        );
-    } else {
-        println!("Graduated '{}' into '{}'", outcome.roll, outcome.rolling);
+        ),
+        (false, false) => println!("Graduated '{}' into '{}'", outcome.roll, outcome.rolling),
     }
 }
 

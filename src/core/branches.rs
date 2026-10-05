@@ -41,7 +41,9 @@ pub enum RollState {
     Active,    // not yet merged to rolling
     Graduated, // merged to rolling, no new commits since
     Diverged,  // merged to rolling, but has new commits since (needs re-graduation)
+    Reverted,  // merged to rolling, but that merge was later reverted there (needs re-graduation)
     Promoted,  // merged to main
+    Demoted,   // merged to main, but that merge was later reverted there (needs re-promotion)
     Blocked,   // active but has ungraduated dependencies
 }
 
@@ -51,7 +53,9 @@ impl RollState {
             RollState::Active => "active",
             RollState::Graduated => "✓ graduated",
             RollState::Diverged => "⚠ diverged",
+            RollState::Reverted => "↩ reverted",
             RollState::Promoted => "✓ promoted",
+            RollState::Demoted => "↩ demoted",
             RollState::Blocked => "⛔ blocked",
         }
     }
@@ -177,10 +181,22 @@ pub fn list_rolls(config: &Config) -> Result<Vec<RollInfo>, RfError> {
         let is_graduated = graduation_commit.is_some();
 
         let state = if is_promoted {
-            RollState::Promoted
+            // Only revert-check promoted rolls; a roll that never promoted has
+            // nothing on stable to have been reverted.
+            if check_promotion_reverted(repo, &branch, &config.stable_branch) {
+                RollState::Demoted
+            } else {
+                RollState::Promoted
+            }
         } else if is_graduated {
-            // Only divergence-check graduated (not-yet-promoted) rolls.
-            if check_diverged(repo, &branch, &config.rolling_branch) {
+            // Only revert/divergence-check graduated (not-yet-promoted) rolls.
+            // Reverted takes priority over Diverged: a roll can gain new
+            // commits on its own branch at any point regardless of whether its
+            // graduation merge is still standing, and "the graduation was
+            // undone" is the more urgent fact to surface.
+            if check_reverted(repo, &branch, &config.rolling_branch) {
+                RollState::Reverted
+            } else if check_diverged(repo, &branch, &config.rolling_branch) {
                 RollState::Diverged
             } else {
                 RollState::Graduated
@@ -333,6 +349,54 @@ pub fn check_diverged(repo: &Path, roll_branch: &str, rolling_ref: &str) -> bool
         .and_then(|s| s.trim().parse::<u32>().ok())
         .map(|n| n > 0)
         .unwrap_or(false)
+}
+
+/// True if the roll's graduation onto `rolling_ref` was later undone there by
+/// a `git revert`. See [`find_reverted_graduation`] for the commit that would
+/// need reverting *again* to restore it — the actual re-graduation, since the
+/// roll branch's own tip remains an ancestor of rolling either way (a revert
+/// adds a commit on top; it does not remove anything from history), so an
+/// ordinary `--no-ff` re-merge of the roll has nothing new to bring in and
+/// cannot undo the revert.
+pub fn check_reverted(repo: &Path, roll_branch: &str, rolling_ref: &str) -> bool {
+    find_reverted_graduation(repo, roll_branch, rolling_ref).is_some()
+}
+
+/// If `roll_branch`'s graduation onto `rolling_ref` is currently reverted
+/// there, the hash of the commit to revert *now* to restore it. `None` when
+/// the roll never graduated, or its graduation is currently in effect
+/// (never reverted, or reverted an even number of times — see
+/// [`find_active_revert_in_range`]).
+pub fn find_reverted_graduation(
+    repo: &Path,
+    roll_branch: &str,
+    rolling_ref: &str,
+) -> Option<String> {
+    let rolling = git::resolve_branch(repo, rolling_ref)?;
+    let merge_hash = find_graduation_commit(repo, roll_branch, &rolling)?;
+    find_active_revert_in_range(repo, &merge_hash, &rolling)
+}
+
+/// True if `roll_branch`'s single-roll promotion (`Promote <roll> to
+/// <stable>`, the `rf promote --roll` shape) onto `stable_ref` was later
+/// undone there by a `git revert`.
+///
+/// Deliberately narrower than [`check_reverted`]: it only recognizes the
+/// single-roll promotion shape ([`scan_promotion_commits`]), not the
+/// multi-roll `Promote <rolling> to <stable>` shape that can carry several
+/// rolls in one merge — a revert of a bundled promotion is not attributed to
+/// any one roll here. Detect-only: nothing currently automates the fix the
+/// way [`find_reverted_graduation`] does for a reverted graduation, since
+/// that would mean teaching the per-roll promotion pipeline (version gate,
+/// release tags, carried-rolls disclosure) a second kind of step.
+pub fn check_promotion_reverted(repo: &Path, roll_branch: &str, stable_ref: &str) -> bool {
+    let Some(stable) = git::resolve_branch(repo, stable_ref) else {
+        return false;
+    };
+    let Some(hash) = scan_promotion_commits(repo, &stable).remove(roll_branch) else {
+        return false;
+    };
+    find_active_revert_in_range(repo, &hash, &stable).is_some()
 }
 
 /// True if the roll has been promoted to the stable branch.
@@ -643,8 +707,7 @@ fn dep_tip_missing(repo: &Path, dep_branch: &str, roll_branch: &str) -> bool {
 
 /// Find the git hash of the merge/graduation commit for `roll_branch` on
 /// `rolling_ref` — pass a stable ref to get the graduation once it has been
-/// promoted, which is what the future revert flow (issue #38) needs. Returns
-/// `None` if no graduation commit is found. Scans merge
+/// promoted. Returns `None` if no graduation commit is found. Scans merge
 /// commits and matches subjects through [`extract_graduated_branch`], so all
 /// three merge-subject shapes (local `Merge branch`, `Graduate`, and GitHub
 /// `Merge pull request`) are recognized from one source of truth.
@@ -660,6 +723,83 @@ fn find_graduation_commit(repo: &Path, roll_branch: &str, rolling_ref: &str) -> 
         }
     }
     None
+}
+
+/// Whether `event_hash` is currently "in effect" on `range_head`'s history,
+/// by chaining `git revert`'s own `` "This reverts commit <hash>." `` body
+/// line: a revert flips the parity, and the revert commit itself becomes the new
+/// thing a later revert-of-the-revert must reference (so a revert, undone,
+/// re-reverted, ... is tracked correctly rather than only one level deep).
+///
+/// Returns the hash to revert *now* to restore `event_hash`'s effect — its
+/// own revert, or the latest un-reverting revert still standing in the chain
+/// — or `None` when `event_hash` is currently in effect (never reverted, or
+/// reverted an even number of times).
+///
+/// Matched on the body rather than the subject: that boilerplate line is
+/// pre-filled by git itself and tends to survive even a conflicted revert's
+/// hand-edited subject (the editor opens with it already there), the same
+/// leniency [`extract_graduated_branch`] relies on for hand-written merges.
+fn find_active_revert_in_range(repo: &Path, event_hash: &str, range_head: &str) -> Option<String> {
+    let range = format!("{event_hash}..{range_head}");
+    // Oldest first, so the chain is walked in the order it actually happened.
+    let out =
+        git::capture_git(repo, &["log", "--reverse", &range, "--format=%H%x09%b%x00"]).ok()?;
+
+    let mut current = event_hash.to_string();
+    let mut reverted = false;
+    for entry in out.split('\0') {
+        let Some((hash, body)) = entry.split_once('\t') else {
+            continue;
+        };
+        let reverts_current = body.lines().any(|line| {
+            let line = line.trim_start();
+            line.starts_with("This reverts commit") && line.contains(&current)
+        });
+        if reverts_current {
+            reverted = !reverted;
+            current = hash.to_string();
+        }
+    }
+
+    reverted.then_some(current)
+}
+
+/// Scan `stable_ref`'s own mainline for `Promote <branch> to <stable>`
+/// merges — the mirror of [`scan_graduated`], but for the single-roll
+/// promotion shape (`rf promote --roll`) rather than graduation. Maps each
+/// promoted branch to the hash of that promotion commit, which is what a
+/// revert on stable would target.
+///
+/// Deliberately narrow, same caveat as [`check_promotion_reverted`]: the
+/// multi-roll `Promote <rolling> to <stable>` shape names `<rolling>`, not a
+/// roll, so it is harmlessly recorded under a key no roll branch matches.
+fn scan_promotion_commits(repo: &Path, stable_ref: &str) -> HashMap<String, String> {
+    let mut map = HashMap::new();
+    let Ok(out) = git::capture_git(
+        repo,
+        &[
+            "log",
+            "--first-parent",
+            "--merges",
+            "--format=%H%x09%s",
+            stable_ref,
+        ],
+    ) else {
+        return map;
+    };
+    for line in out.lines() {
+        let Some((hash, subject)) = line.split_once('\t') else {
+            continue;
+        };
+        if let Some(rest) = subject.strip_prefix("Promote ") {
+            if let Some(branch) = rest.split_whitespace().next() {
+                map.entry(branch.to_string())
+                    .or_insert_with(|| hash.to_string());
+            }
+        }
+    }
+    map
 }
 
 #[cfg(test)]

@@ -512,10 +512,14 @@ pub fn run(
 
 // ── Pure decision logic (unit-tested) ───────────────────────────────────────
 
-/// A roll can graduate only while it is active (or diverged and needs
-/// re-graduation). Graduated / promoted / blocked rolls cannot.
+/// A roll can graduate only while it is active, or needs re-graduation
+/// (diverged, or reverted on rolling). Graduated / promoted / blocked rolls
+/// cannot.
 pub(crate) fn can_graduate(state: &RollState) -> bool {
-    matches!(state, RollState::Active | RollState::Diverged)
+    matches!(
+        state,
+        RollState::Active | RollState::Diverged | RollState::Reverted
+    )
 }
 
 /// Promotion is offered when the rolling branch has something to carry to
@@ -1098,10 +1102,11 @@ fn push_version_check(lines: &mut Vec<String>, check: &VersionCheck, source: &st
 /// Build the dependency rows to show in the detail view for `selected`.
 ///
 /// Each number in `selected.deps` is looked up in `all` to recover the
-/// dependency's branch and state. A dep is flagged as a *blocker* when it has
-/// not yet graduated (state is `Active`/`Blocked`) — those are what actually
-/// hold the roll back, matching the same rule `list_rolls` uses to set
-/// `RollState::Blocked`. `needs_reintegration` is a separate, ancestry-based
+/// dependency's branch and state. A dep is flagged as a *blocker* when it is
+/// not currently graduated on rolling (state is `Active`/`Blocked`, or
+/// `Reverted` — graduated once, but that merge was since undone there) —
+/// those are what actually hold the roll back, matching the same states
+/// `promote_target_for` refuses to promote. `needs_reintegration` is a separate, ancestry-based
 /// question answered by `selected.stale_deps`: has the dependency's branch
 /// moved since `selected` integrated it, whatever its state — so a dep can be
 /// both a blocker *and* stale at once (still active, and already moved again).
@@ -1116,7 +1121,10 @@ pub(crate) fn dep_rows(selected: &RollInfo, all: &[RollInfo]) -> Vec<DepRow> {
             number: dep.number,
             branch: dep.branch.clone(),
             state: dep.state.clone(),
-            is_blocker: matches!(dep.state, RollState::Active | RollState::Blocked),
+            is_blocker: matches!(
+                dep.state,
+                RollState::Active | RollState::Blocked | RollState::Reverted
+            ),
             needs_reintegration: selected.stale_deps.contains(&dep.number),
         })
         .collect()
@@ -1132,9 +1140,10 @@ pub(crate) fn dep_rows(selected: &RollInfo, all: &[RollInfo]) -> Vec<DepRow> {
 /// `all`) are skipped, mirroring [`dep_rows`].
 ///
 /// A row's `is_blocker` here is repurposed to mean "this dependent is still
-/// gated by the target" — true while `target` is `Active`/`Blocked`, mirroring
-/// [`dep_rows`]'s rule, since until it graduates the dependent cannot advance
-/// past it. `needs_reintegration` is the mirror image of `dep_rows`' version:
+/// gated by the target" — true while `target` is `Active`/`Blocked`/`Reverted`,
+/// mirroring [`dep_rows`]'s rule, since until it graduates (or re-graduates)
+/// the dependent cannot advance past it. `needs_reintegration` is the mirror
+/// image of `dep_rows`' version:
 /// it reads each dependent's *own* `stale_deps` (not `target`'s state), since
 /// whether a given dependent's copy of `target` is stale depends on when that
 /// dependent last integrated it, not on what `target` is doing now. The detail
@@ -1143,7 +1152,10 @@ pub(crate) fn dep_rows(selected: &RollInfo, all: &[RollInfo]) -> Vec<DepRow> {
 /// testable. A roll is never its own dependent, even if a self-referential
 /// entry somehow appears.
 pub(crate) fn dependent_rows(target: &RollInfo, all: &[RollInfo]) -> Vec<DepRow> {
-    let target_gates = matches!(target.state, RollState::Active | RollState::Blocked);
+    let target_gates = matches!(
+        target.state,
+        RollState::Active | RollState::Blocked | RollState::Reverted
+    );
     target
         .dependents
         .iter()
@@ -1174,7 +1186,9 @@ fn state_color(state: &RollState) -> Color {
         RollState::Active => Color::Yellow,
         RollState::Graduated => Color::Green,
         RollState::Diverged => Color::Red,
+        RollState::Reverted => Color::LightRed,
         RollState::Promoted => Color::DarkGray,
+        RollState::Demoted => Color::Cyan,
         RollState::Blocked => Color::Magenta,
     }
 }
@@ -1205,6 +1219,15 @@ pub(crate) fn promote_target_for(
     match sel.state {
         RollState::Graduated | RollState::Diverged => Ok(Some(sel.branch.clone())),
         RollState::Promoted => Err(format!("{} is already promoted", sel.branch)),
+        RollState::Reverted => Err(format!(
+            "{} was reverted on rolling — graduate it again before promoting",
+            sel.branch
+        )),
+        RollState::Demoted => Err(format!(
+            "{} was promoted, but that promotion was reverted on the stable branch — \
+             re-promotion isn't automated yet; revert the revert manually",
+            sel.branch
+        )),
         RollState::Active | RollState::Blocked => Err(format!(
             "{} is {} — only graduated rolls can be promoted",
             sel.branch,
@@ -1246,7 +1269,11 @@ pub(crate) fn update_target_for(
                 ))
             }
         }
-        RollState::Graduated | RollState::Diverged | RollState::Promoted => Err(format!(
+        RollState::Graduated
+        | RollState::Diverged
+        | RollState::Reverted
+        | RollState::Promoted
+        | RollState::Demoted => Err(format!(
             "{} is {} — only active rolls can be updated",
             sel.branch,
             sel.state.label()
@@ -1330,7 +1357,7 @@ pub(crate) fn validate_action(
                 Ok(())
             } else {
                 Err(format!(
-                    "{} is {} — only active or diverged rolls can graduate",
+                    "{} is {} — only active, diverged, or reverted rolls can graduate",
                     sel.branch,
                     sel.state.label()
                 ))
@@ -2837,7 +2864,14 @@ fn run_op(config: &Config, action: Action, target: Option<&str>) -> Result<Vec<S
             ops::ensure_clean_state(config)?;
             let o = ops::graduate(config, roll, false, &force)?;
             push_gate_notices(&mut lines, &o.gate_notices);
-            lines.push(format!("Graduated '{}' into '{}'", o.roll, o.rolling));
+            if o.restored {
+                lines.push(format!(
+                    "Restored '{}' on '{}' (reverted the revert)",
+                    o.roll, o.rolling
+                ));
+            } else {
+                lines.push(format!("Graduated '{}' into '{}'", o.roll, o.rolling));
+            }
         }
         Action::Integrate => {
             let roll = target.ok_or_else(|| anyhow!("no roll selected"))?;

@@ -616,4 +616,28 @@ impl Sandbox {
             self.git(&["checkout", &here]);
         }
     }
+
+    /// Revert a merge commit (graduation or promotion) on `on_branch` with
+    /// `git revert -m 1 --no-edit`, leaving HEAD back where it was. Models
+    /// someone undoing a graduation or promotion after the fact.
+    pub fn revert_merge(&self, on_branch: &str, commit: &str) {
+        let here = self.current_branch();
+        self.git(&["checkout", on_branch]);
+        self.git(&["revert", "-m", "1", "--no-edit", commit]);
+        if here != on_branch {
+            self.git(&["checkout", &here]);
+        }
+    }
+
+    /// Revert an ordinary (single-parent) commit on `on_branch` with
+    /// `git revert --no-edit`, leaving HEAD back where it was. Used to model
+    /// someone manually "un-reverting" by reverting the revert commit itself.
+    pub fn revert_commit(&self, on_branch: &str, commit: &str) {
+        let here = self.current_branch();
+        self.git(&["checkout", on_branch]);
+        self.git(&["revert", "--no-edit", commit]);
+        if here != on_branch {
+            self.git(&["checkout", &here]);
+        }
+    }
 }
