@@ -17,14 +17,12 @@ Branch names are configurable. Defaults: `rolling_branch = "rolling"`, `stable_b
 - **graduated** — merged to rolling (by merge commit or Graduate commit)
 - **promoted** — merged to main, stable
 - **diverged** — graduated but branch has commits after the merge point (needs re-graduation)
+- **reverted** — graduated, but a `git revert` later undid that merge on rolling (needs
+  re-graduation — see [Revert detection](algorithms.md#revert-detection-corebranchesrs))
+- **demoted** — promoted, but a `git revert` later undid that merge on the stable branch
+  (needs re-promotion — detected but not automated, see
+  [Revert detection](algorithms.md#revert-detection-corebranchesrs))
 - **blocked** — has ungraduated dependencies that must graduate first
-
-One flag sits beside the state rather than in it: **outdated** (`⟳`) — a
-dependency's branch has changed since this roll integrated it, beyond a version
-line. It is orthogonal to the lifecycle (a blocked roll can be outdated; so can a
-graduated one), which is why it is a `RollInfo::outdated` list and not a sixth
-state. Re-integrating the dependency clears it. See the dependency-detection
-notes in [algorithms.md](algorithms.md).
 
 ## Quasi-rolls
 
