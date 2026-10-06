@@ -1308,6 +1308,7 @@ fn cmd_status_json() -> Result<()> {
     let detached = git::is_detached_head(&config.repo_root)?;
     let clean = ops::workflow_clean(&config)?;
     let rolls = branches::list_rolls(&config)?;
+    let hotfixes = branches::list_hotfixes(&config)?;
     let tier = ops::branch_tier(&config, &current, detached);
 
     let readiness = ops::promotion_readiness(&config, &current, clean, detached);
@@ -1323,6 +1324,20 @@ fn cmd_status_json() -> Result<()> {
         tier,
         clean_working_tree: clean,
         pending_roll_branches: rolls.into_iter().map(|r| r.branch).collect(),
+        hotfixes: hotfixes
+            .into_iter()
+            .map(|h| JsonHotfix {
+                branch: h.branch,
+                number: h.number,
+                state: match h.state {
+                    branches::HotfixState::Open => "open",
+                    branches::HotfixState::Landed => "landed",
+                }
+                .to_string(),
+                location: h.location.symbol().to_string(),
+                is_current: h.is_current,
+            })
+            .collect(),
         promotion,
     };
     println!("{}", serde_json::to_string_pretty(&payload)?);
@@ -1403,12 +1418,15 @@ fn cmd_prune(
     let plan = ops::prune_plan(&config, &scope)?;
 
     if plan.is_empty() {
-        println!("no promoted roll branches to prune");
+        println!("no promoted roll branches or landed hotfixes to prune");
         render_prune_skips(&plan.skipped);
         return Ok(());
     }
 
-    render_prune_plan(&plan, "Promoted roll branches to prune:");
+    render_prune_plan(
+        &plan,
+        "Promoted roll branches and landed hotfixes to prune:",
+    );
     render_prune_skips(&plan.skipped);
 
     if dry_run {
@@ -1474,12 +1492,15 @@ fn cmd_tidy(
         .join(", ");
 
     if plan.is_empty() {
-        println!("no local roll branches to tidy ({wanted})");
+        println!("no local roll branches or hotfixes to tidy ({wanted})");
         render_prune_skips(&plan.skipped);
         return Ok(());
     }
 
-    render_prune_plan(&plan, &format!("Local roll branches to tidy ({wanted}):"));
+    render_prune_plan(
+        &plan,
+        &format!("Local roll branches and hotfixes to tidy ({wanted}):"),
+    );
     render_prune_skips(&plan.skipped);
 
     if dry_run {
@@ -1611,7 +1632,11 @@ fn render_prune_plan(plan: &ops::PrunePlan, title: &str) {
         };
         println!(
             "  {num:>3}  {name:<nw$}  {target}",
-            num = candidate.number,
+            num = if candidate.hotfix {
+                format!("h{}", candidate.number)
+            } else {
+                candidate.number.to_string()
+            },
             name = candidate.branch,
             nw = name_w,
         );
@@ -1670,7 +1695,8 @@ fn cmd_list_text(no_tui: bool, deps: bool) -> Result<()> {
         return tui::rolls::run(config, current, rolls, deps);
     }
 
-    if rolls.is_empty() {
+    let hotfixes = branches::list_hotfixes(&config)?;
+    if rolls.is_empty() && hotfixes.is_empty() {
         println!("(no roll branches)");
         return Ok(());
     }
@@ -1678,6 +1704,7 @@ fn cmd_list_text(no_tui: bool, deps: bool) -> Result<()> {
     let name_w = rolls
         .iter()
         .map(|r| r.branch.len())
+        .chain(hotfixes.iter().map(|h| h.branch.len()))
         .max()
         .unwrap_or(6)
         .max(6);
@@ -1760,8 +1787,37 @@ fn cmd_list_text(no_tui: bool, deps: bool) -> Result<()> {
             sw = state_w,
         );
     }
+    print_hotfix_rows(&hotfixes, name_w, state_w);
 
     Ok(())
+}
+
+/// Append the `hotfix/*` rows under a plain roll table, in the same columns.
+///
+/// Shared by `rf status --no-tui` and `rf list --no-tui` so the two read
+/// identically. Numbered `h<N>`: hotfixes number independently of rolls, and a
+/// bare `1` under a roll `1` would read as a duplicate. Widths are the caller's
+/// so the columns line up with the rolls above; a hotfix name wider than every
+/// roll's simply runs long, which beats re-measuring the whole table for a tier
+/// that is usually empty.
+pub(crate) fn print_hotfix_rows(hotfixes: &[branches::HotfixInfo], name_w: usize, state_w: usize) {
+    // A thin rule between the tiers, as the TUI draws: rolls and hotfixes
+    // number independently, so a roll 1 and an h1 should not read as one list.
+    if !hotfixes.is_empty() {
+        println!("  {}", "┄".repeat(3 + 2 + name_w + 2 + 3 + 2 + state_w));
+    }
+    for hotfix in hotfixes {
+        let cur = if hotfix.is_current { ">" } else { " " };
+        println!(
+            "{cur} {num:>3}  {name:<nw$}  {loc:<3}  {state:<sw$}",
+            num = format!("h{}", hotfix.number),
+            name = hotfix.branch,
+            loc = hotfix.location.symbol(),
+            state = hotfix.state.label(),
+            nw = name_w,
+            sw = state_w,
+        );
+    }
 }
 
 /// Header for the per-branch crate version, shared by both plain tables.
@@ -1843,7 +1899,21 @@ struct StatusPayload {
     tier: String,
     clean_working_tree: bool,
     pending_roll_branches: Vec<String>,
+    /// Every `hotfix/*` branch, open or landed. Added as its own array rather
+    /// than folded into the roll list, so scripted consumers reading rolls are
+    /// not handed a branch with no roll number.
+    hotfixes: Vec<JsonHotfix>,
     promotion: PromotionReadiness,
+}
+
+#[derive(Serialize)]
+struct JsonHotfix {
+    branch: String,
+    number: u32,
+    /// `open` until the landing merge is on stable, then `landed`.
+    state: String,
+    location: String,
+    is_current: bool,
 }
 
 #[derive(Serialize)]

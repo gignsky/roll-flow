@@ -61,6 +61,15 @@ The TUI table pins the stable and rolling branches above the rolls, so `[space]`
 switches to them the same way it switches to a roll. A base branch that exists
 neither locally nor on `origin` is not listed.
 
+Hotfix branches (`hotfix/N-MMDD-slug`, see [`hotfix`](hotfix.md)) are listed
+below the rolls, numbered `h1`, `h2`, … because they number independently of
+rolls and a bare `1` under a roll `1` would read as a duplicate. Their `state`
+column reads `hotfix` while open and `✓ landed` once the landing merge is on
+stable — detected from merge subjects exactly the way promotion is. They have no
+dependencies and no detail overlay, but `[space]`, `[p]`/`[P]`/`[f]` and
+`[d]elete` work on them as on any other row. `--json` carries them as their own
+`hotfixes` array rather than mixed into the roll list.
+
 ## Keys
 
 The status bar carries the handful you need before you know the rest exist:
@@ -115,6 +124,7 @@ The full list:
 | `V` | verify all rolls, or a set of them |
 | `G` / `m` / `u` | graduate / promote / update from stable |
 | `b` | bump the version |
+| `h` / `H` | create a hotfix off stable / land the checked-out hotfix |
 | `d` / `x` / `t` | delete / prune / tidy branches |
 | `esc` | close the output panel |
 | `PgUp` / `PgDn` / `End` | scroll the panel, or follow new output |
@@ -230,6 +240,16 @@ on, whatever any roll's gates said. A dirty tree is refused in the status bar
 before the picker even opens. One job, one panel: each roll's report under its
 own header, then `N passed, M failed, K skipped`, and the panel marks failed if
 any did — see [`verify`](verify.md#verifying-many-at-once).
+## Hotfixes
+
+`[h]` opens the same slug modal as `[c]reate` and runs `rf hotfix <slug>`,
+branching `hotfix/N-MMDD-slug` off stable and selecting it. `[H]` runs
+`rf hotfix --land` on the **checked-out** hotfix — the merge comes from HEAD, so
+the cursor cannot pick a different one; on a hotfix row that is not checked out
+it says to `[space]` onto it first. The confirmation names both merges, because
+landing writes to stable *and* then reintegrates stable into rolling. Gates run
+as they do from the CLI and are never forced from a keypress. `[d]elete` works
+on a hotfix row with the same shapes and the same safety rules as a roll.
 
 ## Bumping the version
 

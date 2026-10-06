@@ -27,7 +27,7 @@ use ratatui::{
 
 use super::output::{self, Followup, JobDone, JobProgress};
 use crate::core::{
-    branches::{self, BranchLocation, RollInfo, RollState, VerifySet},
+    branches::{self, BranchLocation, HotfixInfo, HotfixState, RollInfo, RollState, VerifySet},
     config::Config,
     git::{self, TrackState},
     ops,
@@ -55,6 +55,10 @@ pub(crate) enum Action {
     /// Delete the local copy of every graduated or promoted roll branch,
     /// leaving `origin` untouched.
     Tidy,
+    /// Land the *checked-out* hotfix into stable, then reintegrate stable into
+    /// rolling. Reads HEAD like `[v]` and `[b]` do: `ops::hotfix_land` merges
+    /// from the branch that is checked out, so the cursor cannot pick another.
+    LandHotfix,
 }
 
 impl Action {
@@ -68,6 +72,7 @@ impl Action {
             Action::Update => "update",
             Action::Prune => "prune",
             Action::Tidy => "tidy",
+            Action::LandHotfix => "hotfix --land",
         };
         match target {
             Some(t) => format!("rf {verb} {t}"),
@@ -259,11 +264,12 @@ enum Mode {
         /// what was there.
         trail: Vec<(RollInfo, Option<(u32, u32)>)>,
     },
-    /// Slug-input modal for creating a new roll (issue #79). Holds the
-    /// in-progress text buffer; on Enter it runs `ops::create` through the same
-    /// suspend/resume path as the other actions.
+    /// Slug-input modal for creating a new roll (issue #79) or a hotfix. Holds
+    /// the in-progress text buffer; on Enter it runs `ops::create` or
+    /// `ops::hotfix_create` through the same job path as the other actions.
     CreateInput {
         slug: String,
+        kind: CreateKind,
     },
     /// Destructive per-row branch deletion. Deliberately not a `Confirm`: the
     /// prompt shape depends on where the branch exists, and the decision
@@ -316,6 +322,24 @@ enum Mode {
         branch: String,
         remote: String,
     },
+}
+
+/// What the slug-input modal creates. One modal for both, because the input
+/// is identical — a slug — and only the op it feeds and the words on the box
+/// differ.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub(crate) enum CreateKind {
+    Roll,
+    Hotfix,
+}
+
+impl CreateKind {
+    fn noun(self) -> &'static str {
+        match self {
+            CreateKind::Roll => "roll",
+            CreateKind::Hotfix => "hotfix",
+        }
+    }
 }
 
 /// Which copies of a roll branch a `[d]elete` targets.
@@ -425,15 +449,24 @@ pub(crate) struct BaseBranch {
 pub(crate) enum RowKind {
     Base(usize),
     Roll(usize),
+    /// A `hotfix/N-…` row, listed below the rolls.
+    Hotfix(usize),
 }
 
-/// Map a flat table index onto the base-then-roll row layout. `None` when the
-/// index is past the last row.
-pub(crate) fn row_at(index: usize, base_count: usize, roll_count: usize) -> Option<RowKind> {
+/// Map a flat table index onto the base-then-roll-then-hotfix row layout.
+/// `None` when the index is past the last row.
+pub(crate) fn row_at(
+    index: usize,
+    base_count: usize,
+    roll_count: usize,
+    hotfix_count: usize,
+) -> Option<RowKind> {
     if index < base_count {
         Some(RowKind::Base(index))
     } else if index - base_count < roll_count {
         Some(RowKind::Roll(index - base_count))
+    } else if index - base_count - roll_count < hotfix_count {
+        Some(RowKind::Hotfix(index - base_count - roll_count))
     } else {
         None
     }
@@ -475,8 +508,12 @@ pub(crate) fn base_branches(
 /// Initial table selection: the row for the current branch when it is on
 /// screen (a base branch or one of the rolls), else the first row. `None` only
 /// when there is nothing to select at all.
-pub(crate) fn initial_selection(bases: &[BaseBranch], rolls: &[RollInfo]) -> Option<usize> {
-    if bases.is_empty() && rolls.is_empty() {
+pub(crate) fn initial_selection(
+    bases: &[BaseBranch],
+    rolls: &[RollInfo],
+    hotfixes: &[HotfixInfo],
+) -> Option<usize> {
+    if bases.is_empty() && rolls.is_empty() && hotfixes.is_empty() {
         return None;
     }
     if let Some(i) = bases.iter().position(|b| b.is_current) {
@@ -484,6 +521,9 @@ pub(crate) fn initial_selection(bases: &[BaseBranch], rolls: &[RollInfo]) -> Opt
     }
     if let Some(i) = rolls.iter().position(|r| r.is_current) {
         return Some(bases.len() + i);
+    }
+    if let Some(i) = hotfixes.iter().position(|h| h.is_current) {
+        return Some(bases.len() + rolls.len() + i);
     }
     Some(0)
 }
@@ -517,6 +557,10 @@ struct StatusApp {
     /// so `is_current` tracks the branch actually checked out.
     bases: Vec<BaseBranch>,
     rolls: Vec<RollInfo>,
+    /// `hotfix/*` rows shown below the rolls; recomputed on reload like the
+    /// rolls are. Kept apart from `rolls` because they carry no dependencies
+    /// and number independently — see `branches::HotfixInfo`.
+    hotfixes: Vec<HotfixInfo>,
     show_deps: bool,
     /// Upstream tracking state per local branch, refreshed on reload. Sourced in
     /// one `for-each-ref` rather than an `ahead_behind` call per row.
@@ -757,6 +801,28 @@ fn is_tidy_candidate(roll: &RollInfo) -> bool {
         && matches!(roll.location, BranchLocation::Local | BranchLocation::Both)
 }
 
+/// Landed hotfixes prune would consider: landing is a hotfix's promotion, so
+/// `ops::prune_plan` winds them up alongside promoted rolls.
+pub(crate) fn prunable_hotfix_count(hotfixes: &[HotfixInfo]) -> usize {
+    hotfixes
+        .iter()
+        .filter(|h| h.state == HotfixState::Landed)
+        .count()
+}
+
+/// Hotfixes `[t]` would consider. `ops::tidy_plan` maps a landed hotfix to
+/// `Promoted` and an open one to `Active`, and [`TIDY_STATES`] — tidy's
+/// default — selects only the former; as with rolls, only a local copy counts.
+pub(crate) fn tidyable_hotfix_count(hotfixes: &[HotfixInfo]) -> usize {
+    hotfixes
+        .iter()
+        .filter(|h| {
+            h.state == HotfixState::Landed
+                && matches!(h.location, BranchLocation::Local | BranchLocation::Both)
+        })
+        .count()
+}
+
 // ── Keymap ──────────────────────────────────────────────────────────────────
 
 /// One entry in the keymap.
@@ -939,8 +1005,22 @@ pub(crate) const BINDINGS: &[Binding] = &[
         replay: &[KeyCode::Char('b')],
     },
     Binding {
+        keys: "h",
+        label: "create a hotfix off stable",
+        group: "hotfix",
+        hint: None,
+        replay: &[KeyCode::Char('h')],
+    },
+    Binding {
+        keys: "H",
+        label: "land the checked-out hotfix into stable and rolling",
+        group: "hotfix",
+        hint: None,
+        replay: &[KeyCode::Char('H')],
+    },
+    Binding {
         keys: "d",
-        label: "delete the selected branch",
+        label: "delete the selected roll or hotfix branch",
         group: "branches",
         hint: None,
         replay: &[KeyCode::Char('d')],
@@ -1378,6 +1458,15 @@ fn state_color(state: &RollState) -> Color {
     }
 }
 
+/// Hotfix rows in their own colour, distinct from every roll state, so a
+/// glance separates the two tiers even when their labels are both a tick.
+fn hotfix_color(state: HotfixState) -> Color {
+    match state {
+        HotfixState::Open => Color::LightRed,
+        HotfixState::Landed => Color::DarkGray,
+    }
+}
+
 /// What `[p]` should promote, given the current selection.
 ///
 /// `Ok(None)` means the whole rolling branch — one merge behind one gate run,
@@ -1526,6 +1615,29 @@ pub(crate) fn integrate_target_for(
     Ok(sel.branch.clone())
 }
 
+/// [`validate_action`], plus the hotfix rows: prune and tidy are repo-wide and
+/// also reach landed hotfixes, so either is worth offering when only hotfixes
+/// qualify. Every other action is about rolls and is decided by
+/// `validate_action` alone.
+pub(crate) fn validate_with_hotfixes(
+    action: Action,
+    selected: Option<&RollInfo>,
+    rolls: &[RollInfo],
+    hotfixes: &[HotfixInfo],
+    current_branch: &str,
+    roll_prefix: &str,
+) -> Result<(), String> {
+    let hotfixes_qualify = match action {
+        Action::Prune => prunable_hotfix_count(hotfixes) > 0,
+        Action::Tidy => tidyable_hotfix_count(hotfixes) > 0,
+        _ => false,
+    };
+    if hotfixes_qualify {
+        return Ok(());
+    }
+    validate_action(action, selected, rolls, current_branch, roll_prefix)
+}
+
 /// Validate an action against the current selection/list. `Ok(())` means the
 /// confirm modal may open; `Err(msg)` is a brief reason to surface instead.
 pub(crate) fn validate_action(
@@ -1557,7 +1669,7 @@ pub(crate) fn validate_action(
             if can_prune(rolls) {
                 Ok(())
             } else {
-                Err("nothing to prune — no promoted roll branches".to_string())
+                Err("nothing to prune — no promoted roll branches or landed hotfixes".to_string())
             }
         }
         Action::Tidy => {
@@ -1565,6 +1677,15 @@ pub(crate) fn validate_action(
                 Ok(())
             } else {
                 Err("nothing to tidy — no local graduated or promoted roll branches".to_string())
+            }
+        }
+        Action::LandHotfix => {
+            if current_branch.starts_with(branches::HOTFIX_PREFIX) {
+                Ok(())
+            } else {
+                Err(format!(
+                    "'{current_branch}' is not a hotfix — [space] onto one to land it"
+                ))
             }
         }
     }
@@ -1604,12 +1725,15 @@ pub(crate) fn is_submittable_slug(buffer: &str) -> bool {
 /// checked-out branch's local copy is never deletable, so a both-location
 /// current roll degrades to a remote-only y/N and a local-only current roll is
 /// refused. `Neither` is refused too — the row is stale, there is nothing there.
-pub(crate) fn delete_prompt(roll: &RollInfo) -> Result<DeletePrompt, String> {
-    match (&roll.location, roll.is_current) {
-        (BranchLocation::Neither, _) => Err(format!("{} no longer exists", roll.branch)),
+pub(crate) fn delete_prompt(
+    branch: &str,
+    location: &BranchLocation,
+    is_current: bool,
+) -> Result<DeletePrompt, String> {
+    match (location, is_current) {
+        (BranchLocation::Neither, _) => Err(format!("{branch} no longer exists")),
         (BranchLocation::Local, true) => Err(format!(
-            "{} is checked out — switch away before deleting it",
-            roll.branch
+            "{branch} is checked out — switch away before deleting it"
         )),
         (BranchLocation::Local, false) => Ok(DeletePrompt::Single(DeleteScope::Local)),
         (BranchLocation::Remote, _) => Ok(DeletePrompt::Single(DeleteScope::Remote)),
@@ -1702,16 +1826,21 @@ impl StatusApp {
         let bases = base_branches(&config, &current_branch, |refspec| {
             git::ref_exists(&config.repo_root, refspec)
         });
+        // Loaded here rather than passed in: the CLI's plain table loads its
+        // own, and a load failure degrades to "no hotfix rows" instead of
+        // refusing to open the view.
+        let hotfixes = branches::list_hotfixes(&config).unwrap_or_default();
         let mut table = TableState::default();
-        table.select(initial_selection(&bases, &rolls));
+        table.select(initial_selection(&bases, &rolls, &hotfixes));
         let tracking = load_tracking(&config);
-        let versions = load_versions(&config, &bases, &rolls);
+        let versions = load_versions(&config, &bases, &rolls, &hotfixes);
         let version = version::read_version(&config.repo_root).unwrap_or(None);
         Self {
             config,
             current_branch,
             bases,
             rolls,
+            hotfixes,
             show_deps,
             tracking,
             versions,
@@ -1900,8 +2029,19 @@ impl StatusApp {
                 }
                 self.mode = Mode::CreateInput {
                     slug: String::new(),
+                    kind: CreateKind::Roll,
                 }
             }
+            KeyCode::Char('h') => {
+                if self.busy() {
+                    return Ok(false);
+                }
+                self.mode = Mode::CreateInput {
+                    slug: String::new(),
+                    kind: CreateKind::Hotfix,
+                }
+            }
+            KeyCode::Char('H') => self.request_land_hotfix(),
             KeyCode::Char(' ') => {
                 if self.busy() {
                     return Ok(false);
@@ -1914,6 +2054,10 @@ impl StatusApp {
                     Some(RowKind::Base(i)) => {
                         let base = self.bases[i].clone();
                         self.execute_switch(base.branch, base.location);
+                    }
+                    Some(RowKind::Hotfix(i)) => {
+                        let hotfix = self.hotfixes[i].clone();
+                        self.execute_switch(hotfix.branch, hotfix.location);
                     }
                     None => self.message = Some("no branch selected".to_string()),
                 }
@@ -1944,6 +2088,13 @@ impl StatusApp {
                 if let Some(RowKind::Base(i)) = self.selected_row() {
                     // Base branches have no roll detail to drill into.
                     self.message = Some(format!("'{}' is a base branch", self.bases[i].branch));
+                } else if let Some(RowKind::Hotfix(i)) = self.selected_row() {
+                    // Nor do hotfixes: no dependencies, nothing to break out.
+                    self.message = Some(format!(
+                        "'{}' is a hotfix branch — {}",
+                        self.hotfixes[i].branch,
+                        self.hotfixes[i].state.label()
+                    ));
                 } else if let Some(roll) = self.selected_roll() {
                     let roll = roll.clone();
                     // Capture the branch's divergence from origin for the overlay
@@ -2018,7 +2169,7 @@ impl StatusApp {
     /// cancel back to browsing, or submit. Submitting an empty buffer surfaces a
     /// message instead of invoking `ops::create`.
     fn handle_create_input(&mut self, code: KeyCode) {
-        let outcome = if let Mode::CreateInput { slug } = &mut self.mode {
+        let outcome = if let Mode::CreateInput { slug, .. } = &mut self.mode {
             handle_create_key(slug, code)
         } else {
             return;
@@ -2027,12 +2178,12 @@ impl StatusApp {
             InputOutcome::Continue => {}
             InputOutcome::Cancel => self.mode = Mode::Browsing,
             InputOutcome::Submit => {
-                let slug = match std::mem::replace(&mut self.mode, Mode::Browsing) {
-                    Mode::CreateInput { slug } => slug,
-                    _ => String::new(),
+                let (slug, kind) = match std::mem::replace(&mut self.mode, Mode::Browsing) {
+                    Mode::CreateInput { slug, kind } => (slug, kind),
+                    _ => (String::new(), CreateKind::Roll),
                 };
                 if is_submittable_slug(&slug) {
-                    self.execute_create(slug);
+                    self.execute_create(slug, kind);
                 } else {
                     self.message = Some("slug cannot be empty".to_string());
                 }
@@ -2100,13 +2251,18 @@ impl StatusApp {
 
     /// Total number of table rows: the pinned base branches plus the rolls.
     fn row_count(&self) -> usize {
-        self.bases.len() + self.rolls.len()
+        self.bases.len() + self.rolls.len() + self.hotfixes.len()
     }
 
     /// Which row the cursor is on, or `None` when the table is empty.
     fn selected_row(&self) -> Option<RowKind> {
         let index = self.table.selected()?;
-        row_at(index, self.bases.len(), self.rolls.len())
+        row_at(
+            index,
+            self.bases.len(),
+            self.rolls.len(),
+            self.hotfixes.len(),
+        )
     }
 
     /// The selected roll, or `None` when the cursor is on a base-branch row —
@@ -2114,17 +2270,18 @@ impl StatusApp {
     fn selected_roll(&self) -> Option<&RollInfo> {
         match self.selected_row()? {
             RowKind::Roll(i) => self.rolls.get(i),
-            RowKind::Base(_) => None,
+            RowKind::Base(_) | RowKind::Hotfix(_) => None,
         }
     }
 
     /// Validate an action and either open the confirm modal or set a message.
     fn request(&mut self, action: Action) {
         let selected = self.selected_roll();
-        let validation = validate_action(
+        let validation = validate_with_hotfixes(
             action,
             selected,
             &self.rolls,
+            &self.hotfixes,
             &self.current_branch,
             &self.config.roll_prefix,
         );
@@ -2172,6 +2329,13 @@ impl StatusApp {
             self.message = Some(format!(
                 "'{}' is a base branch — [u]pdate brings stable into your rolls",
                 self.bases[i].branch
+            ));
+            return;
+        }
+        if let Some(RowKind::Hotfix(i)) = self.selected_row() {
+            self.message = Some(format!(
+                "'{}' is a hotfix — it lands on stable, not into a roll",
+                self.hotfixes[i].branch
             ));
             return;
         }
@@ -2319,13 +2483,26 @@ impl StatusApp {
     }
 
     fn request_delete(&mut self) -> Result<()> {
-        let Some(roll) = self.selected_roll() else {
-            self.message = Some("no roll selected".to_string());
-            return Ok(());
+        // Rolls and hotfixes alike: `delete_branch_plan` takes any branch that
+        // is not stable or rolling, and the safety rules downstream are the
+        // same. Only a base row is refused, and `selected_roll` already treats
+        // it as no selection.
+        let (branch, location, is_current) = match self.selected_row() {
+            Some(RowKind::Roll(i)) => {
+                let r = &self.rolls[i];
+                (r.branch.clone(), r.location.clone(), r.is_current)
+            }
+            Some(RowKind::Hotfix(i)) => {
+                let h = &self.hotfixes[i];
+                (h.branch.clone(), h.location.clone(), h.is_current)
+            }
+            _ => {
+                self.message = Some("no roll or hotfix selected".to_string());
+                return Ok(());
+            }
         };
-        let roll = roll.clone();
 
-        let prompt = match delete_prompt(&roll) {
+        let prompt = match delete_prompt(&branch, &location, is_current) {
             Ok(prompt) => prompt,
             Err(msg) => {
                 self.message = Some(msg);
@@ -2333,17 +2510,15 @@ impl StatusApp {
             }
         };
 
-        let (local_unmerged, remote_unmerged) =
-            ops::unmerged_commit_counts(&self.config, &roll.branch);
+        let (local_unmerged, remote_unmerged) = ops::unmerged_commit_counts(&self.config, &branch);
 
         self.mode = Mode::Delete {
             preview: DeletePreview {
-                branch: roll.branch,
+                branch,
                 prompt,
                 local_unmerged,
                 remote_unmerged,
-                local_is_checked_out: roll.is_current
-                    && matches!(roll.location, BranchLocation::Both),
+                local_is_checked_out: is_current && matches!(location, BranchLocation::Both),
             },
         };
         Ok(())
@@ -2429,15 +2604,43 @@ impl StatusApp {
     /// Create a roll from `slug`, selecting it once the reload turns it up. An
     /// `ops::create` error (e.g. an invalid slug) lands in the panel like any
     /// other failure and never aborts the TUI.
-    fn execute_create(&mut self, slug: String) {
+    fn execute_create(&mut self, slug: String, kind: CreateKind) {
         let config = self.config.clone();
-        self.start_job("rf create", move || {
-            let outcome = ops::create(&config, &slug, None, false)?;
+        let title = match kind {
+            CreateKind::Roll => "rf create",
+            CreateKind::Hotfix => "rf hotfix",
+        };
+        self.start_job(title, move || {
+            let outcome = match kind {
+                CreateKind::Roll => ops::create(&config, &slug, None, false)?,
+                CreateKind::Hotfix => ops::hotfix_create(&config, &slug, None, false)?,
+            };
             Ok(JobDone::with_next(
                 vec![format!("Created {}", outcome.branch)],
                 Followup::SelectBranch(outcome.branch),
             ))
         });
+    }
+
+    /// `[H]` — land the checked-out hotfix. The cursor is consulted only to
+    /// explain a refusal: a hotfix row that is not checked out gets told how to
+    /// become so, since `ops::hotfix_land` can only merge from HEAD.
+    fn request_land_hotfix(&mut self) {
+        if let Some(RowKind::Hotfix(i)) = self.selected_row() {
+            let hotfix = &self.hotfixes[i];
+            if !hotfix.is_current {
+                self.message = Some(format!(
+                    "[space] onto '{}' first — landing merges from the checked-out branch",
+                    hotfix.branch
+                ));
+                return;
+            }
+            if hotfix.state == HotfixState::Landed {
+                self.message = Some(format!("'{}' is already landed", hotfix.branch));
+                return;
+            }
+        }
+        self.request(Action::LandHotfix);
     }
 
     /// Switch the working tree to `branch` (issue #99). Git natively carries
@@ -2472,6 +2675,10 @@ impl StatusApp {
         let (branch, location) = match self.selected_row()? {
             RowKind::Roll(i) => (self.rolls[i].branch.clone(), self.rolls[i].location.clone()),
             RowKind::Base(i) => (self.bases[i].branch.clone(), self.bases[i].location.clone()),
+            RowKind::Hotfix(i) => (
+                self.hotfixes[i].branch.clone(),
+                self.hotfixes[i].location.clone(),
+            ),
         };
         Some(SyncTarget::resolve(
             &branch,
@@ -2585,6 +2792,13 @@ impl StatusApp {
                 self.rolls
                     .iter()
                     .map(|r| (r.branch.clone(), r.location.clone())),
+            )
+            // Hotfix rows are rows too: `[P]` pushes one unchanged, so `PP`
+            // covers them under the same ahead-or-unpublished rule.
+            .chain(
+                self.hotfixes
+                    .iter()
+                    .map(|h| (h.branch.clone(), h.location.clone())),
             )
             .collect();
         let plan = plan_push_all(&rows, &self.current_branch, &self.tracking);
@@ -2905,8 +3119,9 @@ impl StatusApp {
             git::ref_exists(&self.config.repo_root, refspec)
         });
         self.rolls = branches::list_rolls(&self.config)?;
+        self.hotfixes = branches::list_hotfixes(&self.config).unwrap_or_default();
         self.tracking = load_tracking(&self.config);
-        self.versions = load_versions(&self.config, &self.bases, &self.rolls);
+        self.versions = load_versions(&self.config, &self.bases, &self.rolls, &self.hotfixes);
         // Read from the worktree, so a bump — or a branch switch that changes it —
         // shows in the header straight away.
         self.version = version::read_version(&self.config.repo_root).unwrap_or(None);
@@ -2956,6 +3171,7 @@ impl StatusApp {
                         target: target.as_deref(),
                         carried,
                         rolls: &self.rolls,
+                        hotfixes: &self.hotfixes,
                         current_branch: &self.current_branch,
                     },
                 );
@@ -2969,7 +3185,9 @@ impl StatusApp {
                 let path: Vec<u32> = trail.iter().map(|(r, _)| r.number).collect();
                 render_detail(f, area, roll, *ahead_behind, &self.rolls, *cursor, &path)
             }
-            Mode::CreateInput { slug } => render_create_input(f, area, &self.config, slug),
+            Mode::CreateInput { slug, kind } => {
+                render_create_input(f, area, &self.config, slug, *kind)
+            }
             Mode::Delete { preview } => render_delete_modal(f, area, &self.config, preview),
             Mode::Bump { current } => render_bump_modal(f, area, *current, &self.current_branch),
             Mode::VerifyMany { counts } => render_verify_many_modal(f, area, counts),
@@ -3149,6 +3367,44 @@ impl StatusApp {
             }
             Row::new(cells)
         }));
+        // Hotfixes last, numbered `h<N>` so their independent numbering is never
+        // read as a roll's. Same columns, so the sync keys work unchanged.
+        let first_hotfix = rows.len();
+        rows.extend(self.hotfixes.iter().enumerate().map(|(i, hotfix)| {
+            let base_style = if hotfix.is_current {
+                Style::default().add_modifier(Modifier::BOLD)
+            } else {
+                Style::default()
+            };
+            let (sync_text, sync_color) = sync_cell(track_of(tracking, &hotfix.branch));
+            let color = hotfix_color(hotfix.state);
+            let mut cells = vec![
+                Cell::from(current_marker(hotfix.is_current)).style(
+                    Style::default()
+                        .fg(Color::Green)
+                        .add_modifier(Modifier::BOLD),
+                ),
+                Cell::from(format!("h{}", hotfix.number)).style(base_style.fg(color)),
+                Cell::from(hotfix.branch.clone()).style(base_style.fg(color)),
+                Cell::from(hotfix.location.symbol()).style(base_style),
+                Cell::from(sync_text).style(Style::default().fg(sync_color)),
+                Cell::from(hotfix.state.label()).style(Style::default().fg(color)),
+            ];
+            if show_versions {
+                cells.push(
+                    Cell::from(version_cell(versions.get(&hotfix.branch).copied()))
+                        .style(base_style),
+                );
+            }
+            if show_deps {
+                cells.push(Cell::from(""));
+                cells.push(Cell::from(""));
+            }
+            // The first hotfix row keeps a blank line above it, which the rule
+            // below is drawn into: the tiers number independently, so they
+            // should not read as one list.
+            Row::new(cells).top_margin(u16::from(i == 0))
+        }));
 
         let table = Table::new(rows, col_constraints)
             .header(table_header)
@@ -3157,6 +3413,29 @@ impl StatusApp {
             .highlight_symbol("▶ ");
 
         f.render_stateful_widget(table, area, &mut self.table);
+
+        // Drawn over that margin rather than as a row of its own, so it is never
+        // selectable and every index `row_at` maps stays as it was. The table
+        // has scrolled by `offset` rows (all one line tall above the hotfixes);
+        // when the first hotfix is the top visible row there is nothing above
+        // it to separate from, and the margin is not drawn over.
+        if !self.hotfixes.is_empty() && first_hotfix > self.table.offset() {
+            // Top border and header, then one line per visible row above.
+            let y = area.y + 2 + (first_hotfix - self.table.offset()) as u16;
+            if y + 1 < area.bottom() {
+                let rule = Rect {
+                    x: area.x + 1,
+                    y,
+                    width: area.width.saturating_sub(2),
+                    height: 1,
+                };
+                f.render_widget(
+                    Paragraph::new("┄".repeat(rule.width as usize))
+                        .style(Style::default().fg(Color::DarkGray)),
+                    rule,
+                );
+            }
+        }
     }
 
     fn render_status_bar(&self, f: &mut Frame, area: Rect) {
@@ -3389,7 +3668,7 @@ fn run_op(config: &Config, action: Action, target: Option<&str>) -> Result<Vec<S
             // needs `rf prune --force` from the CLI, deliberately.
             let plan = ops::prune_plan(config, &ops::PruneScope::both())?;
             if plan.is_empty() {
-                lines.push("no promoted roll branches to prune".to_string());
+                lines.push("no promoted roll branches or landed hotfixes to prune".to_string());
                 push_prune_skips(&mut lines, &plan.skipped);
             } else {
                 let results = ops::prune_apply(config, &plan)?;
@@ -3404,12 +3683,22 @@ fn run_op(config: &Config, action: Action, target: Option<&str>) -> Result<Vec<S
             // three places allowed to delete a ref on origin.
             let plan = ops::tidy_plan(config, &ops::PruneScope::tidy(false), &TIDY_STATES)?;
             if plan.is_empty() {
-                lines.push("no local roll branches to tidy".to_string());
+                lines.push("no local roll branches or hotfixes to tidy".to_string());
                 push_prune_skips(&mut lines, &plan.skipped);
             } else {
                 let results = ops::prune_apply(config, &plan)?;
                 lines.extend(render_prune_outcome(&plan, &results));
             }
+        }
+        Action::LandHotfix => {
+            // The same op `rf hotfix --land` runs, gates and all; never dry,
+            // never forced — a hotfix that fails its gates is fixed on the
+            // branch, not pushed past them from a keypress.
+            ops::ensure_clean_state(config)?;
+            let o = ops::hotfix_land(config, false)?;
+            push_gate_notices(&mut lines, &o.gate_notices);
+            lines.push(format!("Landed '{}' into '{}'", o.current, o.stable));
+            lines.push(format!("Reintegrated '{}' into '{}'", o.stable, o.rolling));
         }
     }
     Ok(lines)
@@ -3458,20 +3747,22 @@ fn load_versions(
     config: &Config,
     bases: &[BaseBranch],
     rolls: &[RollInfo],
+    hotfixes: &[HotfixInfo],
 ) -> HashMap<String, Semver> {
-    let rows = bases
+    let rows: Vec<(&String, &BranchLocation)> = bases
         .iter()
         .map(|b| (&b.branch, &b.location))
-        .chain(rolls.iter().map(|r| (&r.branch, &r.location)));
+        .chain(rolls.iter().map(|r| (&r.branch, &r.location)))
+        .chain(hotfixes.iter().map(|h| (&h.branch, &h.location)))
+        .collect();
     let refs: Vec<String> = rows
+        .iter()
         .map(|(branch, location)| branches::content_ref(branch, location))
         .collect();
 
     let by_ref = version::versions_at(&config.repo_root, &refs);
-    bases
-        .iter()
-        .map(|b| &b.branch)
-        .chain(rolls.iter().map(|r| &r.branch))
+    rows.iter()
+        .map(|(branch, _)| *branch)
         .zip(refs.iter())
         .filter_map(|(branch, refspec)| Some((branch.clone(), *by_ref.get(refspec)?)))
         .collect()
@@ -3848,6 +4139,8 @@ struct ConfirmModal<'a> {
     /// See [`Mode::Confirm`]'s field of the same name.
     carried: &'a [String],
     rolls: &'a [RollInfo],
+    /// Counted alongside `rolls` by `[x]` and `[t]`, which reach landed hotfixes.
+    hotfixes: &'a [HotfixInfo],
     current_branch: &'a str,
 }
 
@@ -3856,12 +4149,35 @@ struct ConfirmModal<'a> {
 /// `carried` is non-empty only for `[m]` on a roll row, and the modal then grows
 /// to list those rolls: the merge lands them on stable too, and the confirmation
 /// is the last place the user can see that before it happens.
+/// What a prune or tidy confirmation is about to delete: `n` roll branches
+/// described by `rolls`, and `hotfixes` landed hotfixes. The hotfix half only
+/// appears when there is one, so a roll-only prompt reads exactly as before.
+fn deletion_count(n: usize, rolls: &str, hotfixes: usize) -> String {
+    let plural = |n: usize, one: &str, many: &str| {
+        if n == 1 {
+            one.to_string()
+        } else {
+            many.to_string()
+        }
+    };
+    let roll_part = format!("{n} {rolls} {}", plural(n, "branch", "branches"));
+    match (n, hotfixes) {
+        (_, 0) => roll_part,
+        (0, h) => format!("{h} landed {}", plural(h, "hotfix", "hotfixes")),
+        (_, h) => format!(
+            "{roll_part} and {h} landed {}",
+            plural(h, "hotfix", "hotfixes")
+        ),
+    }
+}
+
 fn render_modal(f: &mut Frame, area: Rect, config: &Config, modal: &ConfirmModal) {
     let ConfirmModal {
         action,
         target,
         carried,
         rolls,
+        hotfixes,
         current_branch,
     } = *modal;
     let prompt = match action {
@@ -3895,22 +4211,30 @@ fn render_modal(f: &mut Frame, area: Rect, config: &Config, modal: &ConfirmModal
             ),
         },
         Action::Prune => {
-            let n = prunable_count(rolls);
-            format!(
-                "Delete {n} promoted roll branch{} (local + origin)?",
-                if n == 1 { "" } else { "es" }
-            )
+            let what = deletion_count(
+                prunable_count(rolls),
+                "promoted roll",
+                prunable_hotfix_count(hotfixes),
+            );
+            format!("Delete {what} (local + origin)?")
         }
         // Says "local only" where prune says "local + origin": the two keys sit
         // next to each other and differ in exactly that, so the prompt is where
         // the difference has to be visible.
         Action::Tidy => {
-            let n = tidyable_count(rolls);
-            format!(
-                "Delete {n} local graduated/promoted roll branch{} (local only)?",
-                if n == 1 { "" } else { "es" }
-            )
+            let what = deletion_count(
+                tidyable_count(rolls),
+                "local graduated/promoted roll",
+                tidyable_hotfix_count(hotfixes),
+            );
+            format!("Delete {what} (local only)?")
         }
+        // Both merges named, because the second is the one people forget:
+        // landing writes to stable *and* to rolling.
+        Action::LandHotfix => format!(
+            "Land {} into {}, then reintegrate into {}?",
+            current_branch, config.stable_branch, config.rolling_branch
+        ),
     };
     let hint = "[y] confirm    [n] cancel";
 
@@ -4235,8 +4559,12 @@ fn column_width<'a>(values: impl Iterator<Item = &'a str>) -> usize {
 
 /// Render the centered slug-input popup for creating a new roll. Shows the
 /// prompt, the current buffer with a trailing caret, and the key hints.
-fn render_create_input(f: &mut Frame, area: Rect, config: &Config, buffer: &str) {
-    let prompt = format!("New roll slug (branched from {}):", config.stable_branch);
+fn render_create_input(f: &mut Frame, area: Rect, config: &Config, buffer: &str, kind: CreateKind) {
+    let prompt = format!(
+        "New {} slug (branched from {}):",
+        kind.noun(),
+        config.stable_branch
+    );
     let input_line = format!("{buffer}_");
     let hint = "[enter] create    [esc] cancel";
 
@@ -4257,7 +4585,7 @@ fn render_create_input(f: &mut Frame, area: Rect, config: &Config, buffer: &str)
         Line::from(Span::styled(hint, Style::default().fg(Color::DarkGray))),
     ])
     .alignment(Alignment::Center)
-    .block(Block::bordered().title(" create roll "));
+    .block(Block::bordered().title(format!(" create {} ", kind.noun())));
     f.render_widget(body, modal);
 }
 
@@ -4641,16 +4969,16 @@ mod tests {
 
     #[test]
     fn row_at_maps_indices_over_bases_then_rolls() {
-        assert_eq!(row_at(0, 2, 3), Some(RowKind::Base(0)));
-        assert_eq!(row_at(1, 2, 3), Some(RowKind::Base(1)));
-        assert_eq!(row_at(2, 2, 3), Some(RowKind::Roll(0)));
-        assert_eq!(row_at(4, 2, 3), Some(RowKind::Roll(2)));
+        assert_eq!(row_at(0, 2, 3, 0), Some(RowKind::Base(0)));
+        assert_eq!(row_at(1, 2, 3, 0), Some(RowKind::Base(1)));
+        assert_eq!(row_at(2, 2, 3, 0), Some(RowKind::Roll(0)));
+        assert_eq!(row_at(4, 2, 3, 0), Some(RowKind::Roll(2)));
         // Past the last row.
-        assert_eq!(row_at(5, 2, 3), None);
+        assert_eq!(row_at(5, 2, 3, 0), None);
         // No bases → rolls start at 0; no rolls → only bases.
-        assert_eq!(row_at(0, 0, 1), Some(RowKind::Roll(0)));
-        assert_eq!(row_at(1, 1, 0), None);
-        assert_eq!(row_at(0, 0, 0), None);
+        assert_eq!(row_at(0, 0, 1, 0), Some(RowKind::Roll(0)));
+        assert_eq!(row_at(1, 1, 0, 0), None);
+        assert_eq!(row_at(0, 0, 0, 0), None);
     }
 
     #[test]
@@ -4660,22 +4988,22 @@ mod tests {
         let mut rolls = vec![roll_n(1, RollState::Active), roll_n(2, RollState::Active)];
 
         // Current branch is the rolling base → its own row.
-        assert_eq!(initial_selection(&bases, &rolls), Some(1));
+        assert_eq!(initial_selection(&bases, &rolls, &[]), Some(1));
 
         // Current branch is a roll → offset past the bases.
         let off_bases = base_branches(&cfg, "roll/2-0101-x", |_| true);
         rolls[1].is_current = true;
-        assert_eq!(initial_selection(&off_bases, &rolls), Some(3));
+        assert_eq!(initial_selection(&off_bases, &rolls, &[]), Some(3));
 
         // Nothing current → first row.
         rolls[1].is_current = false;
-        assert_eq!(initial_selection(&off_bases, &rolls), Some(0));
+        assert_eq!(initial_selection(&off_bases, &rolls, &[]), Some(0));
 
         // Rolls but no bases still selects the first roll.
-        assert_eq!(initial_selection(&[], &rolls), Some(0));
+        assert_eq!(initial_selection(&[], &rolls, &[]), Some(0));
 
         // Nothing at all → no selection.
-        assert_eq!(initial_selection(&[], &[]), None);
+        assert_eq!(initial_selection(&[], &[], &[]), None);
     }
 
     fn roll_n(number: u32, state: RollState) -> RollInfo {
@@ -4699,6 +5027,54 @@ mod tests {
         assert!(!can_graduate(&RollState::Graduated));
         assert!(!can_graduate(&RollState::Promoted));
         assert!(!can_graduate(&RollState::Blocked));
+    }
+
+    #[test]
+    fn landed_hotfixes_make_prune_and_tidy_worth_offering() {
+        let hotfix = |number: u32, state: HotfixState, location: BranchLocation| HotfixInfo {
+            branch: format!("hotfix/{number}-0720-x"),
+            number,
+            state,
+            location,
+            is_current: false,
+        };
+        let hotfixes = vec![
+            hotfix(1, HotfixState::Landed, BranchLocation::Both),
+            hotfix(2, HotfixState::Landed, BranchLocation::Remote),
+            hotfix(3, HotfixState::Open, BranchLocation::Local),
+        ];
+        // Prune takes both copies of every landed hotfix; tidy only local
+        // copies, and an open hotfix is no more tidy's default than an active
+        // roll is.
+        assert_eq!(prunable_hotfix_count(&hotfixes), 2);
+        assert_eq!(tidyable_hotfix_count(&hotfixes), 1);
+
+        // No roll qualifies, yet the hotfixes alone make both keys valid.
+        let rolls = vec![roll_n(1, RollState::Active)];
+        for action in [Action::Prune, Action::Tidy] {
+            assert!(validate_action(action, None, &rolls, "main", "roll/").is_err());
+            assert!(
+                validate_with_hotfixes(action, None, &rolls, &hotfixes, "main", "roll/").is_ok(),
+                "{action:?}"
+            );
+            assert!(
+                validate_with_hotfixes(action, None, &rolls, &[], "main", "roll/").is_err(),
+                "{action:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn deletion_prompts_count_hotfixes_only_when_there_are_some() {
+        assert_eq!(
+            deletion_count(2, "promoted roll", 0),
+            "2 promoted roll branches"
+        );
+        assert_eq!(
+            deletion_count(1, "promoted roll", 2),
+            "1 promoted roll branch and 2 landed hotfixes"
+        );
+        assert_eq!(deletion_count(0, "promoted roll", 1), "1 landed hotfix");
     }
 
     #[test]
@@ -5767,9 +6143,13 @@ mod tests {
         }
     }
 
+    fn delete_prompt_of(roll: &RollInfo) -> Result<DeletePrompt, String> {
+        delete_prompt(&roll.branch, &roll.location, roll.is_current)
+    }
+
     #[test]
     fn delete_prompt_shape_follows_location() {
-        let single = |loc| delete_prompt(&roll(RollState::Active, loc));
+        let single = |loc| delete_prompt_of(&roll(RollState::Active, loc));
         assert_eq!(
             single(BranchLocation::Local),
             Ok(DeletePrompt::Single(DeleteScope::Local))
@@ -5796,7 +6176,7 @@ mod tests {
             RollState::Blocked,
         ] {
             assert_eq!(
-                delete_prompt(&roll(state.clone(), BranchLocation::Local)),
+                delete_prompt_of(&roll(state.clone(), BranchLocation::Local)),
                 Ok(DeletePrompt::Single(DeleteScope::Local)),
                 "{state:?} should still be deletable"
             );
@@ -5807,14 +6187,14 @@ mod tests {
     fn delete_prompt_never_offers_the_checked_out_local_copy() {
         let mut local = roll(RollState::Active, BranchLocation::Local);
         local.is_current = true;
-        let err = delete_prompt(&local).expect_err("checked-out local-only roll");
+        let err = delete_prompt_of(&local).expect_err("checked-out local-only roll");
         assert!(err.contains("checked out"), "should explain itself: {err}");
 
         // The origin copy of a checked-out roll is still fair game.
         let mut both = roll(RollState::Active, BranchLocation::Both);
         both.is_current = true;
         assert_eq!(
-            delete_prompt(&both),
+            delete_prompt_of(&both),
             Ok(DeletePrompt::Single(DeleteScope::Remote)),
             "a checked-out both-location roll degrades to origin-only"
         );
@@ -6114,6 +6494,85 @@ mod tests {
     }
 
     #[test]
+    fn the_hotfix_keys_are_in_the_keymap_and_found_by_the_search() {
+        let hits: Vec<&str> = filter_bindings("hotfix")
+            .into_iter()
+            .map(|i| BINDINGS[i].keys)
+            .collect();
+        assert!(hits.contains(&"h"), "{hits:?}");
+        assert!(hits.contains(&"H"), "{hits:?}");
+        // Neither belongs on the slim bar.
+        for b in BINDINGS.iter().filter(|b| b.keys == "h" || b.keys == "H") {
+            assert!(b.hint.is_none(), "{} on the status bar", b.keys);
+        }
+    }
+
+    #[test]
+    fn landing_a_hotfix_needs_one_checked_out() {
+        let rolls = vec![roll_n(1, RollState::Active)];
+        assert!(validate_action(
+            Action::LandHotfix,
+            None,
+            &rolls,
+            "hotfix/1-0720-urgent",
+            "roll/"
+        )
+        .is_ok());
+        let err = validate_action(Action::LandHotfix, None, &rolls, "main", "roll/")
+            .expect_err("main is not a hotfix");
+        assert!(err.contains("[space]"), "{err}");
+    }
+
+    #[test]
+    fn the_land_modal_names_both_merges() {
+        let cfg = config("main", "develop");
+        let out = draw(|f, area| {
+            render_modal(
+                f,
+                area,
+                &cfg,
+                &ConfirmModal {
+                    action: Action::LandHotfix,
+                    target: None,
+                    carried: &[],
+                    rolls: &[],
+                    hotfixes: &[],
+                    current_branch: "hotfix/1-0720-urgent",
+                },
+            )
+        });
+        assert!(
+            out.contains("Land hotfix/1-0720-urgent into main, then reintegrate into develop?"),
+            "{out}"
+        );
+    }
+
+    #[test]
+    fn the_create_modal_says_which_tier_it_creates() {
+        let cfg = config("main", "develop");
+        let roll = draw(|f, area| render_create_input(f, area, &cfg, "", CreateKind::Roll));
+        assert!(roll.contains("New roll slug"), "{roll}");
+        assert!(roll.contains(" create roll "), "{roll}");
+        let hot = draw(|f, area| render_create_input(f, area, &cfg, "urg", CreateKind::Hotfix));
+        assert!(
+            hot.contains("New hotfix slug (branched from main)"),
+            "{hot}"
+        );
+        assert!(hot.contains("urg_"), "{hot}");
+    }
+
+    #[test]
+    fn a_hotfix_row_gets_the_same_delete_shapes_as_a_roll() {
+        assert_eq!(
+            delete_prompt("hotfix/1-0720-x", &BranchLocation::Both, false),
+            Ok(DeletePrompt::Choice)
+        );
+        let err = delete_prompt("hotfix/1-0720-x", &BranchLocation::Local, true)
+            .expect_err("checked out");
+        assert!(err.contains("checked out"), "{err}");
+    }
+
+    #[test]
     fn every_binding_is_declared_once_and_can_be_run() {
         // The table is the only place keys are declared, so this is where a
         // doubled-up or unlabelled binding has to be caught.
@@ -6174,6 +6633,7 @@ mod tests {
             current_branch: "roll/1-0101-ahead".to_string(),
             bases: Vec::new(),
             rolls,
+            hotfixes: Vec::new(),
             show_deps: false,
             tracking,
             versions: HashMap::new(),
@@ -6222,6 +6682,7 @@ mod tests {
             current_branch: "main".to_string(),
             bases: Vec::new(),
             rolls,
+            hotfixes: Vec::new(),
             show_deps: false,
             tracking: HashMap::new(),
             versions,
@@ -6252,6 +6713,7 @@ mod tests {
             current_branch: "main".to_string(),
             bases: Vec::new(),
             rolls: vec![roll_n(1, RollState::Active)],
+            hotfixes: Vec::new(),
             show_deps: false,
             tracking: HashMap::new(),
             versions: HashMap::new(),
@@ -6294,6 +6756,7 @@ mod tests {
             current_branch: "main".to_string(),
             bases: Vec::new(),
             rolls: vec![roll_n(1, RollState::Active)],
+            hotfixes: Vec::new(),
             show_deps: false,
             tracking: HashMap::new(),
             versions: HashMap::new(),
@@ -6896,6 +7359,7 @@ mod tests {
                     target: Some("roll/1-0101-alpha"),
                     carried: &[],
                     rolls: &[],
+                    hotfixes: &[],
                     current_branch: "roll/2-0102-beta",
                 },
             )
@@ -6926,6 +7390,7 @@ mod tests {
                     target: Some("roll/8-0918-help-menu"),
                     carried: &carried,
                     rolls: &[],
+                    hotfixes: &[],
                     current_branch: "rolling",
                 },
             )
@@ -6960,6 +7425,7 @@ mod tests {
                     target: None,
                     carried: &[],
                     rolls: &rolls,
+                    hotfixes: &[],
                     current_branch: "main",
                 },
             )
@@ -6979,6 +7445,7 @@ mod tests {
                     target: None,
                     carried: &[],
                     rolls: &rolls,
+                    hotfixes: &[],
                     current_branch: "main",
                 },
             )
@@ -7013,18 +7480,104 @@ mod tests {
     /// `state` column and no roll number, and the cursor starts on the checked
     /// out base branch.
     #[test]
+    fn row_at_maps_hotfixes_after_the_rolls() {
+        assert_eq!(row_at(5, 2, 3, 2), Some(RowKind::Hotfix(0)));
+        assert_eq!(row_at(6, 2, 3, 2), Some(RowKind::Hotfix(1)));
+        assert_eq!(row_at(7, 2, 3, 2), None);
+        // No rolls at all: hotfixes follow the bases directly.
+        assert_eq!(row_at(2, 2, 0, 1), Some(RowKind::Hotfix(0)));
+    }
+
+    #[test]
+    fn a_hotfix_row_renders_below_the_rolls_with_its_own_number() {
+        let hotfixes = vec![
+            HotfixInfo {
+                branch: "hotfix/1-0720-urgent".to_string(),
+                number: 1,
+                state: HotfixState::Open,
+                location: BranchLocation::Local,
+                is_current: false,
+            },
+            HotfixInfo {
+                branch: "hotfix/2-0721-landed-one".to_string(),
+                number: 2,
+                state: HotfixState::Landed,
+                location: BranchLocation::Both,
+                is_current: false,
+            },
+        ];
+        let mut table = TableState::default();
+        table.select(initial_selection(&[], &[], &hotfixes));
+        let mut app = StatusApp {
+            config: test_config(),
+            current_branch: "main".to_string(),
+            bases: Vec::new(),
+            rolls: vec![roll_n(1, RollState::Active)],
+            hotfixes,
+            show_deps: false,
+            tracking: HashMap::new(),
+            versions: HashMap::new(),
+            version: None,
+            table,
+            mode: Mode::Browsing,
+            message: None,
+            job: None,
+            panel: None,
+            pending_g: false,
+            pending_push: None,
+        };
+        let out = draw(|f, area| app.render_table(f, area));
+        let lines: Vec<&str> = out.lines().collect();
+        let roll_line = lines
+            .iter()
+            .position(|l| l.contains("roll/1-0101-x"))
+            .unwrap();
+        let hotfix_line = lines
+            .iter()
+            .position(|l| l.contains("hotfix/1-0720-urgent"))
+            .unwrap();
+        assert!(hotfix_line > roll_line, "hotfix above the roll:\n{out}");
+        // A thin rule sits between the two tiers, in a line of its own — not a
+        // row, so selection indices are unaffected.
+        assert_eq!(hotfix_line, roll_line + 2, "no gap for the rule:\n{out}");
+        assert!(
+            lines[roll_line + 1].contains("┄┄┄"),
+            "no separator between rolls and hotfixes:\n{out}"
+        );
+        // ...and none without hotfixes to separate.
+        let hotfixes = std::mem::take(&mut app.hotfixes);
+        let bare = draw(|f, area| app.render_table(f, area));
+        assert!(!bare.contains('┄'), "separator with no hotfixes:\n{bare}");
+        app.hotfixes = hotfixes;
+        // `h1`, not a bare `1`: hotfix numbering is independent of rolls, and
+        // this row sits under a roll that is also number 1.
+        assert!(lines[hotfix_line].contains("h1"), "{}", lines[hotfix_line]);
+        assert!(
+            lines[hotfix_line].contains("hotfix"),
+            "{}",
+            lines[hotfix_line]
+        );
+        assert!(out.contains("✓ landed"), "{out}");
+        // The current-branch hunt reaches hotfix rows too.
+        let mut current = app.hotfixes.clone();
+        current[1].is_current = true;
+        assert_eq!(initial_selection(&[], &app.rolls, &current), Some(2));
+    }
+
+    #[test]
     fn base_rows_render_above_the_rolls() {
         use ratatui::{backend::TestBackend, Terminal};
 
         let cfg = config("main", "develop");
         let bases = base_branches(&cfg, "develop", |_| true);
         let mut table = TableState::default();
-        table.select(initial_selection(&bases, &[]));
+        table.select(initial_selection(&bases, &[], &[]));
         let mut app = StatusApp {
             config: cfg,
             current_branch: "develop".to_string(),
             bases,
             rolls: vec![roll_n(1, RollState::Active)],
+            hotfixes: Vec::new(),
             show_deps: false,
             tracking: HashMap::new(),
             versions: HashMap::new(),

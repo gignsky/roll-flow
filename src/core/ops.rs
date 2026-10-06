@@ -22,7 +22,7 @@ use crate::core::{branches, config::Config, git, merge_driver, proc, version};
 /// Prefix for the hotfix tier. Parallel to `roll_prefix`, but fixed rather than
 /// configurable — hotfixes are a rarely-used sanctioned exception with their own
 /// independent numbering.
-pub(crate) const HOTFIX_PREFIX: &str = "hotfix/";
+pub(crate) use crate::core::branches::HOTFIX_PREFIX;
 
 // ── Clean-state / working-tree guards ───────────────────────────────────────
 
@@ -1015,20 +1015,6 @@ fn next_hotfix_number(config: &Config) -> Result<u32> {
     Ok(max + 1)
 }
 
-/// Short reference form used in hotfix merge subjects: the branch
-/// `hotfix/N-MMDD-slug` renders as `hotfix/N-slug` (date dropped).
-fn hotfix_short_name(branch: &str) -> Option<String> {
-    let rest = branch.strip_prefix(HOTFIX_PREFIX)?;
-    let mut parts = rest.splitn(3, '-');
-    let number = parts.next()?;
-    let _mmdd = parts.next()?;
-    let slug = parts.next()?;
-    if number.is_empty() || slug.is_empty() {
-        return None;
-    }
-    Some(format!("{HOTFIX_PREFIX}{number}-{slug}"))
-}
-
 /// Create a hotfix branch off the stable branch: `hotfix/N-MMDD-slug`.
 ///
 /// Mirrors [`create`] but over the `hotfix/` tier, which carries its own
@@ -1096,7 +1082,7 @@ pub(crate) fn hotfix_land(config: &Config, dry_run: bool) -> Result<HotfixLandOu
             current
         );
     }
-    let short = hotfix_short_name(&current)
+    let short = branches::hotfix_short_name(&current)
         .ok_or_else(|| anyhow!("could not parse hotfix branch name '{current}'"))?;
     let stable = config.stable_branch.clone();
     let rolling = config.rolling_branch.clone();
@@ -3114,6 +3100,9 @@ impl PruneScope {
 pub(crate) struct PruneCandidate {
     pub branch: String,
     pub number: u32,
+    /// A `hotfix/N-…` branch rather than a roll. Hotfixes number independently,
+    /// so `number` alone would pass `hotfix/1` off as roll 1.
+    pub hotfix: bool,
     pub delete_local: bool,
     pub delete_remote: bool,
 }
@@ -3434,6 +3423,7 @@ fn plan_branch_deletion(
     (delete_local || delete_remote).then(|| PruneCandidate {
         branch: branch.to_string(),
         number,
+        hotfix: branch.starts_with(HOTFIX_PREFIX),
         delete_local,
         delete_remote,
     })
@@ -3447,10 +3437,16 @@ fn plan_branch_deletion(
 /// take commits after its graduation merge). Every copy is additionally checked
 /// for containment in stable, and anything that fails is skipped with a reason
 /// unless `--force` is given.
+///
+/// Landed hotfixes are wound up alongside promoted rolls: landing is a
+/// hotfix's promotion, and the same containment check guards both.
 pub(crate) fn prune_plan(config: &Config, scope: &PruneScope) -> Result<PrunePlan> {
-    plan_rolls(config, scope, |state| {
-        *state == branches::RollState::Promoted
-    })
+    plan_rolls(
+        config,
+        scope,
+        |state| *state == branches::RollState::Promoted,
+        |state| *state == branches::HotfixState::Landed,
+    )
 }
 
 /// Decide what `rf tidy` would delete locally, without deleting anything.
@@ -3464,16 +3460,36 @@ pub(crate) fn prune_plan(config: &Config, scope: &PruneScope) -> Result<PrunePla
 /// It takes a [`PruneScope`] like everything else here rather than a bespoke
 /// one: there is deliberately a single deletion path, and tidy is a set of
 /// arguments to it, not a second implementation.
+///
+/// Hotfixes have no states of their own to select, so each follows the roll
+/// state it corresponds to: a landed hotfix is tidied when `Promoted` is
+/// selected (it reached stable), an open one when `Active` is (it reached
+/// nothing yet, so only a fully pushed copy counts as recoverable).
 pub(crate) fn tidy_plan(
     config: &Config,
     scope: &PruneScope,
     states: &[branches::RollState],
 ) -> Result<PrunePlan> {
-    plan_rolls(config, scope, |state| states.contains(state))
+    plan_rolls(
+        config,
+        scope,
+        |state| states.contains(state),
+        |state| states.contains(&hotfix_tidy_state(*state)),
+    )
 }
 
-/// The shared body of [`prune_plan`] and [`tidy_plan`]: walk every roll the
-/// `accept` predicate keeps and plan each one's deletion against `scope`.
+/// The roll state a hotfix counts as when `rf tidy --state` selects branches.
+fn hotfix_tidy_state(state: branches::HotfixState) -> branches::RollState {
+    match state {
+        branches::HotfixState::Landed => branches::RollState::Promoted,
+        branches::HotfixState::Open => branches::RollState::Active,
+    }
+}
+
+/// The shared body of [`prune_plan`] and [`tidy_plan`]: walk every roll
+/// `accept` keeps and every hotfix `accept_hotfix` keeps, and plan each
+/// one's deletion against `scope` — through the same [`plan_branch_deletion`],
+/// so a hotfix gets exactly the safety rules a roll does.
 ///
 /// The [`DeletionContext`] is built once, so the pruning fetch and the worktree
 /// scan are each paid for a single time no matter how many rolls match.
@@ -3481,6 +3497,7 @@ fn plan_rolls(
     config: &Config,
     scope: &PruneScope,
     accept: impl Fn(&branches::RollState) -> bool,
+    accept_hotfix: impl Fn(&branches::HotfixState) -> bool,
 ) -> Result<PrunePlan> {
     let ctx = DeletionContext::build(config, scope)?;
 
@@ -3494,6 +3511,21 @@ fn plan_rolls(
         if let Some(candidate) =
             plan_branch_deletion(config, &roll.branch, roll.number, scope, &ctx, &mut skipped)
         {
+            candidates.push(candidate);
+        }
+    }
+    for hotfix in branches::list_hotfixes(config)? {
+        if !accept_hotfix(&hotfix.state) {
+            continue;
+        }
+        if let Some(candidate) = plan_branch_deletion(
+            config,
+            &hotfix.branch,
+            hotfix.number,
+            scope,
+            &ctx,
+            &mut skipped,
+        ) {
             candidates.push(candidate);
         }
     }
