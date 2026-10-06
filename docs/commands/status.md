@@ -28,11 +28,35 @@ The table carries a `deps` column (roll numbers this roll integrated) and a
 `dependants` column (roll numbers that integrated it) — `--no-deps` hides both.
 They are shown whatever the roll's state, so a roll that has already graduated
 still reports what it depends on and what depends on it. A dep number in the
-plain table gets a trailing `⚠` when that dependency's branch has moved since
-this roll integrated it — `26⚠` — so a stale copy is visible without opening
-the detail view, which matters before reintegrating or merging a batch of
-dependent rolls against a dependency that is still gaining commits. `--json`
-carries the same signal as `stale_deps`, a subset of `deps`.
+table (TUI and plain alike) gets a trailing `⚠` when that dependency's branch
+has moved since this roll integrated it — `26⚠` — so a stale copy is visible
+without opening the detail view, which matters before reintegrating or merging
+a batch of dependent rolls against a dependency that is still gaining commits.
+`--json` carries the same signal as `stale_deps`, a subset of `deps`.
+
+A trailing `↻` marks a dependency that integrated this roll back — a
+**dependency cycle**, which is what two rows each `⛔ blocked` on the other
+means. No order of separate graduations can satisfy a cycle, so it is resolved
+by containment instead: the member whose tip contains every other member's tip
+is the cycle's *carrier*, reads `active` (unless something outside the cycle
+still blocks it), and graduating it lands the rest; the others stay `⛔ blocked`
+waiting on it. Every table prints one line per cycle beneath it saying exactly
+what to do, `--no-deps` or not:
+
+```text
+    2  roll/2-0919-add-hotfix-to-menu  L    ⛔ blocked    3⚠↻   3
+>   3  roll/3-0919-show-hotfixes       L    active       2↻    2
+
+  ↻ rolls 2 ⇄ 3 integrated each other: roll/3-0919-show-hotfixes contains the others' latest work — graduate roll/3-0919-show-hotfixes and it carries 2 to rolling
+```
+
+When no member contains the others yet — each moved on after integrating the
+other — the line instead names the member to integrate the others into, and the
+exact `rf integrate` to run on it; after that it is the carrier. `--json` gives
+each member's row the same `cycle` object (`null` outside a cycle): `members`,
+`carrier` (`null` when there is none yet), `suggested`, `lacks` (the tips
+`suggested` is missing) and the `advice` line. See
+[graduate](graduate.md#dependency-cycles).
 
 Press `[enter]` on a roll for the detail overlay, which breaks the same two
 relationships out with per-dependency markers, and the two are independent —
@@ -41,7 +65,9 @@ a dep can be both at once: `⛔ blocker` for a dep that has not graduated yet
 has moved since this roll integrated it (the same `⚠` as the plain table),
 whatever its own state — a dependency does not need to have graduated and
 diverged to be stale; it only needs to have kept moving after it was
-integrated. See
+integrated. A cycle carrier's fellow members read `↻ carried` rather than
+`⛔ blocker`, and a roll in a cycle gets the same advice line as the tables at
+the top of its dependencies. See
 [divergence after integration](../internals/algorithms.md#dependency-detection-coredependenciesrs).
 
 The TUI table pins the stable and rolling branches above the rolls, so `[space]`

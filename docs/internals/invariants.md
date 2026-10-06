@@ -70,6 +70,29 @@ long list — that keeps two rolls adding rules in different areas from collidin
   `RollState::Diverged` alone misses every dependency that is stale while still
   active — exactly the case that matters before merging a batch of dependent
   rolls against a dependency someone keeps pushing to.
+- **A dependency cycle is never a deadlock.** Rolls that integrated each other
+  have no graduation order, so the ordering constraint is satisfied by
+  containment instead: a cycle's *carrier* — the member whose tip contains every
+  other member's tip — is not blocked by its fellow members, and graduating it
+  lands them (see [Dependency cycles](algorithms.md#dependency-cycles)). This
+  exception is scoped to cycles on purpose; outside one, a contained but
+  ungraduated dependency still blocks, because an order exists in which it
+  lands first with a graduation merge of its own. When no member contains the
+  others, nothing graduates, and every surface — the planner's refusal, both
+  plain tables, the TUI detail view and `--json` — gives the same
+  `DepCycle::advice`: which `rf integrate` makes a carrier. Never `--force`.
+- **Every walk over dependencies terminates.** Cycles are found once, by
+  Tarjan's SCC (`branches::dependency_cycles`), and recorded on
+  `RollInfo::cycle`; walks either treat a recorded cycle as one node
+  (graduation), skip an edge back into the current path (promotion, which is
+  ordered by rolling's history, not the dependency graph), or refuse it. A new
+  walk over `RollInfo::deps` must do one of the three — recursing on `deps`
+  alone loops on the first cycle a user's merges create.
+- **A graduation commit is a point on rolling's mainline.** A roll that only
+  reached rolling inside another roll's history (a cycle's carried member, or a
+  `--force` graduation) is re-anchored by `scan_graduated` to the first-parent
+  commit where it landed — never left pointing at an integrate merge on a roll
+  branch, which `rf promote --roll` would then advance stable to.
 
 ## Verification
 

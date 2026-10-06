@@ -60,6 +60,11 @@ immediately: M's `deps` column gains N, N's `dependants` column gains M, and M
 becomes `⛔ blocked` until N graduates. That is the intended ordering constraint —
 M's history now contains N's commits, so N has to reach rolling first.
 
+Integrating M back into N as well makes the two depend on each other — a
+dependency cycle, marked `↻` in the `deps` column. That is not a dead end: the
+member that now contains the other's tip graduates and carries it along, and the
+table says which. See [graduate](graduate.md#dependency-cycles).
+
 Unlike `graduate` and `promote`, this does not require a clean working tree: git
 already refuses a merge that would clobber local changes and carries harmless ones
 through. A conflict is a normal outcome — the merge stops, the panel shows git's
