@@ -3207,6 +3207,9 @@ fn render_verify_many(results: &[ops::VerifyManyResult]) -> (Vec<String>, Vec<St
     let mut skipped = 0;
     for result in results {
         lines.push(format!("── {} ──", result.branch));
+        if let Some(dev) = result.marked {
+            lines.push(format!("version marked {dev}"));
+        }
         if let Some(o) = &result.outcome {
             if o.diverged_note {
                 lines.push(format!(
@@ -5794,21 +5797,28 @@ mod tests {
             ops::VerifyManyResult {
                 branch: "roll/1-x".to_string(),
                 outcome: None,
+                marked: Some(crate::core::version::Semver::parse("0.0.1-roll1").unwrap()),
                 verdict: ops::VerifyVerdict::Passed,
             },
             ops::VerifyManyResult {
                 branch: "roll/2-y".to_string(),
                 outcome: None,
+                marked: None,
                 verdict: ops::VerifyVerdict::Failed("gate exited 1".to_string()),
             },
             ops::VerifyManyResult {
                 branch: "roll/3-z".to_string(),
                 outcome: None,
+                marked: None,
                 verdict: ops::VerifyVerdict::Skipped("no local copy".to_string()),
             },
         ];
         let (lines, failed) = render_verify_many(&results);
         assert_eq!(failed, vec!["roll/2-y"]);
+        assert!(
+            lines.contains(&"version marked 0.0.1-roll1".to_string()),
+            "{lines:?}"
+        );
         assert!(lines.contains(&"── roll/2-y ──".to_string()), "{lines:?}");
         assert!(
             lines.contains(&"FAILED: gate exited 1".to_string()),

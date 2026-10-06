@@ -418,8 +418,8 @@ fn cmd_verify(dry_run: bool, bump: Option<BumpLevel>, yes: bool) -> Result<()> {
 ///
 /// A thin renderer over `ops::verify_many`, which owns the switch-and-return
 /// discipline; the TUI's `[V]` sits on the same routine so the two agree on
-/// every rule. No bump offer: a bump is a commit on one branch, and this pass
-/// walks many.
+/// every rule — including the per-roll version check and dev marker. No bump
+/// offer: a bump is a commit on one branch, and this pass walks many.
 fn cmd_verify_all(set: branches::VerifySet) -> Result<()> {
     let config = Config::load()?;
     let rolls = branches::list_rolls(&config)?;
@@ -441,6 +441,9 @@ fn cmd_verify_all(set: branches::VerifySet) -> Result<()> {
     let mut skipped = 0;
     for result in &results {
         println!("\n── {} ──", result.branch);
+        if let Some(dev) = result.marked {
+            println!("version marked {dev}");
+        }
         if let Some(outcome) = &result.outcome {
             if outcome.diverged_note {
                 println!(
