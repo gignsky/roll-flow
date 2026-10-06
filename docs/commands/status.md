@@ -47,6 +47,16 @@ graduated and diverged to be stale; it only needs to have kept moving after it
 was integrated. See
 [divergence after integration](../internals/algorithms.md#dependency-detection-coredependenciesrs).
 
+The overlay is a place to dig, not just read. `j`/`k` walk the linked rolls —
+every chain link, then the dependents — and `[enter]` (or `l`) opens the one
+under the cursor as its own pane, with a breadcrumb (`#12 → #9 → #8`) showing
+the path taken. `[backspace]` (or `h`) comes back up one level, and closes when
+there is nowhere further up, so the key never dead-ends; `[esc]` closes outright
+from any depth. Each pane is the same view the table's `[enter]` would open for
+that roll, divergence included, so digging from 12 to 7 shows exactly what
+selecting 7 would have. These keys belong to the overlay, not the table, so they
+are listed in its own footer rather than in the `?` keymap below.
+
 The TUI table pins the stable and rolling branches above the rolls, so `[space]`
 switches to them the same way it switches to a roll. A base branch that exists
 neither locally nor on `origin` is not listed.

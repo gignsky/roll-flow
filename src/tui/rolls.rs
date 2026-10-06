@@ -250,6 +250,14 @@ enum Mode {
     Detail {
         roll: RollInfo,
         ahead_behind: Option<(u32, u32)>,
+        /// Which linked roll `[enter]` opens: an index into
+        /// [`detail_targets`] — the chain rows, then the dependents.
+        cursor: usize,
+        /// The rolls drilled through to get here, innermost last, so
+        /// `[backspace]` retraces the path rather than closing. Each carries
+        /// the divergence it was opened with, so going back redraws exactly
+        /// what was there.
+        trail: Vec<(RollInfo, Option<(u32, u32)>)>,
     },
     /// Slug-input modal for creating a new roll (issue #79). Holds the
     /// in-progress text buffer; on Enter it runs `ops::create` through the same
@@ -1245,6 +1253,68 @@ pub(crate) fn dep_chain(selected: &RollInfo, all: &[RollInfo]) -> Vec<ChainRow> 
     rows
 }
 
+/// The rolls `[enter]` can open from a detail pane, in the order the pane
+/// lists them: every chain row (repeated ones included — opening a diamond's
+/// second mention is as valid as its first), then the dependents. The cursor
+/// in [`Mode::Detail`] is an index into this.
+pub(crate) fn detail_targets(roll: &RollInfo, all: &[RollInfo]) -> Vec<u32> {
+    dep_chain(roll, all)
+        .iter()
+        .map(|r| r.number)
+        .chain(dependent_rows(roll, all).iter().map(|r| r.number))
+        .collect()
+}
+
+/// What a keypress in a detail pane does.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum DetailOutcome {
+    Continue,
+    /// Leave the overlay entirely, however deep the trail.
+    Close,
+    /// Return to the pane this one was opened from.
+    Back,
+    /// Open the linked roll at this index of [`detail_targets`].
+    Open(usize),
+}
+
+/// Apply one keystroke to a detail pane.
+///
+/// The pane is a place to *dig*, not just read: `j`/`k` walk the linked rolls,
+/// `enter` (or `l`/`→`) opens the one under the cursor as its own pane, and
+/// `backspace` (or `h`/`←`) comes back up one level — falling through to
+/// closing when there is nowhere further up, so the key never dead-ends.
+/// `esc`/`q` always close outright, whatever the depth. Pure, so the whole
+/// navigation is testable without a terminal.
+pub(crate) fn detail_key(
+    code: KeyCode,
+    cursor: &mut usize,
+    targets: usize,
+    has_trail: bool,
+) -> DetailOutcome {
+    match code {
+        KeyCode::Esc | KeyCode::Char('q') => DetailOutcome::Close,
+        KeyCode::Backspace | KeyCode::Char('h') | KeyCode::Left => {
+            if has_trail {
+                DetailOutcome::Back
+            } else {
+                DetailOutcome::Close
+            }
+        }
+        KeyCode::Down | KeyCode::Char('j') => {
+            *cursor = (*cursor + 1).min(targets.saturating_sub(1));
+            DetailOutcome::Continue
+        }
+        KeyCode::Up | KeyCode::Char('k') => {
+            *cursor = cursor.saturating_sub(1);
+            DetailOutcome::Continue
+        }
+        KeyCode::Enter | KeyCode::Char('l') | KeyCode::Right if targets > 0 => {
+            DetailOutcome::Open((*cursor).min(targets - 1))
+        }
+        _ => DetailOutcome::Continue,
+    }
+}
+
 /// Build the *reverse*-dependency rows to show in the detail view for `target`:
 /// the rolls that integrated `target` and therefore depend on it. This is the
 /// inverse of [`dep_rows`] and is *not* symmetric with it.
@@ -1883,7 +1953,12 @@ impl StatusApp {
                     } else {
                         None
                     };
-                    self.mode = Mode::Detail { roll, ahead_behind };
+                    self.mode = Mode::Detail {
+                        roll,
+                        ahead_behind,
+                        cursor: 0,
+                        trail: Vec::new(),
+                    };
                 }
             }
             _ => {}
@@ -1891,11 +1966,51 @@ impl StatusApp {
         Ok(false)
     }
 
-    /// Handle a keypress while the read-only detail overlay is open. Only close
-    /// keys apply; everything else is ignored so action keys can't fire here.
+    /// Handle a keypress while the read-only detail overlay is open: walk,
+    /// open and retrace linked rolls (see [`detail_key`]). Action keys are
+    /// ignored, so nothing can fire from here.
     fn handle_detail(&mut self, code: KeyCode) {
-        if matches!(code, KeyCode::Char('q') | KeyCode::Esc) {
-            self.mode = Mode::Browsing;
+        let Mode::Detail {
+            roll,
+            ahead_behind,
+            cursor,
+            trail,
+        } = &mut self.mode
+        else {
+            return;
+        };
+        let targets = detail_targets(roll, &self.rolls);
+        match detail_key(code, cursor, targets.len(), !trail.is_empty()) {
+            DetailOutcome::Continue => {}
+            DetailOutcome::Close => self.mode = Mode::Browsing,
+            DetailOutcome::Back => {
+                if let Some((previous, divergence)) = trail.pop() {
+                    *roll = previous;
+                    *ahead_behind = divergence;
+                    *cursor = 0;
+                }
+            }
+            DetailOutcome::Open(index) => {
+                // Drill into the linked roll: the one under the cursor becomes
+                // the pane, and the current one joins the trail so backspace
+                // can return to it. Divergence is read the way `[enter]` from
+                // the table reads it, at open time, for a both-location roll.
+                let Some(next) = targets
+                    .get(index)
+                    .and_then(|n| self.rolls.iter().find(|r| r.number == *n))
+                    .cloned()
+                else {
+                    return;
+                };
+                let divergence = if matches!(next.location, BranchLocation::Both) {
+                    git::ahead_behind(&self.config.repo_root, &next.branch).ok()
+                } else {
+                    None
+                };
+                trail.push((std::mem::replace(roll, next), *ahead_behind));
+                *ahead_behind = divergence;
+                *cursor = 0;
+            }
         }
     }
 
@@ -2845,8 +2960,14 @@ impl StatusApp {
                     },
                 );
             }
-            Mode::Detail { roll, ahead_behind } => {
-                render_detail(f, area, roll, *ahead_behind, &self.rolls)
+            Mode::Detail {
+                roll,
+                ahead_behind,
+                cursor,
+                trail,
+            } => {
+                let path: Vec<u32> = trail.iter().map(|(r, _)| r.number).collect();
+                render_detail(f, area, roll, *ahead_behind, &self.rolls, *cursor, &path)
             }
             Mode::CreateInput { slug } => render_create_input(f, area, &self.config, slug),
             Mode::Delete { preview } => render_delete_modal(f, area, &self.config, preview),
@@ -4148,11 +4269,30 @@ fn render_detail(
     roll: &RollInfo,
     ahead_behind: Option<(u32, u32)>,
     all: &[RollInfo],
+    cursor: usize,
+    trail: &[u32],
 ) {
     let chain = dep_chain(roll, all);
     let dependents = dependent_rows(roll, all);
+    // The cursor marker: chain rows first, then dependents, matching
+    // `detail_targets` exactly so what is highlighted is what enter opens.
+    let cursor_mark = |index: usize| if index == cursor { "▶ " } else { "  " };
 
-    let mut lines = vec![
+    let mut lines = Vec::new();
+    // Where this pane was reached from, so a deep dig still reads as a path
+    // rather than as a pane that appeared from nowhere.
+    if !trail.is_empty() {
+        let mut crumbs = String::new();
+        for n in trail {
+            crumbs.push_str(&format!("#{n} → "));
+        }
+        crumbs.push_str(&format!("#{}", roll.number));
+        lines.push(Line::from(Span::styled(
+            crumbs,
+            Style::default().fg(Color::DarkGray),
+        )));
+    }
+    lines.extend([
         Line::from(vec![
             Span::styled("roll #", Style::default().add_modifier(Modifier::BOLD)),
             Span::styled(
@@ -4171,7 +4311,7 @@ fn render_detail(
             Span::raw("    location: "),
             Span::raw(roll.location.label()),
         ]),
-    ];
+    ]);
 
     // Local-vs-origin divergence, only for both-location rolls (issue #99).
     if let Some(text) = format_ahead_behind(ahead_behind) {
@@ -4206,8 +4346,8 @@ fn render_detail(
             header,
             Style::default().add_modifier(Modifier::BOLD),
         )));
-        for r in &chain {
-            let indent = "  ".repeat(r.depth + 1);
+        for (i, r) in chain.iter().enumerate() {
+            let indent = "  ".repeat(r.depth);
             let elbow = if r.depth > 0 { "└ " } else { "" };
             let (marker, marker_style) = match (r.repeated, r.is_blocker, r.needs_reintegration) {
                 (true, _, true) => ("↑ shown above, ⚠ stale", Style::default().fg(Color::Yellow)),
@@ -4218,7 +4358,7 @@ fn render_detail(
                 (false, false, false) => ("✓ ok", Style::default().fg(Color::Green)),
             };
             lines.push(Line::from(vec![
-                Span::raw(format!("{indent}{elbow}#{}  ", r.number)),
+                Span::raw(format!("{}{indent}{elbow}#{}  ", cursor_mark(i), r.number)),
                 Span::styled(r.branch.clone(), Style::default().fg(Color::Cyan)),
                 Span::raw("  ["),
                 Span::styled(r.state.label(), Style::default().fg(state_color(&r.state))),
@@ -4241,9 +4381,9 @@ fn render_detail(
             format!("dependents ({}):", dependents.len()),
             Style::default().add_modifier(Modifier::BOLD),
         )));
-        for r in &dependents {
+        for (i, r) in dependents.iter().enumerate() {
             lines.push(Line::from(vec![
-                Span::raw(format!("  #{}  ", r.number)),
+                Span::raw(format!("{}#{}  ", cursor_mark(chain.len() + i), r.number)),
                 Span::styled(r.branch.clone(), Style::default().fg(Color::Cyan)),
                 Span::raw("  ["),
                 Span::styled(r.state.label(), Style::default().fg(state_color(&r.state))),
@@ -4253,8 +4393,14 @@ fn render_detail(
     }
 
     lines.push(Line::from(""));
+    let hint = match (chain.is_empty() && dependents.is_empty(), trail.is_empty()) {
+        (true, true) => "[q/esc] close",
+        (true, false) => "[backspace] back   [esc] close",
+        (false, true) => "[j/k] move   [enter] open   [esc] close",
+        (false, false) => "[j/k] move   [enter] open   [backspace] back   [esc] close",
+    };
     lines.push(Line::from(Span::styled(
-        "[q/esc] back",
+        hint,
         Style::default().fg(Color::DarkGray),
     )));
 
@@ -5476,11 +5622,122 @@ mod tests {
         assert_eq!(flags, vec![(9, false), (8, true), (7, false)]);
     }
 
+    /// 12 → 9 → 8 → 7, with 3 depending on 12: the shape this feature exists for.
+    fn drill_fixture() -> Vec<RollInfo> {
+        let mut rolls = vec![
+            roll_n(7, RollState::Graduated),
+            roll_n(8, RollState::Active),
+            roll_n(9, RollState::Blocked),
+            roll_n(12, RollState::Blocked),
+            roll_n(3, RollState::Blocked),
+        ];
+        rolls[0].dependents = vec![8];
+        rolls[1].deps = vec![7];
+        rolls[1].dependents = vec![9];
+        rolls[2].deps = vec![8];
+        rolls[2].dependents = vec![12];
+        rolls[3].deps = vec![9];
+        rolls[3].dependents = vec![3];
+        rolls[4].deps = vec![12];
+        rolls
+    }
+
+    #[test]
+    fn the_detail_targets_are_the_chain_then_the_dependents_in_pane_order() {
+        let all = drill_fixture();
+        let twelve = all.iter().find(|r| r.number == 12).unwrap();
+        // What the cursor walks is exactly what the pane lists, in order — so
+        // the highlighted row and the opened row can never disagree.
+        assert_eq!(detail_targets(twelve, &all), vec![9, 8, 7, 3]);
+        let seven = all.iter().find(|r| r.number == 7).unwrap();
+        assert_eq!(detail_targets(seven, &all), vec![8]);
+    }
+
+    #[test]
+    fn detail_keys_walk_open_and_retrace() {
+        let mut cursor = 0;
+        // Movement clamps to the list.
+        assert_eq!(
+            detail_key(KeyCode::Char('j'), &mut cursor, 3, false),
+            DetailOutcome::Continue
+        );
+        assert_eq!(
+            detail_key(KeyCode::Down, &mut cursor, 3, false),
+            DetailOutcome::Continue
+        );
+        assert_eq!(
+            detail_key(KeyCode::Char('j'), &mut cursor, 3, false),
+            DetailOutcome::Continue
+        );
+        assert_eq!(cursor, 2, "walked past the end");
+        assert_eq!(
+            detail_key(KeyCode::Char('k'), &mut cursor, 3, false),
+            DetailOutcome::Continue
+        );
+        assert_eq!(cursor, 1);
+
+        // Enter opens the row under the cursor; with nothing to open it does nothing.
+        assert_eq!(
+            detail_key(KeyCode::Enter, &mut cursor, 3, false),
+            DetailOutcome::Open(1)
+        );
+        assert_eq!(
+            detail_key(KeyCode::Char('l'), &mut cursor, 3, false),
+            DetailOutcome::Open(1)
+        );
+        assert_eq!(
+            detail_key(KeyCode::Enter, &mut cursor, 0, false),
+            DetailOutcome::Continue
+        );
+
+        // Backspace retraces when there is a trail and closes when there is not,
+        // so the key never dead-ends. Esc always closes outright.
+        assert_eq!(
+            detail_key(KeyCode::Backspace, &mut cursor, 3, true),
+            DetailOutcome::Back
+        );
+        assert_eq!(
+            detail_key(KeyCode::Char('h'), &mut cursor, 3, true),
+            DetailOutcome::Back
+        );
+        assert_eq!(
+            detail_key(KeyCode::Backspace, &mut cursor, 3, false),
+            DetailOutcome::Close
+        );
+        assert_eq!(
+            detail_key(KeyCode::Esc, &mut cursor, 3, true),
+            DetailOutcome::Close
+        );
+        assert_eq!(
+            detail_key(KeyCode::Char('q'), &mut cursor, 3, true),
+            DetailOutcome::Close
+        );
+    }
+
+    #[test]
+    fn a_drilled_pane_shows_where_it_came_from_and_marks_the_cursor() {
+        let all = drill_fixture();
+        let nine = all.iter().find(|r| r.number == 9).unwrap();
+        let out = draw(|f, area| render_detail(f, area, nine, None, &all, 1, &[12]));
+        assert!(out.contains("#12 → #9"), "no breadcrumb:\n{out}");
+        // Cursor on the second target (#7), not the first.
+        assert!(out.contains("▶ "), "{out}");
+        let marked = out.lines().find(|l| l.contains("▶ ")).unwrap();
+        assert!(marked.contains("#7"), "cursor on the wrong row: {marked}");
+        assert!(out.contains("[backspace] back"), "{out}");
+
+        // A top-level pane has no breadcrumb and no back hint.
+        let top = draw(|f, area| render_detail(f, area, nine, None, &all, 0, &[]));
+        assert!(!top.contains("→ #9"), "{top}");
+        assert!(!top.contains("[backspace]"), "{top}");
+        assert!(top.contains("[enter] open"), "{top}");
+    }
+
     #[test]
     fn the_detail_view_draws_the_chain_with_its_markers() {
         let mut all = linear_chain();
         all[3].stale_deps = vec![9];
-        let out = draw(|f, area| render_detail(f, area, &all[3], None, &all));
+        let out = draw(|f, area| render_detail(f, area, &all[3], None, &all, 0, &[]));
         assert!(
             out.contains("dependency chain (1 blocking, 1 stale)"),
             "{out}"
