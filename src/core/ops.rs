@@ -1205,21 +1205,30 @@ pub(crate) fn ensure_version_merge_driver(config: &Config) -> Result<bool> {
 /// `cargo update --workspace --locked` gate is the real enforcement. Keeping it
 /// non-fatal also lets the integration tests run offline against fixture
 /// manifests that are not real crates.
+///
+/// Runs through [`proc::run`] like the gates do, because cargo always talks:
+/// a dev marker sorts *below* the bare version, so marking a roll prints
+/// `Downgrading <pkg> v0.2.7 -> v0.2.7-roll34`. Under the TUI that line used to
+/// land on the alternate screen itself, scribbling over cells ratatui then
+/// never repainted — the table looked out of date until something forced a
+/// full redraw.
 fn refresh_lockfile(repo: &Path) {
     if !repo.join("Cargo.lock").exists() {
         return;
     }
-    let offline = Command::new("cargo")
-        .args(["update", "--workspace", "--offline"])
-        .current_dir(repo)
-        .status();
+    let offline = proc::run(
+        Command::new("cargo")
+            .args(["update", "--workspace", "--offline"])
+            .current_dir(repo),
+    );
     if matches!(&offline, Ok(s) if s.success()) {
         return;
     }
-    let _ = Command::new("cargo")
-        .args(["update", "--workspace"])
-        .current_dir(repo)
-        .status();
+    let _ = proc::run(
+        Command::new("cargo")
+            .args(["update", "--workspace"])
+            .current_dir(repo),
+    );
 }
 
 /// Create the release tag for a completed promotion.

@@ -3933,6 +3933,62 @@ mod tests {
     }
 
     #[test]
+    fn run_verify_routes_the_lockfile_refresh_into_the_panel() {
+        // Regression test: marking a roll's dev version rewrites Cargo.toml and
+        // then refreshes Cargo.lock with `cargo update`, which used to inherit
+        // stdio. `0.0.1-roll1` sorts *below* `0.0.1`, so cargo announces
+        // `Downgrading fixture v0.0.1 -> v0.0.1-roll1` — written straight over
+        // the TUI's alternate screen, where ratatui's diffing never repaints
+        // the cells it clobbered. With a sink installed, as the TUI's job
+        // thread has, that line must arrive in the panel instead.
+        let dir = sandbox_repo();
+        let repo = dir.path();
+        std::fs::create_dir(repo.join("src")).expect("mkdir src");
+        std::fs::write(repo.join("src/lib.rs"), "").expect("write lib.rs");
+        std::fs::write(
+            repo.join("Cargo.lock"),
+            "version = 4\n\n[[package]]\nname = \"fixture\"\nversion = \"0.0.1\"\n",
+        )
+        .expect("write Cargo.lock");
+        for args in [
+            &["add", "src/lib.rs", "Cargo.lock"][..],
+            &["commit", "-q", "-m", "lockfile"][..],
+        ] {
+            let status = std::process::Command::new("git")
+                .args(args)
+                .current_dir(repo)
+                .status()
+                .expect("run git");
+            assert!(status.success(), "git {args:?} failed");
+        }
+        let mut cfg = config("main", "rolling");
+        cfg.repo_root = repo.to_path_buf();
+
+        let (tx, rx) = std::sync::mpsc::channel();
+        let lines = crate::core::proc::with_sink(tx, || run_verify(&cfg))
+            .expect("verify should pass with no gates configured");
+        assert!(
+            lines
+                .iter()
+                .any(|l| l.contains("version marked 0.0.1-roll1")),
+            "{lines:?}"
+        );
+
+        let panel: Vec<String> = rx.try_iter().map(|l| l.text().to_string()).collect();
+        assert!(
+            panel
+                .iter()
+                .any(|l| l.contains("fixture") && l.contains("0.0.1-roll1")),
+            "cargo's lockfile update did not reach the panel: {panel:?}"
+        );
+        let lock = std::fs::read_to_string(repo.join("Cargo.lock")).expect("read Cargo.lock");
+        assert!(
+            lock.contains("0.0.1-roll1"),
+            "lockfile not refreshed: {lock}"
+        );
+    }
+
+    #[test]
     fn base_rows_list_stable_then_rolling() {
         let cfg = config("main", "develop");
         // Both exist locally only.
