@@ -43,6 +43,17 @@ pub enum Followup {
     SelectBranch(String),
     /// The push was rejected as non-fast-forward. Ask whether to force it.
     OfferForcePush { branch: String, remote: String },
+    /// A graduation or promotion stopped on conflicts and was unwound. Offer
+    /// the ways forward — the diagnosis itself is already in the panel.
+    OfferConflictResolution {
+        source: String,
+        target: String,
+        /// Rolls already on the target that touched the conflicted paths.
+        culprits: Vec<String>,
+        /// True when `source` is the checked-out roll, so the culprits can be
+        /// integrated into it from here.
+        can_integrate: bool,
+    },
 }
 
 /// A successful job's result: lines to append to the panel, plus an optional

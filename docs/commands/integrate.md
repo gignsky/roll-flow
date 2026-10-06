@@ -45,13 +45,21 @@ dependencies too (method 2 in
 [algorithms](../internals/algorithms.md#dependency-detection-coredependenciesrs)).
 
 This is the recovery path when a roll fails to merge into rolling at graduation
-time: rather than let `graduate` hit the conflict ungracefully, press `[I]` to
-bring rolling into the roll first, resolve the conflict here — same as any
+time: rather than let `graduate` hit the conflict, press `[I]` to bring
+rolling into the roll first, resolve the conflict here — same as any
 other `[i]`/`[I]` conflict, in the panel or in lazygit (`gg`) — commit it, and
 then graduate normally.
 
 It is refused when the checked-out branch is not a roll, or when it already
 *is* the rolling branch.
+
+## After a conflicting graduation
+
+This is also what [`graduate`](graduate.md#when-the-merge-conflicts) recommends
+when its merge conflicts with a roll already on rolling: integrating that roll
+reproduces the conflict on your branch, where you resolve and commit it, and
+records the dependency the conflict revealed. `rf graduate --yes` does it for
+you.
 
 ## Consequences
 
