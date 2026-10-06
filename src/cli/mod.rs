@@ -1,7 +1,7 @@
 pub mod clean;
 pub mod status;
 
-use crate::core::branches::RollState;
+use crate::core::branches::{RollState, VerifySet};
 use crate::core::version::BumpLevel;
 use std::io::IsTerminal;
 
@@ -19,6 +19,27 @@ pub(crate) fn prompt_yes(msg: &str) -> anyhow::Result<bool> {
     std::io::stdin().read_line(&mut line)?;
     let ans = line.trim().to_ascii_lowercase();
     Ok(ans == "y" || ans == "yes")
+}
+
+/// Prompt for one of `1..=max`, returning `default` on an empty line. Any
+/// other answer re-prompts, so a stray keypress never picks an option.
+pub(crate) fn prompt_choice(max: usize, default: usize) -> anyhow::Result<usize> {
+    use std::io::Write;
+    loop {
+        print!("Choose [1-{max}, default {default}]: ");
+        std::io::stdout().flush()?;
+        let mut line = String::new();
+        std::io::stdin().read_line(&mut line)?;
+        let ans = line.trim();
+        if ans.is_empty() {
+            return Ok(default);
+        }
+        if let Ok(n) = ans.parse::<usize>() {
+            if (1..=max).contains(&n) {
+                return Ok(n);
+            }
+        }
+    }
 }
 
 /// How a destructive command's confirmation resolved.
@@ -138,6 +159,13 @@ pub enum Cmd {
         /// Answer yes to prompts (non-interactive).
         #[arg(long)]
         yes: bool,
+        /// Verify every roll in `--state` (default: all) in turn instead of the
+        /// current branch, switching to each and back again. Never bumps.
+        #[arg(long, conflicts_with_all = ["bump", "yes", "dry_run"])]
+        all: bool,
+        /// Which rolls `--all` covers.
+        #[arg(long, value_enum, default_value = "all", requires = "all")]
+        state: VerifySet,
     },
 
     /// Graduate the current roll branch into rolling (--no-ff merge).
@@ -155,7 +183,8 @@ pub enum Cmd {
         #[arg(long)]
         no_tag: bool,
         /// Answer yes to prompts (non-interactive): pushes the dev tag without
-        /// asking.
+        /// asking, and when the merge conflicts takes the recommended way
+        /// forward — integrating the conflicting roll(s) into this one.
         #[arg(long)]
         yes: bool,
     },

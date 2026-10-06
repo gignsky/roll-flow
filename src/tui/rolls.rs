@@ -12,7 +12,7 @@
 //! lazygit's rather than one of our own — `[G]raduate` and `[m] promote` moved
 //! aside to make room for it.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::time::{Duration, Instant};
 
 use anyhow::{anyhow, bail, Result};
@@ -27,7 +27,7 @@ use ratatui::{
 
 use super::output::{self, Followup, JobDone, JobProgress};
 use crate::core::{
-    branches::{self, BranchLocation, RollInfo, RollState},
+    branches::{self, BranchLocation, RollInfo, RollState, VerifySet},
     config::Config,
     git::{self, TrackState},
     ops,
@@ -121,6 +121,37 @@ pub(crate) fn bump_key(code: KeyCode) -> BumpOutcome {
         KeyCode::Char('n') | KeyCode::Char('N') | KeyCode::Esc => BumpOutcome::Cancel,
         _ => BumpOutcome::Ignore,
     }
+}
+
+/// What a keypress in the `[V]` picker resolves to.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub(crate) enum VerifyManyOutcome {
+    Ignore,
+    Cancel,
+    Set(VerifySet),
+}
+
+/// Decide a keystroke in the verify-many picker: digits pick a set in the
+/// order [`VerifySet::ALL`] lists them, `n`/`esc` cancel. Digits for the same
+/// reason the bump modal uses them — six choices share too many initials.
+pub(crate) fn verify_many_key(code: KeyCode) -> VerifyManyOutcome {
+    match code {
+        KeyCode::Char(c @ '1'..='9') => {
+            let index = (c as usize) - ('1' as usize);
+            match VerifySet::ALL.get(index) {
+                Some(set) => VerifyManyOutcome::Set(*set),
+                None => VerifyManyOutcome::Ignore,
+            }
+        }
+        KeyCode::Char('n') | KeyCode::Char('N') | KeyCode::Esc => VerifyManyOutcome::Cancel,
+        _ => VerifyManyOutcome::Ignore,
+    }
+}
+
+/// How many rolls each set would verify, in menu order. Computed once when the
+/// modal opens so the counts it shows are the counts the pass will use.
+pub(crate) fn verify_set_counts(rolls: &[RollInfo]) -> [(VerifySet, usize); 6] {
+    VerifySet::ALL.map(|set| (set, set.select(rolls).len()))
 }
 
 /// The three levels and what each would produce, in the order the modal lists
@@ -219,6 +250,14 @@ enum Mode {
     Detail {
         roll: RollInfo,
         ahead_behind: Option<(u32, u32)>,
+        /// Which linked roll `[enter]` opens: an index into
+        /// [`detail_targets`] — the chain rows, then the dependents.
+        cursor: usize,
+        /// The rolls drilled through to get here, innermost last, so
+        /// `[backspace]` retraces the path rather than closing. Each carries
+        /// the divergence it was opened with, so going back redraws exactly
+        /// what was there.
+        trail: Vec<(RollInfo, Option<(u32, u32)>)>,
     },
     /// Slug-input modal for creating a new roll (issue #79). Holds the
     /// in-progress text buffer; on Enter it runs `ops::create` through the same
@@ -236,6 +275,20 @@ enum Mode {
     /// opened, so the previews it shows and the bump it applies agree.
     Bump {
         current: Semver,
+    },
+    /// `[V]`: pick which set of rolls to verify in one pass. Holds the counts
+    /// read when the modal opened, so the numbers it shows and the set it
+    /// runs agree.
+    VerifyMany {
+        counts: [(VerifySet, usize); 6],
+    },
+    /// A graduation or promotion conflicted and was unwound. Offers the ways
+    /// forward; the diagnosis is in the panel underneath.
+    Conflict {
+        source: String,
+        target: String,
+        culprits: Vec<String>,
+        can_integrate: bool,
     },
     /// `PP`: confirm pushing every branch that needs it.
     ///
@@ -851,6 +904,13 @@ pub(crate) const BINDINGS: &[Binding] = &[
         replay: &[KeyCode::Char('v')],
     },
     Binding {
+        keys: "V",
+        label: "verify all rolls, or a set of them",
+        group: "roll",
+        hint: None,
+        replay: &[KeyCode::Char('V')],
+    },
+    Binding {
         keys: "G",
         label: "graduate the selected roll into rolling",
         group: "roll",
@@ -1129,6 +1189,130 @@ pub(crate) fn dep_rows(selected: &RollInfo, all: &[RollInfo]) -> Vec<DepRow> {
             needs_reintegration: selected.stale_deps.contains(&dep.number),
         })
         .collect()
+}
+
+/// One link in the dependency chain the detail view draws.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct ChainRow {
+    /// 0 for a direct dependency, 1 for a dependency of that one, and so on.
+    pub depth: usize,
+    pub number: u32,
+    pub branch: String,
+    pub state: RollState,
+    /// Not yet graduated/promoted — holds its parent back.
+    pub is_blocker: bool,
+    /// The parent integrated this roll, and its branch has moved since —
+    /// [`DepRow::needs_reintegration`], read from the parent's `stale_deps`.
+    pub needs_reintegration: bool,
+    /// Already listed higher up the chain (a diamond). Its own dependencies
+    /// are not repeated under it.
+    pub repeated: bool,
+}
+
+/// The whole dependency chain below `selected`, depth-first, as the detail
+/// view shows it: roll 12 depends on 9, which depends on 8, which depends on 7.
+///
+/// [`dep_rows`] is the first level of this. The traversal keeps a set of rolls
+/// already listed, and a roll reached a second time — a diamond, or a cycle if
+/// the history is strange enough — is listed once more as `repeated` and not
+/// descended into, so the output is finite and every roll's own deps appear
+/// exactly once. Both markers on a link are the *parent's* judgement of it —
+/// `needs_reintegration` reads the parent's `RollInfo::stale_deps`, since that
+/// is who integrated it. Unknown numbers are skipped, as in [`dep_rows`].
+pub(crate) fn dep_chain(selected: &RollInfo, all: &[RollInfo]) -> Vec<ChainRow> {
+    fn walk(
+        parent: &RollInfo,
+        all: &[RollInfo],
+        depth: usize,
+        seen: &mut HashSet<u32>,
+        rows: &mut Vec<ChainRow>,
+    ) {
+        // Each level is exactly `dep_rows` of its parent, so there is one
+        // definition of a direct dependency row and the chain only adds depth.
+        for row in dep_rows(parent, all) {
+            let repeated = !seen.insert(row.number);
+            rows.push(ChainRow {
+                depth,
+                number: row.number,
+                branch: row.branch,
+                state: row.state,
+                is_blocker: row.is_blocker,
+                needs_reintegration: row.needs_reintegration,
+                repeated,
+            });
+            if !repeated {
+                if let Some(dep) = all.iter().find(|r| r.number == row.number) {
+                    walk(dep, all, depth + 1, seen, rows);
+                }
+            }
+        }
+    }
+    let mut seen = HashSet::from([selected.number]);
+    let mut rows = Vec::new();
+    walk(selected, all, 0, &mut seen, &mut rows);
+    rows
+}
+
+/// The rolls `[enter]` can open from a detail pane, in the order the pane
+/// lists them: every chain row (repeated ones included — opening a diamond's
+/// second mention is as valid as its first), then the dependents. The cursor
+/// in [`Mode::Detail`] is an index into this.
+pub(crate) fn detail_targets(roll: &RollInfo, all: &[RollInfo]) -> Vec<u32> {
+    dep_chain(roll, all)
+        .iter()
+        .map(|r| r.number)
+        .chain(dependent_rows(roll, all).iter().map(|r| r.number))
+        .collect()
+}
+
+/// What a keypress in a detail pane does.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum DetailOutcome {
+    Continue,
+    /// Leave the overlay entirely, however deep the trail.
+    Close,
+    /// Return to the pane this one was opened from.
+    Back,
+    /// Open the linked roll at this index of [`detail_targets`].
+    Open(usize),
+}
+
+/// Apply one keystroke to a detail pane.
+///
+/// The pane is a place to *dig*, not just read: `j`/`k` walk the linked rolls,
+/// `enter` (or `l`/`→`) opens the one under the cursor as its own pane, and
+/// `backspace` (or `h`/`←`) comes back up one level — falling through to
+/// closing when there is nowhere further up, so the key never dead-ends.
+/// `esc`/`q` always close outright, whatever the depth. Pure, so the whole
+/// navigation is testable without a terminal.
+pub(crate) fn detail_key(
+    code: KeyCode,
+    cursor: &mut usize,
+    targets: usize,
+    has_trail: bool,
+) -> DetailOutcome {
+    match code {
+        KeyCode::Esc | KeyCode::Char('q') => DetailOutcome::Close,
+        KeyCode::Backspace | KeyCode::Char('h') | KeyCode::Left => {
+            if has_trail {
+                DetailOutcome::Back
+            } else {
+                DetailOutcome::Close
+            }
+        }
+        KeyCode::Down | KeyCode::Char('j') => {
+            *cursor = (*cursor + 1).min(targets.saturating_sub(1));
+            DetailOutcome::Continue
+        }
+        KeyCode::Up | KeyCode::Char('k') => {
+            *cursor = cursor.saturating_sub(1);
+            DetailOutcome::Continue
+        }
+        KeyCode::Enter | KeyCode::Char('l') | KeyCode::Right if targets > 0 => {
+            DetailOutcome::Open((*cursor).min(targets - 1))
+        }
+        _ => DetailOutcome::Continue,
+    }
 }
 
 /// Build the *reverse*-dependency rows to show in the detail view for `target`:
@@ -1557,12 +1741,16 @@ impl StatusApp {
                     }
                     if matches!(self.mode, Mode::Confirm { .. }) {
                         self.handle_confirm(key.code);
+                    } else if matches!(self.mode, Mode::Conflict { .. }) {
+                        self.handle_conflict(key.code);
                     } else if matches!(self.mode, Mode::PushAll { .. }) {
                         self.handle_push_all(key.code);
                     } else if matches!(self.mode, Mode::ForcePush { .. }) {
                         self.handle_force_push(key.code);
                     } else if matches!(self.mode, Mode::Bump { .. }) {
                         self.handle_bump(key.code);
+                    } else if matches!(self.mode, Mode::VerifyMany { .. }) {
+                        self.handle_verify_many(key.code);
                     } else if matches!(self.mode, Mode::Detail { .. }) {
                         self.handle_detail(key.code);
                     } else if matches!(self.mode, Mode::CreateInput { .. }) {
@@ -1611,6 +1799,19 @@ impl StatusApp {
             }
             Some(Followup::OfferForcePush { branch, remote }) => {
                 self.mode = Mode::ForcePush { branch, remote };
+            }
+            Some(Followup::OfferConflictResolution {
+                source,
+                target,
+                culprits,
+                can_integrate,
+            }) => {
+                self.mode = Mode::Conflict {
+                    source,
+                    target,
+                    culprits,
+                    can_integrate,
+                };
             }
             None => {}
         }
@@ -1721,6 +1922,7 @@ impl StatusApp {
             KeyCode::Char('P') => self.arm_push(),
             KeyCode::Char('f') => self.start_fetch(),
             KeyCode::Char('v') => self.start_verify(),
+            KeyCode::Char('V') => self.request_verify_many(),
             KeyCode::Char('G') => self.request(Action::Graduate),
             KeyCode::Char('i') => self.request_integrate(),
             KeyCode::Char('I') => self.request_integrate_rolling(),
@@ -1751,7 +1953,12 @@ impl StatusApp {
                     } else {
                         None
                     };
-                    self.mode = Mode::Detail { roll, ahead_behind };
+                    self.mode = Mode::Detail {
+                        roll,
+                        ahead_behind,
+                        cursor: 0,
+                        trail: Vec::new(),
+                    };
                 }
             }
             _ => {}
@@ -1759,11 +1966,51 @@ impl StatusApp {
         Ok(false)
     }
 
-    /// Handle a keypress while the read-only detail overlay is open. Only close
-    /// keys apply; everything else is ignored so action keys can't fire here.
+    /// Handle a keypress while the read-only detail overlay is open: walk,
+    /// open and retrace linked rolls (see [`detail_key`]). Action keys are
+    /// ignored, so nothing can fire from here.
     fn handle_detail(&mut self, code: KeyCode) {
-        if matches!(code, KeyCode::Char('q') | KeyCode::Esc) {
-            self.mode = Mode::Browsing;
+        let Mode::Detail {
+            roll,
+            ahead_behind,
+            cursor,
+            trail,
+        } = &mut self.mode
+        else {
+            return;
+        };
+        let targets = detail_targets(roll, &self.rolls);
+        match detail_key(code, cursor, targets.len(), !trail.is_empty()) {
+            DetailOutcome::Continue => {}
+            DetailOutcome::Close => self.mode = Mode::Browsing,
+            DetailOutcome::Back => {
+                if let Some((previous, divergence)) = trail.pop() {
+                    *roll = previous;
+                    *ahead_behind = divergence;
+                    *cursor = 0;
+                }
+            }
+            DetailOutcome::Open(index) => {
+                // Drill into the linked roll: the one under the cursor becomes
+                // the pane, and the current one joins the trail so backspace
+                // can return to it. Divergence is read the way `[enter]` from
+                // the table reads it, at open time, for a both-location roll.
+                let Some(next) = targets
+                    .get(index)
+                    .and_then(|n| self.rolls.iter().find(|r| r.number == *n))
+                    .cloned()
+                else {
+                    return;
+                };
+                let divergence = if matches!(next.location, BranchLocation::Both) {
+                    git::ahead_behind(&self.config.repo_root, &next.branch).ok()
+                } else {
+                    None
+                };
+                trail.push((std::mem::replace(roll, next), *ahead_behind));
+                *ahead_behind = divergence;
+                *cursor = 0;
+            }
         }
     }
 
@@ -1982,6 +2229,67 @@ impl StatusApp {
         }
     }
 
+    /// `[V]` — open the verify-many picker, or say why it cannot run.
+    ///
+    /// The clean-tree check happens here as well as inside `ops::verify_many`,
+    /// so the refusal is a status-bar message before the modal opens rather
+    /// than a failed job after the user has already chosen a set.
+    fn request_verify_many(&mut self) {
+        if self.busy() {
+            return;
+        }
+        if let Err(err) = ops::ensure_clean_state(&self.config) {
+            self.message = Some(format!("{err} — verifying many rolls switches branches"));
+            return;
+        }
+        self.mode = Mode::VerifyMany {
+            counts: verify_set_counts(&self.rolls),
+        };
+    }
+
+    /// Handle a keypress while the verify-many picker is open.
+    fn handle_verify_many(&mut self, code: KeyCode) {
+        match verify_many_key(code) {
+            VerifyManyOutcome::Ignore => {}
+            VerifyManyOutcome::Cancel => self.mode = Mode::Browsing,
+            VerifyManyOutcome::Set(set) => {
+                self.mode = Mode::Browsing;
+                self.execute_verify_many(set);
+            }
+        }
+    }
+
+    /// Verify every roll in `set`, as one job. Sequential and in one panel: a
+    /// pass that switches branches under the table must not race another job,
+    /// and the roll-by-roll log reads best as a single scroll.
+    fn execute_verify_many(&mut self, set: VerifySet) {
+        let selected = set.select(&self.rolls);
+        if selected.is_empty() {
+            self.message = Some(format!("no rolls to verify ({})", set.label()));
+            return;
+        }
+        let config = self.config.clone();
+        let n = selected.len();
+        self.start_job(
+            format!("rf verify --all ({}, {n})", set.label()),
+            move || {
+                let results = ops::verify_many(&config, &selected)?;
+                let (lines, failed) = render_verify_many(&results);
+                if failed.is_empty() {
+                    Ok(JobDone::lines(lines))
+                } else {
+                    // Folded into the error so a failed panel still carries the
+                    // per-roll report rather than only the names.
+                    Err(anyhow!(
+                        "{}\nverification failed for: {}",
+                        lines.join("\n"),
+                        failed.join(", ")
+                    ))
+                }
+            },
+        );
+    }
+
     /// Handle a keypress while the bump picker is open.
     fn handle_bump(&mut self, code: KeyCode) {
         match bump_key(code) {
@@ -2102,8 +2410,19 @@ impl StatusApp {
     fn execute(&mut self, action: Action, target: Option<String>) {
         let config = self.config.clone();
         let title = action.job_title(target.as_deref());
+        let current = self.current_branch.clone();
         self.start_job(title, move || {
-            Ok(JobDone::lines(run_op(&config, action, target.as_deref())?))
+            match run_op(&config, action, target.as_deref()) {
+                Ok(lines) => Ok(JobDone::lines(lines)),
+                // A conflict is an expected answer to act on, not an error to
+                // stop at — the same treatment a rejected push gets. The repo is
+                // already clean again; the panel carries the diagnosis and the
+                // follow-up modal carries the choices.
+                Err(err) => match err.downcast::<ops::MergeConflict>() {
+                    Ok(conflict) => Ok(conflict_job_done(&conflict, &current)),
+                    Err(err) => Err(err),
+                },
+            }
         });
     }
 
@@ -2481,6 +2800,91 @@ impl StatusApp {
         }
     }
 
+    /// Answer the conflict modal.
+    fn handle_conflict(&mut self, code: KeyCode) {
+        let Mode::Conflict { can_integrate, .. } = &self.mode else {
+            return;
+        };
+        match conflict_key(code, *can_integrate) {
+            ConflictOutcome::Ignore => {}
+            ConflictOutcome::Close => self.mode = Mode::Browsing,
+            ConflictOutcome::Integrate => {
+                let Mode::Conflict {
+                    source, culprits, ..
+                } = std::mem::replace(&mut self.mode, Mode::Browsing)
+                else {
+                    return;
+                };
+                self.integrate_culprits_job(source, culprits);
+            }
+            ConflictOutcome::Stage => {
+                let Mode::Conflict { source, target, .. } =
+                    std::mem::replace(&mut self.mode, Mode::Browsing)
+                else {
+                    return;
+                };
+                self.stage_conflict_job(source, target);
+            }
+        }
+    }
+
+    /// Integrate each culprit into the checked-out roll in turn, stopping at
+    /// the first one that conflicts — that conflict is now on the roll branch,
+    /// which is the point. When every culprit merges cleanly, the graduation
+    /// is retried on the spot, since nothing stands in its way any more.
+    fn integrate_culprits_job(&mut self, source: String, culprits: Vec<String>) {
+        let config = self.config.clone();
+        self.start_job(format!("rf integrate → {source}"), move || {
+            let mut lines = Vec::new();
+            for culprit in &culprits {
+                match ops::integrate(&config, culprit) {
+                    Ok(o) => lines.push(format!("Integrated '{}' into '{}'", o.branch, o.current)),
+                    Err(err) => {
+                        if git::ref_exists(&config.repo_root, "MERGE_HEAD") {
+                            lines.push(format!(
+                                "'{source}' is now mid-merge with '{culprit}': resolve the \
+                                 conflicts and commit (gg for lazygit, or git merge --abort), \
+                                 then [G]raduate again"
+                            ));
+                            return Ok(JobDone::lines(lines));
+                        }
+                        return Err(err);
+                    }
+                }
+            }
+            lines.push("every culprit merged cleanly; retrying the graduation".to_string());
+            let force = ops::ForceOpts::new(false, None)?;
+            let o = ops::graduate(&config, &source, false, &force, true)?;
+            push_gate_notices(&mut lines, &o.gate_notices);
+            lines.push(format!("Graduated '{}' into '{}'", o.roll, o.rolling));
+            if let Some(line) = o.tag.describe() {
+                lines.push(line);
+            }
+            Ok(JobDone::lines(lines))
+        });
+    }
+
+    /// Re-run the merge on the target and leave the conflict there. The one
+    /// job that leaves `MERGE_HEAD` behind on purpose — and only because the
+    /// user pressed the key that asks for exactly that.
+    fn stage_conflict_job(&mut self, source: String, target: String) {
+        let config = self.config.clone();
+        self.start_job(format!("git merge {source} (left for you)"), move || {
+            let lines = if ops::stage_conflict(&config, &source, &target)? {
+                vec![format!(
+                    "'{target}' is checked out mid-merge with '{source}': resolve the conflicts \
+                     and commit (gg for lazygit), or git merge --abort to back out"
+                )]
+            } else {
+                vec![format!(
+                    "the merge of '{source}' into '{target}' went through cleanly this time and \
+                     is committed"
+                )]
+            };
+            Ok(JobDone::lines(lines))
+        });
+    }
+
     /// Where `branch` currently exists, for a branch named by an open modal
     /// rather than by the selection.
     fn location_of(&self, branch: &str) -> BranchLocation {
@@ -2556,15 +2960,28 @@ impl StatusApp {
                     },
                 );
             }
-            Mode::Detail { roll, ahead_behind } => {
-                render_detail(f, area, roll, *ahead_behind, &self.rolls)
+            Mode::Detail {
+                roll,
+                ahead_behind,
+                cursor,
+                trail,
+            } => {
+                let path: Vec<u32> = trail.iter().map(|(r, _)| r.number).collect();
+                render_detail(f, area, roll, *ahead_behind, &self.rolls, *cursor, &path)
             }
             Mode::CreateInput { slug } => render_create_input(f, area, &self.config, slug),
             Mode::Delete { preview } => render_delete_modal(f, area, &self.config, preview),
             Mode::Bump { current } => render_bump_modal(f, area, *current, &self.current_branch),
+            Mode::VerifyMany { counts } => render_verify_many_modal(f, area, counts),
             Mode::ForcePush { branch, remote } => {
                 render_force_push_modal(f, area, branch, remote, self.tracking.get(branch))
             }
+            Mode::Conflict {
+                source,
+                target,
+                culprits,
+                can_integrate,
+            } => render_conflict_modal(f, area, source, target, culprits, *can_integrate),
             Mode::PushAll { plan } => render_push_all_modal(f, area, plan),
             Mode::Help { query, cursor } => render_help(f, area, query, *cursor),
             Mode::Browsing => {}
@@ -3086,6 +3503,94 @@ fn track_of(tracking: &HashMap<String, git::LocalBranch>, branch: &str) -> Optio
 /// Render the version-bump picker.
 ///
 /// Every level shows the version it would produce, not just its name: "minor" is
+/// Render a verify-many pass as printable lines, plus the branches that failed.
+///
+/// Mirrors `run_verify`'s vocabulary roll by roll, then a summary line, so a
+/// six-roll pass reads like six `[v]` results stacked — and never offers a
+/// bump, which is a commit on one branch where this pass walks many.
+fn render_verify_many(results: &[ops::VerifyManyResult]) -> (Vec<String>, Vec<String>) {
+    let mut lines = Vec::new();
+    let mut failed = Vec::new();
+    let mut passed = 0;
+    let mut skipped = 0;
+    for result in results {
+        lines.push(format!("── {} ──", result.branch));
+        if let Some(dev) = result.marked {
+            lines.push(format!("version marked {dev}"));
+        }
+        if let Some(o) = &result.outcome {
+            if o.diverged_note {
+                lines.push(format!(
+                    "note: '{}' has commits not in '{}'; graduation/promotion will create a --no-ff merge",
+                    o.target, o.source
+                ));
+            }
+            push_version_check(&mut lines, &o.version, &o.source, &o.target);
+            push_gate_notices(&mut lines, &o.gate_notices);
+            push_gate_notices(&mut lines, &o.host_notices);
+            push_host_results(&mut lines, &o.host_results);
+        }
+        match &result.verdict {
+            ops::VerifyVerdict::Passed => {
+                passed += 1;
+                lines.push("PASSED".to_string());
+            }
+            ops::VerifyVerdict::Failed(why) => {
+                failed.push(result.branch.clone());
+                lines.push(format!("FAILED: {why}"));
+            }
+            ops::VerifyVerdict::Skipped(why) => {
+                skipped += 1;
+                lines.push(format!("skipped: {why}"));
+            }
+        }
+    }
+    lines.push(format!(
+        "{passed} passed, {} failed, {skipped} skipped",
+        failed.len()
+    ));
+    (lines, failed)
+}
+
+/// Render the `[V]` picker: each set with how many rolls it would cover.
+fn render_verify_many_modal(f: &mut Frame, area: Rect, counts: &[(VerifySet, usize); 6]) {
+    let mut lines = vec![
+        Line::from(Span::styled(
+            "Verify which rolls? (switches to each, then back)",
+            Style::default().add_modifier(Modifier::BOLD),
+        )),
+        Line::from(""),
+    ];
+    for (i, (set, n)) in counts.iter().enumerate() {
+        lines.push(Line::from(vec![
+            Span::styled(format!("[{}] ", i + 1), Style::default().fg(Color::Yellow)),
+            Span::raw(format!("{:<24}", set.label())),
+            Span::styled(
+                format!("{n} roll{}", if *n == 1 { "" } else { "s" }),
+                Style::default().fg(Color::DarkGray),
+            ),
+        ]));
+    }
+    lines.push(Line::from(""));
+    lines.push(Line::from(Span::styled(
+        "[n] cancel",
+        Style::default().fg(Color::Yellow),
+    )));
+
+    let width = lines
+        .iter()
+        .map(|l| l.width())
+        .max()
+        .unwrap_or(32)
+        .clamp(28, 70) as u16;
+    let modal = centered_rect(area, width + 4, lines.len() as u16 + 2);
+    f.render_widget(Clear, modal);
+    f.render_widget(
+        Paragraph::new(lines).block(Block::bordered().title(" verify all ")),
+        modal,
+    );
+}
+
 /// abstract, `0.2.0 → 0.3.0` is not, and seeing all three at once is what makes
 /// picking the right one obvious.
 fn render_bump_modal(f: &mut Frame, area: Rect, current: Semver, branch: &str) {
@@ -3143,6 +3648,128 @@ fn render_bump_modal(f: &mut Frame, area: Rect, current: Semver, branch: &str) {
 /// key in the view that can destroy commits on the remote. The counts come from
 /// the tracking batch, so the prompt says what would actually be overwritten
 /// rather than asking in the abstract.
+/// What a keypress in the conflict modal does.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ConflictOutcome {
+    Integrate,
+    Stage,
+    Close,
+    Ignore,
+}
+
+/// Decide the conflict modal's key. `[i]` is only live when the source is the
+/// checked-out roll — `ops::integrate` merges into HEAD, so offering it for
+/// any other row would integrate into the wrong branch. Enter is unbound on
+/// purpose: every choice here leaves something to resolve by hand.
+pub(crate) fn conflict_key(code: KeyCode, can_integrate: bool) -> ConflictOutcome {
+    match code {
+        KeyCode::Char('i') | KeyCode::Char('I') if can_integrate => ConflictOutcome::Integrate,
+        KeyCode::Char('m') | KeyCode::Char('M') => ConflictOutcome::Stage,
+        KeyCode::Char('n') | KeyCode::Char('N') | KeyCode::Esc => ConflictOutcome::Close,
+        _ => ConflictOutcome::Ignore,
+    }
+}
+
+/// Turn a diagnosed conflict into a finished job: the report as panel lines,
+/// plus the follow-up that opens the modal.
+fn conflict_job_done(conflict: &ops::MergeConflict, current_branch: &str) -> JobDone {
+    let report = &conflict.report;
+    let culprits = report.culprit_rolls();
+    let mut lines = vec![conflict.to_string(), String::new()];
+    lines.extend(report.render());
+    lines.push(String::new());
+    if culprits.is_empty() {
+        lines.push(format!(
+            "the conflicting change was made on '{}' directly, not by a roll",
+            report.target
+        ));
+    } else {
+        lines.push(format!(
+            "the conflicting change is already on '{}' — it came in with {}",
+            report.target,
+            culprits.join(", ")
+        ));
+    }
+    lines.push(format!(
+        "NOT merged: '{}' is unchanged and '{}' is clean",
+        report.target, conflict.original
+    ));
+    JobDone::with_next(
+        lines,
+        Followup::OfferConflictResolution {
+            source: report.source.clone(),
+            target: report.target.clone(),
+            can_integrate: report.source == current_branch && !culprits.is_empty(),
+            culprits,
+        },
+    )
+}
+
+/// Render the conflict modal: which rolls collided, and the keys that decide
+/// what happens next. Red border, like the delete modal — every choice here
+/// leaves a merge for the user to finish.
+fn render_conflict_modal(
+    f: &mut Frame,
+    area: Rect,
+    source: &str,
+    target: &str,
+    culprits: &[String],
+    can_integrate: bool,
+) {
+    let red = Style::default().fg(Color::Red);
+    let dim = Style::default().fg(Color::DarkGray);
+    let mut lines = vec![
+        Line::from(Span::styled(
+            format!("'{source}' conflicts with '{target}'"),
+            Style::default().add_modifier(Modifier::BOLD),
+        )),
+        Line::from(""),
+    ];
+    if culprits.is_empty() {
+        lines.push(Line::from(
+            "The other side was changed directly, not by a roll.",
+        ));
+    } else {
+        lines.push(Line::from(format!(
+            "Already on {target} via: {}",
+            culprits.join(", ")
+        )));
+    }
+    lines.push(Line::from(""));
+    if can_integrate {
+        lines.push(Line::from(Span::styled(
+            "[i] integrate them into this roll and resolve here   (recommended)",
+            Style::default().fg(Color::Yellow),
+        )));
+    } else if !culprits.is_empty() {
+        lines.push(Line::from(Span::styled(
+            format!("[space] switch to {source} first to integrate them here"),
+            dim,
+        )));
+    }
+    lines.push(Line::from(Span::styled(
+        format!("[m] redo the merge on {target} and leave it for lazygit"),
+        Style::default().fg(Color::Yellow),
+    )));
+    lines.push(Line::from(Span::styled(
+        "[n] nothing — the panel has the details",
+        Style::default().fg(Color::Yellow),
+    )));
+
+    let width = lines
+        .iter()
+        .map(|l| l.width())
+        .max()
+        .unwrap_or(40)
+        .clamp(32, 78) as u16;
+    let modal = centered_rect(area, width + 4, lines.len() as u16 + 2);
+    f.render_widget(Clear, modal);
+    let body = Paragraph::new(lines)
+        .alignment(Alignment::Left)
+        .block(Block::bordered().border_style(red).title(" conflict "));
+    f.render_widget(body, modal);
+}
+
 fn render_force_push_modal(
     f: &mut Frame,
     area: Rect,
@@ -3642,11 +4269,30 @@ fn render_detail(
     roll: &RollInfo,
     ahead_behind: Option<(u32, u32)>,
     all: &[RollInfo],
+    cursor: usize,
+    trail: &[u32],
 ) {
-    let rows = dep_rows(roll, all);
+    let chain = dep_chain(roll, all);
     let dependents = dependent_rows(roll, all);
+    // The cursor marker: chain rows first, then dependents, matching
+    // `detail_targets` exactly so what is highlighted is what enter opens.
+    let cursor_mark = |index: usize| if index == cursor { "▶ " } else { "  " };
 
-    let mut lines = vec![
+    let mut lines = Vec::new();
+    // Where this pane was reached from, so a deep dig still reads as a path
+    // rather than as a pane that appeared from nowhere.
+    if !trail.is_empty() {
+        let mut crumbs = String::new();
+        for n in trail {
+            crumbs.push_str(&format!("#{n} → "));
+        }
+        crumbs.push_str(&format!("#{}", roll.number));
+        lines.push(Line::from(Span::styled(
+            crumbs,
+            Style::default().fg(Color::DarkGray),
+        )));
+    }
+    lines.extend([
         Line::from(vec![
             Span::styled("roll #", Style::default().add_modifier(Modifier::BOLD)),
             Span::styled(
@@ -3665,7 +4311,7 @@ fn render_detail(
             Span::raw("    location: "),
             Span::raw(roll.location.label()),
         ]),
-    ];
+    ]);
 
     // Local-vs-origin divergence, only for both-location rolls (issue #99).
     if let Some(text) = format_ahead_behind(ahead_behind) {
@@ -3677,33 +4323,42 @@ fn render_detail(
 
     lines.push(Line::from(""));
 
-    if rows.is_empty() {
+    if chain.is_empty() {
         lines.push(Line::from(Span::styled(
             "no dependencies / not blocked",
             Style::default().fg(Color::Green),
         )));
     } else {
-        let blockers = rows.iter().filter(|r| r.is_blocker).count();
-        let stale = rows.iter().filter(|r| r.needs_reintegration).count();
+        // Blockers anywhere in the chain, each counted once: a dependency's
+        // own ungraduated dependency holds this roll back just as surely.
+        // Stale links are counted per link, since each is a separate
+        // integration — the same roll reached twice may be stale in one
+        // parent and current in the other.
+        let blockers = chain.iter().filter(|r| r.is_blocker && !r.repeated).count();
+        let stale = chain.iter().filter(|r| r.needs_reintegration).count();
         let header = match (blockers, stale) {
-            (0, 0) => "dependencies (all graduated):".to_string(),
-            (0, s) => format!("dependencies ({s} stale — reintegrate):"),
-            (b, 0) => format!("dependencies ({b} blocking):"),
-            (b, s) => format!("dependencies ({b} blocking, {s} stale):"),
+            (0, 0) => "dependency chain (all graduated):".to_string(),
+            (0, s) => format!("dependency chain ({s} stale — reintegrate):"),
+            (b, 0) => format!("dependency chain ({b} blocking):"),
+            (b, s) => format!("dependency chain ({b} blocking, {s} stale):"),
         };
         lines.push(Line::from(Span::styled(
             header,
             Style::default().add_modifier(Modifier::BOLD),
         )));
-        for r in &rows {
-            let (marker, marker_style) = match (r.is_blocker, r.needs_reintegration) {
-                (true, true) => ("⛔ blocker, ⚠ stale", Style::default().fg(Color::Red)),
-                (true, false) => ("⛔ blocker", Style::default().fg(Color::Red)),
-                (false, true) => ("⚠ reintegrate", Style::default().fg(Color::Yellow)),
-                (false, false) => ("✓ ok", Style::default().fg(Color::Green)),
+        for (i, r) in chain.iter().enumerate() {
+            let indent = "  ".repeat(r.depth);
+            let elbow = if r.depth > 0 { "└ " } else { "" };
+            let (marker, marker_style) = match (r.repeated, r.is_blocker, r.needs_reintegration) {
+                (true, _, true) => ("↑ shown above, ⚠ stale", Style::default().fg(Color::Yellow)),
+                (true, _, false) => ("↑ shown above", Style::default().fg(Color::DarkGray)),
+                (false, true, true) => ("⛔ blocker, ⚠ stale", Style::default().fg(Color::Red)),
+                (false, true, false) => ("⛔ blocker", Style::default().fg(Color::Red)),
+                (false, false, true) => ("⚠ reintegrate", Style::default().fg(Color::Yellow)),
+                (false, false, false) => ("✓ ok", Style::default().fg(Color::Green)),
             };
             lines.push(Line::from(vec![
-                Span::raw(format!("  #{}  ", r.number)),
+                Span::raw(format!("{}{indent}{elbow}#{}  ", cursor_mark(i), r.number)),
                 Span::styled(r.branch.clone(), Style::default().fg(Color::Cyan)),
                 Span::raw("  ["),
                 Span::styled(r.state.label(), Style::default().fg(state_color(&r.state))),
@@ -3726,9 +4381,9 @@ fn render_detail(
             format!("dependents ({}):", dependents.len()),
             Style::default().add_modifier(Modifier::BOLD),
         )));
-        for r in &dependents {
+        for (i, r) in dependents.iter().enumerate() {
             lines.push(Line::from(vec![
-                Span::raw(format!("  #{}  ", r.number)),
+                Span::raw(format!("{}#{}  ", cursor_mark(chain.len() + i), r.number)),
                 Span::styled(r.branch.clone(), Style::default().fg(Color::Cyan)),
                 Span::raw("  ["),
                 Span::styled(r.state.label(), Style::default().fg(state_color(&r.state))),
@@ -3738,8 +4393,14 @@ fn render_detail(
     }
 
     lines.push(Line::from(""));
+    let hint = match (chain.is_empty() && dependents.is_empty(), trail.is_empty()) {
+        (true, true) => "[q/esc] close",
+        (true, false) => "[backspace] back   [esc] close",
+        (false, true) => "[j/k] move   [enter] open   [esc] close",
+        (false, false) => "[j/k] move   [enter] open   [backspace] back   [esc] close",
+    };
     lines.push(Line::from(Span::styled(
-        "[q/esc] back",
+        hint,
         Style::default().fg(Color::DarkGray),
     )));
 
@@ -4875,6 +5536,219 @@ mod tests {
         assert_eq!(rows[0].number, 1);
     }
 
+    /// `12 → 9 → 8 → 7`: the chain the user asked to see, built the way
+    /// `list_rolls` would record it (each roll's `deps` are its direct
+    /// integrations only).
+    fn linear_chain() -> Vec<RollInfo> {
+        let mut r7 = roll_n(7, RollState::Graduated);
+        let mut r8 = roll_n(8, RollState::Graduated);
+        let mut r9 = roll_n(9, RollState::Active);
+        let mut r12 = roll_n(12, RollState::Blocked);
+        r8.deps = vec![7];
+        r9.deps = vec![8];
+        r12.deps = vec![9];
+        r7.dependents = vec![8];
+        r8.dependents = vec![9];
+        r9.dependents = vec![12];
+        vec![r7, r8, r9, r12]
+    }
+
+    #[test]
+    fn dep_chain_follows_every_link_to_the_bottom() {
+        let all = linear_chain();
+        let rows = dep_chain(&all[3], &all);
+        let shape: Vec<(usize, u32, bool)> = rows
+            .iter()
+            .map(|r| (r.depth, r.number, r.is_blocker))
+            .collect();
+        // Depth grows one per link; only 9 is still ungraduated.
+        assert_eq!(shape, vec![(0, 9, true), (1, 8, false), (2, 7, false)]);
+        assert!(rows.iter().all(|r| !r.repeated));
+        // The first level is exactly `dep_rows`, by construction.
+        let direct: Vec<u32> = dep_rows(&all[3], &all).iter().map(|r| r.number).collect();
+        assert_eq!(direct, vec![9]);
+    }
+
+    #[test]
+    fn dep_chain_lists_a_diamond_once_and_never_loops() {
+        // 4 depends on 2 and 3; both depend on 1 (a diamond). 1 also claims to
+        // depend on 4 (a cycle, which real history cannot produce but a scan
+        // of hand-written merges might).
+        let mut r1 = roll_n(1, RollState::Active);
+        let mut r2 = roll_n(2, RollState::Active);
+        let mut r3 = roll_n(3, RollState::Active);
+        let mut r4 = roll_n(4, RollState::Blocked);
+        r1.deps = vec![4];
+        r2.deps = vec![1];
+        r3.deps = vec![1];
+        r4.deps = vec![2, 3];
+        let all = vec![r1, r2, r3, r4];
+
+        let rows = dep_chain(&all[3], &all);
+        let shape: Vec<(usize, u32, bool)> = rows
+            .iter()
+            .map(|r| (r.depth, r.number, r.repeated))
+            .collect();
+        assert_eq!(
+            shape,
+            vec![
+                (0, 2, false),
+                (1, 1, false),
+                // 1's dep on 4 is the roll we started from: repeated, not
+                // descended — so the walk terminates.
+                (2, 4, true),
+                (0, 3, false),
+                // Second arm of the diamond: 1 is shown again but marked.
+                (1, 1, true),
+            ]
+        );
+        // Blockers are counted once, however many arms reach them.
+        assert_eq!(
+            rows.iter().filter(|r| r.is_blocker && !r.repeated).count(),
+            3
+        );
+    }
+
+    #[test]
+    fn dep_chain_marks_the_link_the_parent_finds_stale() {
+        let mut all = linear_chain();
+        // 9 integrated 8 and 8 has since moved; 12's own view of 9 is fine.
+        all[2].stale_deps = vec![8];
+        let rows = dep_chain(&all[3], &all);
+        let flags: Vec<(u32, bool)> = rows
+            .iter()
+            .map(|r| (r.number, r.needs_reintegration))
+            .collect();
+        assert_eq!(flags, vec![(9, false), (8, true), (7, false)]);
+    }
+
+    /// 12 → 9 → 8 → 7, with 3 depending on 12: the shape this feature exists for.
+    fn drill_fixture() -> Vec<RollInfo> {
+        let mut rolls = vec![
+            roll_n(7, RollState::Graduated),
+            roll_n(8, RollState::Active),
+            roll_n(9, RollState::Blocked),
+            roll_n(12, RollState::Blocked),
+            roll_n(3, RollState::Blocked),
+        ];
+        rolls[0].dependents = vec![8];
+        rolls[1].deps = vec![7];
+        rolls[1].dependents = vec![9];
+        rolls[2].deps = vec![8];
+        rolls[2].dependents = vec![12];
+        rolls[3].deps = vec![9];
+        rolls[3].dependents = vec![3];
+        rolls[4].deps = vec![12];
+        rolls
+    }
+
+    #[test]
+    fn the_detail_targets_are_the_chain_then_the_dependents_in_pane_order() {
+        let all = drill_fixture();
+        let twelve = all.iter().find(|r| r.number == 12).unwrap();
+        // What the cursor walks is exactly what the pane lists, in order — so
+        // the highlighted row and the opened row can never disagree.
+        assert_eq!(detail_targets(twelve, &all), vec![9, 8, 7, 3]);
+        let seven = all.iter().find(|r| r.number == 7).unwrap();
+        assert_eq!(detail_targets(seven, &all), vec![8]);
+    }
+
+    #[test]
+    fn detail_keys_walk_open_and_retrace() {
+        let mut cursor = 0;
+        // Movement clamps to the list.
+        assert_eq!(
+            detail_key(KeyCode::Char('j'), &mut cursor, 3, false),
+            DetailOutcome::Continue
+        );
+        assert_eq!(
+            detail_key(KeyCode::Down, &mut cursor, 3, false),
+            DetailOutcome::Continue
+        );
+        assert_eq!(
+            detail_key(KeyCode::Char('j'), &mut cursor, 3, false),
+            DetailOutcome::Continue
+        );
+        assert_eq!(cursor, 2, "walked past the end");
+        assert_eq!(
+            detail_key(KeyCode::Char('k'), &mut cursor, 3, false),
+            DetailOutcome::Continue
+        );
+        assert_eq!(cursor, 1);
+
+        // Enter opens the row under the cursor; with nothing to open it does nothing.
+        assert_eq!(
+            detail_key(KeyCode::Enter, &mut cursor, 3, false),
+            DetailOutcome::Open(1)
+        );
+        assert_eq!(
+            detail_key(KeyCode::Char('l'), &mut cursor, 3, false),
+            DetailOutcome::Open(1)
+        );
+        assert_eq!(
+            detail_key(KeyCode::Enter, &mut cursor, 0, false),
+            DetailOutcome::Continue
+        );
+
+        // Backspace retraces when there is a trail and closes when there is not,
+        // so the key never dead-ends. Esc always closes outright.
+        assert_eq!(
+            detail_key(KeyCode::Backspace, &mut cursor, 3, true),
+            DetailOutcome::Back
+        );
+        assert_eq!(
+            detail_key(KeyCode::Char('h'), &mut cursor, 3, true),
+            DetailOutcome::Back
+        );
+        assert_eq!(
+            detail_key(KeyCode::Backspace, &mut cursor, 3, false),
+            DetailOutcome::Close
+        );
+        assert_eq!(
+            detail_key(KeyCode::Esc, &mut cursor, 3, true),
+            DetailOutcome::Close
+        );
+        assert_eq!(
+            detail_key(KeyCode::Char('q'), &mut cursor, 3, true),
+            DetailOutcome::Close
+        );
+    }
+
+    #[test]
+    fn a_drilled_pane_shows_where_it_came_from_and_marks_the_cursor() {
+        let all = drill_fixture();
+        let nine = all.iter().find(|r| r.number == 9).unwrap();
+        let out = draw(|f, area| render_detail(f, area, nine, None, &all, 1, &[12]));
+        assert!(out.contains("#12 → #9"), "no breadcrumb:\n{out}");
+        // Cursor on the second target (#7), not the first.
+        assert!(out.contains("▶ "), "{out}");
+        let marked = out.lines().find(|l| l.contains("▶ ")).unwrap();
+        assert!(marked.contains("#7"), "cursor on the wrong row: {marked}");
+        assert!(out.contains("[backspace] back"), "{out}");
+
+        // A top-level pane has no breadcrumb and no back hint.
+        let top = draw(|f, area| render_detail(f, area, nine, None, &all, 0, &[]));
+        assert!(!top.contains("→ #9"), "{top}");
+        assert!(!top.contains("[backspace]"), "{top}");
+        assert!(top.contains("[enter] open"), "{top}");
+    }
+
+    #[test]
+    fn the_detail_view_draws_the_chain_with_its_markers() {
+        let mut all = linear_chain();
+        all[3].stale_deps = vec![9];
+        let out = draw(|f, area| render_detail(f, area, &all[3], None, &all, 0, &[]));
+        assert!(
+            out.contains("dependency chain (1 blocking, 1 stale)"),
+            "{out}"
+        );
+        assert!(out.contains("#9"), "{out}");
+        // The blocker and the staleness are both on the one link.
+        assert!(out.contains("blocker, ⚠ stale"), "{out}");
+        assert!(out.contains("└ #8"), "{out}");
+        assert!(out.contains("└ #7"), "{out}");
+    }
+
     // ── delete ──────────────────────────────────────────────────────────
 
     /// A preview with the given per-copy unmerged counts, for the force-confirm
@@ -5522,6 +6396,116 @@ mod tests {
     }
 
     #[test]
+    fn the_verify_many_picker_maps_digits_to_sets_in_menu_order() {
+        for (i, set) in VerifySet::ALL.iter().enumerate() {
+            let key = KeyCode::Char(char::from_digit(i as u32 + 1, 10).unwrap());
+            assert_eq!(
+                verify_many_key(key),
+                VerifyManyOutcome::Set(*set),
+                "{key:?}"
+            );
+        }
+        // A digit past the menu is ignored rather than wrapping or panicking.
+        assert_eq!(
+            verify_many_key(KeyCode::Char('9')),
+            VerifyManyOutcome::Ignore
+        );
+        for key in [KeyCode::Char('n'), KeyCode::Char('N'), KeyCode::Esc] {
+            assert_eq!(verify_many_key(key), VerifyManyOutcome::Cancel, "{key:?}");
+        }
+        // Enter is deliberately unbound: this pass switches branches, so a
+        // stray Enter must not start it.
+        for key in [KeyCode::Enter, KeyCode::Char(' '), KeyCode::Char('V')] {
+            assert_eq!(verify_many_key(key), VerifyManyOutcome::Ignore, "{key:?}");
+        }
+    }
+
+    #[test]
+    fn verify_sets_select_by_state_and_never_include_promoted_rolls() {
+        let rolls = vec![
+            roll_n(1, RollState::Active),
+            roll_n(2, RollState::Blocked),
+            roll_n(3, RollState::Graduated),
+            roll_n(4, RollState::Diverged),
+            roll_n(5, RollState::Promoted),
+            RollInfo {
+                location: BranchLocation::Remote,
+                ..roll_n(6, RollState::Active)
+            },
+        ];
+        let names = |set: VerifySet| -> Vec<u32> {
+            set.select(&rolls)
+                .iter()
+                .map(|b| branches::parse_roll_number(b, "roll/").unwrap())
+                .collect()
+        };
+        // Promoted has nowhere left to go, so it is in no set — not even All.
+        assert_eq!(names(VerifySet::All), vec![1, 2, 3, 4, 6]);
+        assert_eq!(names(VerifySet::Active), vec![1, 6]);
+        assert_eq!(names(VerifySet::Blocked), vec![2]);
+        assert_eq!(names(VerifySet::Graduated), vec![3]);
+        assert_eq!(names(VerifySet::Diverged), vec![4]);
+        // Local is a location filter: the remote-only roll drops out.
+        assert_eq!(names(VerifySet::Local), vec![1, 2, 3, 4]);
+
+        let counts = verify_set_counts(&rolls);
+        assert_eq!(counts[0], (VerifySet::All, 5));
+        assert_eq!(counts[5], (VerifySet::Local, 4));
+    }
+
+    #[test]
+    fn the_verify_many_modal_shows_each_set_with_its_count() {
+        let rolls = vec![
+            roll_n(1, RollState::Active),
+            roll_n(2, RollState::Graduated),
+        ];
+        let counts = verify_set_counts(&rolls);
+        let out = draw(|f, area| render_verify_many_modal(f, area, &counts));
+        assert!(out.contains("[1] all rolls"), "{out}");
+        assert!(out.contains("2 rolls"), "{out}");
+        assert!(out.contains("[2] active"), "{out}");
+        assert!(out.contains("1 roll "), "{out}");
+        assert!(out.contains("[n] cancel"), "{out}");
+    }
+
+    #[test]
+    fn a_verify_many_report_summarises_and_names_the_failures() {
+        let results = vec![
+            ops::VerifyManyResult {
+                branch: "roll/1-x".to_string(),
+                outcome: None,
+                marked: Some(crate::core::version::Semver::parse("0.0.1-roll1").unwrap()),
+                verdict: ops::VerifyVerdict::Passed,
+            },
+            ops::VerifyManyResult {
+                branch: "roll/2-y".to_string(),
+                outcome: None,
+                marked: None,
+                verdict: ops::VerifyVerdict::Failed("gate exited 1".to_string()),
+            },
+            ops::VerifyManyResult {
+                branch: "roll/3-z".to_string(),
+                outcome: None,
+                marked: None,
+                verdict: ops::VerifyVerdict::Skipped("no local copy".to_string()),
+            },
+        ];
+        let (lines, failed) = render_verify_many(&results);
+        assert_eq!(failed, vec!["roll/2-y"]);
+        assert!(
+            lines.contains(&"version marked 0.0.1-roll1".to_string()),
+            "{lines:?}"
+        );
+        assert!(lines.contains(&"── roll/2-y ──".to_string()), "{lines:?}");
+        assert!(
+            lines.contains(&"FAILED: gate exited 1".to_string()),
+            "{lines:?}"
+        );
+        assert!(lines.contains(&"skipped: no local copy".to_string()));
+        assert_eq!(lines.last().unwrap(), "1 passed, 1 failed, 1 skipped");
+    }
+
+    #[test]
     fn the_bump_modal_cancels_and_ignores_everything_else() {
         for key in [KeyCode::Char('n'), KeyCode::Char('N'), KeyCode::Esc] {
             assert_eq!(bump_key(key), BumpOutcome::Cancel, "{key:?}");
@@ -5591,6 +6575,108 @@ mod tests {
         let without = draw(|f, area| app.render_header(f, area));
         assert!(without.contains(&expected), "{without}");
         assert!(without.contains("Branch: main"), "{without}");
+    }
+
+    #[test]
+    fn the_conflict_modal_only_offers_integrate_for_the_checked_out_roll() {
+        // `ops::integrate` merges into HEAD, so [i] for any other row would
+        // integrate into the wrong branch. The key is simply dead there.
+        assert_eq!(
+            conflict_key(KeyCode::Char('i'), true),
+            ConflictOutcome::Integrate
+        );
+        assert_eq!(
+            conflict_key(KeyCode::Char('i'), false),
+            ConflictOutcome::Ignore
+        );
+        assert_eq!(
+            conflict_key(KeyCode::Char('m'), false),
+            ConflictOutcome::Stage
+        );
+        for key in [KeyCode::Char('n'), KeyCode::Esc] {
+            assert_eq!(conflict_key(key, true), ConflictOutcome::Close);
+        }
+        // Enter is unbound: every choice leaves a merge to finish by hand.
+        assert_eq!(conflict_key(KeyCode::Enter, true), ConflictOutcome::Ignore);
+    }
+
+    #[test]
+    fn a_diagnosed_conflict_becomes_panel_lines_and_a_followup() {
+        let conflict = ops::MergeConflict {
+            report: ops::ConflictReport {
+                source: "roll/3-x".to_string(),
+                target: "rolling".to_string(),
+                conflicts: vec![ops::Conflict {
+                    path: "src/tui/rolls.rs".to_string(),
+                    culprits: vec![ops::Culprit {
+                        commit: "abcdef0123".to_string(),
+                        subject: "Graduate roll/8-y into rolling".to_string(),
+                        roll: Some("roll/8-y".to_string()),
+                    }],
+                }],
+            },
+            original: "roll/3-x".to_string(),
+        };
+
+        let done = conflict_job_done(&conflict, "roll/3-x");
+        let text = done.lines.join("\n");
+        assert!(text.contains("src/tui/rolls.rs"), "{text}");
+        assert!(text.contains("roll/8-y  (abcdef0"), "{text}");
+        assert!(text.contains("NOT merged"), "{text}");
+        match done.next {
+            Some(Followup::OfferConflictResolution {
+                culprits,
+                can_integrate,
+                ..
+            }) => {
+                assert_eq!(culprits, vec!["roll/8-y".to_string()]);
+                assert!(can_integrate, "source is checked out, so [i] must be live");
+            }
+            other => panic!("wrong followup: {other:?}"),
+        }
+
+        // Same conflict seen from a different checkout: no integrate offer.
+        let done = conflict_job_done(&conflict, "rolling");
+        assert!(matches!(
+            done.next,
+            Some(Followup::OfferConflictResolution {
+                can_integrate: false,
+                ..
+            })
+        ));
+    }
+
+    #[test]
+    fn the_conflict_modal_names_the_culprits_and_the_keys() {
+        let out = draw(|f, area| {
+            render_conflict_modal(
+                f,
+                area,
+                "roll/3-x",
+                "rolling",
+                &["roll/8-y".to_string()],
+                true,
+            )
+        });
+        assert!(out.contains("via: roll/8-y"), "{out}");
+        assert!(out.contains("[i] integrate"), "{out}");
+        assert!(out.contains("[m] redo the merge"), "{out}");
+
+        let elsewhere = draw(|f, area| {
+            render_conflict_modal(
+                f,
+                area,
+                "roll/3-x",
+                "rolling",
+                &["roll/8-y".to_string()],
+                false,
+            )
+        });
+        assert!(!elsewhere.contains("[i] integrate"), "{elsewhere}");
+        assert!(
+            elsewhere.contains("[space] switch to roll/3-x"),
+            "{elsewhere}"
+        );
     }
 
     #[test]

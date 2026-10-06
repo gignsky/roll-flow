@@ -87,6 +87,19 @@ The token it returns is not validated against the roll prefix, and does not need
 to be: every caller either compares it to a real roll branch name or runs it
 through `parse_roll_number`, so a candidate that is not a roll matches nothing.
 
+**Dependency chain.** The detail view (`[enter]`) walks `deps` transitively —
+roll 12 depends on 9, which depends on 8, which depends on 7 — through
+`tui::rolls::dep_chain`. Each level is exactly `dep_rows` of its parent, so there
+is one definition of a direct dependency row and the chain only adds depth. A
+roll reached a second time (a diamond, or a cycle if hand-written merge subjects
+ever produce one) is listed once more as `↑ shown above` and not descended into,
+so the walk is finite and every roll's own dependencies appear exactly once.
+Each link keeps both of `DepRow`'s markers, and both are its *parent's* judgement
+— `⚠ reintegrate` on a deep link reads the parent's `stale_deps`, since the
+parent is who integrated it, not the selected roll.
+The table's `deps` column stays direct-only; widening it for transitive counts
+would cost the `branch` column, which has nothing to spare.
+
 One consequence worth knowing, since `[i]` makes roll-into-roll merges cheap: the
 graduated scan below has a second pass *without* `--first-parent`, so once M
 graduates, N's integrate merge is reachable from rolling and N reports as
@@ -221,6 +234,22 @@ Phases:
 
 The interactive selection table columns: `#`, `roll`, `loc` (L/R/B/-), `dev` (↑↓✓⚠=),
 `blk` (🔒 if blocked), `scope` (NHFD flags), then per-host verification columns (✓⌛✗—).
+
+## Conflict diagnosis (`core/ops.rs`)
+
+When a `--no-ff` merge in `run_merge` or `merge_gated` fails, the conflicted
+paths are read (`git diff --name-only --diff-filter=U`) **before** `git merge
+--abort` — afterwards there is nothing to read. Each path is then attributed by
+walking the target's first-parent history since the merge base for that path
+(`git log --first-parent <base>..<target> -- <path>`): every commit is a
+culprit, and a merge whose subject names a branch (via
+`branches::extract_graduated_branch`, the single reader of merge subjects) is a
+culprit *roll*. A merge naming the source itself — its own earlier graduation,
+on re-graduation — is dropped. The result is a typed `ops::MergeConflict`
+error carrying a `ConflictReport`, raised only after the unwind so the repo is
+clean by the time anyone acts on it; a merge that failed with no conflicted
+paths keeps the plain error. Diagnosis never errors: it runs on a failing path
+and must not hide the failure it explains.
 
 ## Merge commit message format
 

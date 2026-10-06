@@ -501,6 +501,66 @@ fn scan_promoted(repo: &Path, stable_ref: &str) -> HashSet<String> {
     promoted
 }
 
+/// Which rolls a "verify many" pass covers. A user-facing menu shared by
+/// `rf verify --all --state` and the TUI's `[V]`, so the two can never offer
+/// different sets. `Local` is a location, not a state: it exists because
+/// verification runs in the working tree, so a remote-only roll can only ever be
+/// skipped, and a user with many of those wants a set that never mentions them.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, clap::ValueEnum)]
+#[clap(rename_all = "lowercase")]
+pub enum VerifySet {
+    All,
+    Active,
+    Blocked,
+    Graduated,
+    Diverged,
+    Local,
+}
+
+impl VerifySet {
+    /// Every set, in the order menus list them.
+    pub const ALL: [VerifySet; 6] = [
+        VerifySet::All,
+        VerifySet::Active,
+        VerifySet::Blocked,
+        VerifySet::Graduated,
+        VerifySet::Diverged,
+        VerifySet::Local,
+    ];
+
+    pub fn label(self) -> &'static str {
+        match self {
+            VerifySet::All => "all rolls",
+            VerifySet::Active => "active",
+            VerifySet::Blocked => "blocked",
+            VerifySet::Graduated => "graduated",
+            VerifySet::Diverged => "diverged",
+            VerifySet::Local => "rolls with a local copy",
+        }
+    }
+
+    /// The branches in this set, in table order. Promoted rolls are never
+    /// included: they have nowhere left to go, and `ops::verify` would only
+    /// report "nothing to merge" for each one.
+    pub fn select(self, rolls: &[RollInfo]) -> Vec<String> {
+        rolls
+            .iter()
+            .filter(|r| r.state != RollState::Promoted)
+            .filter(|r| match self {
+                VerifySet::All => true,
+                VerifySet::Active => r.state == RollState::Active,
+                VerifySet::Blocked => r.state == RollState::Blocked,
+                VerifySet::Graduated => r.state == RollState::Graduated,
+                VerifySet::Diverged => r.state == RollState::Diverged,
+                VerifySet::Local => {
+                    matches!(r.location, BranchLocation::Local | BranchLocation::Both)
+                }
+            })
+            .map(|r| r.branch.clone())
+            .collect()
+    }
+}
+
 /// The ref to read a branch's file content at: its own tip when there is a
 /// local copy, `origin/<branch>` when the branch only exists on the remote.
 ///
@@ -529,7 +589,7 @@ pub fn content_ref(branch: &str, location: &BranchLocation) -> String {
 /// match this replaced returned `None` for it, and since this one function is
 /// how *every* consumer reads a merge subject, that single miss took the roll's
 /// dependency, its graduation and its graduation commit with it.
-fn extract_graduated_branch(subject: &str) -> Option<String> {
+pub(crate) fn extract_graduated_branch(subject: &str) -> Option<String> {
     // Cut the ` into ` clause first. It names the merge *target*, never the
     // source, and dropping it is what makes the lenient fallback below safe:
     // `Merge branch 'roll/8-x' into roll/7-y` must never yield roll/7, because

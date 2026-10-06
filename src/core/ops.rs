@@ -345,6 +345,259 @@ fn unwind_merge(repo: &Path, original: &str) {
     let _ = git::run_git(repo, &["checkout", original]);
 }
 
+/// Turn a failed `git merge` into the error the caller gets, after unwinding.
+///
+/// The diagnosis has to happen *between* the failure and the abort: the
+/// conflicted paths only exist while `MERGE_HEAD` does, and this is the one
+/// moment both they and a clean way back are available. A merge that failed
+/// for some other reason (no conflicted paths) keeps the old, plain error.
+fn conflict_or_error(
+    repo: &Path,
+    source: &str,
+    target: &str,
+    original: &str,
+    merge_err: crate::error::RfError,
+) -> anyhow::Error {
+    let report = diagnose_conflicts(repo, source, target);
+    unwind_merge(repo, original);
+    if report.is_empty() {
+        return anyhow!(
+            "merge of '{source}' into '{target}' failed (likely conflicts); \
+             the merge was aborted and you are back on '{original}'. \
+             Resolve manually: git checkout {target} && git merge --no-ff {source} ({merge_err})"
+        );
+    }
+    anyhow::Error::new(MergeConflict {
+        report,
+        original: original.to_string(),
+    })
+}
+
+// ── Conflict diagnosis ──────────────────────────────────────────────────────
+
+/// A commit on the target branch that touched a conflicted path.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct Culprit {
+    /// The commit on the target's first-parent line that brought the change in.
+    pub commit: String,
+    pub subject: String,
+    /// The roll that commit graduated, when its subject names one. `None` for a
+    /// direct commit on the target, a hotfix merge, or a promotion merge.
+    pub roll: Option<String>,
+}
+
+/// One conflicted path, and what on the target side last touched it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct Conflict {
+    pub path: String,
+    /// Newest first, as `git log` lists them.
+    pub culprits: Vec<Culprit>,
+}
+
+/// Why a merge conflicted, in terms the workflow can act on: not "these files",
+/// but "these *rolls*, already on the target, changed the same files".
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct ConflictReport {
+    pub source: String,
+    pub target: String,
+    pub conflicts: Vec<Conflict>,
+}
+
+/// A merge that stopped on conflicts, was diagnosed, and was then unwound.
+///
+/// A typed error rather than text so the CLI and the TUI can offer choices —
+/// the repo is already clean again by the time this is constructed, so acting
+/// on it is safe.
+#[derive(Debug)]
+pub(crate) struct MergeConflict {
+    pub report: ConflictReport,
+    /// The branch the caller was on, and is on again.
+    pub original: String,
+}
+
+impl std::fmt::Display for MergeConflict {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let n = self.report.conflicts.len();
+        write!(
+            f,
+            "merge of '{}' into '{}' conflicted in {n} file{}; the merge was aborted and you are back on '{}'",
+            self.report.source,
+            self.report.target,
+            if n == 1 { "" } else { "s" },
+            self.original
+        )
+    }
+}
+
+impl std::error::Error for MergeConflict {}
+
+impl ConflictReport {
+    pub fn is_empty(&self) -> bool {
+        self.conflicts.is_empty()
+    }
+
+    /// Every roll implicated, deduplicated, in the order first seen. These are
+    /// the branches the source would integrate to take the conflict onto its
+    /// own side.
+    pub fn culprit_rolls(&self) -> Vec<String> {
+        let mut rolls: Vec<String> = Vec::new();
+        for c in &self.conflicts {
+            for roll in c.culprits.iter().filter_map(|k| k.roll.as_deref()) {
+                if !rolls.iter().any(|r| r == roll) {
+                    rolls.push(roll.to_string());
+                }
+            }
+        }
+        rolls
+    }
+
+    /// The report as printable lines: each path, then what touched it. Shared
+    /// by the CLI and the TUI panel so the two never describe a conflict
+    /// differently.
+    pub fn render(&self) -> Vec<String> {
+        let mut lines = Vec::new();
+        for c in &self.conflicts {
+            lines.push(format!("  {}", c.path));
+            if c.culprits.is_empty() {
+                lines.push(format!(
+                    "    (nothing on '{}' since the merge base touched it — renamed or deleted on one side?)",
+                    self.target
+                ));
+            }
+            for k in &c.culprits {
+                let short: String = k.commit.chars().take(7).collect();
+                match &k.roll {
+                    Some(roll) => lines.push(format!("    {roll}  ({short}: {})", k.subject)),
+                    None => lines.push(format!("    {short}: {}", k.subject)),
+                }
+            }
+        }
+        lines
+    }
+}
+
+/// One first-parent entry from the target's log, as [`attribute_culprits`]
+/// reads it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct TargetLogEntry {
+    pub commit: String,
+    pub parents: usize,
+    pub subject: String,
+}
+
+/// Turn the target's first-parent history of a path into culprits.
+///
+/// Pure, so attribution is tested without a repo. Every entry is a culprit —
+/// a direct commit on rolling changed the file just as surely as a graduation
+/// did — but only a merge whose subject names a branch gets a `roll`, read
+/// through [`branches::extract_graduated_branch`], the one reader of merge
+/// subjects. A merge naming the *source* itself (an earlier graduation of the
+/// same roll, on re-graduation) is dropped: the source cannot conflict with
+/// its own past in a way integrating it would fix.
+pub(crate) fn attribute_culprits(entries: &[TargetLogEntry], source: &str) -> Vec<Culprit> {
+    entries
+        .iter()
+        .filter_map(|e| {
+            let roll = if e.parents > 1 {
+                branches::extract_graduated_branch(&e.subject)
+            } else {
+                None
+            };
+            if roll.as_deref() == Some(source) {
+                return None;
+            }
+            Some(Culprit {
+                commit: e.commit.clone(),
+                subject: e.subject.clone(),
+                roll,
+            })
+        })
+        .collect()
+}
+
+/// Parse `git log --format=%H%x09%P%x09%s` output.
+fn parse_target_log(out: &str) -> Vec<TargetLogEntry> {
+    out.lines()
+        .filter_map(|line| {
+            let mut parts = line.splitn(3, '\t');
+            let commit = parts.next()?.to_string();
+            let parents = parts.next()?.split_whitespace().count();
+            let subject = parts.next().unwrap_or("").to_string();
+            Some(TargetLogEntry {
+                commit,
+                parents,
+                subject,
+            })
+        })
+        .collect()
+}
+
+/// Read the conflicted paths of the merge in progress and attribute each to
+/// what changed it on the target side since the merge base.
+///
+/// Must run while `MERGE_HEAD` is set; afterwards there is nothing to read.
+/// Every git failure degrades to an empty report rather than an error, because
+/// this runs on an already-failing path — a diagnosis that cannot be made
+/// must not hide the merge failure it was diagnosing.
+fn diagnose_conflicts(repo: &Path, source: &str, target: &str) -> ConflictReport {
+    let mut report = ConflictReport {
+        source: source.to_string(),
+        target: target.to_string(),
+        conflicts: Vec::new(),
+    };
+    let Ok(paths) = git::capture_git(repo, &["diff", "--name-only", "--diff-filter=U"]) else {
+        return report;
+    };
+    let base = git::merge_base(repo, source, target).ok();
+    for path in paths.lines().map(str::trim).filter(|p| !p.is_empty()) {
+        let culprits = match &base {
+            Some(base) => {
+                let range = format!("{base}..{target}");
+                git::capture_git(
+                    repo,
+                    &[
+                        "log",
+                        "--first-parent",
+                        "--format=%H%x09%P%x09%s",
+                        &range,
+                        "--",
+                        path,
+                    ],
+                )
+                .map(|out| attribute_culprits(&parse_target_log(&out), source))
+                .unwrap_or_default()
+            }
+            None => Vec::new(),
+        };
+        report.conflicts.push(Conflict {
+            path: path.to_string(),
+            culprits,
+        });
+    }
+    report
+}
+
+/// Re-run a conflicting merge and *leave it* in the working tree.
+///
+/// The user's explicit choice after seeing a [`ConflictReport`]: they want the
+/// conflict markers in front of them (for lazygit, say) rather than a clean
+/// tree. Returns `Ok(true)` when the merge stopped on conflicts as expected and
+/// the target is now checked out mid-merge; `Ok(false)` when it unexpectedly
+/// went through — the tree changed underneath — in which case it landed as an
+/// ordinary `--no-ff` merge and the caller should say so. Never run unattended:
+/// it is the one path that leaves `MERGE_HEAD` behind on purpose.
+pub(crate) fn stage_conflict(config: &Config, source: &str, target: &str) -> Result<bool> {
+    let repo = &config.repo_root;
+    ensure_clean_state(config)?;
+    git::run_git(repo, &["checkout", target])
+        .with_context(|| format!("failed to check out '{target}'"))?;
+    match git::run_git(repo, &["merge", "--no-ff", "--no-edit", source]) {
+        Ok(()) => Ok(false),
+        Err(_) if git::ref_exists(repo, "MERGE_HEAD") => Ok(true),
+        Err(e) => Err(e.into()),
+    }
+}
+
 /// Force the staged `Cargo.toml` (and its lockfile) to carry exactly
 /// `resolved`'s version, rewriting and re-staging it if the merge produced
 /// anything else — then the gates and the eventual commit see this value
@@ -1551,6 +1804,201 @@ pub(crate) fn verify(config: &Config, dry_run: bool) -> Result<VerifyOutcome> {
         failed_hosts,
         version,
     })
+}
+
+/// Why a roll in a verify-many pass did not produce a plain pass.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum VerifyVerdict {
+    Passed,
+    /// The gates, hosts or version gate refused it. Carries the reason.
+    Failed(String),
+    /// Nothing was checked: no local copy, or nothing to merge. Carries why.
+    Skipped(String),
+}
+
+/// One roll's result from [`verify_many`].
+pub(crate) struct VerifyManyResult {
+    pub branch: String,
+    /// `None` when the roll was skipped before `verify` could run.
+    pub outcome: Option<VerifyOutcome>,
+    /// The dev marker this pass committed onto the roll, when it was missing.
+    pub marked: Option<Semver>,
+    pub verdict: VerifyVerdict,
+}
+
+impl VerifyManyResult {
+    fn skipped(branch: &str, why: impl Into<String>) -> Self {
+        VerifyManyResult {
+            branch: branch.to_string(),
+            outcome: None,
+            marked: None,
+            verdict: VerifyVerdict::Skipped(why.into()),
+        }
+    }
+
+    fn failed(branch: &str, marked: Option<Semver>, why: impl Into<String>) -> Self {
+        VerifyManyResult {
+            branch: branch.to_string(),
+            outcome: None,
+            marked,
+            verdict: VerifyVerdict::Failed(why.into()),
+        }
+    }
+}
+
+/// Why the checked-out roll's version numbers are behind stable's, if they are.
+///
+/// Numbers only — the marker is ignored on both sides. A roll's `-roll<N>`
+/// always sorts below the same release, so comparing whole versions would call
+/// every freshly-updated roll "behind"; what matters is a roll still on
+/// `0.2.3-roll13` after stable released `0.2.7`, which has missed a release and
+/// would carry a stale version into rolling. `rf update` is the remedy: the
+/// merge driver keeps the roll's marker and takes stable's higher numbers.
+///
+/// `None` when there is nothing to compare: the gate is off, there is no
+/// `Cargo.toml` on either side, or stable cannot be resolved.
+fn version_behind_stable(config: &Config) -> Result<Option<String>> {
+    if !config.version_gate {
+        return Ok(None);
+    }
+    let repo = &config.repo_root;
+    let Some(head) = version::read_version(repo)? else {
+        return Ok(None);
+    };
+    let Some(stable_ref) = git::resolve_branch(repo, &config.stable_branch) else {
+        return Ok(None);
+    };
+    let Some(stable) = git::show_file_at_ref(repo, &stable_ref, version::VERSION_FILE)?
+        .as_deref()
+        .and_then(version::parse_version)
+    else {
+        return Ok(None);
+    };
+    if head.release() >= stable.release() {
+        return Ok(None);
+    }
+    Ok(Some(format!(
+        "version {head} is behind '{}' ({stable}); run `rf update` (or [u] in the TUI) \
+         to bring it up to date",
+        config.stable_branch
+    )))
+}
+
+/// The verdict `verify`'s outcome amounts to, so the CLI's `rf verify`, the
+/// TUI's `[v]` and [`verify_many`] all draw the line in the same place.
+pub(crate) fn verify_verdict(outcome: &VerifyOutcome) -> VerifyVerdict {
+    if !outcome.failed_hosts.is_empty() {
+        return VerifyVerdict::Failed(format!(
+            "host verification failed: {}",
+            outcome.failed_hosts.join(", ")
+        ));
+    }
+    if !outcome.version.is_satisfied() {
+        return VerifyVerdict::Failed(
+            version_gate_error(&outcome.version, &outcome.source, &outcome.target).to_string(),
+        );
+    }
+    VerifyVerdict::Passed
+}
+
+/// Verify several rolls in one pass, returning a result per branch in the
+/// order given.
+///
+/// `verify` judges the checked-out branch and runs the gates in the working
+/// tree, so this has to check each roll out in turn — which is the whole
+/// design problem. The rules that make it safe:
+///
+/// - A dirty tree is refused up front, before the first switch, rather than
+///   discovered halfway through with HEAD somewhere else.
+/// - The starting branch is recorded first and restored **unconditionally** at
+///   the end: after a failed gate, after a `verify` error, after a roll that
+///   would not even check out. A pass that leaves HEAD on roll 3 because roll 3
+///   failed has turned a report into a surprise.
+/// - A roll with no local copy is skipped with a reason, never fetched: nothing
+///   here writes to or reads from the remote, and a switch that would create a
+///   branch from `origin/` is a side effect the user did not ask for.
+/// - "Nothing to merge" is a skip, not a failure: the roll has nothing to be
+///   judged on, which is not the same as failing judgement.
+/// - Each roll's version gets what a single `rf verify` gives it: a missing
+///   `-roll<N>` marker is committed first (before the `--locked` gates, for the
+///   same lockfile reason), and then a roll whose numbers are behind stable's
+///   fails without running its gates — a version problem should cost
+///   milliseconds, not a gate run. The marker is the one commit this pass
+///   makes; it never bumps.
+///
+/// Every gate's output still streams through `core::proc`'s sink as it runs,
+/// so the caller sees each roll's gates as they happen; this returns only the
+/// structured summary.
+pub(crate) fn verify_many(config: &Config, branches: &[String]) -> Result<Vec<VerifyManyResult>> {
+    ensure_clean_state(config)?;
+    let repo = &config.repo_root;
+    let start = git::current_branch(repo)?;
+
+    let mut results = Vec::with_capacity(branches.len());
+    for branch in branches {
+        if !git::ref_exists(repo, branch) {
+            results.push(VerifyManyResult::skipped(
+                branch,
+                "no local copy — pull it first",
+            ));
+            continue;
+        }
+        if let Err(err) = git::run_git(repo, &["switch", "--quiet", branch]) {
+            results.push(VerifyManyResult::skipped(
+                branch,
+                format!("could not switch to it: {err}"),
+            ));
+            continue;
+        }
+        let marked = match apply_dev_version_for_branch(config, branch) {
+            Ok(marked) => marked,
+            Err(err) => {
+                results.push(VerifyManyResult::failed(
+                    branch,
+                    None,
+                    format!("could not apply its dev marker: {err}"),
+                ));
+                continue;
+            }
+        };
+        match version_behind_stable(config) {
+            Ok(None) => {}
+            Ok(Some(why)) => {
+                results.push(VerifyManyResult::failed(branch, marked, why));
+                continue;
+            }
+            Err(err) => {
+                results.push(VerifyManyResult::failed(
+                    branch,
+                    marked,
+                    format!("could not compare its version with stable: {err}"),
+                ));
+                continue;
+            }
+        }
+        results.push(match verify(config, false) {
+            Ok(outcome) => {
+                let verdict = verify_verdict(&outcome);
+                VerifyManyResult {
+                    branch: branch.clone(),
+                    outcome: Some(outcome),
+                    marked,
+                    verdict,
+                }
+            }
+            Err(err) if err.to_string().starts_with("nothing to merge") => VerifyManyResult {
+                marked,
+                ..VerifyManyResult::skipped(branch, err.to_string())
+            },
+            Err(err) => VerifyManyResult::failed(branch, marked, err.to_string()),
+        });
+    }
+
+    // Unconditional, and the one error this function refuses to swallow: a
+    // report that cannot say where it left HEAD is worse than no report.
+    git::run_git(repo, &["switch", "--quiet", &start])
+        .with_context(|| format!("verified, but could not switch back to '{start}'"))?;
+    Ok(results)
 }
 
 // ── graduate ────────────────────────────────────────────────────────────────
@@ -3284,6 +3732,94 @@ pub(crate) fn promotion_readiness(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn entry(commit: &str, parents: usize, subject: &str) -> TargetLogEntry {
+        TargetLogEntry {
+            commit: commit.to_string(),
+            parents,
+            subject: subject.to_string(),
+        }
+    }
+
+    #[test]
+    fn culprits_are_attributed_to_the_roll_a_merge_subject_names() {
+        let log = vec![
+            entry("aaa", 2, "Graduate roll/8-0918-help-menu into develop"),
+            entry("bbb", 2, "Merge branch 'roll/4-0918-corner' into develop"),
+            entry("ccc", 1, "docs: touch the same file directly"),
+            entry("ddd", 2, "Merge pull request #7 from gignsky/hotfix/1-x"),
+        ];
+        let culprits = attribute_culprits(&log, "roll/3-0918-push-all");
+        let rolls: Vec<Option<&str>> = culprits.iter().map(|c| c.roll.as_deref()).collect();
+        // Both graduation shapes resolve; a direct commit is still a culprit but
+        // names no roll; a PR merge of a hotfix names the hotfix branch — which
+        // is a branch, just not a roll, and downstream matching handles that.
+        assert_eq!(
+            rolls,
+            vec![
+                Some("roll/8-0918-help-menu"),
+                Some("roll/4-0918-corner"),
+                None,
+                Some("hotfix/1-x"),
+            ]
+        );
+        assert_eq!(culprits[2].subject, "docs: touch the same file directly");
+    }
+
+    #[test]
+    fn a_rolls_own_earlier_graduation_is_not_its_culprit() {
+        // Re-graduating a diverged roll: its previous merge on rolling touched
+        // the same files, but integrating a roll into itself fixes nothing.
+        let log = vec![
+            entry("aaa", 2, "Graduate roll/3-x into develop"),
+            entry("bbb", 2, "Graduate roll/8-y into develop"),
+        ];
+        let culprits = attribute_culprits(&log, "roll/3-x");
+        assert_eq!(culprits.len(), 1);
+        assert_eq!(culprits[0].roll.as_deref(), Some("roll/8-y"));
+    }
+
+    #[test]
+    fn the_report_dedups_rolls_across_paths_in_first_seen_order() {
+        let k = |commit: &str, roll: &str| Culprit {
+            commit: commit.to_string(),
+            subject: format!("Graduate {roll} into develop"),
+            roll: Some(roll.to_string()),
+        };
+        let report = ConflictReport {
+            source: "roll/3-x".to_string(),
+            target: "develop".to_string(),
+            conflicts: vec![
+                Conflict {
+                    path: "a.rs".to_string(),
+                    culprits: vec![k("1", "roll/8-y"), k("2", "roll/4-z")],
+                },
+                Conflict {
+                    path: "b.md".to_string(),
+                    culprits: vec![k("1", "roll/8-y")],
+                },
+            ],
+        };
+        assert_eq!(
+            report.culprit_rolls(),
+            vec!["roll/8-y".to_string(), "roll/4-z".to_string()]
+        );
+        let text = report.render().join("\n");
+        assert!(
+            text.contains("  a.rs\n    roll/8-y  (1: Graduate roll/8-y into develop)"),
+            "{text}"
+        );
+        assert!(text.contains("  b.md"), "{text}");
+    }
+
+    #[test]
+    fn the_target_log_format_parses_parent_counts() {
+        let out = "aaa\tp1 p2\tGraduate roll/8-y into develop\nbbb\tp1\tplain commit\n";
+        let entries = parse_target_log(out);
+        assert_eq!(entries[0].parents, 2);
+        assert_eq!(entries[1].parents, 1);
+        assert_eq!(entries[1].subject, "plain commit");
+    }
 
     /// A scope covering both copies, with `force` under test.
     fn both(force: bool) -> PruneScope {

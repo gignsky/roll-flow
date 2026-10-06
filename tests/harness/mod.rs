@@ -402,7 +402,8 @@ impl Sandbox {
         self.set_gate_array("rolling_to_main_gates", gates);
     }
 
-    /// Rewrite the `roll_to_rolling_gates` array — the gates `rf graduate` runs.
+    /// Rewrite the `roll_to_rolling_gates` array — the gates `rf graduate` and
+    /// `rf verify` on a roll branch run.
     pub fn set_graduate_gates(&self, gates: &[&str]) {
         self.set_gate_array("roll_to_rolling_gates", gates);
     }
