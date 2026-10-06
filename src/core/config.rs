@@ -113,11 +113,23 @@ pub struct Config {
     /// `.github/workflows/tag-on-main.yml`.
     #[serde(default = "default_true")]
     pub tag_on_promote: bool,
+    /// Create an annotated `v<X.Y.Z>-dev` tag on rolling's new tip at
+    /// `rf graduate`, mirroring `tag_on_promote`'s shape one tier down.
+    #[serde(default = "default_true")]
+    pub tag_on_graduate: bool,
     /// After creating a release tag, offer to push it to `origin`. The push is
     /// always confirmed interactively (or with `--yes`); this only controls
-    /// whether the offer is made at all.
+    /// whether the offer is made at all. Governs both `tag_on_promote` and
+    /// `tag_on_graduate`'s tags.
     #[serde(default = "default_true")]
     pub push_tag: bool,
+    /// Mark a new roll branch's `Cargo.toml` version as `X.Y.Z-roll<N>` at
+    /// `rf start`, so the checked-out version says which roll you are on.
+    /// `rf graduate` carries it onto rolling's own `X.Y.Z-dev` marker, and a
+    /// *final* `rf promote` strips that back to a bare release version.
+    /// Repos with no `Cargo.toml` are unaffected regardless of this setting.
+    #[serde(default = "default_true")]
+    pub dev_versions: bool,
     /// Workflow ownership mode. Defaults to [`Mode::Manage`] for configs that
     /// predate this field (via `#[serde(default)]`).
     #[serde(default)]
@@ -168,7 +180,9 @@ impl Config {
         "roll_prefix",
         "version_gate",
         "tag_on_promote",
+        "tag_on_graduate",
         "push_tag",
+        "dev_versions",
         "mode",
         "username",
         "hosts",
@@ -325,7 +339,9 @@ impl Config {
             roll_prefix: "roll/".to_string(),
             version_gate: default_true(),
             tag_on_promote: default_true(),
+            tag_on_graduate: default_true(),
             push_tag: default_true(),
+            dev_versions: default_true(),
             mode: Mode::default(),
             username,
             hosts,
@@ -586,7 +602,9 @@ mod tests {
             roll_prefix: "roll/".to_string(),
             version_gate: true,
             tag_on_promote: true,
+            tag_on_graduate: true,
             push_tag: true,
+            dev_versions: true,
             mode: super::Mode::default(),
             username: "old".to_string(),
             hosts: vec!["x".to_string()],
@@ -621,7 +639,9 @@ mod tests {
             roll_prefix: "roll/".to_string(),
             version_gate: true,
             tag_on_promote: true,
+            tag_on_graduate: true,
             push_tag: true,
+            dev_versions: true,
             mode: Mode::Assist,
             username: "me".to_string(),
             hosts: vec![],
@@ -905,17 +925,33 @@ mod tests {
             hosts = []
             version_gate = false
             tag_on_promote = false
+            tag_on_graduate = false
             push_tag = false
+            dev_versions = false
         "#;
         let parsed: Config = toml::from_str(legacy).expect("parse");
         assert!(!parsed.version_gate);
         assert!(!parsed.tag_on_promote);
+        assert!(!parsed.tag_on_graduate);
         assert!(!parsed.push_tag);
+        assert!(!parsed.dev_versions);
 
         let rendered = parsed.to_toml_string().expect("render");
         let reparsed: Config = toml::from_str(&rendered).expect("reparse");
         assert!(!reparsed.version_gate);
         assert!(!reparsed.tag_on_promote);
+        assert!(!reparsed.tag_on_graduate);
         assert!(!reparsed.push_tag);
+        assert!(!reparsed.dev_versions);
+
+        // And a config written before the flag existed still parses, defaulting
+        // the marker on — the `#[serde(default)]` contract every release flag
+        // here carries.
+        let predates = legacy
+            .replace("tag_on_graduate = false\n", "")
+            .replace("dev_versions = false\n", "");
+        let parsed: Config = toml::from_str(&predates).expect("parse without the flag");
+        assert!(parsed.dev_versions);
+        assert!(parsed.tag_on_graduate);
     }
 }

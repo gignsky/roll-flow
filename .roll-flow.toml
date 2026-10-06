@@ -19,7 +19,9 @@ rolling_to_main_gates = [
 ]
 version_gate = true
 tag_on_promote = true
+tag_on_graduate = true
 push_tag = true
+dev_versions = true
 mode = "manage"
 host_gates = []
 clean_protect = []

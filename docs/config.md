@@ -14,7 +14,9 @@ stable_branch = "main"
 roll_prefix = "roll/"
 version_gate = true
 tag_on_promote = true
+tag_on_graduate = true
 push_tag = true
+dev_versions = true
 mode = "manage"
 username = "gig"
 hosts = ["ganoslal", "merlin", "wsl"]
@@ -42,7 +44,9 @@ wsl = false
 | `roll_prefix` | — | fresh file, or `--roll-prefix` | everything; a value without a trailing `/` is normalized with a warning |
 | `version_gate` | `true` | fresh file | `rf verify` / `rf promote` |
 | `tag_on_promote` | `true` | fresh file | `rf promote` |
-| `push_tag` | `true` | fresh file | `rf promote` |
+| `tag_on_graduate` | `true` | fresh file | `rf graduate` |
+| `push_tag` | `true` | fresh file | `rf promote` / `rf graduate` (offer to push the tag they create) |
+| `dev_versions` | `true` | fresh file | `rf start` / `rf graduate` / `rf promote` (dev-version markers) |
 | `mode` | `"manage"` | `--mode`, else kept | **nothing yet** — round-tripped only; intended to let `assist` make mutating commands report instead of merge |
 | `username` | — | detected: `vars/default.nix` `username`, then `$USER`, then git `user.name` | **nothing yet** — reserved for attributing `user@host` rebuild commits |
 | `hosts` | — | detected from `vars/hosts.nix` | ordering for `host_gates`; may be empty (see `host_active`) |
@@ -103,10 +107,10 @@ repo where `nix eval` would not.
 
 ## Release flags, cleaning, pulling, lazygit
 
-`version_gate`, `tag_on_promote`, and `push_tag` control the release behavior
-described in
-[Versioning and release tags](../README.md#versioning-and-release-tags). All three
-default to `true` and are inert in repos without a `Cargo.toml`.
+`version_gate`, `tag_on_promote`, `tag_on_graduate`, `push_tag`, and
+`dev_versions` control the release behavior described in
+[Versioning and release tags](../README.md#versioning-and-release-tags). All
+five default to `true` and are inert in repos without a `Cargo.toml`.
 
 `clean_protect` names branches [`rf clean`](commands/clean.md) must never delete,
 on top of the stable and rolling branches and each remote's default branch, which
