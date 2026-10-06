@@ -714,7 +714,12 @@ fn cmd_graduate(
     // `ops::graduate` checks the dev marker belongs to this roll and runs the
     // gates, merge, and dev-tag creation — shared with the `rf promote`
     // fall-through and the TUI's `[G]`, so this is just the CLI wrapper now.
-    let outcome = ops::graduate(&config, &current, dry_run, &force, tag)?;
+    // A conflict is diagnosed and offered a way forward; when the way chosen
+    // is to integrate the culprit rolls and that merges cleanly, the
+    // graduation is retried on the spot.
+    let outcome = with_conflict_handling(&config, yes, Some(&current), || {
+        ops::graduate(&config, &current, dry_run, &force, tag)
+    })?;
     print_graduate(&outcome);
     if !dry_run {
         offer_graduate_tag_push(&config, &outcome, yes)?;
@@ -775,14 +780,10 @@ fn cmd_promote(
             }
             None => None,
         };
-        let outcome = ops::promote(
-            &config,
-            &ops::PromoteTarget::Rolls(rolls),
-            dry_run,
-            &force,
-            tag,
-            level,
-        )?;
+        let target = ops::PromoteTarget::Rolls(rolls);
+        let outcome = with_conflict_handling(&config, yes, None, || {
+            ops::promote(&config, &target, dry_run, &force, tag, level)
+        })?;
         print_promote(&outcome);
         offer_step_tag_pushes(&config, &outcome, yes)?;
         if !dry_run {
@@ -798,7 +799,9 @@ fn cmd_promote(
                 "note: '{}' is a roll branch; graduating into '{}' — use rf graduate directly next time",
                 roll, config.rolling_branch
             );
-            let outcome = ops::graduate(&config, &roll, dry_run, &force, tag)?;
+            let outcome = with_conflict_handling(&config, yes, Some(&roll), || {
+                ops::graduate(&config, &roll, dry_run, &force, tag)
+            })?;
             print_graduate(&outcome);
             if !dry_run {
                 offer_graduate_tag_push(&config, &outcome, yes)?;
@@ -812,20 +815,222 @@ fn cmd_promote(
             // gets merged, and so it precedes the `--locked` cargo gates.
             resolve_version_gate(&config, bump, yes, forced, dry_run)?;
 
-            let outcome = ops::promote(
-                &config,
-                &ops::PromoteTarget::Rolling,
-                dry_run,
-                &force,
-                tag,
-                None,
-            )?;
+            let outcome = with_conflict_handling(&config, yes, None, || {
+                ops::promote(
+                    &config,
+                    &ops::PromoteTarget::Rolling,
+                    dry_run,
+                    &force,
+                    tag,
+                    None,
+                )
+            })?;
             print_promote(&outcome);
             offer_step_tag_pushes(&config, &outcome, yes)?;
         }
         None => return Err(ops::not_promotable_error(&config, &current)),
     }
     Ok(())
+}
+
+// ── Merge conflicts ─────────────────────────────────────────────────────────
+
+/// What the user chose to do about a merge that stopped on conflicts.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ConflictChoice {
+    /// Integrate the culprit rolls into the source, taking the conflict onto
+    /// the roll branch where it can be resolved and committed.
+    Integrate,
+    /// Print the commands and change nothing.
+    Manual,
+    /// Re-run the merge on the target and leave the conflict in the tree.
+    Stage,
+}
+
+/// How [`handle_merge_conflict`] left things.
+enum ConflictOutcome {
+    /// The culprits merged cleanly into the source — the caller may retry.
+    Retry,
+    /// Something is now mid-merge, by the user's choice; the message says what.
+    Stopped(String),
+}
+
+/// Decide what to do about a conflict, honouring `--yes` and unattended runs.
+///
+/// `--yes` takes the recommended option; an unattended run without it changes
+/// nothing, the same rule `cli::confirm` applies — a command that lands in
+/// someone's CI must report, never leave a repo mid-merge.
+fn choose_conflict_action(yes: bool, can_integrate: bool) -> Result<ConflictChoice> {
+    let recommended = if can_integrate {
+        ConflictChoice::Integrate
+    } else {
+        ConflictChoice::Manual
+    };
+    if yes {
+        return Ok(recommended);
+    }
+    if !std::io::stdin().is_terminal() {
+        return Ok(ConflictChoice::Manual);
+    }
+    let options: Vec<ConflictChoice> = if can_integrate {
+        vec![
+            ConflictChoice::Integrate,
+            ConflictChoice::Manual,
+            ConflictChoice::Stage,
+        ]
+    } else {
+        vec![ConflictChoice::Manual, ConflictChoice::Stage]
+    };
+    let default = options.iter().position(|c| *c == recommended).unwrap_or(0) + 1;
+    let picked = cli::prompt_choice(options.len(), default)?;
+    Ok(options[picked - 1])
+}
+
+/// Print the diagnosis of a conflicting merge, offer the ways forward, and
+/// carry out the one chosen.
+///
+/// `integrate_into` is the checked-out roll when the failed merge was a
+/// graduation — the one case where the conflict can be taken onto the source
+/// side with `rf integrate`. It is the recommended choice because it is the
+/// workflow's own way of saying "this roll now depends on that one": the
+/// integrate merge leaves the same conflict on the roll branch, where it is
+/// resolved and committed like any other, and the dependency shows in
+/// `rf status` from then on. Promotion has no such option — its source is a
+/// commit on rolling, and the fix for a hotfix-vs-rolling conflict is to
+/// resolve it on the branch it landed on.
+fn handle_merge_conflict(
+    config: &Config,
+    conflict: &ops::MergeConflict,
+    yes: bool,
+    integrate_into: Option<&str>,
+) -> Result<ConflictOutcome> {
+    let report = &conflict.report;
+    let culprits = report.culprit_rolls();
+    println!("{conflict}");
+    println!();
+    for line in report.render() {
+        println!("{line}");
+    }
+    println!();
+    if culprits.is_empty() {
+        println!(
+            "Nothing on '{}' since the merge base is attributable to a roll; the \
+             conflicting change was made there directly.",
+            report.target
+        );
+    } else {
+        println!(
+            "The conflicting change is already on '{}' — it came in with {}.",
+            report.target,
+            culprits.join(", ")
+        );
+    }
+
+    let can_integrate = integrate_into.is_some() && !culprits.is_empty();
+    println!();
+    println!("Ways forward:");
+    let mut n = 0;
+    if can_integrate {
+        n += 1;
+        println!(
+            "  {n}) integrate {} into '{}' now, resolve there, then re-run rf graduate   [recommended]",
+            culprits.join(" and "),
+            integrate_into.unwrap_or_default()
+        );
+    }
+    n += 1;
+    println!(
+        "  {n}) nothing now; print the commands to do it by hand{}",
+        if can_integrate {
+            ""
+        } else {
+            "   [recommended]"
+        }
+    );
+    n += 1;
+    println!(
+        "  {n}) re-run the merge and leave the conflict in the working tree on '{}' for lazygit",
+        report.target
+    );
+
+    match choose_conflict_action(yes, can_integrate)? {
+        ConflictChoice::Integrate => {
+            let roll = integrate_into.unwrap_or_default();
+            for culprit in &culprits {
+                println!();
+                println!("integrating {culprit} into {roll}");
+                if let Err(err) = ops::integrate(config, culprit) {
+                    if git::ref_exists(&config.repo_root, "MERGE_HEAD") {
+                        return Ok(ConflictOutcome::Stopped(format!(
+                            "'{roll}' is now mid-merge with '{culprit}': resolve the conflicts \
+                             and commit, then run rf graduate again (gg in the TUI opens \
+                             lazygit; `git merge --abort` backs out)"
+                        )));
+                    }
+                    return Err(err);
+                }
+                println!("integrated {culprit} into {roll} cleanly");
+            }
+            Ok(ConflictOutcome::Retry)
+        }
+        ConflictChoice::Manual => {
+            println!();
+            println!("To resolve on '{}':", report.target);
+            println!(
+                "  git checkout {} && git merge --no-ff {}",
+                report.target, report.source
+            );
+            if let (Some(roll), false) = (integrate_into, culprits.is_empty()) {
+                println!("Or take the conflict onto '{roll}' (from '{roll}'):");
+                for culprit in &culprits {
+                    println!("  rf integrate {culprit}");
+                }
+            }
+            Ok(ConflictOutcome::Stopped(format!(
+                "'{}' was not merged into '{}'",
+                report.source, report.target
+            )))
+        }
+        ConflictChoice::Stage => {
+            if ops::stage_conflict(config, &report.source, &report.target)? {
+                Ok(ConflictOutcome::Stopped(format!(
+                    "'{}' is now checked out mid-merge with '{}': resolve the conflicts and \
+                     commit (gg in the TUI opens lazygit), or `git merge --abort` to back out",
+                    report.target, report.source
+                )))
+            } else {
+                Ok(ConflictOutcome::Stopped(format!(
+                    "the merge of '{}' into '{}' went through cleanly this time and is \
+                     committed; run the command again to finish",
+                    report.source, report.target
+                )))
+            }
+        }
+    }
+}
+
+/// Run a merge-performing operation, and if it stops on conflicts, diagnose,
+/// offer choices, and retry once when the choice made a retry possible.
+fn with_conflict_handling<T>(
+    config: &Config,
+    yes: bool,
+    integrate_into: Option<&str>,
+    mut op: impl FnMut() -> Result<T>,
+) -> Result<T> {
+    match op() {
+        Ok(value) => Ok(value),
+        Err(err) => match err.downcast::<ops::MergeConflict>() {
+            Ok(conflict) => match handle_merge_conflict(config, &conflict, yes, integrate_into)? {
+                ConflictOutcome::Retry => {
+                    println!();
+                    println!("retrying");
+                    op()
+                }
+                ConflictOutcome::Stopped(message) => bail!("{message}"),
+            },
+            Err(err) => Err(err),
+        },
+    }
 }
 
 /// Gate every real promotion on an explicit "is this final?" before anything

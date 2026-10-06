@@ -589,7 +589,7 @@ pub fn content_ref(branch: &str, location: &BranchLocation) -> String {
 /// match this replaced returned `None` for it, and since this one function is
 /// how *every* consumer reads a merge subject, that single miss took the roll's
 /// dependency, its graduation and its graduation commit with it.
-fn extract_graduated_branch(subject: &str) -> Option<String> {
+pub(crate) fn extract_graduated_branch(subject: &str) -> Option<String> {
     // Cut the ` into ` clause first. It names the merge *target*, never the
     // source, and dropping it is what makes the lenient fallback below safe:
     // `Merge branch 'roll/8-x' into roll/7-y` must never yield roll/7, because

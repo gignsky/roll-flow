@@ -35,13 +35,16 @@ dependent rolls against a dependency that is still gaining commits. `--json`
 carries the same signal as `stale_deps`, a subset of `deps`.
 
 Press `[enter]` on a roll for the detail overlay, which breaks the same two
-relationships out with per-dependency markers, and the two are independent —
-a dep can be both at once: `⛔ blocker` for a dep that has not graduated yet
-(it gates this roll's graduation), and `⚠ reintegrate` for one whose branch
-has moved since this roll integrated it (the same `⚠` as the plain table),
-whatever its own state — a dependency does not need to have graduated and
-diverged to be stale; it only needs to have kept moving after it was
-integrated. See
+relationships out with per-dependency markers. Its dependency list follows the
+chain all the way down — roll 12 depends on 9, which depends on 8, which
+depends on 7 — one indented line per link; a roll reached twice (a diamond) is
+shown once more as `↑ shown above` and not expanded again. The two markers are
+independent — a dep can be both at once: `⛔ blocker` for a dep that has not
+graduated yet (it gates its parent's graduation), and `⚠ reintegrate` for one
+whose branch has moved since its parent integrated it (the same `⚠` as the
+plain table), whatever its own state — a dependency does not need to have
+graduated and diverged to be stale; it only needs to have kept moving after it
+was integrated. See
 [divergence after integration](../internals/algorithms.md#dependency-detection-coredependenciesrs).
 
 The TUI table pins the stable and rolling branches above the rolls, so `[space]`
