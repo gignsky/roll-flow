@@ -4149,8 +4149,8 @@ fn render_detail(
             header,
             Style::default().add_modifier(Modifier::BOLD),
         )));
-        for r in &chain {
-            let indent = "  ".repeat(r.depth + 1);
+        for (i, r) in chain.iter().enumerate() {
+            let indent = "  ".repeat(r.depth);
             let elbow = if r.depth > 0 { "└ " } else { "" };
             let (marker, marker_style) = match (r.repeated, r.is_blocker, r.needs_reintegration) {
                 (true, _, true) => ("↑ shown above, ⚠ stale", Style::default().fg(Color::Yellow)),
@@ -4161,7 +4161,7 @@ fn render_detail(
                 (false, false, false) => ("✓ ok", Style::default().fg(Color::Green)),
             };
             lines.push(Line::from(vec![
-                Span::raw(format!("{indent}{elbow}#{}  ", r.number)),
+                Span::raw(format!("{}{indent}{elbow}#{}  ", cursor_mark(i), r.number)),
                 Span::styled(r.branch.clone(), Style::default().fg(Color::Cyan)),
                 Span::raw("  ["),
                 Span::styled(r.state.label(), Style::default().fg(state_color(&r.state))),
@@ -5540,7 +5540,7 @@ mod tests {
     fn the_detail_view_draws_the_chain_with_its_markers() {
         let mut all = linear_chain();
         all[3].stale_deps = vec![9];
-        let out = draw(|f, area| render_detail(f, area, &all[3], None, &all));
+        let out = draw(|f, area| render_detail(f, area, &all[3], None, &all, 0, &[]));
         assert!(
             out.contains("dependency chain (1 blocking, 1 stale)"),
             "{out}"
