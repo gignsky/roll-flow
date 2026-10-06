@@ -474,7 +474,7 @@ fn deletes_promoted_rolls_when_a_config_is_present() {
     sb.commit_empty("audio work");
     assert!(sb.rf(&["graduate"]).success, "graduate");
     sb.git(&["switch", "rolling"]);
-    assert!(sb.rf(&["promote"]).success, "promote");
+    assert!(sb.rf(&["promote", "--yes"]).success, "promote");
     sb.git(&["switch", "main"]);
 
     assert_eq!(
