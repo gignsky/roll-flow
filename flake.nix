@@ -192,9 +192,9 @@
                 if grep -q warning stderr.txt; then echo "rf warned about the generated config:"; cat stderr.txt; exit 1; fi
                 touch $out
               '';
-          # nixos-module = p.writeText "roll-flow-nixos-module-check" (
-          #   lib.concatStringsSep "\n" (map (pkg: pkg.name) nixos.config.environment.systemPackages)
-          # );
+          nixos-module = p.writeText "roll-flow-nixos-module-check" (
+            lib.concatStringsSep "\n" (map (pkg: pkg.name) nixos.config.environment.systemPackages)
+          );
         }
       );
     };
