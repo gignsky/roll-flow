@@ -2281,21 +2281,66 @@ pub(crate) struct ChainStep {
     pub number: u32,
     pub state: branches::RollState,
     pub reason: ChainReason,
+    /// Fellow members of a dependency cycle this step's roll is the carrier
+    /// of: they have no step of their own, because this one's merge lands
+    /// their tips too (see [`branches::DepCycle`]). Empty for any roll not
+    /// carrying a cycle.
+    pub carries: Vec<u32>,
 }
 
 impl ChainStep {
-    /// One line for a plan listing: `roll/8-x  (dependency of 9, ⛔ blocked)`.
+    /// One line for a plan listing: `roll/8-x  (dependency of 9, ⛔ blocked)`,
+    /// with `, carries 14` appended when the step lands a cycle's other members.
     pub fn describe(&self) -> String {
+        let carries = if self.carries.is_empty() {
+            String::new()
+        } else {
+            format!(", carries {}", branches::format_roll_numbers(&self.carries))
+        };
         match &self.reason {
-            ChainReason::Requested => format!("{}  ({})", self.branch, self.state.label()),
+            ChainReason::Requested => {
+                format!("{}  ({}{carries})", self.branch, self.state.label())
+            }
             ChainReason::Dependency { of } => format!(
-                "{}  (dependency of {}, {})",
+                "{}  (dependency of {}, {}{carries})",
                 self.branch,
                 of,
                 self.state.label()
             ),
         }
     }
+
+    /// The line reporting, after this step's graduation, which rolls it
+    /// carried — by branch name, since that is what the user will look for.
+    /// Shared by the CLI and the TUI's output panel.
+    pub fn carried_line(&self, rolls: &[branches::RollInfo], dry_run: bool) -> String {
+        let names: Vec<String> = self
+            .carries
+            .iter()
+            .map(|n| {
+                rolls
+                    .iter()
+                    .find(|r| r.number == *n)
+                    .map(|r| r.branch.clone())
+                    .unwrap_or_else(|| format!("roll {n}"))
+            })
+            .collect();
+        format!(
+            "  {} {} with it (dependency cycle)",
+            if dry_run { "would carry" } else { "carried" },
+            names.join(", ")
+        )
+    }
+}
+
+/// True when graduating `target` is exactly one merge of `target` itself — no
+/// dependency first, and no other branch merged in its place. That is the case
+/// that has always run without a confirmation; anything else merges a branch
+/// the user is not standing on, and is shown and confirmed first. A carrier
+/// graduating its own cycle is still lone: its merge is its own branch, and
+/// the rolls it carries are already inside it.
+pub(crate) fn chain_is_lone(chain: &[ChainStep], target: &str) -> bool {
+    matches!(chain, [only] if only.branch == target)
 }
 
 /// Plan the ordered merges needed to graduate or promote `target`, dependencies
@@ -2309,10 +2354,28 @@ impl ChainStep {
 /// history, not a step, and is not walked further: what *it* integrated is
 /// already on the branch being merged into.
 ///
+/// Dependency cycles — two rolls that integrated each other, as 14 and 15 did —
+/// have no post-order, so for graduation a cycle `branches::list_rolls` recorded
+/// on `RollInfo::cycle` is planned as **one node**: every member's dependencies
+/// outside the cycle first, then a single step for the cycle's carrier, which
+/// lands the others because it contains their tips (`ChainStep::carries`). The
+/// carried members get no step of their own; after the carrier's merge they
+/// read as graduated through its integrate merges. Asking for a carried member
+/// plans the carrier's step in its place — that is the only way it can land.
+/// A cycle with no carrier is refused with [`branches::DepCycle::advice`],
+/// which names the `rf integrate` that makes one.
+///
+/// For promotion a cycle orders nothing: members that graduated together share
+/// a graduation merge, and per-roll promotion is ordered by rolling's history
+/// (`plan_roll_steps`), not by this list. An edge back into the current path is
+/// therefore skipped rather than refused, so the walk still terminates.
+///
 /// Pure over the roll list, so ordering, cycle detection and the refusals below
 /// are unit-tested without a repository. Refusals, all naming the roll:
 /// - a dependency number nothing in the list carries;
-/// - a cycle, which `rf integrate` cannot normally produce but a hand merge can;
+/// - a dependency cycle with no carrier (see above), or — for graduation — a
+///   back edge `RollInfo::cycle` does not account for, which only an
+///   inconsistent roll list can produce;
 /// - for graduation, a dependency with no local copy — `ops::graduate` merges
 ///   a local branch, and "branch not found" halfway through a chain is a worse
 ///   place to learn that than before it starts;
@@ -2346,6 +2409,11 @@ pub(crate) fn dependency_chain(
 
 /// Depth-first post-order over one roll's dependencies. `visiting` is the
 /// current path, for cycle detection; `done` is everything already emitted.
+///
+/// For graduation, a roll in a recorded dependency cycle is visited as its
+/// whole cycle (see [`dependency_chain`]): `group` is every member, the
+/// dependencies walked are all of theirs that lie outside it, and the one step
+/// emitted is the carrier's.
 fn chain_visit(
     roll: &branches::RollInfo,
     reason: ChainReason,
@@ -2355,8 +2423,6 @@ fn chain_visit(
     done: &mut HashSet<u32>,
     visiting: &mut Vec<u32>,
 ) -> Result<()> {
-    use branches::{BranchLocation, RollState};
-
     if done.contains(&roll.number) {
         return Ok(());
     }
@@ -2371,84 +2437,144 @@ fn chain_visit(
             cycle.join(" -> ")
         );
     }
-    visiting.push(roll.number);
 
-    for dep in &roll.deps {
-        let Some(dep_roll) = rolls.iter().find(|r| r.number == *dep) else {
-            bail!(
-                "'{}' depends on roll {dep}, which is not among the known roll branches",
-                roll.branch
-            );
-        };
-        match kind {
-            ChainKind::Graduate => {
-                if !matches!(
-                    dep_roll.state,
-                    RollState::Active
-                        | RollState::Blocked
-                        | RollState::Diverged
-                        | RollState::Reverted
-                ) {
-                    continue;
-                }
-                if !matches!(
-                    dep_roll.location,
-                    BranchLocation::Local | BranchLocation::Both
-                ) {
+    // The unit this visit plans: the roll alone, or — graduating a roll in a
+    // dependency cycle — the whole cycle, landed by its carrier.
+    let (group, emitted): (Vec<&branches::RollInfo>, &branches::RollInfo) =
+        match (kind, roll.cycle.as_ref()) {
+            (ChainKind::Graduate, Some(cycle)) => {
+                let Some(carrier) = cycle.carrier() else {
+                    bail!("{}", cycle.advice(rolls));
+                };
+                let members: Vec<&branches::RollInfo> =
+                    rolls.iter().filter(|r| cycle.contains(r.number)).collect();
+                let Some(carrier_roll) = members.iter().copied().find(|r| r.number == carrier)
+                else {
                     bail!(
-                        "'{}' depends on '{}', which exists only on origin — fetch it \
-                         (or press [space] on it in the TUI) before graduating",
-                        roll.branch,
-                        dep_roll.branch
+                        "'{}' is in a dependency cycle whose carrier, roll {carrier}, is not \
+                         among the known roll branches",
+                        roll.branch
                     );
-                }
+                };
+                (members, carrier_roll)
             }
-            ChainKind::Promote => match dep_roll.state {
-                RollState::Promoted => continue,
-                RollState::Graduated | RollState::Diverged => {}
-                RollState::Active | RollState::Blocked => bail!(
-                    "'{}' depends on '{}', which has not graduated — graduate it first",
-                    roll.branch,
-                    dep_roll.branch
-                ),
-                // Its graduation was reverted on rolling, so its content is
-                // not really there to advance stable to.
-                RollState::Reverted => bail!(
-                    "'{}' depends on '{}', whose graduation was reverted on rolling — \
-                     re-graduate it first",
-                    roll.branch,
-                    dep_roll.branch
-                ),
-                // Re-promotion is detect-only (see algorithms.md), and a
-                // per-roll step cannot undo a revert on stable by re-merging.
-                RollState::Demoted => bail!(
-                    "'{}' depends on '{}', whose promotion was reverted on stable — \
-                     restore it by hand (revert the revert) first",
-                    roll.branch,
-                    dep_roll.branch
-                ),
-            },
+            _ => (vec![roll], roll),
+        };
+    visiting.extend(group.iter().map(|r| r.number));
+
+    for member in &group {
+        for dep in &member.deps {
+            if group.iter().any(|g| g.number == *dep) {
+                continue;
+            }
+            // Promotion follows graduation order, so a cycle among graduated
+            // rolls orders nothing: skip the edge back rather than refuse it.
+            if kind == ChainKind::Promote && visiting.contains(dep) {
+                continue;
+            }
+            chain_visit_dep(member, *dep, rolls, kind, order, done, visiting)?;
         }
-        chain_visit(
-            dep_roll,
-            ChainReason::Dependency { of: roll.number },
-            rolls,
-            kind,
-            order,
-            done,
-            visiting,
-        )?;
     }
 
-    visiting.pop();
-    done.insert(roll.number);
+    visiting.retain(|n| !group.iter().any(|g| g.number == *n));
+    done.extend(group.iter().map(|r| r.number));
+    let reason = if emitted.number == roll.number {
+        reason
+    } else {
+        match reason {
+            // Asked for a carried member: the carrier lands it, on its behalf.
+            ChainReason::Requested => ChainReason::Dependency { of: roll.number },
+            other => other,
+        }
+    };
     order.push(ChainStep {
-        branch: roll.branch.clone(),
-        number: roll.number,
-        state: roll.state.clone(),
+        branch: emitted.branch.clone(),
+        number: emitted.number,
+        state: emitted.state.clone(),
         reason,
+        carries: group
+            .iter()
+            .map(|r| r.number)
+            .filter(|n| *n != emitted.number)
+            .collect(),
     });
     Ok(())
+}
+
+/// One dependency edge of [`chain_visit`]: whether `dep` is a step for this
+/// `kind`, the refusals that apply to it, and the recursion into it.
+fn chain_visit_dep(
+    roll: &branches::RollInfo,
+    dep: u32,
+    rolls: &[branches::RollInfo],
+    kind: ChainKind,
+    order: &mut Vec<ChainStep>,
+    done: &mut HashSet<u32>,
+    visiting: &mut Vec<u32>,
+) -> Result<()> {
+    use branches::{BranchLocation, RollState};
+
+    let Some(dep_roll) = rolls.iter().find(|r| r.number == dep) else {
+        bail!(
+            "'{}' depends on roll {dep}, which is not among the known roll branches",
+            roll.branch
+        );
+    };
+    match kind {
+        ChainKind::Graduate => {
+            if !matches!(
+                dep_roll.state,
+                RollState::Active | RollState::Blocked | RollState::Diverged | RollState::Reverted
+            ) {
+                return Ok(());
+            }
+            if !matches!(
+                dep_roll.location,
+                BranchLocation::Local | BranchLocation::Both
+            ) {
+                bail!(
+                    "'{}' depends on '{}', which exists only on origin — fetch it \
+                         (or press [space] on it in the TUI) before graduating",
+                    roll.branch,
+                    dep_roll.branch
+                );
+            }
+        }
+        ChainKind::Promote => match dep_roll.state {
+            RollState::Promoted => return Ok(()),
+            RollState::Graduated | RollState::Diverged => {}
+            RollState::Active | RollState::Blocked => bail!(
+                "'{}' depends on '{}', which has not graduated — graduate it first",
+                roll.branch,
+                dep_roll.branch
+            ),
+            // Its graduation was reverted on rolling, so its content is
+            // not really there to advance stable to.
+            RollState::Reverted => bail!(
+                "'{}' depends on '{}', whose graduation was reverted on rolling — \
+                     re-graduate it first",
+                roll.branch,
+                dep_roll.branch
+            ),
+            // Re-promotion is detect-only (see algorithms.md), and a
+            // per-roll step cannot undo a revert on stable by re-merging.
+            RollState::Demoted => bail!(
+                "'{}' depends on '{}', whose promotion was reverted on stable — \
+                     restore it by hand (revert the revert) first",
+                roll.branch,
+                dep_roll.branch
+            ),
+        },
+    }
+    chain_visit(
+        dep_roll,
+        ChainReason::Dependency { of: roll.number },
+        rolls,
+        kind,
+        order,
+        done,
+        visiting,
+    )
 }
 
 /// Graduate every step of a chain in order, stopping at the first failure.
@@ -2777,7 +2903,23 @@ fn plan_roll_steps(config: &Config, rolls: &[String], stable_ref: &str) -> Resul
     }
 
     planned.sort_by_key(|(pos, _)| *pos);
-    let mut steps: Vec<PlannedStep> = planned.into_iter().map(|(_, step)| step).collect();
+    // Rolls that graduated in one merge — a dependency cycle's carrier and the
+    // members it carried — share a graduation commit. Merging it once lands
+    // them all; a second step would merge an already-merged commit.
+    let mut steps: Vec<PlannedStep> = Vec::new();
+    for (_, step) in planned {
+        if let Some(earlier) = steps.iter().find(|s| s.source == step.source) {
+            skipped.push(SkippedRoll {
+                roll: step.roll.clone().unwrap_or_default(),
+                reason: format!(
+                    "lands with '{}' (same graduation merge)",
+                    earlier.roll.as_deref().unwrap_or_default()
+                ),
+            });
+            continue;
+        }
+        steps.push(step);
+    }
     fill_carried_rolls(repo, &known, &order, &mut steps, stable_ref);
     Ok(PromotePlan { steps, skipped })
 }
@@ -4358,7 +4500,7 @@ mod tests {
     }
     mod chains {
         use super::super::{dependency_chain, ChainKind, ChainReason};
-        use crate::core::branches::{BranchLocation, RollInfo, RollState};
+        use crate::core::branches::{BranchLocation, DepCycle, RollInfo, RollState};
 
         fn roll(n: u32, state: RollState, deps: &[u32]) -> RollInfo {
             RollInfo {
@@ -4371,6 +4513,20 @@ mod tests {
                 dependents: Vec::new(),
                 stale_deps: Vec::new(),
                 graduation_commit: None,
+                cycle: None,
+            }
+        }
+
+        /// Mark `members` as one cycle on every roll in it, the way
+        /// `branches::list_rolls` would, with `suggested` lacking `lacks`.
+        fn in_cycle(rolls: &mut [RollInfo], members: &[u32], suggested: u32, lacks: &[u32]) {
+            let cycle = DepCycle {
+                members: members.to_vec(),
+                suggested,
+                lacks: lacks.to_vec(),
+            };
+            for r in rolls.iter_mut().filter(|r| members.contains(&r.number)) {
+                r.cycle = Some(cycle.clone());
             }
         }
 
@@ -4458,6 +4614,89 @@ mod tests {
                 .to_string();
             assert!(err.contains("cycle"), "{err}");
             assert!(err.contains("1 -> 2 -> 1"), "{err}");
+        }
+
+        #[test]
+        fn a_cycle_graduates_as_one_step_its_carrier_carrying_the_rest() {
+            // 14 and 15 integrated each other; 15 contains 14.
+            let mut rolls = vec![
+                roll(14, RollState::Blocked, &[15]),
+                roll(15, RollState::Active, &[14]),
+            ];
+            in_cycle(&mut rolls, &[14, 15], 15, &[]);
+
+            // Asked for the carrier: one step, its own, carrying 14.
+            let chain = dependency_chain(&rolls, "roll/15-0101-r15", ChainKind::Graduate).unwrap();
+            assert_eq!(chain.len(), 1);
+            assert_eq!(chain[0].number, 15);
+            assert_eq!(chain[0].reason, ChainReason::Requested);
+            assert_eq!(chain[0].carries, vec![14]);
+
+            // Asked for the carried member: the same single step — 14 cannot
+            // land any other way — now as a dependency of what was asked for.
+            let chain = dependency_chain(&rolls, "roll/14-0101-r14", ChainKind::Graduate).unwrap();
+            assert_eq!(chain.len(), 1);
+            assert_eq!(chain[0].number, 15);
+            assert_eq!(chain[0].reason, ChainReason::Dependency { of: 14 });
+            assert!(chain[0].describe().contains("carries 14"));
+        }
+
+        #[test]
+        fn a_cycles_outside_dependencies_come_first_whichever_member_needs_them() {
+            // The real shape: both integrated 8; only 14 integrated 7. The
+            // carrier lands 14, so 14's own dependency has to precede it too.
+            let mut rolls = vec![
+                roll(7, RollState::Active, &[]),
+                roll(8, RollState::Active, &[]),
+                roll(14, RollState::Blocked, &[7, 8, 15]),
+                roll(15, RollState::Blocked, &[8, 14]),
+            ];
+            in_cycle(&mut rolls, &[14, 15], 15, &[]);
+            assert_eq!(
+                numbers(&rolls, "roll/15-0101-r15", ChainKind::Graduate),
+                vec![7, 8, 15]
+            );
+            // And a roll depending on the cycle from outside comes after it.
+            rolls.push(roll(16, RollState::Blocked, &[14]));
+            assert_eq!(
+                numbers(&rolls, "roll/16-0101-r16", ChainKind::Graduate),
+                vec![7, 8, 15, 16]
+            );
+        }
+
+        #[test]
+        fn a_cycle_with_no_carrier_is_refused_with_the_integrate_that_makes_one() {
+            let mut rolls = vec![
+                roll(14, RollState::Blocked, &[15]),
+                roll(15, RollState::Blocked, &[14]),
+            ];
+            in_cycle(&mut rolls, &[14, 15], 15, &[14]);
+            for target in ["roll/14-0101-r14", "roll/15-0101-r15"] {
+                let err = dependency_chain(&rolls, target, ChainKind::Graduate)
+                    .unwrap_err()
+                    .to_string();
+                assert!(
+                    err.contains("on roll/15-0101-r15 run `rf integrate roll/14-0101-r14`"),
+                    "{err}"
+                );
+            }
+        }
+
+        #[test]
+        fn a_promotion_chain_through_a_graduated_cycle_terminates() {
+            // Both graduated in one merge (15 carried 14); promotion follows
+            // graduation order, so the cycle orders nothing and must not be
+            // refused — let alone walked forever.
+            let rolls = vec![
+                roll(14, RollState::Graduated, &[15]),
+                roll(15, RollState::Graduated, &[14]),
+            ];
+            let mut got = numbers(&rolls, "roll/15-0101-r15", ChainKind::Promote);
+            got.sort_unstable();
+            assert_eq!(got, vec![14, 15]);
+            let mut got = numbers(&rolls, "roll/14-0101-r14", ChainKind::Promote);
+            got.sort_unstable();
+            assert_eq!(got, vec![14, 15]);
         }
 
         #[test]

@@ -22,7 +22,10 @@ Branch names are configurable. Defaults: `rolling_branch = "rolling"`, `stable_b
 - **demoted** — promoted, but a `git revert` later undid that merge on the stable branch
   (needs re-promotion — detected but not automated, see
   [Revert detection](algorithms.md#revert-detection-corebranchesrs))
-- **blocked** — has ungraduated dependencies that must graduate first
+- **blocked** — has ungraduated dependencies that must graduate first. In a dependency
+  cycle (rolls that integrated each other) only the *carrier* — the member containing
+  the others' tips — escapes this, since graduating it lands them (see
+  [Dependency cycles](algorithms.md#dependency-cycles))
 
 ## Quasi-rolls
 

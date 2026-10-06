@@ -540,6 +540,12 @@ pub(crate) fn initial_selection(
 /// commits is just as stale as a `Diverged` one that graduated and then moved.
 /// A roll can therefore be both blocked on a dependency *and* behind its
 /// latest commits at the same time.
+///
+/// `carried` marks the one exception to `is_blocker`: a fellow member of a
+/// dependency cycle that the roll on the other end carries (see
+/// [`branches::DepCycle`]). The carrier contains its tip, so graduating the
+/// carrier lands it — it is ungraduated, but it gates nothing. Always false
+/// when `is_blocker` is true.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct DepRow {
     pub number: u32,
@@ -547,6 +553,16 @@ pub(crate) struct DepRow {
     pub state: RollState,
     pub is_blocker: bool,
     pub needs_reintegration: bool,
+    pub carried: bool,
+}
+
+/// True when `carrier` is the carrier of a dependency cycle `member` is also
+/// in — the one relation under which an ungraduated dependency does not block.
+fn carries(carrier: &RollInfo, member: u32) -> bool {
+    carrier
+        .cycle
+        .as_ref()
+        .is_some_and(|c| c.carrier() == Some(carrier.number) && c.contains(member))
 }
 
 /// Owns everything needed to render and to *reload* after an action.
@@ -1251,22 +1267,29 @@ fn push_version_check(lines: &mut Vec<String>, check: &VersionCheck, source: &st
 /// question answered by `selected.stale_deps`: has the dependency's branch
 /// moved since `selected` integrated it, whatever its state — so a dep can be
 /// both a blocker *and* stale at once (still active, and already moved again).
-/// Unknown dep numbers (not present in `all`) are skipped. The empty result
-/// means "no dependencies / not blocked".
+/// The one exception to "ungraduated blocks" is a fellow dependency-cycle
+/// member `selected` carries: it is `carried`, not a blocker, because
+/// graduating `selected` lands it. Unknown dep numbers (not present in `all`)
+/// are skipped. The empty result means "no dependencies / not blocked".
 pub(crate) fn dep_rows(selected: &RollInfo, all: &[RollInfo]) -> Vec<DepRow> {
     selected
         .deps
         .iter()
         .filter_map(|num| all.iter().find(|r| r.number == *num))
-        .map(|dep| DepRow {
-            number: dep.number,
-            branch: dep.branch.clone(),
-            state: dep.state.clone(),
-            is_blocker: matches!(
-                dep.state,
-                RollState::Active | RollState::Blocked | RollState::Reverted
-            ),
-            needs_reintegration: selected.stale_deps.contains(&dep.number),
+        .map(|dep| {
+            let carried = carries(selected, dep.number);
+            DepRow {
+                number: dep.number,
+                branch: dep.branch.clone(),
+                state: dep.state.clone(),
+                is_blocker: !carried
+                    && matches!(
+                        dep.state,
+                        RollState::Active | RollState::Blocked | RollState::Reverted
+                    ),
+                needs_reintegration: selected.stale_deps.contains(&dep.number),
+                carried,
+            }
         })
         .collect()
 }
@@ -1284,6 +1307,10 @@ pub(crate) struct ChainRow {
     /// The parent integrated this roll, and its branch has moved since —
     /// [`DepRow::needs_reintegration`], read from the parent's `stale_deps`.
     pub needs_reintegration: bool,
+    /// [`DepRow::carried`], read the same way: the roll's parent at this link
+    /// is the cycle's carrier, so this link gates nothing despite being
+    /// ungraduated. Always false when `is_blocker` is true.
+    pub carried: bool,
     /// Already listed higher up the chain (a diamond). Its own dependencies
     /// are not repeated under it.
     pub repeated: bool,
@@ -1318,6 +1345,7 @@ pub(crate) fn dep_chain(selected: &RollInfo, all: &[RollInfo]) -> Vec<ChainRow> 
                 state: row.state,
                 is_blocker: row.is_blocker,
                 needs_reintegration: row.needs_reintegration,
+                carried: row.carried,
                 repeated,
             });
             if !repeated {
@@ -1414,8 +1442,9 @@ pub(crate) fn detail_key(
 /// dependent last integrated it, not on what `target` is doing now. The detail
 /// view does not render a per-row marker for dependents, so both flags are
 /// purely informational here, but they keep the fields meaningful and
-/// testable. A roll is never its own dependent, even if a self-referential
-/// entry somehow appears.
+/// testable. A dependent that carries `target` (a dependency-cycle carrier) is
+/// `carried` rather than gated, mirroring [`dep_rows`]. A roll is never its own
+/// dependent, even if a self-referential entry somehow appears.
 pub(crate) fn dependent_rows(target: &RollInfo, all: &[RollInfo]) -> Vec<DepRow> {
     let target_gates = matches!(
         target.state,
@@ -1426,14 +1455,29 @@ pub(crate) fn dependent_rows(target: &RollInfo, all: &[RollInfo]) -> Vec<DepRow>
         .iter()
         .filter(|num| **num != target.number)
         .filter_map(|num| all.iter().find(|r| r.number == *num))
-        .map(|dependent| DepRow {
-            number: dependent.number,
-            branch: dependent.branch.clone(),
-            state: dependent.state.clone(),
-            is_blocker: target_gates,
-            needs_reintegration: dependent.stale_deps.contains(&target.number),
+        .map(|dependent| {
+            let carried = carries(dependent, target.number);
+            DepRow {
+                number: dependent.number,
+                branch: dependent.branch.clone(),
+                state: dependent.state.clone(),
+                is_blocker: target_gates && !carried,
+                needs_reintegration: dependent.stale_deps.contains(&target.number),
+                carried,
+            }
         })
         .collect()
+}
+
+/// The detail view's dependency-cycle note: [`branches::DepCycle::advice`] —
+/// the same sentence the plain tables print and `--json` carries — broken at
+/// its dash so it fits a popup rather than stretching it across the screen.
+pub(crate) fn cycle_lines(cycle: &branches::DepCycle, all: &[RollInfo]) -> Vec<String> {
+    let advice = cycle.advice(all);
+    match advice.split_once(" — ") {
+        Some((what, todo)) => vec![what.to_string(), format!("  {todo}")],
+        None => vec![advice],
+    }
 }
 
 /// Render the ahead/behind divergence of a both-location roll versus its
@@ -3367,7 +3411,7 @@ impl StatusApp {
                 );
             }
             if show_deps {
-                cells.push(Cell::from(branches::format_roll_numbers(&roll.deps)));
+                cells.push(Cell::from(branches::format_deps(roll)));
                 cells.push(Cell::from(branches::format_roll_numbers(&roll.dependents)));
             }
             Row::new(cells)
@@ -3590,7 +3634,8 @@ fn run_op(config: &Config, action: Action, target: Option<&str>) -> Result<Vec<S
             // partway names what landed and what did not.
             let rolls = branches::list_rolls(config)?;
             let chain = ops::dependency_chain(&rolls, roll, ops::ChainKind::Graduate)?;
-            for o in ops::graduate_chain(config, &chain, false, &force, true, ops::graduate)? {
+            let outcomes = ops::graduate_chain(config, &chain, false, &force, true, ops::graduate)?;
+            for (step, o) in chain.iter().zip(&outcomes) {
                 push_gate_notices(&mut lines, &o.gate_notices);
                 if o.restored {
                     lines.push(format!(
@@ -3599,6 +3644,9 @@ fn run_op(config: &Config, action: Action, target: Option<&str>) -> Result<Vec<S
                     ));
                 } else {
                     lines.push(format!("Graduated '{}' into '{}'", o.roll, o.rolling));
+                }
+                if !step.carries.is_empty() {
+                    lines.push(step.carried_line(&rolls, false));
                 }
                 if let Some(line) = o.tag.describe() {
                     lines.push(line);
@@ -4310,7 +4358,10 @@ fn render_modal(f: &mut Frame, area: Rect, config: &Config, modal: &ConfirmModal
 /// said why, and the modal is not the place to repeat it).
 fn chain_lines(rolls: &[RollInfo], target: &str, kind: ops::ChainKind) -> Option<Vec<String>> {
     let chain = ops::dependency_chain(rolls, target, kind).ok()?;
-    if chain.len() < 2 {
+    // A lone step is still worth listing when it is not `target` (a carried
+    // cycle member graduates by way of its carrier) or carries other rolls:
+    // either way more lands than the row under the cursor.
+    if ops::chain_is_lone(&chain, target) && chain.iter().all(|s| s.carries.is_empty()) {
         return None;
     }
     Some(
@@ -4718,6 +4769,17 @@ fn render_detail(
 
     lines.push(Line::from(""));
 
+    // A cycle explains what the dependency rows alone cannot: why two rolls
+    // are each waiting on the other, and which one to graduate to end it.
+    if let Some(cycle) = &roll.cycle {
+        lines.extend(
+            cycle_lines(cycle, all)
+                .into_iter()
+                .map(|text| Line::from(Span::styled(text, Style::default().fg(Color::Cyan)))),
+        );
+        lines.push(Line::from(""));
+    }
+
     if chain.is_empty() {
         lines.push(Line::from(Span::styled(
             "no dependencies / not blocked",
@@ -4744,14 +4806,27 @@ fn render_detail(
         for (i, r) in chain.iter().enumerate() {
             let indent = "  ".repeat(r.depth);
             let elbow = if r.depth > 0 { "└ " } else { "" };
-            let (marker, marker_style) = match (r.repeated, r.is_blocker, r.needs_reintegration) {
-                (true, _, true) => ("↑ shown above, ⚠ stale", Style::default().fg(Color::Yellow)),
-                (true, _, false) => ("↑ shown above", Style::default().fg(Color::DarkGray)),
-                (false, true, true) => ("⛔ blocker, ⚠ stale", Style::default().fg(Color::Red)),
-                (false, true, false) => ("⛔ blocker", Style::default().fg(Color::Red)),
-                (false, false, true) => ("⚠ reintegrate", Style::default().fg(Color::Yellow)),
-                (false, false, false) => ("✓ ok", Style::default().fg(Color::Green)),
-            };
+            // `repeated` (shown higher in the chain already) takes priority
+            // over everything else, same as a plain blocker/stale link would.
+            // `carried` is checked next, ahead of blocker/stale: a cycle's
+            // carrier contains this row's tip, so it gates nothing despite
+            // being ungraduated — see [`ChainRow::carried`].
+            let (marker, marker_style) =
+                match (r.repeated, r.carried, r.is_blocker, r.needs_reintegration) {
+                    (true, _, _, true) => {
+                        ("↑ shown above, ⚠ stale", Style::default().fg(Color::Yellow))
+                    }
+                    (true, _, _, false) => ("↑ shown above", Style::default().fg(Color::DarkGray)),
+                    (false, true, _, _) => ("↻ carried", Style::default().fg(Color::Cyan)),
+                    (false, false, true, true) => {
+                        ("⛔ blocker, ⚠ stale", Style::default().fg(Color::Red))
+                    }
+                    (false, false, true, false) => ("⛔ blocker", Style::default().fg(Color::Red)),
+                    (false, false, false, true) => {
+                        ("⚠ reintegrate", Style::default().fg(Color::Yellow))
+                    }
+                    (false, false, false, false) => ("✓ ok", Style::default().fg(Color::Green)),
+                };
             lines.push(Line::from(vec![
                 Span::raw(format!("{}{indent}{elbow}#{}  ", cursor_mark(i), r.number)),
                 Span::styled(r.branch.clone(), Style::default().fg(Color::Cyan)),
@@ -4900,6 +4975,7 @@ mod tests {
             dependents: Vec::new(),
             stale_deps: Vec::new(),
             graduation_commit: None,
+            cycle: None,
         }
     }
 
@@ -5084,6 +5160,7 @@ mod tests {
             dependents: Vec::new(),
             stale_deps: Vec::new(),
             graduation_commit: None,
+            cycle: None,
         }
     }
 
@@ -7726,5 +7803,99 @@ mod tests {
         // Cursor sits on the current branch (the rolling base), not the roll.
         assert!(line(6).contains('▶'), "{}", line(6));
         assert!(!line(5).contains('▶') && !line(7).contains('▶'));
+    }
+
+    /// Rolls 14 and 15 integrated each other; `lacks` empty makes 15 the
+    /// carrier, non-empty leaves the cycle without one.
+    fn cycle_14_15(lacks: &[u32]) -> Vec<RollInfo> {
+        let cycle = branches::DepCycle {
+            members: vec![14, 15],
+            suggested: 15,
+            lacks: lacks.to_vec(),
+        };
+        let mut r14 = roll_n(14, RollState::Blocked);
+        r14.deps = vec![15];
+        r14.dependents = vec![15];
+        r14.cycle = Some(cycle.clone());
+        let mut r15 = roll_n(15, RollState::Active);
+        r15.deps = vec![14];
+        r15.dependents = vec![14];
+        r15.cycle = Some(cycle);
+        vec![r14, r15]
+    }
+
+    #[test]
+    fn a_carrier_shows_its_cycle_member_as_carried_not_blocking() {
+        let all = cycle_14_15(&[]);
+        // 15 carries 14: ungraduated, but it gates nothing.
+        let rows = dep_rows(&all[1], &all);
+        assert_eq!(rows.len(), 1);
+        assert!(rows[0].carried && !rows[0].is_blocker, "{rows:?}");
+        // 14 really is waiting on 15, which is what lands it.
+        let rows = dep_rows(&all[0], &all);
+        assert!(rows[0].is_blocker && !rows[0].carried, "{rows:?}");
+        // And from the other side: 15, as 14's dependent, is not gated by it.
+        let rows = dependent_rows(&all[0], &all);
+        assert!(rows[0].carried && !rows[0].is_blocker, "{rows:?}");
+    }
+
+    #[test]
+    fn the_detail_cycle_note_says_which_roll_to_graduate() {
+        let all = cycle_14_15(&[]);
+        let lines = cycle_lines(all[0].cycle.as_ref().unwrap(), &all);
+        assert_eq!(lines.len(), 2, "{lines:?}");
+        assert!(lines[0].contains("14 ⇄ 15"), "{lines:?}");
+        assert!(lines[1].contains("graduate roll/15-0101-x"), "{lines:?}");
+    }
+
+    #[test]
+    fn graduating_a_carried_member_lists_the_carrier_in_the_confirm() {
+        // A one-step chain, but not of the row under the cursor — so the
+        // modal must say what will actually merge.
+        let all = cycle_14_15(&[]);
+        let lines = chain_lines(&all, "roll/14-0101-x", ops::ChainKind::Graduate)
+            .expect("the plan is listed");
+        assert_eq!(lines.len(), 1);
+        assert!(lines[0].contains("roll/15-0101-x"), "{lines:?}");
+        assert!(lines[0].contains("carries 14"), "{lines:?}");
+        assert!(validate_action(Action::Graduate, Some(&all[0]), &all, "main", "roll/").is_ok());
+    }
+
+    #[test]
+    fn graduating_a_cycle_with_no_carrier_is_refused_with_the_remedy() {
+        let all = cycle_14_15(&[14]);
+        for sel in &all {
+            let err =
+                validate_action(Action::Graduate, Some(sel), &all, "main", "roll/").unwrap_err();
+            assert!(err.contains("`rf integrate roll/14-0101-x`"), "{err}");
+        }
+    }
+
+    #[test]
+    fn dep_chain_carries_the_carried_marker_onto_its_rows() {
+        // Regression test: `dep_chain` builds each `ChainRow` from `dep_rows`,
+        // and used to drop `carried` doing it — a merge-conflict casualty
+        // (ChainRow predates the cycle feature) that left a carried member
+        // reading as a plain blocker several levels down. `dep_rows` itself
+        // was already covered by `a_carrier_shows_its_cycle_member_as_carried_
+        // not_blocking`; this is the same fact, through `dep_chain` instead.
+        let all = cycle_14_15(&[]);
+        let chain = dep_chain(&all[1], &all); // 15, the carrier
+                                              // 14 at depth 0, then 15 again at depth 1 (14's own dep is 15 —
+                                              // the cycle), marked `repeated` since 15 is the pane's own root.
+        let direct = chain.iter().find(|r| r.number == 14).expect("14 in chain");
+        assert!(
+            direct.carried && !direct.is_blocker,
+            "carried dropped in dep_chain: {direct:?}"
+        );
+    }
+
+    #[test]
+    fn the_detail_pane_marks_a_carried_dependency_rather_than_a_blocker() {
+        let all = cycle_14_15(&[]);
+        // Selecting 15 (the carrier): its one dependency, 14, is carried.
+        let out = draw(|f, area| render_detail(f, area, &all[1], None, &all, 0, &[]));
+        assert!(out.contains("↻ carried"), "{out}");
+        assert!(!out.contains("⛔ blocker"), "{out}");
     }
 }

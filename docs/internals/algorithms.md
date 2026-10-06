@@ -105,7 +105,14 @@ graduated scan below has a second pass *without* `--first-parent`, so once M
 graduates, N's integrate merge is reachable from rolling and N reports as
 graduated too. That is accurate — N's commits really are on rolling, carried in by
 M — and the `⛔ blocked` gate is what keeps it from happening out of order. It is
-only reachable at all via `rf graduate --force`.
+reachable in two ways: `rf graduate --force`, and — deliberately — a dependency
+cycle's carrier (see [Dependency cycles](#dependency-cycles) below). Either way
+the merge that pass finds lives on M's branch, not on rolling's mainline, so
+`scan_graduated` re-anchors N's graduation commit to where it actually *landed*
+(`landing_point`: the oldest first-parent commit of rolling that descends from
+it, i.e. M's graduation merge). That is the commit `rf promote --roll N`
+advances stable to, so stable still only ever moves to points rolling stood at;
+`plan_roll_steps` then folds rolls that share a graduation commit into one step.
 
 Integrating the rolling branch itself (`[I]`, see
 [integrate](../commands/integrate.md#i--integrate-rolling)) is the one case Method
@@ -150,9 +157,65 @@ stale, which is precisely the case that matters before merging a batch of
 dependent rolls against a dependency someone keeps pushing to — each dependent
 needs to say whether it has that dependency's latest work, not just whether
 the dependency has graduated. The plain table surfaces the same signal with a
-`⚠` suffix on the dep number (`branches::format_deps_with_staleness`), and
+`⚠` suffix on the dep number (`branches::format_deps`), and
 `rf list/status --json` carries it as `stale_deps`, so the check does not
 require opening the detail view.
+
+### Dependency cycles
+
+Method 2b reads integrations, and nothing stops two rolls integrating each
+other — the real case was roll 14 built on roll 15, then 15 folding 14 in. Each
+then depends on the other; under the plain rule both are `⛔ blocked` on a roll
+that is blocked on them, and `ops::dependency_chain` (which graduates
+dependencies first) has no post-order to offer. Before this was handled, the
+only way out was `--force`.
+
+**Detection.** `branches::dependency_cycles` is Tarjan's strongly connected
+components over the dependency graph — every node and edge visited once, so it
+cannot loop — and `assign_cycles` runs it in `list_rolls` over rolls that still
+need graduating (`Active`, `Diverged`; an edge to a graduated roll orders
+nothing, so a cycle through one is already broken). `Reverted` is excluded on
+purpose: its remedy is reverting the revert, which no carrier merge performs.
+Each member gets the same `RollInfo::cycle` (`branches::DepCycle`).
+
+**Resolution by containment, not order.** The ordering constraint exists so a
+dependency's commits reach rolling *before or with* its dependent. A member
+whose tip contains every other member's tip (`tip_contains`, a plain
+`merge-base --is-ancestor`) lands all of them in its own graduation merge, so
+it is the cycle's **carrier** (`DepCycle::carrier`):
+
+- its fellow members do not block it; it is still blocked by any ungraduated
+  dependency *outside* the cycle of *any* member, since its merge is what lands
+  those members;
+- every other member stays `⛔ blocked` on the carrier, like on any dependency;
+- for graduation, `dependency_chain` plans the whole cycle as one node: every
+  member's outside dependencies first, then a single `ChainStep` for the
+  carrier with the rest in `ChainStep::carries`. Asking for a carried member
+  plans the carrier in its place. The carrier is an ordinary `ops::graduate`;
+  afterwards the carried members read graduated through the second
+  `scan_graduated` pass, re-anchored as described above.
+
+This is narrower than "a dependency whose tip is already contained does not
+block", on purpose. Outside a cycle there is always an order in which N
+graduates first, with its own graduation merge (which per-roll promotion
+relies on) — so the plain rule keeps it. Only inside a cycle, where no order
+exists, is containment the way through.
+
+**No carrier.** When no member contains the others — each moved on after
+integrating the other — any graduation lands a partial copy of some member, so
+nothing is offered as graduatable and every member stays blocked. That is a
+refusal with a remedy, not a deadlock: `pick_carrier` names the member missing
+the fewest tips (highest number on a tie) and exactly which, and
+`DepCycle::advice` turns that into "on X run `rf integrate Y`, then graduate X".
+One integrate per missing tip makes X the carrier. The same advice sentence is
+the planner's refusal, the plain tables' footnote, the TUI detail view's note
+and the `--json` `cycle.advice`, so all four say the same thing.
+
+**Promotion.** A cycle orders nothing for promotion: members that graduated
+together share a graduation commit and per-roll promotion is ordered by
+rolling's history anyway. So the `ChainKind::Promote` walk skips an edge back
+into its current path instead of refusing it — it terminates, and
+`plan_roll_steps` collapses the shared commit to one merge.
 
 **Method 3 — file overlap**: if rolls modify the same files and the other roll has a
 lower number, it's a dependency. Uses `--first-parent --no-merges` on the other roll
@@ -227,8 +290,10 @@ Phases:
 3. **Selection** — interactive numbered table, or `--all`, or explicit branch args
 4. **Dependency resolution** — topological sort selected rolls with their deps.
    `ops::dependency_chain` is that sort: a pure post-order over `RollInfo::deps`
-   that emits every roll after what it integrated, target last, and refuses
-   cycles, unknown dependency numbers, and (for graduation) dependencies with no
+   that emits every roll after what it integrated, target last, plans a
+   dependency cycle as its carrier's single step (see
+   [Dependency cycles](#dependency-cycles)), and refuses a cycle with no
+   carrier, unknown dependency numbers, and (for graduation) dependencies with no
    local copy. `ChainKind` picks which dependencies count — not-yet-graduated for
    graduation, graduated-but-unpromoted for promotion; anything already past that
    point is history and is not walked further. Both the CLI and the TUI drive the

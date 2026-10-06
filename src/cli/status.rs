@@ -154,7 +154,7 @@ fn print_rolls_table(
         let deps_col = if show_deps {
             format!(
                 "  {:<dep_w$}  {}",
-                branches::format_deps_with_staleness(&roll.deps, &roll.stale_deps),
+                branches::format_deps(roll),
                 branches::format_roll_numbers(&roll.dependents),
             )
         } else {
@@ -181,6 +181,14 @@ fn print_rolls_table(
         println!(
             "  ⚠ after a dep number: it has moved since this roll integrated it — reintegrate"
         );
+        if !branches::distinct_cycles(rolls).is_empty() {
+            println!("  ↻ after a dep number: it integrated this roll back — a dependency cycle");
+        }
+    }
+    // Printed with or without `--no-deps`: it is what explains a `⛔ blocked`
+    // that would otherwise be waiting on a roll that is waiting on it.
+    for cycle in branches::distinct_cycles(rolls) {
+        println!("  {}", cycle.advice(rolls));
     }
 }
 
