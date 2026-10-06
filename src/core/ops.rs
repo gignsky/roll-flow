@@ -217,21 +217,22 @@ fn run_merge(
     }
     merge_args.push(source);
 
-    let merged = match git::run_git(repo, &merge_args) {
-        Ok(()) => Ok(()),
+    if let Err(merge_err) = git::run_git(repo, &merge_args) {
         // A stop on nothing but the version line is not a conflict this
-        // workflow has; finish it the way the driver would have.
-        Err(_) if settle_version_only_conflicts(repo) => commit_settled_merge(repo),
-        Err(err) => Err(err.into()),
-    };
-    if let Err(merge_err) = merged {
-        let _ = git::run_git(repo, &["merge", "--abort"]);
-        let _ = git::run_git(repo, &["checkout", &original]);
-        bail!(
-            "merge of '{source}' into '{target}' failed (likely conflicts); \
-             the merge was aborted and you are back on '{original}'. \
-             Resolve manually: git checkout {target} && git merge --no-ff {source} ({merge_err})"
-        );
+        // workflow has; finish it the way the driver would have. Anything else
+        // is a real conflict, diagnosed before the unwind erases it.
+        if !settle_version_only_conflicts(repo) {
+            return Err(conflict_or_error(
+                repo, source, target, &original, merge_err,
+            ));
+        }
+        if let Err(commit_err) = commit_settled_merge(repo) {
+            unwind_merge(repo, &original);
+            return Err(commit_err.context(format!(
+                "the merge of '{source}' into '{target}' was aborted and you are back on \
+                 '{original}'"
+            )));
+        }
     }
 
     git::run_git(repo, &["checkout", &original]).with_context(|| {
@@ -274,23 +275,15 @@ fn merge_gated<T>(
     // is precisely the state the gates need to see — and a version-only stop
     // settled here leaves exactly that state too, so the gates (and
     // graduation's own `reconcile_staged_version`) cannot tell the two apart.
-    let staged = git::run_git(
+    if let Err(merge_err) = git::run_git(
         repo,
         &["merge", "--no-ff", "--no-commit", "--no-edit", source],
-    );
-    if let Err(merge_err) = staged.or_else(|err| {
-        if settle_version_only_conflicts(repo) {
-            Ok(())
-        } else {
-            Err(err)
+    ) {
+        if !settle_version_only_conflicts(repo) {
+            return Err(conflict_or_error(
+                repo, source, target, &original, merge_err,
+            ));
         }
-    }) {
-        unwind_merge(repo, &original);
-        bail!(
-            "merge of '{source}' into '{target}' failed (likely conflicts); \
-             the merge was aborted and you are back on '{original}'. \
-             Resolve manually: git checkout {target} && git merge --no-ff {source} ({merge_err})"
-        );
     }
 
     let outcome = match run_step() {
