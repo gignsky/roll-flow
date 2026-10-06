@@ -1133,12 +1133,15 @@ fn cmd_prune(
     let plan = ops::prune_plan(&config, &scope)?;
 
     if plan.is_empty() {
-        println!("no promoted roll branches to prune");
+        println!("no promoted roll branches or landed hotfixes to prune");
         render_prune_skips(&plan.skipped);
         return Ok(());
     }
 
-    render_prune_plan(&plan, "Promoted roll branches to prune:");
+    render_prune_plan(
+        &plan,
+        "Promoted roll branches and landed hotfixes to prune:",
+    );
     render_prune_skips(&plan.skipped);
 
     if dry_run {
@@ -1204,12 +1207,15 @@ fn cmd_tidy(
         .join(", ");
 
     if plan.is_empty() {
-        println!("no local roll branches to tidy ({wanted})");
+        println!("no local roll branches or hotfixes to tidy ({wanted})");
         render_prune_skips(&plan.skipped);
         return Ok(());
     }
 
-    render_prune_plan(&plan, &format!("Local roll branches to tidy ({wanted}):"));
+    render_prune_plan(
+        &plan,
+        &format!("Local roll branches and hotfixes to tidy ({wanted}):"),
+    );
     render_prune_skips(&plan.skipped);
 
     if dry_run {
@@ -1341,7 +1347,11 @@ fn render_prune_plan(plan: &ops::PrunePlan, title: &str) {
         };
         println!(
             "  {num:>3}  {name:<nw$}  {target}",
-            num = candidate.number,
+            num = if candidate.hotfix {
+                format!("h{}", candidate.number)
+            } else {
+                candidate.number.to_string()
+            },
             name = candidate.branch,
             nw = name_w,
         );
@@ -1506,6 +1516,11 @@ fn cmd_list_text(no_tui: bool, deps: bool) -> Result<()> {
 /// roll's simply runs long, which beats re-measuring the whole table for a tier
 /// that is usually empty.
 pub(crate) fn print_hotfix_rows(hotfixes: &[branches::HotfixInfo], name_w: usize, state_w: usize) {
+    // A thin rule between the tiers, as the TUI draws: rolls and hotfixes
+    // number independently, so a roll 1 and an h1 should not read as one list.
+    if !hotfixes.is_empty() {
+        println!("  {}", "┄".repeat(3 + 2 + name_w + 2 + 3 + 2 + state_w));
+    }
     for hotfix in hotfixes {
         let cur = if hotfix.is_current { ">" } else { " " };
         println!(

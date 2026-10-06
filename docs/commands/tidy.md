@@ -54,6 +54,12 @@ default set â€” they need attention (see [`list`](list.md)), not disk cleanup â€
 but their branch tips are still structurally contained the same way a
 `diverged` one is, so naming them explicitly works like any other state.
 
+Hotfix branches have no states of their own to select, so each follows the roll
+state it corresponds to: a **landed** hotfix counts as `promoted` (it reached
+stable), an **open** one as `active` (it reached nothing yet, so like an active
+roll it only goes when it is fully pushed). The default therefore clears landed
+hotfixes and leaves open ones; `[t]` does the same.
+
 ```text
 rf tidy                                  # graduated + promoted
 rf tidy --state promoted                 # the same set prune would consider

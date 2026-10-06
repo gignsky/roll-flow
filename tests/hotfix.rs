@@ -210,3 +210,33 @@ fn hotfixes_appear_in_status_and_read_landed_once_merged() {
         json.stdout
     );
 }
+
+#[test]
+fn the_plain_table_rules_off_hotfixes_from_rolls() {
+    // The two tiers number independently (a roll 1 and a hotfix h1 coexist),
+    // so the table draws a thin rule between them rather than running one
+    // list into the other.
+    let sb = Sandbox::plain();
+    assert!(sb.init().success, "init failed");
+    assert!(sb.create_roll("feature", "0611").success, "create roll");
+    sb.git(&["checkout", "main"]);
+    let out = sb.rf(&["hotfix", "urgent", "--date", "0720"]);
+    assert!(out.success, "hotfix create failed: {}", out.combined());
+
+    let out = sb.rf(&["list", "--no-tui"]);
+    assert!(out.success, "{}", out.combined());
+    let text = out.combined();
+    let lines: Vec<&str> = text.lines().collect();
+    let hotfix = lines
+        .iter()
+        .position(|l| l.contains("hotfix/1-0720-urgent"))
+        .unwrap_or_else(|| panic!("no hotfix row:\n{text}"));
+    assert!(
+        lines[hotfix - 1].trim_start().starts_with('┄'),
+        "no rule above the hotfixes:\n{text}"
+    );
+    assert!(
+        lines[hotfix - 2].contains("roll/1-0611-feature"),
+        "rule is not between the rolls and the hotfixes:\n{text}"
+    );
+}

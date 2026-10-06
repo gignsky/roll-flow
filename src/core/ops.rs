@@ -2478,6 +2478,9 @@ impl PruneScope {
 pub(crate) struct PruneCandidate {
     pub branch: String,
     pub number: u32,
+    /// A `hotfix/N-…` branch rather than a roll. Hotfixes number independently,
+    /// so `number` alone would pass `hotfix/1` off as roll 1.
+    pub hotfix: bool,
     pub delete_local: bool,
     pub delete_remote: bool,
 }
@@ -2798,6 +2801,7 @@ fn plan_branch_deletion(
     (delete_local || delete_remote).then(|| PruneCandidate {
         branch: branch.to_string(),
         number,
+        hotfix: branch.starts_with(HOTFIX_PREFIX),
         delete_local,
         delete_remote,
     })
@@ -2811,10 +2815,16 @@ fn plan_branch_deletion(
 /// take commits after its graduation merge). Every copy is additionally checked
 /// for containment in stable, and anything that fails is skipped with a reason
 /// unless `--force` is given.
+///
+/// Landed hotfixes are wound up alongside promoted rolls: landing is a
+/// hotfix's promotion, and the same containment check guards both.
 pub(crate) fn prune_plan(config: &Config, scope: &PruneScope) -> Result<PrunePlan> {
-    plan_rolls(config, scope, |state| {
-        *state == branches::RollState::Promoted
-    })
+    plan_rolls(
+        config,
+        scope,
+        |state| *state == branches::RollState::Promoted,
+        |state| *state == branches::HotfixState::Landed,
+    )
 }
 
 /// Decide what `rf tidy` would delete locally, without deleting anything.
@@ -2828,16 +2838,36 @@ pub(crate) fn prune_plan(config: &Config, scope: &PruneScope) -> Result<PrunePla
 /// It takes a [`PruneScope`] like everything else here rather than a bespoke
 /// one: there is deliberately a single deletion path, and tidy is a set of
 /// arguments to it, not a second implementation.
+///
+/// Hotfixes have no states of their own to select, so each follows the roll
+/// state it corresponds to: a landed hotfix is tidied when `Promoted` is
+/// selected (it reached stable), an open one when `Active` is (it reached
+/// nothing yet, so only a fully pushed copy counts as recoverable).
 pub(crate) fn tidy_plan(
     config: &Config,
     scope: &PruneScope,
     states: &[branches::RollState],
 ) -> Result<PrunePlan> {
-    plan_rolls(config, scope, |state| states.contains(state))
+    plan_rolls(
+        config,
+        scope,
+        |state| states.contains(state),
+        |state| states.contains(&hotfix_tidy_state(*state)),
+    )
 }
 
-/// The shared body of [`prune_plan`] and [`tidy_plan`]: walk every roll the
-/// `accept` predicate keeps and plan each one's deletion against `scope`.
+/// The roll state a hotfix counts as when `rf tidy --state` selects branches.
+fn hotfix_tidy_state(state: branches::HotfixState) -> branches::RollState {
+    match state {
+        branches::HotfixState::Landed => branches::RollState::Promoted,
+        branches::HotfixState::Open => branches::RollState::Active,
+    }
+}
+
+/// The shared body of [`prune_plan`] and [`tidy_plan`]: walk every roll
+/// `accept` keeps and every hotfix `accept_hotfix` keeps, and plan each
+/// one's deletion against `scope` — through the same [`plan_branch_deletion`],
+/// so a hotfix gets exactly the safety rules a roll does.
 ///
 /// The [`DeletionContext`] is built once, so the pruning fetch and the worktree
 /// scan are each paid for a single time no matter how many rolls match.
@@ -2845,6 +2875,7 @@ fn plan_rolls(
     config: &Config,
     scope: &PruneScope,
     accept: impl Fn(&branches::RollState) -> bool,
+    accept_hotfix: impl Fn(&branches::HotfixState) -> bool,
 ) -> Result<PrunePlan> {
     let ctx = DeletionContext::build(config, scope)?;
 
@@ -2858,6 +2889,21 @@ fn plan_rolls(
         if let Some(candidate) =
             plan_branch_deletion(config, &roll.branch, roll.number, scope, &ctx, &mut skipped)
         {
+            candidates.push(candidate);
+        }
+    }
+    for hotfix in branches::list_hotfixes(config)? {
+        if !accept_hotfix(&hotfix.state) {
+            continue;
+        }
+        if let Some(candidate) = plan_branch_deletion(
+            config,
+            &hotfix.branch,
+            hotfix.number,
+            scope,
+            &ctx,
+            &mut skipped,
+        ) {
             candidates.push(candidate);
         }
     }
