@@ -17,7 +17,7 @@ use std::process::Command;
 use anyhow::{anyhow, bail, Context, Result};
 
 use crate::core::version::{BumpLevel, Marker, Semver, VersionCheck, VersionStatus};
-use crate::core::{branches, config::Config, git, proc, version};
+use crate::core::{branches, config::Config, git, merge_driver, proc, version};
 
 /// Prefix for the hotfix tier. Parallel to `roll_prefix`, but fixed rather than
 /// configurable — hotfixes are a rarely-used sanctioned exception with their own
@@ -42,9 +42,11 @@ pub(crate) fn workflow_clean(config: &Config) -> Result<bool> {
     }
     let status = git::capture_git(&config.repo_root, &["status", "--porcelain"])?;
     let config_rel = repo_relative_path(config, &Config::config_path(&config.repo_root));
-    // `.gitattributes` is the other file `rf init` writes without committing
-    // (`ensure_version_merge_driver`) — untracked if `rf init` just created
-    // it, modified if it already existed and gained the merge-driver line.
+    // `.gitattributes` is the file older versions of `rf init` wrote without
+    // committing — untracked if it created it, modified if it already existed
+    // and gained the merge-driver line. `ensure_version_merge_driver` now
+    // writes the clone's own `info/attributes` instead, which is never in the
+    // tree; this keeps clones set up the old way from reading as dirty.
     let attrs_rel = repo_relative_path(config, &config.repo_root.join(".gitattributes"));
     let all_allowed = status.lines().all(|line| {
         let trimmed = line.trim();
@@ -206,6 +208,8 @@ fn run_merge(
     git::run_git(repo, &["checkout", target])
         .with_context(|| format!("failed to check out '{target}'"))?;
 
+    wire_driver_quietly(repo);
+
     let mut merge_args = vec!["merge", "--no-ff", "--no-edit", "-m", subject];
     if let Some(body) = body {
         merge_args.push("-m");
@@ -213,7 +217,14 @@ fn run_merge(
     }
     merge_args.push(source);
 
-    if let Err(merge_err) = git::run_git(repo, &merge_args) {
+    let merged = match git::run_git(repo, &merge_args) {
+        Ok(()) => Ok(()),
+        // A stop on nothing but the version line is not a conflict this
+        // workflow has; finish it the way the driver would have.
+        Err(_) if settle_version_only_conflicts(repo) => commit_settled_merge(repo),
+        Err(err) => Err(err.into()),
+    };
+    if let Err(merge_err) = merged {
         let _ = git::run_git(repo, &["merge", "--abort"]);
         let _ = git::run_git(repo, &["checkout", &original]);
         bail!(
@@ -257,12 +268,23 @@ fn merge_gated<T>(
     git::run_git(repo, &["checkout", target])
         .with_context(|| format!("failed to check out '{target}'"))?;
 
+    wire_driver_quietly(repo);
+
     // `--no-ff --no-commit` leaves MERGE_HEAD set and the result staged, which
-    // is precisely the state the gates need to see.
-    if let Err(merge_err) = git::run_git(
+    // is precisely the state the gates need to see — and a version-only stop
+    // settled here leaves exactly that state too, so the gates (and
+    // graduation's own `reconcile_staged_version`) cannot tell the two apart.
+    let staged = git::run_git(
         repo,
         &["merge", "--no-ff", "--no-commit", "--no-edit", source],
-    ) {
+    );
+    if let Err(merge_err) = staged.or_else(|err| {
+        if settle_version_only_conflicts(repo) {
+            Ok(())
+        } else {
+            Err(err)
+        }
+    }) {
         unwind_merge(repo, &original);
         bail!(
             "merge of '{source}' into '{target}' failed (likely conflicts); \
@@ -713,7 +735,17 @@ pub(crate) fn integrate(config: &Config, branch: &str) -> Result<IntegrateOutcom
     if !git::ref_exists(repo, branch) {
         bail!("branch not found: {}", branch);
     }
-    git::run_git(repo, &["merge", "--no-ff", branch])?;
+    wire_driver_quietly(repo);
+    // On a real conflict the merge is left in progress, exactly as git left
+    // it, for the user to resolve right here — unlike graduation there is no
+    // other branch to return to. Only a stop on nothing but the version line
+    // is finished on their behalf.
+    if let Err(err) = git::run_git(repo, &["merge", "--no-ff", branch]) {
+        if !settle_version_only_conflicts(repo) {
+            return Err(err.into());
+        }
+        commit_settled_merge(repo)?;
+    }
     Ok(IntegrateOutcome {
         branch: branch.to_string(),
         current,
@@ -1143,58 +1175,171 @@ fn check_dev_marker_ownership(config: &Config, branch: &str) -> Result<()> {
     }
 }
 
-/// The name `rf init` registers the version merge driver under, in both
-/// `.gitattributes` and local git config.
+/// The name the version merge driver is registered under, in both the
+/// clone's attributes and its git config.
 const VERSION_MERGE_DRIVER: &str = "rf-version";
 
-/// Ensure this clone routes `Cargo.toml` through [`crate::core::merge_driver`]
-/// on merge, so a roll's dev marker never shows up as a real conflict. Called
-/// from `rf init`, which is the command every documented workflow already
-/// runs on a fresh clone — and has to be, since the git config half of this
-/// is local to the clone. `.gitattributes` can declare that `Cargo.toml` uses
-/// a driver *named* `rf-version`, and that line is committed and shared; but
-/// what that name actually runs is never stored in the repo (a well-known git
-/// limitation), so every clone needs its own `git config merge.rf-version.driver`
-/// or the attribute silently falls back to git's default merge, conflicts and
-/// all.
+/// What git runs for [`VERSION_MERGE_DRIVER`]. `%P` tells the driver which of
+/// the two attributed files it is resolving. A bare `rf`, looked up on `PATH`
+/// by git mid-merge, rather than this binary's own path: on Nix that path is a
+/// store path an upgrade or a garbage collection would leave dangling, while
+/// `rf` is whatever the user runs `rf` as. When the lookup fails anyway, the
+/// merge stops and [`settle_version_only_conflicts`] finishes it in-process.
+const VERSION_MERGE_DRIVER_CMD: &str = "rf __merge-driver-version %O %A %B %P";
+
+/// Ensure this clone routes `Cargo.toml` and `Cargo.lock` through
+/// [`crate::core::merge_driver`] on merge, so a roll's dev marker never shows
+/// up as a real conflict. `rf init` calls this to report what it wired; every
+/// `rf` merge calls it too, quietly (see [`wire_driver_quietly`]), because the
+/// whole thing is local to the clone and a fresh clone that never ran
+/// `rf init` — the case that actually happened — would otherwise merge with
+/// git's default driver, conflicts and all.
+///
+/// Both halves live in the clone, never the tree. What a driver name runs is
+/// git config, which is never stored in a repo (a well-known git limitation),
+/// so the attribute naming it is clone-local too: `info/attributes` (via
+/// `git rev-parse --git-path`, so a linked worktree resolves to the shared
+/// one). A committed `.gitattributes` would only apply on branches that carry
+/// it — `main` here never did — and writing one lazily from a merge would
+/// leave an uncommitted file on whatever branch happened to be checked out.
+/// A `.gitattributes` line an older `rf init` left behind names the same
+/// driver and keeps working.
 ///
 /// A no-op on a repo with no `Cargo.toml` at all, matching every other
 /// version-related feature here. Returns whether anything was written, so the
 /// caller can report it.
 pub(crate) fn ensure_version_merge_driver(config: &Config) -> Result<bool> {
-    let repo = &config.repo_root;
+    wire_version_merge_driver(&config.repo_root)
+}
+
+fn wire_version_merge_driver(repo: &Path) -> Result<bool> {
     if !repo.join(version::VERSION_FILE).exists() {
         return Ok(false);
     }
 
     let mut changed = false;
 
-    let attrs_path = repo.join(".gitattributes");
+    let attrs_rel = git::capture_git(repo, &["rev-parse", "--git-path", "info/attributes"])
+        .context("failed to locate the clone's info/attributes")?;
+    let attrs_path = repo.join(attrs_rel);
     let existing = std::fs::read_to_string(&attrs_path).unwrap_or_default();
-    let line = format!("{} merge={VERSION_MERGE_DRIVER}", version::VERSION_FILE);
-    if !existing.lines().any(|l| l.trim() == line) {
-        let mut next = existing;
-        if !next.is_empty() && !next.ends_with('\n') {
+    let mut next = existing.clone();
+    for file in merge_driver::VersionFile::ALL {
+        let line = format!("{} merge={VERSION_MERGE_DRIVER}", file.file_name());
+        if !next.lines().any(|l| l.trim() == line) {
+            if !next.is_empty() && !next.ends_with('\n') {
+                next.push('\n');
+            }
+            next.push_str(&line);
             next.push('\n');
         }
-        next.push_str(&line);
-        next.push('\n');
+    }
+    if next != existing {
+        if let Some(dir) = attrs_path.parent() {
+            std::fs::create_dir_all(dir)
+                .with_context(|| format!("failed to create {}", dir.display()))?;
+        }
         std::fs::write(&attrs_path, next)
             .with_context(|| format!("failed to write {}", attrs_path.display()))?;
         changed = true;
     }
 
     let driver_key = format!("merge.{VERSION_MERGE_DRIVER}.driver");
-    let driver_cmd = "rf __merge-driver-version %O %A %B";
     let current =
         git::capture_git(repo, &["config", "--local", "--get", &driver_key]).unwrap_or_default();
-    if current != driver_cmd {
-        git::run_git(repo, &["config", "--local", &driver_key, driver_cmd])
-            .context("failed to configure the version merge driver")?;
+    if current != VERSION_MERGE_DRIVER_CMD {
+        git::run_git(
+            repo,
+            &["config", "--local", &driver_key, VERSION_MERGE_DRIVER_CMD],
+        )
+        .context("failed to configure the version merge driver")?;
         changed = true;
     }
 
     Ok(changed)
+}
+
+/// [`wire_version_merge_driver`] ahead of an `rf` merge, with its outcome
+/// dropped on purpose. Wiring is an optimisation here, not a precondition: a
+/// clone where it fails (a read-only config, say) still gets every
+/// version-only conflict settled by [`settle_version_only_conflicts`], so
+/// failing the merge over it would be strictly worse. And `core` never prints,
+/// so there is nowhere to say "wired it" mid-merge — `rf init` is the place
+/// that reports it.
+fn wire_driver_quietly(repo: &Path) {
+    let _ = wire_version_merge_driver(repo);
+}
+
+/// Finish a merge that stopped only on the crate's own version, by the same
+/// rule the merge driver applies ([`merge_driver::merge_texts`]). Returns
+/// `true` when it did — every conflict resolved and staged, the merge still in
+/// progress for the caller to commit (or gate) — and `false`, having touched
+/// nothing, in every other case.
+///
+/// This is what makes a version-only conflict impossible rather than merely
+/// unlikely: git can stop on one without the driver ever having run — the
+/// clone was never wired, or `rf` is not on the `PATH` git sees (a `cargo run`
+/// build, a stale install). The resolution is computed from the index's own
+/// conflict stages, so it does not care which.
+///
+/// All or nothing, deliberately. If any unmerged path is not a version file, or
+/// a version file still conflicts once its version line agrees (a dependency
+/// that moved on both sides, say), the merge is left exactly as git left it —
+/// finishing the parts this understands would make the real conflict look
+/// smaller than it is.
+fn settle_version_only_conflicts(repo: &Path) -> bool {
+    if !git::ref_exists(repo, "MERGE_HEAD") {
+        return false;
+    }
+    let Ok(unmerged) = git::capture_git(repo, &["diff", "--name-only", "--diff-filter=U"]) else {
+        return false;
+    };
+    let paths: Vec<&str> = unmerged.lines().filter(|l| !l.is_empty()).collect();
+    if paths.is_empty() {
+        return false;
+    }
+
+    let stage = |n: u8, path: &str| {
+        git::show_file_at_ref(repo, &format!(":{n}"), path)
+            .ok()
+            .flatten()
+    };
+    let mut resolved = Vec::with_capacity(paths.len());
+    for path in &paths {
+        let Some(file) = merge_driver::VersionFile::for_path(Path::new(path)) else {
+            return false;
+        };
+        // Stage 1 is missing when both sides added the file; stages 2/3 when
+        // one side deleted it — a real conflict this has no rule for.
+        let (Some(ours), Some(theirs)) = (stage(2, path), stage(3, path)) else {
+            return false;
+        };
+        let base = stage(1, path).unwrap_or_default();
+        let package = merge_driver::package_name(repo, Path::new(path));
+        match merge_driver::merge_texts(file, package.as_deref(), &base, &ours, &theirs) {
+            Ok(Some(merged)) => resolved.push((*path, merged)),
+            _ => return false,
+        }
+    }
+
+    for (path, merged) in &resolved {
+        if std::fs::write(repo.join(path), merged).is_err() {
+            return false;
+        }
+    }
+    let mut add = vec!["add", "--"];
+    add.extend(resolved.iter().map(|(p, _)| *p));
+    git::run_git(repo, &add).is_ok()
+}
+
+/// Commit a merge that [`settle_version_only_conflicts`] finished, with the
+/// message git prepared for it. `--cleanup=strip` because that message now
+/// carries git's `# Conflicts:` list, which `--no-edit` alone would keep in
+/// the commit.
+fn commit_settled_merge(repo: &Path) -> Result<()> {
+    git::run_git(repo, &["commit", "--no-edit", "--cleanup=strip"])
+        .context("failed to commit the merge after resolving its version-only conflicts")?;
+    Ok(())
 }
 
 /// Best-effort `Cargo.lock` refresh after a version rewrite.
@@ -1205,10 +1350,14 @@ pub(crate) fn ensure_version_merge_driver(config: &Config) -> Result<bool> {
 /// `cargo update --workspace --locked` gate is the real enforcement. Keeping it
 /// non-fatal also lets the integration tests run offline against fixture
 /// manifests that are not real crates.
+///
+/// The crate's own entry is rewritten directly first
+/// ([`sync_lockfile_own_entry`]), so it is right even when cargo cannot run.
 fn refresh_lockfile(repo: &Path) {
     if !repo.join("Cargo.lock").exists() {
         return;
     }
+    sync_lockfile_own_entry(repo);
     let offline = Command::new("cargo")
         .args(["update", "--workspace", "--offline"])
         .current_dir(repo)
@@ -1220,6 +1369,38 @@ fn refresh_lockfile(repo: &Path) {
         .args(["update", "--workspace"])
         .current_dir(repo)
         .status();
+}
+
+/// Make `Cargo.lock`'s own `[[package]]` entry carry `Cargo.toml`'s version,
+/// touching nothing else in the file.
+///
+/// The one part of a lockfile refresh that must never be left to chance: the
+/// two lines change in lockstep on every marker, bump and finalize, and the
+/// merge driver resolves them *as a pair*. A lockfile left one marker behind
+/// (cargo offline, or absent) is a merge conflict waiting on the next
+/// marker-vs-marker merge, and a `--locked` gate failure on the next run.
+/// Best-effort like the rest of [`refresh_lockfile`]: no readable name or
+/// version, or no unambiguous own entry, and the file is left alone.
+fn sync_lockfile_own_entry(repo: &Path) {
+    let lock_path = repo.join(version::LOCK_FILE);
+    let (Ok(manifest), Ok(lock)) = (
+        std::fs::read_to_string(repo.join(version::VERSION_FILE)),
+        std::fs::read_to_string(&lock_path),
+    ) else {
+        return;
+    };
+    let (Some(name), Some(current)) = (
+        version::parse_package_name(&manifest),
+        version::parse_version(&manifest),
+    ) else {
+        return;
+    };
+    if version::parse_lock_package_version(&lock, &name) == Some(current) {
+        return;
+    }
+    if let Some(rewritten) = version::replace_lock_package_version(&lock, &name, current) {
+        let _ = std::fs::write(&lock_path, rewritten);
+    }
 }
 
 /// Create the release tag for a completed promotion.
@@ -1472,8 +1653,8 @@ pub(crate) fn graduate(
         .with_context(|| format!("failed to check out '{roll}' to graduate it"))?;
 
     // Read both sides' version *before* the merge starts: the version merge
-    // driver (`core::merge_driver`, wired up by `rf init` via
-    // `ensure_version_merge_driver`) only ever runs when git needs to
+    // driver (`core::merge_driver`, wired up by `merge_gated` itself via
+    // `wire_driver_quietly`) only ever runs when git needs to
     // content-merge the line — i.e. when *both* sides changed it, which is
     // precisely when it would otherwise conflict. The common graduate case is
     // the opposite: rolling's own version is untouched and only the roll

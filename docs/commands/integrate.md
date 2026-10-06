@@ -65,3 +65,17 @@ already refuses a merge that would clobber local changes and carries harmless on
 through. A conflict is a normal outcome — the merge stops, the panel shows git's
 own `CONFLICT` lines, and you resolve it and commit, press `gg` for lazygit, or
 run `git merge --abort`.
+
+## Dev versions
+
+Two rolls each wear their own `-roll<N>` marker (see
+[`create`](create.md#dev-versions)), in `Cargo.toml` and in `Cargo.lock`'s
+entry for the crate itself, so integrating one into the other touches the same
+version line on both sides of both files. That is never a conflict: the
+[version merge driver](init.md#the-version-merge-driver) keeps the checked-out
+roll's own marker and takes the higher of the two numbers — integrating
+`0.2.8-roll11` into `0.2.7-roll35` leaves `0.2.8-roll35`. `rf integrate` wires
+the driver itself if this clone never ran `rf init`, and if git stops anyway
+with only those lines in conflict it resolves them by the same rule and
+commits the merge. Any other conflict — including a dependency that moved
+differently in each roll's lockfile — stops the merge as described above.
