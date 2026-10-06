@@ -1,4 +1,4 @@
-use std::collections::{HashMap, HashSet};
+use std::collections::{hash_map::Entry, HashMap, HashSet};
 use std::path::Path;
 
 use crate::core::{config::Config, git};
@@ -92,6 +92,116 @@ pub struct RollInfo {
     /// into stable: advancing stable to it promotes exactly this roll (and
     /// whatever graduated before it), which keeps stable a prefix of rolling.
     pub graduation_commit: Option<String>,
+    /// The dependency cycle this roll is part of, if any — see [`DepCycle`].
+    /// Only cycles among rolls that still need graduating are recorded: once
+    /// a member has graduated, edges to it no longer order anything, so the
+    /// cycle is history rather than something to resolve.
+    pub cycle: Option<DepCycle>,
+}
+
+/// A set of ungraduated rolls that (transitively) integrated each other, so no
+/// order of separate graduations satisfies every member's dependencies — the
+/// state that left rolls 14 and 15 both `⛔ blocked` on each other for good.
+///
+/// The way out is containment, not ordering. The constraint `⛔ blocked`
+/// enforces exists so a dependency's commits reach rolling *before or with*
+/// the roll that integrated them; a member whose tip already contains every
+/// other member's tip lands all of them in its own graduation merge. That
+/// member is the cycle's *carrier*: it graduates (and carries the rest), and
+/// every other member waits on it like any other dependency.
+///
+/// When no member contains all the others — each moved on after integrating
+/// the other — any graduation would land a partial copy of some member, so
+/// nothing graduates; instead the cycle names the member closest to being a
+/// carrier ([`suggested`](Self::suggested)) and exactly which tips it lacks,
+/// so one `rf integrate` per missing tip turns it into one. That is a refusal
+/// with a remedy, never a deadlock.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DepCycle {
+    /// Every roll in the cycle, ascending — this roll included.
+    pub members: Vec<u32>,
+    /// The carrier when [`lacks`](Self::lacks) is empty; otherwise the member
+    /// that needs the fewest integrations to become one (ties go to the
+    /// highest number, the roll most likely to be the one folding the others
+    /// in, as 15 did with 14).
+    pub suggested: u32,
+    /// Members whose current tip `suggested` does not contain. Empty exactly
+    /// when `suggested` is a carrier.
+    pub lacks: Vec<u32>,
+}
+
+impl DepCycle {
+    /// The member whose graduation lands the whole cycle, if there is one.
+    pub fn carrier(&self) -> Option<u32> {
+        self.lacks.is_empty().then_some(self.suggested)
+    }
+
+    pub fn contains(&self, number: u32) -> bool {
+        self.members.contains(&number)
+    }
+
+    /// The members other than [`suggested`](Self::suggested): what its
+    /// graduation takes along.
+    pub fn carried(&self) -> Vec<u32> {
+        self.members
+            .iter()
+            .copied()
+            .filter(|n| *n != self.suggested)
+            .collect()
+    }
+
+    /// One line saying what to do about this cycle, naming branches so it can
+    /// be acted on as written. Shared by the plain tables' footnote, `--json`,
+    /// the TUI detail view and the graduation planner's refusal, so all four
+    /// give the same instruction.
+    pub fn advice(&self, rolls: &[RollInfo]) -> String {
+        let branch = |n: u32| {
+            rolls
+                .iter()
+                .find(|r| r.number == n)
+                .map(|r| r.branch.clone())
+                .unwrap_or_else(|| format!("roll {n}"))
+        };
+        let members = self
+            .members
+            .iter()
+            .map(u32::to_string)
+            .collect::<Vec<_>>()
+            .join(" ⇄ ");
+        let carried = format_roll_numbers(&self.carried());
+        let suggested = branch(self.suggested);
+        if self.lacks.is_empty() {
+            format!(
+                "↻ rolls {members} integrated each other: {suggested} contains the others' \
+                 latest work — graduate {suggested} and it carries {carried} to rolling"
+            )
+        } else {
+            let integrates = self
+                .lacks
+                .iter()
+                .map(|n| format!("`rf integrate {}`", branch(*n)))
+                .collect::<Vec<_>>()
+                .join(" and ");
+            format!(
+                "↻ rolls {members} integrated each other and none contains the others' \
+                 latest work — on {suggested} run {integrates}, then graduate {suggested} \
+                 and it carries {carried} to rolling"
+            )
+        }
+    }
+}
+
+/// The distinct cycles among `rolls`, once each, in roll-number order — for a
+/// footnote under the plain tables, where one line per cycle (not per member)
+/// is what reads well.
+pub fn distinct_cycles(rolls: &[RollInfo]) -> Vec<&DepCycle> {
+    let mut seen: Vec<&DepCycle> = Vec::new();
+    for cycle in rolls.iter().filter_map(|r| r.cycle.as_ref()) {
+        if !seen.iter().any(|c| c.members == cycle.members) {
+            seen.push(cycle);
+        }
+    }
+    seen
 }
 
 // ── Public API ────────────────────────────────────────────────────────────────
@@ -106,22 +216,33 @@ pub fn format_roll_numbers(nums: &[u32]) -> String {
         .join(",")
 }
 
-/// Render the `deps` column like [`format_roll_numbers`], but suffix a number
-/// with `⚠` when it is also in `stale` — i.e. `RollInfo::stale_deps` — so a
-/// dependency that has moved since this roll integrated it is visible from the
-/// plain table, not only the detail view. This is what matters before
-/// reintegrating or merging a batch of dependents against a still-moving
-/// dependency: `2,3⚠` says dep 3 has new commits to pick up, dep 2 does not.
-/// Never applied to `dependants`: staleness is a property of what this roll
-/// integrated, not of who integrated this roll.
-pub fn format_deps_with_staleness(nums: &[u32], stale: &[u32]) -> String {
-    nums.iter()
+/// Render a roll's `deps` column like [`format_roll_numbers`], with two
+/// suffixes, so what the detail view knows is visible from every table:
+///
+/// - `⚠` when the dependency is also in `RollInfo::stale_deps` — it has moved
+///   since this roll integrated it. This is what matters before reintegrating
+///   or merging a batch of dependents against a still-moving dependency:
+///   `2,3⚠` says dep 3 has new commits to pick up, dep 2 does not.
+/// - `↻` when it is in the same [`DepCycle`] as this roll — it integrated this
+///   roll back. What the cycle means, which member to graduate, is spelled out
+///   once per cycle under the table by [`DepCycle::advice`].
+///
+/// So `8,15⚠↻` reads "8 is an ordinary dependency; 15 integrated this roll
+/// back and has moved since". Never applied to `dependants`: both marks are
+/// properties of what this roll integrated, not of who integrated it. Shared
+/// by the TUI table and both plain tables, so they cannot drift apart.
+pub fn format_deps(roll: &RollInfo) -> String {
+    roll.deps
+        .iter()
         .map(|n| {
-            if stale.contains(n) {
-                format!("{n}⚠")
-            } else {
-                n.to_string()
+            let mut cell = n.to_string();
+            if roll.stale_deps.contains(n) {
+                cell.push('⚠');
             }
+            if roll.cycle.as_ref().is_some_and(|c| c.contains(*n)) {
+                cell.push('↻');
+            }
+            cell
         })
         .collect::<Vec<_>>()
         .join(",")
@@ -215,6 +336,7 @@ pub fn list_rolls(config: &Config) -> Result<Vec<RollInfo>, RfError> {
             dependents: Vec::new(),
             stale_deps: Vec::new(),
             graduation_commit,
+            cycle: None,
         });
     }
 
@@ -231,6 +353,10 @@ pub fn list_rolls(config: &Config) -> Result<Vec<RollInfo>, RfError> {
     // Blocking, by contrast, only applies to Active rolls: an ungraduated
     // integration holds a roll back from graduating, but once the roll itself
     // has graduated the relationship is history, not a blocker.
+    //
+    // Three passes, because each needs the previous one finished for every
+    // roll: deps (and staleness), then cycles over those deps, then blocking,
+    // which reads both.
     let snapshot = rolls.clone();
     for roll in &mut rolls {
         roll.deps = integration_deps(
@@ -256,17 +382,41 @@ pub fn list_rolls(config: &Config) -> Result<Vec<RollInfo>, RfError> {
                     .is_some_and(|dep| dep_tip_missing(repo, &dep.branch, &roll.branch))
             })
             .collect();
-        if roll.state == RollState::Active {
-            let blocked = roll.deps.iter().any(|dep| {
-                snapshot
-                    .iter()
-                    .find(|r| r.number == *dep)
-                    .map(|r| matches!(r.state, RollState::Active | RollState::Blocked))
-                    .unwrap_or(false)
-            });
-            if blocked {
-                roll.state = RollState::Blocked;
+    }
+
+    assign_cycles(repo, &mut rolls);
+
+    // A dependency blocks while it is ungraduated — except, for a cycle's
+    // carrier, a fellow member: the carrier contains its tip, so graduating
+    // the carrier lands it too (see `DepCycle`). The carrier still answers for
+    // every member's dependencies *outside* the cycle, since its graduation is
+    // the one that lands those members, and with them whatever they integrated.
+    // Every other member stays blocked on the carrier like on any dependency.
+    let snapshot = rolls.clone();
+    for roll in &mut rolls {
+        if roll.state != RollState::Active {
+            continue;
+        }
+        let mut gating = roll.deps.clone();
+        if let Some(cycle) = roll
+            .cycle
+            .as_ref()
+            .filter(|c| c.carrier() == Some(roll.number))
+        {
+            for member in snapshot.iter().filter(|r| cycle.contains(r.number)) {
+                gating.extend(&member.deps);
             }
+            gating.retain(|n| !cycle.contains(*n));
+        }
+        let blocked = gating.iter().any(|dep| {
+            snapshot
+                .iter()
+                .find(|r| r.number == *dep)
+                .map(|r| matches!(r.state, RollState::Active | RollState::Blocked))
+                .unwrap_or(false)
+        });
+        if blocked {
+            roll.state = RollState::Blocked;
         }
     }
 
@@ -442,7 +592,8 @@ fn scan_graduated(repo: &Path, rolling_ref: &str) -> HashMap<String, String> {
     };
 
     let mut graduated = HashMap::new();
-    for args in [
+    let mut carried: Vec<String> = Vec::new();
+    for (pass, args) in [
         vec![
             "log",
             "--first-parent",
@@ -451,7 +602,10 @@ fn scan_graduated(repo: &Path, rolling_ref: &str) -> HashMap<String, String> {
             &rolling,
         ],
         vec!["log", "--merges", "--format=%H%x09%s", &rolling],
-    ] {
+    ]
+    .into_iter()
+    .enumerate()
+    {
         let Ok(out) = git::capture_git(repo, &args) else {
             continue;
         };
@@ -460,11 +614,55 @@ fn scan_graduated(repo: &Path, rolling_ref: &str) -> HashMap<String, String> {
                 continue;
             };
             if let Some(branch) = extract_graduated_branch(subject) {
-                graduated.entry(branch).or_insert_with(|| hash.to_string());
+                if let Entry::Vacant(slot) = graduated.entry(branch) {
+                    if pass == 1 {
+                        carried.push(slot.key().clone());
+                    }
+                    slot.insert(hash.to_string());
+                }
+            }
+        }
+    }
+
+    // A pass-2 hit is a merge *inside* some roll's history — an `rf integrate`
+    // merge in the roll that carried this one onto rolling (a dependency
+    // cycle's carrier, or a `--force` graduation). That commit lives on a roll
+    // branch, not on rolling's mainline, so promoting it would advance stable
+    // to a point rolling never stood at. The graduation commit that means
+    // something is where the roll actually *landed*: the oldest mainline
+    // commit that descends from it, i.e. the carrier's own graduation merge.
+    if !carried.is_empty() {
+        let mainline: Vec<String> =
+            git::capture_git(repo, &["rev-list", "--first-parent", &rolling])
+                .map(|out| out.lines().map(str::to_string).collect())
+                .unwrap_or_default();
+        for branch in carried {
+            let hash = graduated[&branch].clone();
+            if let Some(landing) = landing_point(repo, &hash, &rolling, &mainline) {
+                graduated.insert(branch, landing);
             }
         }
     }
     graduated
+}
+
+/// The oldest commit of `mainline` (rolling's first-parent history, newest
+/// first) that descends from `commit` — where a commit reached only through a
+/// side branch first became part of rolling. `None` when it cannot be told,
+/// which leaves the caller's original answer in place.
+fn landing_point(repo: &Path, commit: &str, rolling: &str, mainline: &[String]) -> Option<String> {
+    let range = format!("{commit}..{rolling}");
+    let descendants: HashSet<String> =
+        git::capture_git(repo, &["rev-list", "--ancestry-path", &range])
+            .ok()?
+            .lines()
+            .map(str::to_string)
+            .collect();
+    mainline
+        .iter()
+        .rev()
+        .find(|c| descendants.contains(*c))
+        .cloned()
 }
 
 /// Scan stable log once, returning the set of branch names that have been
@@ -705,6 +903,192 @@ fn dep_tip_missing(repo: &Path, dep_branch: &str, roll_branch: &str) -> bool {
     !git::is_ancestor(repo, &dep_ref, &roll_ref).unwrap_or(true)
 }
 
+/// True only when both branches resolve and `other`'s tip is an ancestor of
+/// `holder`'s — i.e. graduating `holder` would land every commit `other` has.
+///
+/// Deliberately not `!dep_tip_missing(..)`: that answers "no staleness can be
+/// claimed" for a branch that does not resolve, which is the right default for
+/// a warning but the wrong one here. Containment is what lets a carrier
+/// graduate past a fellow cycle member, so an unknown answer must be "no".
+fn tip_contains(repo: &Path, holder: &str, other: &str) -> bool {
+    let (Some(holder_ref), Some(other_ref)) = (
+        git::resolve_branch(repo, holder),
+        git::resolve_branch(repo, other),
+    ) else {
+        return false;
+    };
+    git::is_ancestor(repo, &other_ref, &holder_ref).unwrap_or(false)
+}
+
+/// Record a [`DepCycle`] on every roll that is part of one.
+///
+/// Cycles are looked for only among rolls that still need graduating (`Active`
+/// or `Diverged`, read before blocking is decided), over edges between such
+/// rolls: an edge to a graduated roll orders nothing, so a cycle through one is
+/// already broken. `Reverted` is left out on purpose — its remedy is reverting
+/// the revert, which a carrier's merge cannot do (its commits are already
+/// ancestors of rolling), so carrying it would silently leave it reverted.
+///
+/// Containment is a handful of `merge-base --is-ancestor` calls per cycle, and
+/// cycles are rare and small, so it is computed eagerly here rather than
+/// leaving every renderer to rediscover which member to graduate.
+fn assign_cycles(repo: &Path, rolls: &mut [RollInfo]) {
+    let pending = |r: &RollInfo| matches!(r.state, RollState::Active | RollState::Diverged);
+    let pending_numbers: HashSet<u32> = rolls
+        .iter()
+        .filter(|r| pending(r))
+        .map(|r| r.number)
+        .collect();
+    let graph: Vec<(u32, Vec<u32>)> = rolls
+        .iter()
+        .filter(|r| pending(r))
+        .map(|r| {
+            let deps = r
+                .deps
+                .iter()
+                .copied()
+                .filter(|d| pending_numbers.contains(d))
+                .collect();
+            (r.number, deps)
+        })
+        .collect();
+
+    for members in dependency_cycles(&graph) {
+        let branch_of = |n: u32| {
+            rolls
+                .iter()
+                .find(|r| r.number == n)
+                .map(|r| r.branch.clone())
+                .unwrap_or_default()
+        };
+        let (suggested, lacks) = pick_carrier(&members, |holder, other| {
+            tip_contains(repo, &branch_of(holder), &branch_of(other))
+        });
+        let cycle = DepCycle {
+            members: members.clone(),
+            suggested,
+            lacks,
+        };
+        for roll in rolls.iter_mut().filter(|r| members.contains(&r.number)) {
+            roll.cycle = Some(cycle.clone());
+        }
+    }
+}
+
+/// Choose the member of a cycle to graduate: the one whose tip contains every
+/// other member's (`contains(holder, other)`), or failing that, the one that
+/// lacks the fewest — returned with the members it lacks, so the advice can
+/// name exactly the integrations that make it a carrier. Ties go to the highest
+/// number: when several members contain each other (identical tips), any of
+/// them lands the cycle and determinism is all that matters; when none does,
+/// the newest roll is the likeliest to be the one folding the others in.
+///
+/// Pure over the containment answer, so the choice is unit-tested without a
+/// repository.
+pub(crate) fn pick_carrier(
+    members: &[u32],
+    contains: impl Fn(u32, u32) -> bool,
+) -> (u32, Vec<u32>) {
+    members
+        .iter()
+        .map(|&holder| {
+            let lacks: Vec<u32> = members
+                .iter()
+                .copied()
+                .filter(|&other| other != holder && !contains(holder, other))
+                .collect();
+            (holder, lacks)
+        })
+        .min_by(|(a, a_lacks), (b, b_lacks)| {
+            a_lacks.len().cmp(&b_lacks.len()).then_with(|| b.cmp(a))
+        })
+        .unwrap_or((0, Vec::new()))
+}
+
+/// The cycles in a dependency graph: every strongly connected component with
+/// more than one member, each sorted ascending, ordered by smallest member.
+///
+/// Tarjan's algorithm, so every node and edge is visited once and a cycle can
+/// never send it round forever — the property every dependency walk needs and
+/// the reason cycle detection is done here, once, rather than discovered by
+/// whichever walk happens to trip over one. Edges to numbers that are not
+/// nodes of the graph are ignored, and a self-edge is not a cycle (a roll's own
+/// subject is already filtered out of its deps). Pure, for unit testing.
+pub(crate) fn dependency_cycles(graph: &[(u32, Vec<u32>)]) -> Vec<Vec<u32>> {
+    struct Tarjan<'a> {
+        graph: &'a [(u32, Vec<u32>)],
+        index: HashMap<u32, usize>,
+        lowlink: HashMap<u32, usize>,
+        stack: Vec<u32>,
+        on_stack: HashSet<u32>,
+        next: usize,
+        found: Vec<Vec<u32>>,
+    }
+
+    impl Tarjan<'_> {
+        fn visit(&mut self, node: u32) {
+            self.index.insert(node, self.next);
+            self.lowlink.insert(node, self.next);
+            self.next += 1;
+            self.stack.push(node);
+            self.on_stack.insert(node);
+
+            let edges = self
+                .graph
+                .iter()
+                .find(|(n, _)| *n == node)
+                .map(|(_, deps)| deps.clone())
+                .unwrap_or_default();
+            for dep in edges {
+                if !self.graph.iter().any(|(n, _)| *n == dep) {
+                    continue;
+                }
+                if !self.index.contains_key(&dep) {
+                    self.visit(dep);
+                    let low = self.lowlink[&node].min(self.lowlink[&dep]);
+                    self.lowlink.insert(node, low);
+                } else if self.on_stack.contains(&dep) {
+                    let low = self.lowlink[&node].min(self.index[&dep]);
+                    self.lowlink.insert(node, low);
+                }
+            }
+
+            if self.lowlink[&node] == self.index[&node] {
+                let mut component = Vec::new();
+                while let Some(top) = self.stack.pop() {
+                    self.on_stack.remove(&top);
+                    component.push(top);
+                    if top == node {
+                        break;
+                    }
+                }
+                if component.len() > 1 {
+                    component.sort_unstable();
+                    self.found.push(component);
+                }
+            }
+        }
+    }
+
+    let mut tarjan = Tarjan {
+        graph,
+        index: HashMap::new(),
+        lowlink: HashMap::new(),
+        stack: Vec::new(),
+        on_stack: HashSet::new(),
+        next: 0,
+        found: Vec::new(),
+    };
+    for (node, _) in graph {
+        if !tarjan.index.contains_key(node) {
+            tarjan.visit(*node);
+        }
+    }
+    let mut found = tarjan.found;
+    found.sort();
+    found
+}
+
 /// Find the git hash of the merge/graduation commit for `roll_branch` on
 /// `rolling_ref` — pass a stable ref to get the graduation once it has been
 /// promoted. Returns `None` if no graduation commit is found. Scans merge
@@ -911,5 +1295,126 @@ mod tests {
             extract_graduated_branch("docs: explain roll/8-0918-help-menu"),
             None
         );
+    }
+
+    mod cycles {
+        use super::super::{
+            dependency_cycles, format_deps, pick_carrier, BranchLocation, DepCycle, RollInfo,
+            RollState,
+        };
+
+        fn graph(edges: &[(u32, &[u32])]) -> Vec<(u32, Vec<u32>)> {
+            edges.iter().map(|(n, d)| (*n, d.to_vec())).collect()
+        }
+
+        #[test]
+        fn an_acyclic_graph_has_no_cycles() {
+            // 9 -> 8 -> 7, and a diamond: 8 and 6 both on 5.
+            let g = graph(&[(5, &[]), (6, &[5]), (7, &[]), (8, &[7, 5]), (9, &[8, 6])]);
+            assert!(dependency_cycles(&g).is_empty());
+        }
+
+        #[test]
+        fn two_rolls_that_integrated_each_other_are_one_cycle() {
+            // The 14/15 shape, with the shared dependency 8 outside the cycle.
+            let g = graph(&[(8, &[]), (14, &[8, 15]), (15, &[8, 14])]);
+            assert_eq!(dependency_cycles(&g), vec![vec![14, 15]]);
+        }
+
+        #[test]
+        fn a_longer_cycle_and_a_separate_one_are_each_found_once() {
+            let g = graph(&[
+                (1, &[2]),
+                (2, &[3]),
+                (3, &[1]),
+                (4, &[1]), // depends on the cycle, is not in it
+                (5, &[6]),
+                (6, &[5]),
+            ]);
+            assert_eq!(dependency_cycles(&g), vec![vec![1, 2, 3], vec![5, 6]]);
+        }
+
+        #[test]
+        fn edges_to_unknown_rolls_and_self_edges_are_not_cycles() {
+            let g = graph(&[(1, &[1, 99]), (2, &[1])]);
+            assert!(dependency_cycles(&g).is_empty());
+        }
+
+        #[test]
+        fn the_carrier_is_the_member_that_contains_every_other() {
+            // 15 contains 14; 14 does not contain 15.
+            let (carrier, lacks) = pick_carrier(&[14, 15], |holder, _| holder == 15);
+            assert_eq!((carrier, lacks), (15, vec![]));
+            // Mirror image: the lower number can carry too.
+            let (carrier, lacks) = pick_carrier(&[14, 15], |holder, _| holder == 14);
+            assert_eq!((carrier, lacks), (14, vec![]));
+        }
+
+        #[test]
+        fn with_no_carrier_the_suggestion_lacks_the_fewest_and_ties_go_high() {
+            // Neither contains the other: tie, so 15, which lacks 14.
+            let (s, lacks) = pick_carrier(&[14, 15], |_, _| false);
+            assert_eq!((s, lacks), (15, vec![14]));
+            // Three members: 2 already contains 1 and lacks only 3.
+            let (s, lacks) = pick_carrier(&[1, 2, 3], |holder, other| holder == 2 && other == 1);
+            assert_eq!((s, lacks), (2, vec![3]));
+            // Identical tips: everyone contains everyone, highest wins.
+            let (s, lacks) = pick_carrier(&[1, 2], |_, _| true);
+            assert_eq!((s, lacks), (2, vec![]));
+        }
+
+        fn roll(n: u32, deps: &[u32], cycle: Option<DepCycle>) -> RollInfo {
+            RollInfo {
+                branch: format!("roll/{n}-0919-r{n}"),
+                number: n,
+                state: RollState::Active,
+                location: BranchLocation::Local,
+                is_current: false,
+                deps: deps.to_vec(),
+                dependents: Vec::new(),
+                stale_deps: Vec::new(),
+                graduation_commit: None,
+                cycle,
+            }
+        }
+
+        #[test]
+        fn advice_names_the_branch_to_graduate_or_the_integrate_to_run() {
+            let carried = DepCycle {
+                members: vec![14, 15],
+                suggested: 15,
+                lacks: vec![],
+            };
+            let rolls = vec![roll(14, &[15], None), roll(15, &[14], None)];
+            let advice = carried.advice(&rolls);
+            assert!(advice.contains("14 ⇄ 15"), "{advice}");
+            assert!(advice.contains("graduate roll/15-0919-r15"), "{advice}");
+            assert!(advice.contains("carries 14"), "{advice}");
+            assert_eq!(carried.carrier(), Some(15));
+
+            let stuck = DepCycle {
+                lacks: vec![14],
+                ..carried
+            };
+            let advice = stuck.advice(&rolls);
+            assert_eq!(stuck.carrier(), None);
+            assert!(
+                advice.contains("on roll/15-0919-r15 run `rf integrate roll/14-0919-r14`"),
+                "{advice}"
+            );
+        }
+
+        #[test]
+        fn the_deps_cell_marks_cycle_members_after_staleness() {
+            let cycle = DepCycle {
+                members: vec![14, 15],
+                suggested: 15,
+                lacks: vec![],
+            };
+            let mut r14 = roll(14, &[8, 15], Some(cycle));
+            r14.stale_deps = vec![15];
+            assert_eq!(format_deps(&r14), "8,15⚠↻");
+            assert_eq!(format_deps(&roll(9, &[8], None)), "8");
+        }
     }
 }

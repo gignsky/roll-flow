@@ -655,13 +655,23 @@ fn graduate_with_deps(
 ) -> Result<()> {
     let rolls = branches::list_rolls(config)?;
     let chain = ops::dependency_chain(&rolls, roll, ops::ChainKind::Graduate)?;
+    let roll_number = rolls.iter().find(|r| r.branch == roll).map(|r| r.number);
 
-    if chain.len() > 1 {
+    if !ops::chain_is_lone(&chain, roll) {
+        // Counted over what lands, not over steps: a cycle's carrier is one
+        // step but every roll it carries is a dependency landing with it.
+        let mut landing: Vec<u32> = chain
+            .iter()
+            .flat_map(|s| std::iter::once(s.number).chain(s.carries.iter().copied()))
+            .filter(|n| Some(*n) != roll_number)
+            .collect();
+        landing.sort_unstable();
+        landing.dedup();
         println!(
             "'{}' depends on {} ungraduated roll{}; graduating in order:",
             roll,
-            chain.len() - 1,
-            if chain.len() == 2 { "" } else { "s" }
+            landing.len(),
+            if landing.len() == 1 { "" } else { "s" }
         );
         for (i, step) in chain.iter().enumerate() {
             println!("  {}. {}", i + 1, step.describe());
@@ -680,12 +690,22 @@ fn graduate_with_deps(
             }
         }
         println!();
+    } else if let [step] = chain.as_slice() {
+        // Merges only the branch the user is on, so no prompt — but it lands
+        // rolls they did not name, which is worth a line before it happens.
+        if !step.carries.is_empty() {
+            println!("{}\n", step.describe());
+        }
     }
 
-    for outcome in ops::graduate_chain(config, &chain, dry_run, force, tag)? {
-        print_graduate(&outcome);
+    let outcomes = ops::graduate_chain(config, &chain, dry_run, force, tag)?;
+    for (step, outcome) in chain.iter().zip(&outcomes) {
+        print_graduate(outcome);
+        if !step.carries.is_empty() {
+            println!("{}", step.carried_line(&rolls, dry_run));
+        }
         if !dry_run {
-            offer_graduate_tag_push(config, &outcome, yes)?;
+            offer_graduate_tag_push(config, outcome, yes)?;
         }
     }
     Ok(())
@@ -1532,7 +1552,7 @@ fn cmd_list_text(no_tui: bool, deps: bool) -> Result<()> {
         let deps_col = if deps {
             format!(
                 "  {:<dep_w$}  {}",
-                branches::format_deps_with_staleness(&roll.deps, &roll.stale_deps),
+                branches::format_deps(roll),
                 branches::format_roll_numbers(&roll.dependents),
             )
         } else {
@@ -1562,6 +1582,16 @@ fn cmd_list_text(no_tui: bool, deps: bool) -> Result<()> {
             nw = name_w,
             sw = state_w,
         );
+    }
+
+    // The same footnote `rf status --no-tui` prints, with or without `--deps`:
+    // a cycle is what explains two rows each `⛔ blocked` on the other.
+    let cycles = branches::distinct_cycles(&rolls);
+    if !cycles.is_empty() {
+        println!();
+        for cycle in cycles {
+            println!("  {}", cycle.advice(&rolls));
+        }
     }
 
     Ok(())
@@ -1617,16 +1647,12 @@ pub(crate) const DEPENDANTS_HDR: &str = "dependants";
 /// for the longest comma-joined number list in the table. Trailing whitespace on
 /// the last column is trimmed by the caller's format, so only `deps` needs a
 /// computed width — `dependants` is returned for the separator rule. `deps`
-/// measures [`branches::format_deps_with_staleness`] rather than the plain
+/// measures [`branches::format_deps`] rather than the plain
 /// listing, so a `⚠` suffix never gets truncated by a width computed without it.
 pub(crate) fn dep_column_widths(rolls: &[branches::RollInfo]) -> (usize, usize) {
     let deps_w = rolls
         .iter()
-        .map(|r| {
-            branches::format_deps_with_staleness(&r.deps, &r.stale_deps)
-                .chars()
-                .count()
-        })
+        .map(|r| branches::format_deps(r).chars().count())
         .max()
         .unwrap_or(0)
         .max(DEPS_HDR.chars().count());
@@ -1677,13 +1703,47 @@ struct JsonRoll {
     /// rather than inferring it from `state` (which only answers whether the
     /// dependency has graduated, not whether it has moved since).
     stale_deps: Vec<u32>,
+    /// The dependency cycle this roll is in, or `null` — see
+    /// [`branches::DepCycle`]. Every member's row carries the same object, so
+    /// a script can tell which member graduates without re-deriving it.
+    cycle: Option<JsonCycle>,
+}
+
+#[derive(Serialize)]
+struct JsonCycle {
+    /// Every roll in the cycle, ascending, this one included.
+    members: Vec<u32>,
+    /// The member whose graduation lands the whole cycle, or `null` when none
+    /// contains the others' latest work yet.
+    carrier: Option<u32>,
+    /// The carrier, or — with none — the member `advice` says to integrate the
+    /// others into.
+    suggested: u32,
+    /// Members whose tip `suggested` lacks; empty exactly when it is the carrier.
+    lacks: Vec<u32>,
+    /// The same instruction the plain tables print under the table.
+    advice: String,
 }
 
 fn rolls_for_json(config: &Config, rolls: Vec<branches::RollInfo>) -> Vec<JsonRoll> {
     let (versions, _) = version_column(config, &rolls);
+    let cycles: Vec<Option<JsonCycle>> = rolls
+        .iter()
+        .map(|r| {
+            r.cycle.as_ref().map(|c| JsonCycle {
+                members: c.members.clone(),
+                carrier: c.carrier(),
+                suggested: c.suggested,
+                lacks: c.lacks.clone(),
+                advice: c.advice(&rolls),
+            })
+        })
+        .collect();
     rolls
         .into_iter()
-        .map(|r| JsonRoll {
+        .zip(cycles)
+        .map(|(r, cycle)| JsonRoll {
+            cycle,
             version: versions.get(&r.branch).cloned(),
             branch: r.branch,
             number: r.number,
