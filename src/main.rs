@@ -3,6 +3,7 @@ mod core;
 mod error;
 mod tui;
 
+use std::collections::HashMap;
 use std::io::IsTerminal;
 
 use anyhow::{bail, Context, Result};
@@ -10,7 +11,7 @@ use clap::Parser;
 use serde::Serialize;
 
 use cli::{Cli, Cmd};
-use core::version::{BumpLevel, VersionCheck, VersionStatus};
+use core::version::{self, BumpLevel, VersionCheck, VersionStatus};
 use core::{branches, config::Config, git, ops};
 
 fn main() -> Result<()> {
@@ -47,7 +48,8 @@ fn main() -> Result<()> {
             slug,
             date,
             dry_run,
-        } => cmd_create(&slug, date, dry_run)?,
+            no_dev_version,
+        } => cmd_create(&slug, date, dry_run, no_dev_version)?,
         Cmd::Integrate { branch } => cmd_integrate(&branch)?,
         Cmd::Hotfix {
             slug,
@@ -83,7 +85,9 @@ fn main() -> Result<()> {
             dry_run,
             force,
             reason,
-        } => cmd_graduate(dry_run, force, reason)?,
+            no_tag,
+            yes,
+        } => cmd_graduate(dry_run, force, reason, !no_tag, yes)?,
         Cmd::Promote {
             roll,
             dry_run,
@@ -91,8 +95,9 @@ fn main() -> Result<()> {
             reason,
             bump,
             no_tag,
+            finalize,
             yes,
-        } => cmd_promote(roll, dry_run, force, reason, bump, !no_tag, yes)?,
+        } => cmd_promote(roll, dry_run, force, reason, bump, !no_tag, finalize, yes)?,
         Cmd::Status {
             no_tui,
             no_deps,
@@ -111,7 +116,7 @@ fn main() -> Result<()> {
                 cmd_list_text(no_tui, deps)?;
             }
         }
-        Cmd::Update { dry_run } => cmd_update(dry_run)?,
+        Cmd::Update { roll, dry_run } => cmd_update(roll, dry_run)?,
         Cmd::Prune {
             dry_run,
             local,
@@ -144,6 +149,14 @@ fn main() -> Result<()> {
             no_fetch,
         } => cli::clean::run(dry_run, yes, force, with_remote, no_fetch)?,
         Cmd::Version => println!("{}", env!("CARGO_PKG_VERSION")),
+        Cmd::MergeDriverVersion {
+            ancestor,
+            ours,
+            theirs,
+        } => {
+            let resolved = core::merge_driver::run(&ancestor, &ours, &theirs)?;
+            std::process::exit(if resolved { 0 } else { 1 });
+        }
     }
 
     Ok(())
@@ -172,6 +185,14 @@ fn cmd_init(
             &config.repo_root,
             &["branch", &config.rolling_branch, &config.stable_branch],
         )?;
+    }
+
+    // Runs on every `rf init`, independent of whether `.roll-flow.toml` itself
+    // needs updating: the git-config half of this is local to the clone (see
+    // `ops::ensure_version_merge_driver`), so a repo whose config is already
+    // up to date on a fresh clone still needs this wired up here.
+    if ops::ensure_version_merge_driver(&config)? {
+        println!("Configured the version merge driver for Cargo.toml");
     }
 
     // Resolve the workflow mode (issue #18): an explicit `--mode` always wins;
@@ -260,11 +281,20 @@ fn config_diff(current: &str, detected: &str) -> String {
     out
 }
 
-fn cmd_create(slug: &str, date: Option<String>, dry_run: bool) -> Result<()> {
+fn cmd_create(slug: &str, date: Option<String>, dry_run: bool, no_dev_version: bool) -> Result<()> {
     let config = Config::load()?;
     ops::ensure_clean_state(&config)?;
     let outcome = ops::create(&config, slug, date, dry_run)?;
     print_create(&outcome);
+
+    // After the branch exists, and only on a real run: the mark is a commit, so
+    // a dry run must not leave one behind. A repo with no `Cargo.toml` reports
+    // `None` and nothing is said.
+    if !dry_run && config.dev_versions && !no_dev_version {
+        if let Some(dev) = ops::apply_dev_version(&config, outcome.number)? {
+            println!("version marked {dev}");
+        }
+    }
     Ok(())
 }
 
@@ -334,6 +364,18 @@ fn cmd_hotfix_land(dry_run: bool) -> Result<()> {
 fn cmd_verify(dry_run: bool, bump: Option<BumpLevel>, yes: bool) -> Result<()> {
     let config = Config::load()?;
     ops::ensure_clean_state(&config)?;
+
+    // On a roll branch, verify is also where a missing dev marker gets applied:
+    // a roll created before the marker existed, or with `--no-dev-version`, can
+    // be brought in line without a manual edit. Same sequencing as the bump
+    // below and for the same reason — it is a commit that touches Cargo.lock,
+    // so it has to land before the `--locked` gates run. A dry run leaves it.
+    let current = git::current_branch(&config.repo_root)?;
+    if !dry_run {
+        if let Some(dev) = ops::apply_dev_version_for_branch(&config, &current)? {
+            println!("version marked {dev}");
+        }
+    }
 
     // Resolved before `ops::verify` so an accepted bump is already committed by
     // the time the gates (and their `--locked` cargo commands) run.
@@ -481,8 +523,39 @@ fn resolve_version_gate(
         return Ok(());
     };
 
-    let check = ops::version_check(config, &source, &target_ref)?;
+    // A *final* promotion must land a bare version on stable, never `-dev` —
+    // so the gate below is run against the *finalized* value rolling will
+    // carry once the marker is stripped, not the raw `-dev` one still on
+    // disk: comparing the raw value would report `VersionStatus::DevVersion`
+    // on every single ordinary promotion, since rolling's steady state now
+    // always carries one. Nothing is written yet; the actual strip is only
+    // committed once this function has decided to proceed — either here, if
+    // the finalized value alone already satisfies the gate, or immediately
+    // before the bump below, so a promotion that ultimately fails (no bump
+    // resolved) doesn't leave rolling finalized with nothing to show for it.
+    let needs_finalize = config.dev_versions
+        && version::read_version(&config.repo_root)?.is_some_and(|v| v.has_marker());
+    let check = if !config.version_gate {
+        VersionCheck::not_applicable()
+    } else if config.dev_versions {
+        let finalized_head = version::read_version(&config.repo_root)?.map(|v| v.release());
+        version::check_against(&config.repo_root, finalized_head, &target_ref)?
+    } else {
+        ops::version_check(config, &source, &target_ref)?
+    };
+
+    let finalize_now = |dry_run: bool| -> Result<()> {
+        if !needs_finalize || dry_run {
+            return Ok(());
+        }
+        if let Some((from, to)) = ops::finalize_rolling(config)? {
+            println!("Finalized {from} -> {to} (chore(release) commit on '{source}')");
+        }
+        Ok(())
+    };
+
     if check.is_satisfied() {
+        finalize_now(dry_run)?;
         return Ok(());
     }
 
@@ -499,6 +572,9 @@ fn resolve_version_gate(
     println!("Version: {head} on '{source}' is unchanged from '{target}'; a bump is required");
 
     if dry_run {
+        if needs_finalize {
+            println!("Dry-run: would also finalize the release before bumping");
+        }
         println!("Dry-run: not bumping the version");
         return Ok(());
     }
@@ -529,9 +605,11 @@ fn resolve_version_gate(
         if forced {
             eprintln!("warning: version not bumped, continuing under --force");
         }
+        finalize_now(false)?;
         return Ok(());
     };
 
+    finalize_now(false)?;
     let (from, to) = ops::apply_version_bump(config, level, &source)?;
     println!("Bumped version {from} -> {to} (chore(release) commit on '{current}')");
     Ok(())
@@ -573,6 +651,7 @@ fn render_version_check(check: &VersionCheck, source: &str, target: &str) {
         VersionStatus::Unchanged => "UNCHANGED",
         VersionStatus::Lower => "LOWER",
         VersionStatus::Unreadable => "UNREADABLE",
+        VersionStatus::DevVersion => "DEV",
         VersionStatus::NotApplicable => return,
     };
     println!("Version: {head} on '{source}' (base '{target}' {base}) {verdict}");
@@ -609,7 +688,13 @@ fn offer_tag_push(config: &Config, tag: &str, yes: bool) -> Result<()> {
     Ok(())
 }
 
-fn cmd_graduate(dry_run: bool, force: bool, reason: Option<String>) -> Result<()> {
+fn cmd_graduate(
+    dry_run: bool,
+    force: bool,
+    reason: Option<String>,
+    tag: bool,
+    yes: bool,
+) -> Result<()> {
     let force = ops::ForceOpts::new(force, reason)?;
     let config = Config::load()?;
     ops::ensure_clean_state(&config)?;
@@ -623,11 +708,18 @@ fn cmd_graduate(dry_run: bool, force: bool, reason: Option<String>) -> Result<()
             config.stable_branch
         );
     }
-    let outcome = ops::graduate(&config, &current, dry_run, &force)?;
+    // `ops::graduate` checks the dev marker belongs to this roll and runs the
+    // gates, merge, and dev-tag creation — shared with the `rf promote`
+    // fall-through and the TUI's `[G]`, so this is just the CLI wrapper now.
+    let outcome = ops::graduate(&config, &current, dry_run, &force, tag)?;
     print_graduate(&outcome);
+    if !dry_run {
+        offer_graduate_tag_push(&config, &outcome, yes)?;
+    }
     Ok(())
 }
 
+#[allow(clippy::too_many_arguments)]
 fn cmd_promote(
     rolls: Vec<String>,
     dry_run: bool,
@@ -635,6 +727,7 @@ fn cmd_promote(
     reason: Option<String>,
     bump: Option<BumpLevel>,
     tag: bool,
+    finalize: bool,
     yes: bool,
 ) -> Result<()> {
     let forced = force;
@@ -646,6 +739,9 @@ fn cmd_promote(
     // and deliberately works from any branch, rather than being redirected to
     // graduate because HEAD happens to sit on a roll.
     if !rolls.is_empty() {
+        if !confirm_final_promotion(&config, dry_run, finalize, yes)? {
+            return Ok(());
+        }
         // Advancing stable to a roll's graduation commit lands whatever
         // graduated ahead of it too (see `ops::PromoteTarget::Rolls`). That is
         // how the route keeps stable a prefix of rolling, but it is not what
@@ -699,10 +795,16 @@ fn cmd_promote(
                 "note: '{}' is a roll branch; graduating into '{}' — use rf graduate directly next time",
                 roll, config.rolling_branch
             );
-            let outcome = ops::graduate(&config, &roll, dry_run, &force)?;
+            let outcome = ops::graduate(&config, &roll, dry_run, &force, tag)?;
             print_graduate(&outcome);
+            if !dry_run {
+                offer_graduate_tag_push(&config, &outcome, yes)?;
+            }
         }
         Some(ops::Route::Promote) => {
+            if !confirm_final_promotion(&config, dry_run, finalize, yes)? {
+                return Ok(());
+            }
             // Resolved before `ops::promote` so the bump commit is part of what
             // gets merged, and so it precedes the `--locked` cargo gates.
             resolve_version_gate(&config, bump, yes, forced, dry_run)?;
@@ -721,6 +823,51 @@ fn cmd_promote(
         None => return Err(ops::not_promotable_error(&config, &current)),
     }
     Ok(())
+}
+
+/// Gate every real promotion on an explicit "is this final?" before anything
+/// is touched — declining aborts the whole command, landing nothing. Only
+/// meaningful when `dev_versions` is on *and* the repo actually has a
+/// `Cargo.toml` to version: a repo without one (the dotfiles repo this tool
+/// was built for) must remain entirely unaffected, matching every other
+/// version-related feature here, so it is checked explicitly rather than
+/// assumed from the config flag alone. A dry run changes nothing to gate
+/// either, and `--final` is its own dedicated escape hatch — the same shape
+/// `--bump <level>` already gives the bump prompt, so this question can be
+/// answered on its own without also accepting the tag-push prompt the way a
+/// blanket `--yes` does.
+///
+/// Unattended without `--final`/`--yes` fails rather than silently finalizing
+/// a release nobody confirmed — the same shape [`confirm_carried_rolls`] uses
+/// for its own irreversible-if-unnoticed default.
+fn confirm_final_promotion(
+    config: &Config,
+    dry_run: bool,
+    finalize: bool,
+    yes: bool,
+) -> Result<bool> {
+    let has_version = version::read_version(&config.repo_root)?.is_some();
+    if dry_run || !config.dev_versions || !has_version || finalize {
+        return Ok(true);
+    }
+    match cli::confirm(
+        yes,
+        &format!(
+            "Finalize this release? This drops the -dev marker before merging into '{}'. [y/N] ",
+            config.stable_branch
+        ),
+    )? {
+        cli::Confirm::Yes => Ok(true),
+        cli::Confirm::Declined => {
+            println!("Promotion cancelled; nothing was touched.");
+            Ok(false)
+        }
+        cli::Confirm::Unattended => bail!(
+            "promoting to '{}' finalizes the release (drops the -dev marker); \
+             re-run with --yes to confirm, or run interactively",
+            config.stable_branch
+        ),
+    }
 }
 
 /// Show the rolls a per-roll promotion would carry besides the ones named, and
@@ -807,7 +954,9 @@ fn offer_update(config: &Config, yes: bool) -> Result<()> {
             config.stable_branch
         ),
     )? {
-        cli::Confirm::Yes => print_update(ops::update(config, false)?),
+        cli::Confirm::Yes => {
+            print_update(ops::update(config, &ops::UpdateTarget::AllActive, false)?)
+        }
         cli::Confirm::Declined => {}
         cli::Confirm::Unattended => {
             println!(
@@ -881,14 +1030,37 @@ fn offer_step_tag_pushes(config: &Config, outcome: &ops::PromoteOutcome, yes: bo
 
 fn print_graduate(outcome: &ops::GraduateOutcome) {
     render_gate_notices(&outcome.gate_notices);
-    if outcome.dry_run {
-        println!(
+    match (outcome.restored, outcome.dry_run) {
+        (true, true) => println!(
+            "Dry-run: would revert the revert, restoring '{}' on '{}'",
+            outcome.roll, outcome.rolling
+        ),
+        (true, false) => println!(
+            "Restored '{}' on '{}' (reverted the revert)",
+            outcome.roll, outcome.rolling
+        ),
+        (false, true) => println!(
             "Dry-run: would graduate '{}' into '{}' (--no-ff)",
             outcome.roll, outcome.rolling
-        );
-    } else {
-        println!("Graduated '{}' into '{}'", outcome.roll, outcome.rolling);
+        ),
+        (false, false) => println!("Graduated '{}' into '{}'", outcome.roll, outcome.rolling),
     }
+    if let Some(line) = outcome.tag.describe() {
+        println!("{line}");
+    }
+}
+
+/// Offer to push the dev tag a graduation just created, mirroring
+/// [`offer_step_tag_pushes`]'s shape one tier down.
+fn offer_graduate_tag_push(
+    config: &Config,
+    outcome: &ops::GraduateOutcome,
+    yes: bool,
+) -> Result<()> {
+    if let Some(tag) = outcome.tag.created_tag() {
+        offer_tag_push(config, tag, yes)?;
+    }
+    Ok(())
 }
 
 /// Render the roll-flow status lines that `ops::run_gates` collects instead of
@@ -951,13 +1123,21 @@ fn cmd_status_json() -> Result<()> {
 fn cmd_list_json() -> Result<()> {
     let config = Config::load()?;
     let rolls = branches::list_rolls(&config)?;
-    println!("{}", serde_json::to_string_pretty(&rolls_for_json(rolls))?);
+    println!(
+        "{}",
+        serde_json::to_string_pretty(&rolls_for_json(&config, rolls))?
+    );
     Ok(())
 }
 
-fn cmd_update(dry_run: bool) -> Result<()> {
+fn cmd_update(rolls: Vec<String>, dry_run: bool) -> Result<()> {
     let config = Config::load()?;
-    print_update(ops::update(&config, dry_run)?);
+    let target = if rolls.is_empty() {
+        ops::UpdateTarget::AllActive
+    } else {
+        ops::UpdateTarget::Rolls(rolls)
+    };
+    print_update(ops::update(&config, &target, dry_run)?);
     Ok(())
 }
 
@@ -1295,13 +1475,22 @@ fn cmd_list_text(no_tui: bool, deps: bool) -> Result<()> {
     let state_w = "⛔ blocked".len();
 
     let (dep_w, dependant_w) = dep_column_widths(&rolls);
+    // Empty in a repo with no `Cargo.toml`, which drops the column entirely.
+    let (versions, ver_w) = version_column(&config, &rolls);
 
     println!(
-        "  {num:>3}  {name:<nw$}  {loc:<3}  {state:<sw$}{deps_hdr}",
+        "  {num:>3}  {name:<nw$}  {loc:<3}  {state:<sw$}{ver_hdr}{deps_hdr}",
         num = "#",
         name = "branch",
         loc = "loc",
         state = "state",
+        ver_hdr = if versions.is_empty() {
+            String::new()
+        } else if deps {
+            format!("  {VERSION_HDR:<ver_w$}")
+        } else {
+            format!("  {VERSION_HDR}")
+        },
         deps_hdr = if deps {
             format!("  {DEPS_HDR:<dep_w$}  {DEPENDANTS_HDR}")
         } else {
@@ -1311,9 +1500,14 @@ fn cmd_list_text(no_tui: bool, deps: bool) -> Result<()> {
         sw = state_w,
     );
     println!(
-        "  ───  {sep_e}  ───  {sep_s}{sep_d}",
+        "  ───  {sep_e}  ───  {sep_s}{sep_v}{sep_d}",
         sep_e = "─".repeat(name_w),
         sep_s = "─".repeat(state_w),
+        sep_v = if versions.is_empty() {
+            String::new()
+        } else {
+            format!("  {}", "─".repeat(ver_w))
+        },
         sep_d = if deps {
             format!("  {}  {}", "─".repeat(dep_w), "─".repeat(dependant_w))
         } else {
@@ -1326,14 +1520,29 @@ fn cmd_list_text(no_tui: bool, deps: bool) -> Result<()> {
         let deps_col = if deps {
             format!(
                 "  {:<dep_w$}  {}",
-                branches::format_roll_numbers(&roll.deps),
+                branches::format_deps_with_staleness(&roll.deps, &roll.stale_deps),
                 branches::format_roll_numbers(&roll.dependents),
             )
         } else {
             String::new()
         };
+        // Padded only when the deps columns follow it, so a last column leaves
+        // no trailing whitespace — the same rule `dependants` follows.
+        let ver_col = if versions.is_empty() {
+            String::new()
+        } else {
+            let v = versions
+                .get(&roll.branch)
+                .map(String::as_str)
+                .unwrap_or("—");
+            if deps {
+                format!("  {v:<ver_w$}")
+            } else {
+                format!("  {v}")
+            }
+        };
         println!(
-            "{cur} {num:>3}  {name:<nw$}  {loc:<3}  {state:<sw$}{deps_col}",
+            "{cur} {num:>3}  {name:<nw$}  {loc:<3}  {state:<sw$}{ver_col}{deps_col}",
             num = roll.number,
             name = roll.branch,
             loc = roll.location.symbol(),
@@ -1346,6 +1555,47 @@ fn cmd_list_text(no_tui: bool, deps: bool) -> Result<()> {
     Ok(())
 }
 
+/// Header for the per-branch crate version, shared by both plain tables.
+pub(crate) const VERSION_HDR: &str = "version";
+
+/// The version string to print per roll, keyed by branch, plus the column width.
+///
+/// An empty map means "no column": either the repo has no `Cargo.toml` at all —
+/// every dotfiles repo — or nothing readable was found, and in both cases the
+/// table is better off without a column of dashes. The same rule the TUI table
+/// and the header version follow.
+///
+/// Versions are read at [`branches::content_ref`] per roll, so the plain tables
+/// and the TUI report the same commit's manifest.
+pub(crate) fn version_column(
+    config: &Config,
+    rolls: &[branches::RollInfo],
+) -> (HashMap<String, String>, usize) {
+    let refs: Vec<String> = rolls
+        .iter()
+        .map(|r| branches::content_ref(&r.branch, &r.location))
+        .collect();
+    let by_ref = version::versions_at(&config.repo_root, &refs);
+
+    let by_branch: HashMap<String, String> = rolls
+        .iter()
+        .zip(refs.iter())
+        .filter_map(|(roll, refspec)| {
+            let v = by_ref.get(refspec)?;
+            // Through `Display`, dev marker included — see `tui::rolls::version_cell`.
+            Some((roll.branch.clone(), v.to_string()))
+        })
+        .collect();
+
+    let width = by_branch
+        .values()
+        .map(|v| v.chars().count())
+        .max()
+        .unwrap_or(0)
+        .max(VERSION_HDR.chars().count());
+    (by_branch, width)
+}
+
 /// Column headers for the dependency pair, shared by `rf list --no-tui --deps`
 /// and `rf status --no-tui` so the two tables read identically.
 pub(crate) const DEPS_HDR: &str = "deps";
@@ -1354,20 +1604,27 @@ pub(crate) const DEPENDANTS_HDR: &str = "dependants";
 /// Widths for the `deps` / `dependants` columns: wide enough for the header and
 /// for the longest comma-joined number list in the table. Trailing whitespace on
 /// the last column is trimmed by the caller's format, so only `deps` needs a
-/// computed width — `dependants` is returned for the separator rule.
+/// computed width — `dependants` is returned for the separator rule. `deps`
+/// measures [`branches::format_deps_with_staleness`] rather than the plain
+/// listing, so a `⚠` suffix never gets truncated by a width computed without it.
 pub(crate) fn dep_column_widths(rolls: &[branches::RollInfo]) -> (usize, usize) {
-    let widest = |pick: fn(&branches::RollInfo) -> &Vec<u32>, hdr: &str| {
-        rolls
-            .iter()
-            .map(|r| branches::format_roll_numbers(pick(r)).chars().count())
-            .max()
-            .unwrap_or(0)
-            .max(hdr.chars().count())
-    };
-    (
-        widest(|r| &r.deps, DEPS_HDR),
-        widest(|r| &r.dependents, DEPENDANTS_HDR),
-    )
+    let deps_w = rolls
+        .iter()
+        .map(|r| {
+            branches::format_deps_with_staleness(&r.deps, &r.stale_deps)
+                .chars()
+                .count()
+        })
+        .max()
+        .unwrap_or(0)
+        .max(DEPS_HDR.chars().count());
+    let dependants_w = rolls
+        .iter()
+        .map(|r| branches::format_roll_numbers(&r.dependents).chars().count())
+        .max()
+        .unwrap_or(0)
+        .max(DEPENDANTS_HDR.chars().count());
+    (deps_w, dependants_w)
 }
 
 #[derive(Serialize)]
@@ -1398,12 +1655,24 @@ struct JsonRoll {
     /// consumers see the same dependency graph the TUI draws.
     deps: Vec<u32>,
     dependants: Vec<u32>,
+    /// The `[package]` version at this roll's tip. `null` in repos with no
+    /// `Cargo.toml`, which is the same absence the tables render as a dash.
+    version: Option<String>,
+    /// Subset of `deps` whose current tip this roll has not integrated — the
+    /// ancestry check behind the TUI's `⚠ reintegrate` marker, exposed so a
+    /// script deciding whether to merge a batch of dependent rolls can check
+    /// each one is caught up with a still-moving dependency before doing so,
+    /// rather than inferring it from `state` (which only answers whether the
+    /// dependency has graduated, not whether it has moved since).
+    stale_deps: Vec<u32>,
 }
 
-fn rolls_for_json(rolls: Vec<branches::RollInfo>) -> Vec<JsonRoll> {
+fn rolls_for_json(config: &Config, rolls: Vec<branches::RollInfo>) -> Vec<JsonRoll> {
+    let (versions, _) = version_column(config, &rolls);
     rolls
         .into_iter()
         .map(|r| JsonRoll {
+            version: versions.get(&r.branch).cloned(),
             branch: r.branch,
             number: r.number,
             state: r.state.label().to_string(),
@@ -1411,6 +1680,7 @@ fn rolls_for_json(rolls: Vec<branches::RollInfo>) -> Vec<JsonRoll> {
             is_current: r.is_current,
             deps: r.deps,
             dependants: r.dependents,
+            stale_deps: r.stale_deps,
         })
         .collect()
 }
