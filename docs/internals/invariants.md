@@ -70,6 +70,29 @@ long list — that keeps two rolls adding rules in different areas from collidin
   `RollState::Diverged` alone misses every dependency that is stale while still
   active — exactly the case that matters before merging a batch of dependent
   rolls against a dependency someone keeps pushing to.
+- **A dependency cycle is never a deadlock.** Rolls that integrated each other
+  have no graduation order, so the ordering constraint is satisfied by
+  containment instead: a cycle's *carrier* — the member whose tip contains every
+  other member's tip — is not blocked by its fellow members, and graduating it
+  lands them (see [Dependency cycles](algorithms.md#dependency-cycles)). This
+  exception is scoped to cycles on purpose; outside one, a contained but
+  ungraduated dependency still blocks, because an order exists in which it
+  lands first with a graduation merge of its own. When no member contains the
+  others, nothing graduates, and every surface — the planner's refusal, both
+  plain tables, the TUI detail view and `--json` — gives the same
+  `DepCycle::advice`: which `rf integrate` makes a carrier. Never `--force`.
+- **Every walk over dependencies terminates.** Cycles are found once, by
+  Tarjan's SCC (`branches::dependency_cycles`), and recorded on
+  `RollInfo::cycle`; walks either treat a recorded cycle as one node
+  (graduation), skip an edge back into the current path (promotion, which is
+  ordered by rolling's history, not the dependency graph), or refuse it. A new
+  walk over `RollInfo::deps` must do one of the three — recursing on `deps`
+  alone loops on the first cycle a user's merges create.
+- **A graduation commit is a point on rolling's mainline.** A roll that only
+  reached rolling inside another roll's history (a cycle's carried member, or a
+  `--force` graduation) is re-anchored by `scan_graduated` to the first-parent
+  commit where it landed — never left pointing at an integrate merge on a roll
+  branch, which `rf promote --roll` would then advance stable to.
 
 ## Verification
 
@@ -194,8 +217,9 @@ long list — that keeps two rolls adding rules in different areas from collidin
   getting stale against an advanced target (via `rf update`/`[i]`/`[I]`) is
   resolved at the git level, not by `rf` committing a strip/reapply on either
   branch first. See `src/core/merge_driver.rs` and
-  `ops::ensure_version_merge_driver` (wired up by `rf init`): `Cargo.toml` is
-  attributed to a custom merge driver that resolves the `version` line by
+  `ops::ensure_version_merge_driver` (wired up by `rf init` and before every
+  `rf` merge): `Cargo.toml` and `Cargo.lock` are attributed to a custom merge
+  driver that resolves the crate's own version line by
   keeping whichever side is being merged *into*'s own marker and the higher of
   the two numbers — "ours" is just whichever branch git has checked out,
   decided by git itself rather than by which `rf` command is running. This
@@ -207,6 +231,25 @@ long list — that keeps two rolls adding rules in different areas from collidin
   itself commits. The driver's generic rule is correct as-is for `[i]`/`[I]`/
   `rf update`, where "ours" (a roll) already carries its own right marker from
   `rf start` — but not for graduation, see below.
+- **A version-only conflict never stops an `rf` merge.** The crate's own
+  version lives in two files that change in lockstep — `Cargo.toml` and
+  `Cargo.lock`'s own `[[package]]` entry — so a fix for one is no fix: both are
+  attributed to the driver, and every version rewrite syncs the lockfile entry
+  itself (`ops::sync_lockfile_own_entry`) rather than trusting a `cargo update`
+  that may not run. The driver is clone-local configuration, so `rf init`
+  cannot be the only thing that sets it: every `rf` merge path (`run_merge`,
+  `merge_gated`, `ops::integrate`) wires it first, into the clone's
+  `info/attributes` rather than the tree. And because git can still fail to
+  run it, those same paths finish a merge that stopped on *nothing but* those
+  lines by the same rule (`ops::settle_version_only_conflicts`). Any new merge
+  path must go through one of the three, not call `git merge` itself.
+- **Only the version line, and only all-or-nothing.** The driver and the
+  in-process fallback touch the crate's own entry and nothing else — never a
+  dependency's lockfile entry, never a `[[package]]` with a `source`, never an
+  ambiguous match. If any unmerged path is something else, or a version file
+  still conflicts once its version line agrees, the merge is left exactly as
+  git left it: finishing the parts `rf` understands would make the real
+  conflict look smaller than it is.
 - `ops::graduate` does not delegate to the merge driver's generic rule, because
   "keep ours's marker" is wrong on the very first graduation ever: rolling has
   never worn `-dev` before that point, so "keep ours's marker" would just carry
@@ -223,11 +266,11 @@ long list — that keeps two rolls adding rules in different areas from collidin
   side (the roll's marked value) without ever invoking any driver. `ops::graduate`
   corrects this itself, inside `merge_gated`'s staged tree, before the gates
   run (`reconcile_staged_version`): it reads both sides' version ahead of the
-  merge and rewrites `Cargo.toml` to its own computed answer (above) if the
-  merge didn't already land there. This is why the fix exists in `ops::graduate`
-  and not purely in `.gitattributes` — the driver alone covers the conflicting
-  case but not the trivial one, and both have to resolve the same way for the
-  marker to never reach rolling wrong. `rf update`'s direction doesn't need
+  merge and rewrites `Cargo.toml` (and syncs `Cargo.lock`'s own entry) to its
+  own computed answer (above) if the merge didn't already land there. This is
+  why the fix exists in `ops::graduate` and not purely in the driver — the
+  driver alone covers the conflicting case but not the trivial one, and both
+  have to resolve the same way for the marker to never reach rolling wrong. `rf update`'s direction doesn't need
   this: its trivial case (stable hasn't touched the version, only the roll's
   own marker has) already resolves correctly by git's own default of keeping
   the side that changed, since that side is the roll.

@@ -68,7 +68,19 @@ fn main() -> Result<()> {
                 }
             }
         }
-        Cmd::Verify { dry_run, bump, yes } => cmd_verify(dry_run, bump, yes)?,
+        Cmd::Verify {
+            dry_run,
+            bump,
+            yes,
+            all,
+            state,
+        } => {
+            if all {
+                cmd_verify_all(state)?
+            } else {
+                cmd_verify(dry_run, bump, yes)?
+            }
+        }
         Cmd::Graduate {
             dry_run,
             force,
@@ -141,8 +153,9 @@ fn main() -> Result<()> {
             ancestor,
             ours,
             theirs,
+            path,
         } => {
-            let resolved = core::merge_driver::run(&ancestor, &ours, &theirs)?;
+            let resolved = core::merge_driver::run(&ancestor, &ours, &theirs, path.as_deref())?;
             std::process::exit(if resolved { 0 } else { 1 });
         }
     }
@@ -191,7 +204,7 @@ fn cmd_init(
     // `ops::ensure_version_merge_driver`), so a repo whose config is already
     // up to date on a fresh clone still needs this wired up here.
     if ops::ensure_version_merge_driver(&overridden)? {
-        println!("Configured the version merge driver for Cargo.toml");
+        println!("Configured the version merge driver for Cargo.toml and Cargo.lock");
     }
 
     // A fresh file is the detected state rendered whole.
@@ -514,6 +527,73 @@ fn cmd_verify(dry_run: bool, bump: Option<BumpLevel>, yes: bool) -> Result<()> {
     Ok(())
 }
 
+/// `rf verify --all [--state <set>]` — verify every roll in the set in turn.
+///
+/// A thin renderer over `ops::verify_many`, which owns the switch-and-return
+/// discipline; the TUI's `[V]` sits on the same routine so the two agree on
+/// every rule — including the per-roll version check and dev marker. No bump
+/// offer: a bump is a commit on one branch, and this pass walks many.
+fn cmd_verify_all(set: branches::VerifySet) -> Result<()> {
+    let config = Config::load()?;
+    let rolls = branches::list_rolls(&config)?;
+    let selected = set.select(&rolls);
+    if selected.is_empty() {
+        println!("no rolls to verify ({})", set.label());
+        return Ok(());
+    }
+    println!(
+        "Verifying {} roll{} ({})",
+        selected.len(),
+        if selected.len() == 1 { "" } else { "s" },
+        set.label()
+    );
+
+    let results = ops::verify_many(&config, &selected)?;
+    let mut failed = Vec::new();
+    let mut passed = 0;
+    let mut skipped = 0;
+    for result in &results {
+        println!("\n── {} ──", result.branch);
+        if let Some(dev) = result.marked {
+            println!("version marked {dev}");
+        }
+        if let Some(outcome) = &result.outcome {
+            if outcome.diverged_note {
+                println!(
+                    "note: '{}' has commits not in '{}'; graduation/promotion will create a --no-ff merge",
+                    outcome.target, outcome.source
+                );
+            }
+            render_version_check(&outcome.version, &outcome.source, &outcome.target);
+            render_gate_notices(&outcome.gate_notices);
+            render_gate_notices(&outcome.host_notices);
+            render_host_results(&outcome.host_results);
+        }
+        match &result.verdict {
+            ops::VerifyVerdict::Passed => {
+                passed += 1;
+                println!("PASSED");
+            }
+            ops::VerifyVerdict::Failed(why) => {
+                failed.push(result.branch.clone());
+                println!("FAILED: {why}");
+            }
+            ops::VerifyVerdict::Skipped(why) => {
+                skipped += 1;
+                println!("skipped: {why}");
+            }
+        }
+    }
+    println!(
+        "\n{passed} passed, {} failed, {skipped} skipped",
+        failed.len()
+    );
+    if !failed.is_empty() {
+        bail!("verification failed for: {}", failed.join(", "));
+    }
+    Ok(())
+}
+
 // ── Version gate ────────────────────────────────────────────────────────────
 
 /// Enforce the crate-version bump requirement before the expensive gates run,
@@ -746,13 +826,125 @@ fn cmd_graduate(
     }
     // `ops::graduate` checks the dev marker belongs to this roll and runs the
     // gates, merge, and dev-tag creation — shared with the `rf promote`
-    // fall-through and the TUI's `[G]`, so this is just the CLI wrapper now.
-    let outcome = ops::graduate(&config, &current, dry_run, &force, tag)?;
-    print_graduate(&outcome);
-    if !dry_run {
-        offer_graduate_tag_push(&config, &outcome, yes)?;
+    // fall-through and the TUI's `[G]`; this wrapper adds the dependency chain
+    // and, per step, the same conflict diagnosis a lone `rf graduate` always had.
+    graduate_with_deps(&config, &current, dry_run, &force, tag, yes)
+}
+
+/// Graduate `roll`, after any ungraduated roll it depends on.
+///
+/// A roll alone is what `rf graduate` always did, and runs without a word. A
+/// chain is shown first and confirmed, because it merges more than the branch
+/// the user is standing on; `--yes` takes it as read, and an unattended run
+/// prints the plan and merges nothing, the same shape every other confirmation
+/// here has. `--dry-run` prints the plan and previews each step.
+fn graduate_with_deps(
+    config: &Config,
+    roll: &str,
+    dry_run: bool,
+    force: &ops::ForceOpts,
+    tag: bool,
+    yes: bool,
+) -> Result<()> {
+    let rolls = branches::list_rolls(config)?;
+    let chain = ops::dependency_chain(&rolls, roll, ops::ChainKind::Graduate)?;
+    let roll_number = rolls.iter().find(|r| r.branch == roll).map(|r| r.number);
+
+    if !ops::chain_is_lone(&chain, roll) {
+        // Counted over what lands, not over steps: a cycle's carrier is one
+        // step but every roll it carries is a dependency landing with it.
+        let mut landing: Vec<u32> = chain
+            .iter()
+            .flat_map(|s| std::iter::once(s.number).chain(s.carries.iter().copied()))
+            .filter(|n| Some(*n) != roll_number)
+            .collect();
+        landing.sort_unstable();
+        landing.dedup();
+        println!(
+            "'{}' depends on {} ungraduated roll{}; graduating in order:",
+            roll,
+            landing.len(),
+            if landing.len() == 1 { "" } else { "s" }
+        );
+        for (i, step) in chain.iter().enumerate() {
+            println!("  {}. {}", i + 1, step.describe());
+        }
+        if !dry_run {
+            match cli::confirm(yes, "\nGraduate these in order? [y/N] ")? {
+                cli::Confirm::Yes => {}
+                cli::Confirm::Declined => {
+                    println!("Nothing graduated.");
+                    return Ok(());
+                }
+                cli::Confirm::Unattended => {
+                    println!("\nNothing graduated. Re-run with --yes to graduate them in order.");
+                    return Ok(());
+                }
+            }
+        }
+        println!();
+    } else if let [step] = chain.as_slice() {
+        // Merges only the branch the user is on, so no prompt — but it lands
+        // rolls they did not name, which is worth a line before it happens.
+        if !step.carries.is_empty() {
+            println!("{}\n", step.describe());
+        }
+    }
+
+    // Each step is offered the same conflict diagnosis a lone `rf graduate`
+    // always had — but the interactive "integrate, then retry" choice is only
+    // sound for the step that merges `roll` itself: `ops::integrate` merges
+    // into HEAD, and HEAD is `roll` throughout this call (`ops::graduate`
+    // checks out whatever step it is running, then restores it on failure).
+    // A dependency step, or the carrier step planned for a carried member,
+    // never matches `roll`, so it falls back to printing the commands by
+    // hand rather than offering to integrate the wrong branch.
+    let outcomes = ops::graduate_chain(
+        config,
+        &chain,
+        dry_run,
+        force,
+        tag,
+        |config, branch, dry_run, force, tag| {
+            let integrate_into = (branch == roll).then_some(roll);
+            with_conflict_handling(config, yes, integrate_into, || {
+                ops::graduate(config, branch, dry_run, force, tag)
+            })
+        },
+    )?;
+    for (step, outcome) in chain.iter().zip(&outcomes) {
+        print_graduate(outcome);
+        if !step.carries.is_empty() {
+            println!("{}", step.carried_line(&rolls, dry_run));
+        }
+        if !dry_run {
+            offer_graduate_tag_push(config, outcome, yes)?;
+        }
     }
     Ok(())
+}
+
+/// Expand each `--roll` into itself plus any graduated-but-unpromoted roll it
+/// depends on, dependencies first, so a per-roll promotion is never asked to
+/// land a roll ahead of what it integrated. Duplicates across the named rolls
+/// collapse to one step. Returns the ordered branch list and whether it grew.
+fn promote_rolls_with_deps(config: &Config, named: &[String]) -> Result<(Vec<String>, bool)> {
+    let rolls = branches::list_rolls(config)?;
+    let mut ordered: Vec<String> = Vec::new();
+    let mut grew = false;
+    for name in named {
+        for step in ops::dependency_chain(&rolls, name, ops::ChainKind::Promote)? {
+            if ordered.contains(&step.branch) {
+                continue;
+            }
+            if step.reason != ops::ChainReason::Requested && !named.contains(&step.branch) {
+                println!("  {}", step.describe());
+                grew = true;
+            }
+            ordered.push(step.branch);
+        }
+    }
+    Ok((ordered, grew))
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -777,6 +969,27 @@ fn cmd_promote(
     if !rolls.is_empty() {
         if !confirm_final_promotion(&config, dry_run, finalize, yes)? {
             return Ok(());
+        }
+        // Dependencies that have graduated but not promoted come first, each
+        // its own step. The expansion is printed as it is found so the plan
+        // reads top to bottom, then confirmed — it merges more than was named.
+        let (rolls, grew) = promote_rolls_with_deps(&config, &rolls)?;
+        if grew {
+            println!("(dependencies added ahead of what was named)");
+            if !dry_run {
+                match cli::confirm(yes, "\nPromote these in order? [y/N] ")? {
+                    cli::Confirm::Yes => {}
+                    cli::Confirm::Declined => {
+                        println!("Nothing promoted.");
+                        return Ok(());
+                    }
+                    cli::Confirm::Unattended => {
+                        println!("\nNothing promoted. Re-run with --yes to promote them in order.");
+                        return Ok(());
+                    }
+                }
+            }
+            println!();
         }
         // Advancing stable to a roll's graduation commit lands whatever
         // graduated ahead of it too (see `ops::PromoteTarget::Rolls`). That is
@@ -808,14 +1021,10 @@ fn cmd_promote(
             }
             None => None,
         };
-        let outcome = ops::promote(
-            &config,
-            &ops::PromoteTarget::Rolls(rolls),
-            dry_run,
-            &force,
-            tag,
-            level,
-        )?;
+        let target = ops::PromoteTarget::Rolls(rolls);
+        let outcome = with_conflict_handling(&config, yes, None, || {
+            ops::promote(&config, &target, dry_run, &force, tag, level)
+        })?;
         print_promote(&outcome);
         offer_step_tag_pushes(&config, &outcome, yes)?;
         if !dry_run {
@@ -831,11 +1040,7 @@ fn cmd_promote(
                 "note: '{}' is a roll branch; graduating into '{}' — use rf graduate directly next time",
                 roll, config.rolling_branch
             );
-            let outcome = ops::graduate(&config, &roll, dry_run, &force, tag)?;
-            print_graduate(&outcome);
-            if !dry_run {
-                offer_graduate_tag_push(&config, &outcome, yes)?;
-            }
+            graduate_with_deps(&config, &roll, dry_run, &force, tag, yes)?;
         }
         Some(ops::Route::Promote) => {
             if !confirm_final_promotion(&config, dry_run, finalize, yes)? {
@@ -845,20 +1050,222 @@ fn cmd_promote(
             // gets merged, and so it precedes the `--locked` cargo gates.
             resolve_version_gate(&config, bump, yes, forced, dry_run)?;
 
-            let outcome = ops::promote(
-                &config,
-                &ops::PromoteTarget::Rolling,
-                dry_run,
-                &force,
-                tag,
-                None,
-            )?;
+            let outcome = with_conflict_handling(&config, yes, None, || {
+                ops::promote(
+                    &config,
+                    &ops::PromoteTarget::Rolling,
+                    dry_run,
+                    &force,
+                    tag,
+                    None,
+                )
+            })?;
             print_promote(&outcome);
             offer_step_tag_pushes(&config, &outcome, yes)?;
         }
         None => return Err(ops::not_promotable_error(&config, &current)),
     }
     Ok(())
+}
+
+// ── Merge conflicts ─────────────────────────────────────────────────────────
+
+/// What the user chose to do about a merge that stopped on conflicts.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ConflictChoice {
+    /// Integrate the culprit rolls into the source, taking the conflict onto
+    /// the roll branch where it can be resolved and committed.
+    Integrate,
+    /// Print the commands and change nothing.
+    Manual,
+    /// Re-run the merge on the target and leave the conflict in the tree.
+    Stage,
+}
+
+/// How [`handle_merge_conflict`] left things.
+enum ConflictOutcome {
+    /// The culprits merged cleanly into the source — the caller may retry.
+    Retry,
+    /// Something is now mid-merge, by the user's choice; the message says what.
+    Stopped(String),
+}
+
+/// Decide what to do about a conflict, honouring `--yes` and unattended runs.
+///
+/// `--yes` takes the recommended option; an unattended run without it changes
+/// nothing, the same rule `cli::confirm` applies — a command that lands in
+/// someone's CI must report, never leave a repo mid-merge.
+fn choose_conflict_action(yes: bool, can_integrate: bool) -> Result<ConflictChoice> {
+    let recommended = if can_integrate {
+        ConflictChoice::Integrate
+    } else {
+        ConflictChoice::Manual
+    };
+    if yes {
+        return Ok(recommended);
+    }
+    if !std::io::stdin().is_terminal() {
+        return Ok(ConflictChoice::Manual);
+    }
+    let options: Vec<ConflictChoice> = if can_integrate {
+        vec![
+            ConflictChoice::Integrate,
+            ConflictChoice::Manual,
+            ConflictChoice::Stage,
+        ]
+    } else {
+        vec![ConflictChoice::Manual, ConflictChoice::Stage]
+    };
+    let default = options.iter().position(|c| *c == recommended).unwrap_or(0) + 1;
+    let picked = cli::prompt_choice(options.len(), default)?;
+    Ok(options[picked - 1])
+}
+
+/// Print the diagnosis of a conflicting merge, offer the ways forward, and
+/// carry out the one chosen.
+///
+/// `integrate_into` is the checked-out roll when the failed merge was a
+/// graduation — the one case where the conflict can be taken onto the source
+/// side with `rf integrate`. It is the recommended choice because it is the
+/// workflow's own way of saying "this roll now depends on that one": the
+/// integrate merge leaves the same conflict on the roll branch, where it is
+/// resolved and committed like any other, and the dependency shows in
+/// `rf status` from then on. Promotion has no such option — its source is a
+/// commit on rolling, and the fix for a hotfix-vs-rolling conflict is to
+/// resolve it on the branch it landed on.
+fn handle_merge_conflict(
+    config: &Config,
+    conflict: &ops::MergeConflict,
+    yes: bool,
+    integrate_into: Option<&str>,
+) -> Result<ConflictOutcome> {
+    let report = &conflict.report;
+    let culprits = report.culprit_rolls();
+    println!("{conflict}");
+    println!();
+    for line in report.render() {
+        println!("{line}");
+    }
+    println!();
+    if culprits.is_empty() {
+        println!(
+            "Nothing on '{}' since the merge base is attributable to a roll; the \
+             conflicting change was made there directly.",
+            report.target
+        );
+    } else {
+        println!(
+            "The conflicting change is already on '{}' — it came in with {}.",
+            report.target,
+            culprits.join(", ")
+        );
+    }
+
+    let can_integrate = integrate_into.is_some() && !culprits.is_empty();
+    println!();
+    println!("Ways forward:");
+    let mut n = 0;
+    if can_integrate {
+        n += 1;
+        println!(
+            "  {n}) integrate {} into '{}' now, resolve there, then re-run rf graduate   [recommended]",
+            culprits.join(" and "),
+            integrate_into.unwrap_or_default()
+        );
+    }
+    n += 1;
+    println!(
+        "  {n}) nothing now; print the commands to do it by hand{}",
+        if can_integrate {
+            ""
+        } else {
+            "   [recommended]"
+        }
+    );
+    n += 1;
+    println!(
+        "  {n}) re-run the merge and leave the conflict in the working tree on '{}' for lazygit",
+        report.target
+    );
+
+    match choose_conflict_action(yes, can_integrate)? {
+        ConflictChoice::Integrate => {
+            let roll = integrate_into.unwrap_or_default();
+            for culprit in &culprits {
+                println!();
+                println!("integrating {culprit} into {roll}");
+                if let Err(err) = ops::integrate(config, culprit) {
+                    if git::ref_exists(&config.repo_root, "MERGE_HEAD") {
+                        return Ok(ConflictOutcome::Stopped(format!(
+                            "'{roll}' is now mid-merge with '{culprit}': resolve the conflicts \
+                             and commit, then run rf graduate again (gg in the TUI opens \
+                             lazygit; `git merge --abort` backs out)"
+                        )));
+                    }
+                    return Err(err);
+                }
+                println!("integrated {culprit} into {roll} cleanly");
+            }
+            Ok(ConflictOutcome::Retry)
+        }
+        ConflictChoice::Manual => {
+            println!();
+            println!("To resolve on '{}':", report.target);
+            println!(
+                "  git checkout {} && git merge --no-ff {}",
+                report.target, report.source
+            );
+            if let (Some(roll), false) = (integrate_into, culprits.is_empty()) {
+                println!("Or take the conflict onto '{roll}' (from '{roll}'):");
+                for culprit in &culprits {
+                    println!("  rf integrate {culprit}");
+                }
+            }
+            Ok(ConflictOutcome::Stopped(format!(
+                "'{}' was not merged into '{}'",
+                report.source, report.target
+            )))
+        }
+        ConflictChoice::Stage => {
+            if ops::stage_conflict(config, &report.source, &report.target)? {
+                Ok(ConflictOutcome::Stopped(format!(
+                    "'{}' is now checked out mid-merge with '{}': resolve the conflicts and \
+                     commit (gg in the TUI opens lazygit), or `git merge --abort` to back out",
+                    report.target, report.source
+                )))
+            } else {
+                Ok(ConflictOutcome::Stopped(format!(
+                    "the merge of '{}' into '{}' went through cleanly this time and is \
+                     committed; run the command again to finish",
+                    report.source, report.target
+                )))
+            }
+        }
+    }
+}
+
+/// Run a merge-performing operation, and if it stops on conflicts, diagnose,
+/// offer choices, and retry once when the choice made a retry possible.
+fn with_conflict_handling<T>(
+    config: &Config,
+    yes: bool,
+    integrate_into: Option<&str>,
+    mut op: impl FnMut() -> Result<T>,
+) -> Result<T> {
+    match op() {
+        Ok(value) => Ok(value),
+        Err(err) => match err.downcast::<ops::MergeConflict>() {
+            Ok(conflict) => match handle_merge_conflict(config, &conflict, yes, integrate_into)? {
+                ConflictOutcome::Retry => {
+                    println!();
+                    println!("retrying");
+                    op()
+                }
+                ConflictOutcome::Stopped(message) => bail!("{message}"),
+            },
+            Err(err) => Err(err),
+        },
+    }
 }
 
 /// Gate every real promotion on an explicit "is this final?" before anything
@@ -1135,6 +1542,7 @@ fn cmd_status_json() -> Result<()> {
     let detached = git::is_detached_head(&config.repo_root)?;
     let clean = ops::workflow_clean(&config)?;
     let rolls = branches::list_rolls(&config)?;
+    let hotfixes = branches::list_hotfixes(&config)?;
     let tier = ops::branch_tier(&config, &current, detached);
 
     let readiness = ops::promotion_readiness(&config, &current, clean, detached);
@@ -1150,6 +1558,20 @@ fn cmd_status_json() -> Result<()> {
         tier,
         clean_working_tree: clean,
         pending_roll_branches: rolls.into_iter().map(|r| r.branch).collect(),
+        hotfixes: hotfixes
+            .into_iter()
+            .map(|h| JsonHotfix {
+                branch: h.branch,
+                number: h.number,
+                state: match h.state {
+                    branches::HotfixState::Open => "open",
+                    branches::HotfixState::Landed => "landed",
+                }
+                .to_string(),
+                location: h.location.symbol().to_string(),
+                is_current: h.is_current,
+            })
+            .collect(),
         promotion,
     };
     println!("{}", serde_json::to_string_pretty(&payload)?);
@@ -1230,12 +1652,15 @@ fn cmd_prune(
     let plan = ops::prune_plan(&config, &scope)?;
 
     if plan.is_empty() {
-        println!("no promoted roll branches to prune");
+        println!("no promoted roll branches or landed hotfixes to prune");
         render_prune_skips(&plan.skipped);
         return Ok(());
     }
 
-    render_prune_plan(&plan, "Promoted roll branches to prune:");
+    render_prune_plan(
+        &plan,
+        "Promoted roll branches and landed hotfixes to prune:",
+    );
     render_prune_skips(&plan.skipped);
 
     if dry_run {
@@ -1301,12 +1726,15 @@ fn cmd_tidy(
         .join(", ");
 
     if plan.is_empty() {
-        println!("no local roll branches to tidy ({wanted})");
+        println!("no local roll branches or hotfixes to tidy ({wanted})");
         render_prune_skips(&plan.skipped);
         return Ok(());
     }
 
-    render_prune_plan(&plan, &format!("Local roll branches to tidy ({wanted}):"));
+    render_prune_plan(
+        &plan,
+        &format!("Local roll branches and hotfixes to tidy ({wanted}):"),
+    );
     render_prune_skips(&plan.skipped);
 
     if dry_run {
@@ -1438,7 +1866,11 @@ fn render_prune_plan(plan: &ops::PrunePlan, title: &str) {
         };
         println!(
             "  {num:>3}  {name:<nw$}  {target}",
-            num = candidate.number,
+            num = if candidate.hotfix {
+                format!("h{}", candidate.number)
+            } else {
+                candidate.number.to_string()
+            },
             name = candidate.branch,
             nw = name_w,
         );
@@ -1497,7 +1929,8 @@ fn cmd_list_text(no_tui: bool, deps: bool) -> Result<()> {
         return tui::rolls::run(config, current, rolls, deps);
     }
 
-    if rolls.is_empty() {
+    let hotfixes = branches::list_hotfixes(&config)?;
+    if rolls.is_empty() && hotfixes.is_empty() {
         println!("(no roll branches)");
         return Ok(());
     }
@@ -1505,6 +1938,7 @@ fn cmd_list_text(no_tui: bool, deps: bool) -> Result<()> {
     let name_w = rolls
         .iter()
         .map(|r| r.branch.len())
+        .chain(hotfixes.iter().map(|h| h.branch.len()))
         .max()
         .unwrap_or(6)
         .max(6);
@@ -1556,7 +1990,7 @@ fn cmd_list_text(no_tui: bool, deps: bool) -> Result<()> {
         let deps_col = if deps {
             format!(
                 "  {:<dep_w$}  {}",
-                branches::format_deps_with_staleness(&roll.deps, &roll.stale_deps),
+                branches::format_deps(roll),
                 branches::format_roll_numbers(&roll.dependents),
             )
         } else {
@@ -1587,8 +2021,47 @@ fn cmd_list_text(no_tui: bool, deps: bool) -> Result<()> {
             sw = state_w,
         );
     }
+    print_hotfix_rows(&hotfixes, name_w, state_w);
+
+    // The same footnote `rf status --no-tui` prints, with or without `--deps`:
+    // a cycle is what explains two rows each `⛔ blocked` on the other.
+    let cycles = branches::distinct_cycles(&rolls);
+    if !cycles.is_empty() {
+        println!();
+        for cycle in cycles {
+            println!("  {}", cycle.advice(&rolls));
+        }
+    }
 
     Ok(())
+}
+
+/// Append the `hotfix/*` rows under a plain roll table, in the same columns.
+///
+/// Shared by `rf status --no-tui` and `rf list --no-tui` so the two read
+/// identically. Numbered `h<N>`: hotfixes number independently of rolls, and a
+/// bare `1` under a roll `1` would read as a duplicate. Widths are the caller's
+/// so the columns line up with the rolls above; a hotfix name wider than every
+/// roll's simply runs long, which beats re-measuring the whole table for a tier
+/// that is usually empty.
+pub(crate) fn print_hotfix_rows(hotfixes: &[branches::HotfixInfo], name_w: usize, state_w: usize) {
+    // A thin rule between the tiers, as the TUI draws: rolls and hotfixes
+    // number independently, so a roll 1 and an h1 should not read as one list.
+    if !hotfixes.is_empty() {
+        println!("  {}", "┄".repeat(3 + 2 + name_w + 2 + 3 + 2 + state_w));
+    }
+    for hotfix in hotfixes {
+        let cur = if hotfix.is_current { ">" } else { " " };
+        println!(
+            "{cur} {num:>3}  {name:<nw$}  {loc:<3}  {state:<sw$}",
+            num = format!("h{}", hotfix.number),
+            name = hotfix.branch,
+            loc = hotfix.location.symbol(),
+            state = hotfix.state.label(),
+            nw = name_w,
+            sw = state_w,
+        );
+    }
 }
 
 /// Header for the per-branch crate version, shared by both plain tables.
@@ -1641,16 +2114,12 @@ pub(crate) const DEPENDANTS_HDR: &str = "dependants";
 /// for the longest comma-joined number list in the table. Trailing whitespace on
 /// the last column is trimmed by the caller's format, so only `deps` needs a
 /// computed width — `dependants` is returned for the separator rule. `deps`
-/// measures [`branches::format_deps_with_staleness`] rather than the plain
+/// measures [`branches::format_deps`] rather than the plain
 /// listing, so a `⚠` suffix never gets truncated by a width computed without it.
 pub(crate) fn dep_column_widths(rolls: &[branches::RollInfo]) -> (usize, usize) {
     let deps_w = rolls
         .iter()
-        .map(|r| {
-            branches::format_deps_with_staleness(&r.deps, &r.stale_deps)
-                .chars()
-                .count()
-        })
+        .map(|r| branches::format_deps(r).chars().count())
         .max()
         .unwrap_or(0)
         .max(DEPS_HDR.chars().count());
@@ -1670,7 +2139,21 @@ struct StatusPayload {
     tier: String,
     clean_working_tree: bool,
     pending_roll_branches: Vec<String>,
+    /// Every `hotfix/*` branch, open or landed. Added as its own array rather
+    /// than folded into the roll list, so scripted consumers reading rolls are
+    /// not handed a branch with no roll number.
+    hotfixes: Vec<JsonHotfix>,
     promotion: PromotionReadiness,
+}
+
+#[derive(Serialize)]
+struct JsonHotfix {
+    branch: String,
+    number: u32,
+    /// `open` until the landing merge is on stable, then `landed`.
+    state: String,
+    location: String,
+    is_current: bool,
 }
 
 #[derive(Serialize)]
@@ -1701,13 +2184,47 @@ struct JsonRoll {
     /// rather than inferring it from `state` (which only answers whether the
     /// dependency has graduated, not whether it has moved since).
     stale_deps: Vec<u32>,
+    /// The dependency cycle this roll is in, or `null` — see
+    /// [`branches::DepCycle`]. Every member's row carries the same object, so
+    /// a script can tell which member graduates without re-deriving it.
+    cycle: Option<JsonCycle>,
+}
+
+#[derive(Serialize)]
+struct JsonCycle {
+    /// Every roll in the cycle, ascending, this one included.
+    members: Vec<u32>,
+    /// The member whose graduation lands the whole cycle, or `null` when none
+    /// contains the others' latest work yet.
+    carrier: Option<u32>,
+    /// The carrier, or — with none — the member `advice` says to integrate the
+    /// others into.
+    suggested: u32,
+    /// Members whose tip `suggested` lacks; empty exactly when it is the carrier.
+    lacks: Vec<u32>,
+    /// The same instruction the plain tables print under the table.
+    advice: String,
 }
 
 fn rolls_for_json(config: &Config, rolls: Vec<branches::RollInfo>) -> Vec<JsonRoll> {
     let (versions, _) = version_column(config, &rolls);
+    let cycles: Vec<Option<JsonCycle>> = rolls
+        .iter()
+        .map(|r| {
+            r.cycle.as_ref().map(|c| JsonCycle {
+                members: c.members.clone(),
+                carrier: c.carrier(),
+                suggested: c.suggested,
+                lacks: c.lacks.clone(),
+                advice: c.advice(&rolls),
+            })
+        })
+        .collect();
     rolls
         .into_iter()
-        .map(|r| JsonRoll {
+        .zip(cycles)
+        .map(|(r, cycle)| JsonRoll {
+            cycle,
             version: versions.get(&r.branch).cloned(),
             branch: r.branch,
             number: r.number,
