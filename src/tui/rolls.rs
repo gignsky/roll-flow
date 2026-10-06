@@ -12,7 +12,7 @@
 //! lazygit's rather than one of our own — `[G]raduate` and `[m] promote` moved
 //! aside to make room for it.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::time::{Duration, Instant};
 
 use anyhow::{anyhow, bail, Result};
@@ -1137,6 +1137,68 @@ pub(crate) fn dep_rows(selected: &RollInfo, all: &[RollInfo]) -> Vec<DepRow> {
             needs_reintegration: selected.stale_deps.contains(&dep.number),
         })
         .collect()
+}
+
+/// One link in the dependency chain the detail view draws.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct ChainRow {
+    /// 0 for a direct dependency, 1 for a dependency of that one, and so on.
+    pub depth: usize,
+    pub number: u32,
+    pub branch: String,
+    pub state: RollState,
+    /// Not yet graduated/promoted — holds its parent back.
+    pub is_blocker: bool,
+    /// The parent integrated this roll, and its branch has moved since —
+    /// [`DepRow::needs_reintegration`], read from the parent's `stale_deps`.
+    pub needs_reintegration: bool,
+    /// Already listed higher up the chain (a diamond). Its own dependencies
+    /// are not repeated under it.
+    pub repeated: bool,
+}
+
+/// The whole dependency chain below `selected`, depth-first, as the detail
+/// view shows it: roll 12 depends on 9, which depends on 8, which depends on 7.
+///
+/// [`dep_rows`] is the first level of this. The traversal keeps a set of rolls
+/// already listed, and a roll reached a second time — a diamond, or a cycle if
+/// the history is strange enough — is listed once more as `repeated` and not
+/// descended into, so the output is finite and every roll's own deps appear
+/// exactly once. Both markers on a link are the *parent's* judgement of it —
+/// `needs_reintegration` reads the parent's `RollInfo::stale_deps`, since that
+/// is who integrated it. Unknown numbers are skipped, as in [`dep_rows`].
+pub(crate) fn dep_chain(selected: &RollInfo, all: &[RollInfo]) -> Vec<ChainRow> {
+    fn walk(
+        parent: &RollInfo,
+        all: &[RollInfo],
+        depth: usize,
+        seen: &mut HashSet<u32>,
+        rows: &mut Vec<ChainRow>,
+    ) {
+        // Each level is exactly `dep_rows` of its parent, so there is one
+        // definition of a direct dependency row and the chain only adds depth.
+        for row in dep_rows(parent, all) {
+            let repeated = !seen.insert(row.number);
+            rows.push(ChainRow {
+                depth,
+                number: row.number,
+                branch: row.branch,
+                state: row.state,
+                is_blocker: row.is_blocker,
+                needs_reintegration: row.needs_reintegration,
+                repeated,
+            });
+            if !repeated {
+                if let Some(dep) = all.iter().find(|r| r.number == row.number) {
+                    walk(dep, all, depth + 1, seen, rows);
+                }
+            }
+        }
+    }
+    let mut seen = HashSet::from([selected.number]);
+    let mut rows = Vec::new();
+    walk(selected, all, 0, &mut seen, &mut rows);
+    rows
 }
 
 /// Build the *reverse*-dependency rows to show in the detail view for `target`:
@@ -3890,7 +3952,7 @@ fn render_detail(
     ahead_behind: Option<(u32, u32)>,
     all: &[RollInfo],
 ) {
-    let rows = dep_rows(roll, all);
+    let chain = dep_chain(roll, all);
     let dependents = dependent_rows(roll, all);
 
     let mut lines = vec![
@@ -3924,33 +3986,42 @@ fn render_detail(
 
     lines.push(Line::from(""));
 
-    if rows.is_empty() {
+    if chain.is_empty() {
         lines.push(Line::from(Span::styled(
             "no dependencies / not blocked",
             Style::default().fg(Color::Green),
         )));
     } else {
-        let blockers = rows.iter().filter(|r| r.is_blocker).count();
-        let stale = rows.iter().filter(|r| r.needs_reintegration).count();
+        // Blockers anywhere in the chain, each counted once: a dependency's
+        // own ungraduated dependency holds this roll back just as surely.
+        // Stale links are counted per link, since each is a separate
+        // integration — the same roll reached twice may be stale in one
+        // parent and current in the other.
+        let blockers = chain.iter().filter(|r| r.is_blocker && !r.repeated).count();
+        let stale = chain.iter().filter(|r| r.needs_reintegration).count();
         let header = match (blockers, stale) {
-            (0, 0) => "dependencies (all graduated):".to_string(),
-            (0, s) => format!("dependencies ({s} stale — reintegrate):"),
-            (b, 0) => format!("dependencies ({b} blocking):"),
-            (b, s) => format!("dependencies ({b} blocking, {s} stale):"),
+            (0, 0) => "dependency chain (all graduated):".to_string(),
+            (0, s) => format!("dependency chain ({s} stale — reintegrate):"),
+            (b, 0) => format!("dependency chain ({b} blocking):"),
+            (b, s) => format!("dependency chain ({b} blocking, {s} stale):"),
         };
         lines.push(Line::from(Span::styled(
             header,
             Style::default().add_modifier(Modifier::BOLD),
         )));
-        for r in &rows {
-            let (marker, marker_style) = match (r.is_blocker, r.needs_reintegration) {
-                (true, true) => ("⛔ blocker, ⚠ stale", Style::default().fg(Color::Red)),
-                (true, false) => ("⛔ blocker", Style::default().fg(Color::Red)),
-                (false, true) => ("⚠ reintegrate", Style::default().fg(Color::Yellow)),
-                (false, false) => ("✓ ok", Style::default().fg(Color::Green)),
+        for r in &chain {
+            let indent = "  ".repeat(r.depth + 1);
+            let elbow = if r.depth > 0 { "└ " } else { "" };
+            let (marker, marker_style) = match (r.repeated, r.is_blocker, r.needs_reintegration) {
+                (true, _, true) => ("↑ shown above, ⚠ stale", Style::default().fg(Color::Yellow)),
+                (true, _, false) => ("↑ shown above", Style::default().fg(Color::DarkGray)),
+                (false, true, true) => ("⛔ blocker, ⚠ stale", Style::default().fg(Color::Red)),
+                (false, true, false) => ("⛔ blocker", Style::default().fg(Color::Red)),
+                (false, false, true) => ("⚠ reintegrate", Style::default().fg(Color::Yellow)),
+                (false, false, false) => ("✓ ok", Style::default().fg(Color::Green)),
             };
             lines.push(Line::from(vec![
-                Span::raw(format!("  #{}  ", r.number)),
+                Span::raw(format!("{indent}{elbow}#{}  ", r.number)),
                 Span::styled(r.branch.clone(), Style::default().fg(Color::Cyan)),
                 Span::raw("  ["),
                 Span::styled(r.state.label(), Style::default().fg(state_color(&r.state))),
@@ -5120,6 +5191,108 @@ mod tests {
         let rows = dep_rows(&selected, &all);
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0].number, 1);
+    }
+
+    /// `12 → 9 → 8 → 7`: the chain the user asked to see, built the way
+    /// `list_rolls` would record it (each roll's `deps` are its direct
+    /// integrations only).
+    fn linear_chain() -> Vec<RollInfo> {
+        let mut r7 = roll_n(7, RollState::Graduated);
+        let mut r8 = roll_n(8, RollState::Graduated);
+        let mut r9 = roll_n(9, RollState::Active);
+        let mut r12 = roll_n(12, RollState::Blocked);
+        r8.deps = vec![7];
+        r9.deps = vec![8];
+        r12.deps = vec![9];
+        r7.dependents = vec![8];
+        r8.dependents = vec![9];
+        r9.dependents = vec![12];
+        vec![r7, r8, r9, r12]
+    }
+
+    #[test]
+    fn dep_chain_follows_every_link_to_the_bottom() {
+        let all = linear_chain();
+        let rows = dep_chain(&all[3], &all);
+        let shape: Vec<(usize, u32, bool)> = rows
+            .iter()
+            .map(|r| (r.depth, r.number, r.is_blocker))
+            .collect();
+        // Depth grows one per link; only 9 is still ungraduated.
+        assert_eq!(shape, vec![(0, 9, true), (1, 8, false), (2, 7, false)]);
+        assert!(rows.iter().all(|r| !r.repeated));
+        // The first level is exactly `dep_rows`, by construction.
+        let direct: Vec<u32> = dep_rows(&all[3], &all).iter().map(|r| r.number).collect();
+        assert_eq!(direct, vec![9]);
+    }
+
+    #[test]
+    fn dep_chain_lists_a_diamond_once_and_never_loops() {
+        // 4 depends on 2 and 3; both depend on 1 (a diamond). 1 also claims to
+        // depend on 4 (a cycle, which real history cannot produce but a scan
+        // of hand-written merges might).
+        let mut r1 = roll_n(1, RollState::Active);
+        let mut r2 = roll_n(2, RollState::Active);
+        let mut r3 = roll_n(3, RollState::Active);
+        let mut r4 = roll_n(4, RollState::Blocked);
+        r1.deps = vec![4];
+        r2.deps = vec![1];
+        r3.deps = vec![1];
+        r4.deps = vec![2, 3];
+        let all = vec![r1, r2, r3, r4];
+
+        let rows = dep_chain(&all[3], &all);
+        let shape: Vec<(usize, u32, bool)> = rows
+            .iter()
+            .map(|r| (r.depth, r.number, r.repeated))
+            .collect();
+        assert_eq!(
+            shape,
+            vec![
+                (0, 2, false),
+                (1, 1, false),
+                // 1's dep on 4 is the roll we started from: repeated, not
+                // descended — so the walk terminates.
+                (2, 4, true),
+                (0, 3, false),
+                // Second arm of the diamond: 1 is shown again but marked.
+                (1, 1, true),
+            ]
+        );
+        // Blockers are counted once, however many arms reach them.
+        assert_eq!(
+            rows.iter().filter(|r| r.is_blocker && !r.repeated).count(),
+            3
+        );
+    }
+
+    #[test]
+    fn dep_chain_marks_the_link_the_parent_finds_stale() {
+        let mut all = linear_chain();
+        // 9 integrated 8 and 8 has since moved; 12's own view of 9 is fine.
+        all[2].stale_deps = vec![8];
+        let rows = dep_chain(&all[3], &all);
+        let flags: Vec<(u32, bool)> = rows
+            .iter()
+            .map(|r| (r.number, r.needs_reintegration))
+            .collect();
+        assert_eq!(flags, vec![(9, false), (8, true), (7, false)]);
+    }
+
+    #[test]
+    fn the_detail_view_draws_the_chain_with_its_markers() {
+        let mut all = linear_chain();
+        all[3].stale_deps = vec![9];
+        let out = draw(|f, area| render_detail(f, area, &all[3], None, &all));
+        assert!(
+            out.contains("dependency chain (1 blocking, 1 stale)"),
+            "{out}"
+        );
+        assert!(out.contains("#9"), "{out}");
+        // The blocker and the staleness are both on the one link.
+        assert!(out.contains("blocker, ⚠ stale"), "{out}");
+        assert!(out.contains("└ #8"), "{out}");
+        assert!(out.contains("└ #7"), "{out}");
     }
 
     // ── delete ──────────────────────────────────────────────────────────

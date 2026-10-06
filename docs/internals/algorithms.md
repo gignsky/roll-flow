@@ -87,6 +87,19 @@ The token it returns is not validated against the roll prefix, and does not need
 to be: every caller either compares it to a real roll branch name or runs it
 through `parse_roll_number`, so a candidate that is not a roll matches nothing.
 
+**Dependency chain.** The detail view (`[enter]`) walks `deps` transitively —
+roll 12 depends on 9, which depends on 8, which depends on 7 — through
+`tui::rolls::dep_chain`. Each level is exactly `dep_rows` of its parent, so there
+is one definition of a direct dependency row and the chain only adds depth. A
+roll reached a second time (a diamond, or a cycle if hand-written merge subjects
+ever produce one) is listed once more as `↑ shown above` and not descended into,
+so the walk is finite and every roll's own dependencies appear exactly once.
+Each link keeps both of `DepRow`'s markers, and both are its *parent's* judgement
+— `⚠ reintegrate` on a deep link reads the parent's `stale_deps`, since the
+parent is who integrated it, not the selected roll.
+The table's `deps` column stays direct-only; widening it for transitive counts
+would cost the `branch` column, which has nothing to spare.
+
 One consequence worth knowing, since `[i]` makes roll-into-roll merges cheap: the
 graduated scan below has a second pass *without* `--first-parent`, so once M
 graduates, N's integrate merge is reachable from rolling and N reports as
