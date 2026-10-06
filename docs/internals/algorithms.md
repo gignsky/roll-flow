@@ -321,9 +321,11 @@ sense. `Semver`'s own `Ord` is then also derived, comparing
 `(major, minor, patch, marker)` in that field order, so the numbers dominate
 the marker exactly as the gate needs.
 
-The merge driver (`core::merge_driver::resolve`, wired up by `rf init`) states
-one rule for every direction a `Cargo.toml` version line gets merged: **keep
-`ours`'s marker; take the higher of the two sides' numbers.** It is correct
+The merge driver (`core::merge_driver::resolve`, wired up by `rf init` and
+before every `rf` merge) states one rule for every direction the crate's own
+version gets merged — `Cargo.toml`'s `version` line and the same value in
+`Cargo.lock`'s own `[[package]]` entry alike: **keep `ours`'s marker; take the
+higher of the two sides' numbers.** It is correct
 as-is for `[i]`/`[I]`/`rf update` (a roll's own `-roll<N>` is already set by
 `rf start`, so "ours" already carries the right marker going in). `ops::graduate`
 does **not** use it, though — the very first graduation ever, rolling has never
@@ -336,6 +338,45 @@ common "only the roll changed the line" trivial case the driver never even
 sees). Once rolling has graduated once, its own `ours` marker *is* `-dev`, so
 the driver's generic rule and `ops::graduate`'s own computation agree from then
 on — the special-casing matters only for bootstrapping.
+
+**Making a version-only conflict impossible.** A driver that only covers one
+of the two files, or that is only configured in clones that happened to run
+`rf init`, still lets a marker-vs-marker merge stop — which is exactly what
+happened to `rf integrate` from one roll into another: the lockfile repeated
+both markers, and the clone had never had the driver configured at all. Three
+layers close that, each covering a gap in the one before:
+
+1. **Both files.** `merge_driver::VersionFile` is `Manifest` or `Lockfile`;
+   git passes `%P` so the driver knows which. In the lockfile only the
+   `[[package]]` entry named after `Cargo.toml`'s `package.name` *with no
+   `source` key* is touched (`version::replace_lock_package_version`) — a
+   registry crate never has an empty source, and an ambiguous match counts as
+   none. The driver doctors *all three* sides (ancestor too) to the resolved
+   value before `git merge-file`, so the line is unchanged everywhere and
+   cannot crowd an edit on a neighbouring line into a conflict; whatever still
+   conflicts is real. Every version rewrite also syncs that lockfile entry
+   directly (`ops::sync_lockfile_own_entry`, ahead of the best-effort `cargo
+   update`), so the two files never drift apart when cargo cannot run.
+2. **Wired whenever `rf` merges.** `ops::wire_version_merge_driver` writes the
+   attribute lines to the clone's own `info/attributes` (via `git rev-parse
+   --git-path`, shared by linked worktrees) and the driver command to local
+   git config — both clone-local, neither in the tree. `run_merge`,
+   `merge_gated` and `ops::integrate` call it quietly before merging, so every
+   `rf` merge (integrate, `[i]`/`[I]`, update, graduate, promote, hotfix land)
+   is covered on a clone that never ran `rf init`. `info/attributes` rather
+   than a committed `.gitattributes` because the latter applies only on
+   branches that carry it, and writing it lazily would leave an uncommitted
+   file on whatever happened to be checked out.
+3. **Settled in-process.** If git stops anyway — `rf` not on the `PATH` git
+   sees, a read-only config — `ops::settle_version_only_conflicts` reads the
+   index's conflict stages (`:1:`/`:2:`/`:3:`) for every unmerged path and
+   runs the same `merge_driver::merge_texts`. It is all-or-nothing: any
+   unmerged path that is not a version file, or that still conflicts with the
+   version line agreed, and it touches nothing. `run_merge`/`ops::integrate`
+   then commit (`--cleanup=strip`, to drop git's `# Conflicts:` comment);
+   `merge_gated` just carries on to its gates, since a settled merge is
+   indistinguishable from a clean `--no-commit` one — which is also why
+   graduation's `reconcile_staged_version` still has the last word.
 
 A dev marker of either kind must never reach stable, and is refused **before**
 the numbers are compared, not by them: `0.2.5-roll9`/`0.2.5-dev` are

@@ -84,12 +84,13 @@ check is read-only, independent of the rest of this section, and runs first
 because it is nearly free next to a full gate run.
 
 Merging a roll that still carries its `-roll<N>` marker into rolling is
-otherwise handled entirely at the git level, by a merge driver scoped to
-`Cargo.toml`'s `version` line — not by `rf` stripping or committing anything
-on the roll branch first. `rf init` wires this up (see [`init`](init.md)): it
-adds `Cargo.toml merge=rf-version` to `.gitattributes` and points
-`git config merge.rf-version.driver` at `rf` itself (the `__merge-driver-version`
-subcommand). The rule it applies, whenever a merge needs to reconcile the
+otherwise handled entirely at the git level, by a merge driver scoped to the
+crate's own version — `Cargo.toml`'s `version` line and the matching entry in
+`Cargo.lock` — not by `rf` stripping or committing anything on the roll branch
+first. It is wired up per clone, by `rf init` and again before every merge `rf`
+makes, and when git still stops on nothing but those lines `rf` finishes the
+merge itself by the same rule (see [`init`](init.md) for both). The rule it
+applies, whenever a merge needs to reconcile the
 line: **keep whichever side is being merged *into*'s own marker — its own
 value if it has one, otherwise the higher of the two numbers.** The same
 driver, same rule, is what [`rf update`](update.md) relies on to keep a roll's

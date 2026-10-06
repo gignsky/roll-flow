@@ -153,8 +153,9 @@ fn main() -> Result<()> {
             ancestor,
             ours,
             theirs,
+            path,
         } => {
-            let resolved = core::merge_driver::run(&ancestor, &ours, &theirs)?;
+            let resolved = core::merge_driver::run(&ancestor, &ours, &theirs, path.as_deref())?;
             std::process::exit(if resolved { 0 } else { 1 });
         }
     }
@@ -192,7 +193,7 @@ fn cmd_init(
     // `ops::ensure_version_merge_driver`), so a repo whose config is already
     // up to date on a fresh clone still needs this wired up here.
     if ops::ensure_version_merge_driver(&config)? {
-        println!("Configured the version merge driver for Cargo.toml");
+        println!("Configured the version merge driver for Cargo.toml and Cargo.lock");
     }
 
     // Resolve the workflow mode (issue #18): an explicit `--mode` always wins;

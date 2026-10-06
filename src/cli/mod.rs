@@ -367,9 +367,10 @@ pub enum Cmd {
     /// Print program version.
     Version,
 
-    /// Internal: git merge driver for Cargo.toml's `version` line. Invoked by
-    /// git itself (wired up by `rf init` via `.gitattributes` and git config)
-    /// — never meant to be run by hand. Hidden from `--help`.
+    /// Internal: git merge driver for the crate's own version in Cargo.toml and
+    /// Cargo.lock. Invoked by git itself (wired up by `rf init` and before every
+    /// `rf` merge, via clone-local attributes and git config) — never meant to
+    /// be run by hand. Hidden from `--help`.
     #[command(name = "__merge-driver-version", hide = true)]
     MergeDriverVersion {
         /// Git's `%O`: the common ancestor's content.
@@ -378,6 +379,10 @@ pub enum Cmd {
         ours: std::path::PathBuf,
         /// Git's `%B`: their side.
         theirs: std::path::PathBuf,
+        /// Git's `%P`: the file's repo-relative path, which says whether this is
+        /// the manifest or the lockfile. Optional so a clone still configured
+        /// with the older three-argument command keeps resolving Cargo.toml.
+        path: Option<std::path::PathBuf>,
     },
 }
 
