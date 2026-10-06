@@ -609,13 +609,13 @@ pub fn run(
 
 // ── Pure decision logic (unit-tested) ───────────────────────────────────────
 
-/// A roll can graduate only while it is active, or needs re-graduation
-/// (diverged, or reverted on rolling). Graduated / promoted / blocked rolls
-/// cannot.
+/// A roll can graduate while it is active, blocked (its ungraduated
+/// dependencies graduate first, as a chain), or needs re-graduation (diverged,
+/// or reverted on rolling). Graduated / promoted rolls cannot.
 pub(crate) fn can_graduate(state: &RollState) -> bool {
     matches!(
         state,
-        RollState::Active | RollState::Diverged | RollState::Reverted
+        RollState::Active | RollState::Diverged | RollState::Reverted | RollState::Blocked
     )
 }
 
@@ -1650,15 +1650,20 @@ pub(crate) fn validate_action(
     match action {
         Action::Graduate => {
             let sel = selected.ok_or_else(|| "no roll selected".to_string())?;
-            if can_graduate(&sel.state) {
-                Ok(())
-            } else {
-                Err(format!(
-                    "{} is {} — only active, diverged, or reverted rolls can graduate",
+            if !can_graduate(&sel.state) {
+                return Err(format!(
+                    "{} is {} — only active, blocked, diverged, or reverted rolls can graduate",
                     sel.branch,
                     sel.state.label()
-                ))
+                ));
             }
+            // A blocked roll graduates after its dependencies; the planner's
+            // refusals (a cycle, a dependency with no local copy) are the
+            // reasons worth showing, so they are surfaced here rather than
+            // discovered mid-run.
+            ops::dependency_chain(rolls, &sel.branch, ops::ChainKind::Graduate)
+                .map(|_| ())
+                .map_err(|e| e.to_string())
         }
         Action::Integrate => {
             integrate_target_for(current_branch, roll_prefix, selected).map(|_| ())
@@ -2297,7 +2302,7 @@ impl StatusApp {
             _ => None,
         };
         let carried = match (action, &target) {
-            (Action::Promote, Some(roll)) => carried_by_promoting(&self.config, roll),
+            (Action::Promote, Some(roll)) => carried_by_promoting(&self.config, &self.rolls, roll),
             _ => Vec::new(),
         };
         match validation {
@@ -3580,18 +3585,24 @@ fn run_op(config: &Config, action: Action, target: Option<&str>) -> Result<Vec<S
         Action::Graduate => {
             let roll = target.ok_or_else(|| anyhow!("no roll selected"))?;
             ops::ensure_clean_state(config)?;
-            let o = ops::graduate(config, roll, false, &force, true)?;
-            push_gate_notices(&mut lines, &o.gate_notices);
-            if o.restored {
-                lines.push(format!(
-                    "Restored '{}' on '{}' (reverted the revert)",
-                    o.roll, o.rolling
-                ));
-            } else {
-                lines.push(format!("Graduated '{}' into '{}'", o.roll, o.rolling));
-            }
-            if let Some(line) = o.tag.describe() {
-                lines.push(line);
+            // The modal listed the chain, so this is the confirmation. Each
+            // step is the ordinary graduation with its own gate run; a failure
+            // partway names what landed and what did not.
+            let rolls = branches::list_rolls(config)?;
+            let chain = ops::dependency_chain(&rolls, roll, ops::ChainKind::Graduate)?;
+            for o in ops::graduate_chain(config, &chain, false, &force, true, ops::graduate)? {
+                push_gate_notices(&mut lines, &o.gate_notices);
+                if o.restored {
+                    lines.push(format!(
+                        "Restored '{}' on '{}' (reverted the revert)",
+                        o.roll, o.rolling
+                    ));
+                } else {
+                    lines.push(format!("Graduated '{}' into '{}'", o.roll, o.rolling));
+                }
+                if let Some(line) = o.tag.describe() {
+                    lines.push(line);
+                }
             }
         }
         Action::Integrate => {
@@ -3607,7 +3618,13 @@ fn run_op(config: &Config, action: Action, target: Option<&str>) -> Result<Vec<S
         Action::Promote => {
             ops::ensure_clean_state(config)?;
             let promote_target = match target {
-                Some(roll) => ops::PromoteTarget::Rolls(vec![roll.to_string()]),
+                // Graduated-but-unpromoted dependencies first, each its own
+                // step — the same expansion `rf promote --roll` performs.
+                Some(roll) => {
+                    let rolls = branches::list_rolls(config)?;
+                    let chain = ops::dependency_chain(&rolls, roll, ops::ChainKind::Promote)?;
+                    ops::PromoteTarget::Rolls(chain.into_iter().map(|s| s.branch).collect())
+                }
                 None => ops::PromoteTarget::Rolling,
             };
             // Tagging is on; the version gate hard-fails here rather than
@@ -4180,12 +4197,28 @@ fn render_modal(f: &mut Frame, area: Rect, config: &Config, modal: &ConfirmModal
         hotfixes,
         current_branch,
     } = *modal;
+    // Lines under the prompt: the ordered steps when an action lands more than
+    // the one roll the cursor is on. Empty for everything else, so the modal
+    // keeps its two-line shape for the ordinary case.
+    let mut detail: Vec<String> = Vec::new();
     let prompt = match action {
-        Action::Graduate => format!(
-            "Graduate {} into {}?",
-            target.unwrap_or("(selected roll)"),
-            config.rolling_branch
-        ),
+        Action::Graduate => {
+            match target.and_then(|t| chain_lines(rolls, t, ops::ChainKind::Graduate)) {
+                Some(lines) => {
+                    let n = lines.len();
+                    detail = lines;
+                    format!(
+                        "Graduate {n} rolls into {}, in this order?",
+                        config.rolling_branch
+                    )
+                }
+                None => format!(
+                    "Graduate {} into {}?",
+                    target.unwrap_or("(selected roll)"),
+                    config.rolling_branch
+                ),
+            }
+        }
         Action::Integrate => format!(
             "Integrate {} into {}?",
             target.unwrap_or("(selected roll)"),
@@ -4195,7 +4228,17 @@ fn render_modal(f: &mut Frame, area: Rect, config: &Config, modal: &ConfirmModal
         // `None` for a whole-branch promotion — the prompt must say which,
         // because the two differ enormously in what they land on stable.
         Action::Promote => match target {
-            Some(roll) => format!("Promote {} into {}?", roll, config.stable_branch),
+            Some(roll) => match chain_lines(rolls, roll, ops::ChainKind::Promote) {
+                Some(lines) => {
+                    let n = lines.len();
+                    detail = lines;
+                    format!(
+                        "Promote {n} rolls into {}, in this order?",
+                        config.stable_branch
+                    )
+                }
+                None => format!("Promote {} into {}?", roll, config.stable_branch),
+            },
             None => format!(
                 "Promote all of {} into {}?",
                 config.rolling_branch, config.stable_branch
@@ -4239,6 +4282,7 @@ fn render_modal(f: &mut Frame, area: Rect, config: &Config, modal: &ConfirmModal
     let hint = "[y] confirm    [n] cancel";
 
     let mut lines = vec![Line::from(prompt)];
+    lines.extend(detail.into_iter().map(Line::from));
     if !carried.is_empty() {
         let yellow = Style::default().fg(Color::Yellow);
         lines.push(Line::from(Span::styled(
@@ -4261,14 +4305,37 @@ fn render_modal(f: &mut Frame, area: Rect, config: &Config, modal: &ConfirmModal
     f.render_widget(body, modal);
 }
 
-/// The rolls that `[m]` on `roll` would land on stable besides `roll` itself.
+/// The numbered steps of a chain that lands more than `target` alone, or `None`
+/// when it is just the one roll (or cannot be planned — validation has already
+/// said why, and the modal is not the place to repeat it).
+fn chain_lines(rolls: &[RollInfo], target: &str, kind: ops::ChainKind) -> Option<Vec<String>> {
+    let chain = ops::dependency_chain(rolls, target, kind).ok()?;
+    if chain.len() < 2 {
+        return None;
+    }
+    Some(
+        chain
+            .iter()
+            .enumerate()
+            .map(|(i, step)| format!("{}. {}", i + 1, step.describe()))
+            .collect(),
+    )
+}
+
+/// The rolls that `[m]` on `roll` would land on stable besides `roll` itself
+/// and the graduated-but-unpromoted dependencies its chain already names (those
+/// are listed as steps of their own, see [`chain_lines`]).
 ///
 /// Best-effort: a planning failure yields an empty list rather than an error.
 /// The keypress opens a confirmation, and `ops::promote` reports the real
 /// problem a moment later if there is one — refusing to draw the modal because
 /// the disclosure could not be computed would be the worse trade.
-fn carried_by_promoting(config: &Config, roll: &str) -> Vec<String> {
-    ops::preview_roll_promotion(config, &[roll.to_string()])
+fn carried_by_promoting(config: &Config, rolls: &[RollInfo], roll: &str) -> Vec<String> {
+    // The same expansion `run_op` promotes, so the disclosure matches the merge.
+    let named: Vec<String> = ops::dependency_chain(rolls, roll, ops::ChainKind::Promote)
+        .map(|chain| chain.into_iter().map(|s| s.branch).collect())
+        .unwrap_or_else(|_| vec![roll.to_string()]);
+    ops::preview_roll_promotion(config, &named)
         .map(|preview| {
             preview
                 .steps
@@ -5026,7 +5093,8 @@ mod tests {
         assert!(can_graduate(&RollState::Diverged));
         assert!(!can_graduate(&RollState::Graduated));
         assert!(!can_graduate(&RollState::Promoted));
-        assert!(!can_graduate(&RollState::Blocked));
+        // Blocked is allowed: the chain graduates what it waits on first.
+        assert!(can_graduate(&RollState::Blocked));
     }
 
     #[test]
@@ -7341,6 +7409,52 @@ mod tests {
         .is_ok());
         assert!(
             validate_action(Action::Integrate, Some(&rolls[0]), &rolls, "main", "roll/").is_err()
+        );
+    }
+
+    #[test]
+    fn the_graduate_modal_lists_the_chain_when_there_is_one() {
+        // A blocked roll's confirm has to say what else is about to land: the
+        // modal is the confirmation, and it would otherwise read as one merge.
+        let cfg = config("main", "rolling");
+        let mut dep = roll_n(8, RollState::Active);
+        dep.branch = "roll/8-0101-dep".to_string();
+        let mut target = roll_n(9, RollState::Blocked);
+        target.branch = "roll/9-0102-target".to_string();
+        target.deps = vec![8];
+        let rolls = vec![dep, target];
+
+        let out = draw(|f, area| {
+            render_modal(
+                f,
+                area,
+                &cfg,
+                &ConfirmModal {
+                    action: Action::Graduate,
+                    target: Some("roll/9-0102-target"),
+                    carried: &[],
+                    rolls: &rolls,
+                    hotfixes: &[],
+                    current_branch: "roll/9-0102-target",
+                },
+            )
+        });
+        assert!(
+            out.contains("Graduate 2 rolls into rolling, in this order?"),
+            "{out}"
+        );
+        assert!(
+            out.contains("1. roll/8-0101-dep  (dependency of 9, active)"),
+            "{out}"
+        );
+        // The blocked glyph is double-width and pads the buffer text, so the
+        // target row is matched in two halves.
+        assert!(out.contains("2. roll/9-0102-target"), "{out}");
+        assert!(out.contains("blocked)"), "{out}");
+
+        // And a blocked roll passes validation — the chain is the answer.
+        assert!(
+            validate_action(Action::Graduate, Some(&rolls[1]), &rolls, "main", "roll/").is_ok()
         );
     }
 

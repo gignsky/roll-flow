@@ -48,16 +48,58 @@ dependency. If every culprit merges cleanly (the roll never touched what the
 culprit changed), the graduation is retried on the spot. Option 3 is the only
 path that leaves `MERGE_HEAD` behind, and says so.
 
-`--yes` takes option 1 without asking. An unattended run without it takes
-option 2 — reports, prints the commands, and changes nothing, so a graduation
-that lands in CI never leaves a repo mid-merge. A change made on rolling
-directly rather than by a roll is reported as such, and option 1 is not
-offered for it.
+`--yes` takes option 1 without asking, when it is offered. An unattended run
+without it takes option 2 — reports, prints the commands, and changes nothing,
+so a graduation that lands in CI never leaves a repo mid-merge. A change made
+on rolling directly rather than by a roll is reported as such, and option 1 is
+not offered for it. Nor is it offered when a chain's dependency step is what
+conflicted (below) rather than the roll named on the command line — only that
+roll is ever checked out for `rf integrate` to merge into.
 
 In the TUI, a conflicting `[G]` puts the same report in the output panel and
 opens a modal with the same choices: `[i]` integrate (only when the roll is the
 checked-out branch, since integrate merges into HEAD), `[m]` redo the merge on
 rolling and leave it for `gg`, `[n]` close.
+
+## Dependencies graduate first
+
+A roll that [integrated](integrate.md) another is `⛔ blocked` until that one
+graduates. Rather than sending you off to do that by hand, `rf graduate` walks
+the dependency chain: every ungraduated dependency, transitively and in the
+order they must land, then the roll you asked for. The plan is printed and
+confirmed first, because it merges more than the branch you are standing on:
+
+```text
+'roll/9-0918-better-deps' depends on 1 ungraduated roll; graduating in order:
+  1. roll/8-0918-help-menu  (dependency of 9, active)
+  2. roll/9-0918-better-deps  (⛔ blocked)
+
+Graduate these in order? [y/N]
+```
+
+`--yes` takes the plan as read. Unattended (no terminal and no `--yes`) the plan
+is printed, nothing is merged, and the exit is 0 — the same shape as every other
+confirmation. `--dry-run` prints the plan and previews each step. A roll with
+nothing ungraduated beneath it graduates without a word, exactly as before.
+
+Each step is an ordinary graduation — its own gate run, its own `--no-ff`
+merge, the same abort-and-restore on conflict — so a chain is precisely what
+running `rf graduate` on each roll by hand would have been. A `diverged` or
+`reverted` dependency re-graduates; one that has already graduated is history
+and is not touched (a `reverted` one is restored by reverting the revert, as
+below). If a step fails, the error names which rolls graduated, which one
+failed, and which were not attempted, since by then the earlier merges are
+committed. Only the step that merges the roll you named can take the
+interactive "ways forward" a conflict offers (above) — `ops::integrate` merges
+into HEAD, and HEAD is that roll throughout the chain. A conflicting
+dependency step instead prints the commands to resolve it by hand, even with
+`--yes`, since integrating its culprit into the wrong branch would make things
+worse, not better.
+
+Refused before anything runs, naming the roll: a dependency that exists only on
+`origin` (fetch it, or press `[space]` on it in the TUI), a dependency number no
+known roll carries, and a dependency cycle. The TUI's `[G]` on a blocked roll
+opens the same plan in its confirm modal.
 
 ## Which branch the gates see
 

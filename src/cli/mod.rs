@@ -182,9 +182,12 @@ pub enum Cmd {
         /// Skip creating the `v<X.Y.Z>-dev` tag on rolling's new tip.
         #[arg(long)]
         no_tag: bool,
-        /// Answer yes to prompts (non-interactive): pushes the dev tag without
-        /// asking, and when the merge conflicts takes the recommended way
-        /// forward — integrating the conflicting roll(s) into this one.
+        /// Answer yes to prompts (non-interactive): graduates ungraduated
+        /// dependencies first, pushes the dev tag, and — when the merge
+        /// conflicts — takes the recommended way forward (integrating the
+        /// conflicting roll(s) into this one) without asking. Without it a
+        /// multi-roll plan is shown and confirmed; unattended, it is shown
+        /// and nothing is merged.
         #[arg(long)]
         yes: bool,
     },

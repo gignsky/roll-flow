@@ -225,7 +225,15 @@ Phases:
 2. **Candidates** — gather roll branches, filter to eligible (ungraduated/diverged for
    graduate; ready/verified for promote)
 3. **Selection** — interactive numbered table, or `--all`, or explicit branch args
-4. **Dependency resolution** — topological sort selected rolls with their deps
+4. **Dependency resolution** — topological sort selected rolls with their deps.
+   `ops::dependency_chain` is that sort: a pure post-order over `RollInfo::deps`
+   that emits every roll after what it integrated, target last, and refuses
+   cycles, unknown dependency numbers, and (for graduation) dependencies with no
+   local copy. `ChainKind` picks which dependencies count — not-yet-graduated for
+   graduation, graduated-but-unpromoted for promotion; anything already past that
+   point is history and is not walked further. Both the CLI and the TUI drive the
+   same planner and the same per-step `ops::graduate`, so a chain is exactly
+   what N hand-run graduations would be
 5. **Pre-merge checks** — uncommitted changes, dep graduation status, verification,
    divergence, flake check per roll
 6. **Confirmation** — show merge plan, require y/N
