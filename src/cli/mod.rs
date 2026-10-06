@@ -103,6 +103,10 @@ pub enum Cmd {
         date: Option<String>,
         #[arg(long)]
         dry_run: bool,
+        /// Skip marking the new branch's Cargo.toml version as
+        /// `X.Y.Z-roll<N>`, overriding `dev_versions` in the config.
+        #[arg(long)]
+        no_dev_version: bool,
     },
 
     /// Merge a feature branch into the current roll.
@@ -154,6 +158,13 @@ pub enum Cmd {
         /// Justification recorded as `Force-Reason:` in the merge commit.
         #[arg(long)]
         reason: Option<String>,
+        /// Skip creating the `v<X.Y.Z>-dev` tag on rolling's new tip.
+        #[arg(long)]
+        no_tag: bool,
+        /// Answer yes to prompts (non-interactive): pushes the dev tag without
+        /// asking.
+        #[arg(long)]
+        yes: bool,
     },
 
     /// Promote rolling into the stable branch (--no-ff merge). On a roll
@@ -180,8 +191,15 @@ pub enum Cmd {
         /// Skip creating the vX.Y.Z release tag on the promotion merge commit.
         #[arg(long)]
         no_tag: bool,
-        /// Answer yes to prompts (non-interactive): applies the bump and pushes
-        /// the release tag without asking.
+        /// Answer yes to the "is this final?" prompt without also accepting
+        /// every other one (the bump level, the tag push): a dedicated escape
+        /// hatch for that question alone, the same way `--bump <level>`
+        /// already sidesteps the bump prompt specifically. `--yes` still
+        /// answers this too, alongside everything else.
+        #[arg(long = "final")]
+        finalize: bool,
+        /// Answer yes to prompts (non-interactive): finalizes the release,
+        /// applies the bump, and pushes the release tag without asking.
         #[arg(long)]
         yes: bool,
     },
@@ -208,8 +226,13 @@ pub enum Cmd {
         json: bool,
     },
 
-    /// Merge the stable branch into all active local roll branches.
+    /// Merge the stable branch into all active local roll branches, or into
+    /// just the named ones.
     Update {
+        /// Update only this roll branch. Repeatable; with no `--roll` given,
+        /// every active local roll is updated.
+        #[arg(long)]
+        roll: Vec<String>,
         #[arg(long)]
         dry_run: bool,
     },
@@ -321,6 +344,19 @@ pub enum Cmd {
 
     /// Print program version.
     Version,
+
+    /// Internal: git merge driver for Cargo.toml's `version` line. Invoked by
+    /// git itself (wired up by `rf init` via `.gitattributes` and git config)
+    /// — never meant to be run by hand. Hidden from `--help`.
+    #[command(name = "__merge-driver-version", hide = true)]
+    MergeDriverVersion {
+        /// Git's `%O`: the common ancestor's content.
+        ancestor: std::path::PathBuf,
+        /// Git's `%A`: our side; also where the result must be written.
+        ours: std::path::PathBuf,
+        /// Git's `%B`: their side.
+        theirs: std::path::PathBuf,
+    },
 }
 
 /// The roll states `rf tidy --state` accepts.
@@ -336,10 +372,14 @@ pub enum TidyState {
     Blocked,
     /// Graduated, then took further commits.
     Diverged,
+    /// Graduated, then that merge was reverted on rolling.
+    Reverted,
     /// Merged to rolling.
     Graduated,
     /// Merged to the stable branch.
     Promoted,
+    /// Promoted, then that merge was reverted on the stable branch.
+    Demoted,
     /// Every state above.
     All,
 }
@@ -359,15 +399,19 @@ impl TidyState {
                 TidyState::Active => push(RollState::Active),
                 TidyState::Blocked => push(RollState::Blocked),
                 TidyState::Diverged => push(RollState::Diverged),
+                TidyState::Reverted => push(RollState::Reverted),
                 TidyState::Graduated => push(RollState::Graduated),
                 TidyState::Promoted => push(RollState::Promoted),
+                TidyState::Demoted => push(RollState::Demoted),
                 TidyState::All => {
                     for state in [
                         RollState::Active,
                         RollState::Blocked,
                         RollState::Diverged,
+                        RollState::Reverted,
                         RollState::Graduated,
                         RollState::Promoted,
+                        RollState::Demoted,
                     ] {
                         push(state);
                     }
