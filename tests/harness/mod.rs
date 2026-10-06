@@ -56,18 +56,27 @@ impl Sandbox {
         sb
     }
 
-    /// A NixOS-flavored fixture: a plain repo plus a minimal `flake.nix` and
-    /// `vars/hosts.nix` so host/username auto-detection has something to read.
+    /// A NixOS-flavored fixture: a plain repo plus a minimal `flake.nix`,
+    /// `vars/hosts.nix` and `vars/default.nix` so host/username auto-detection
+    /// has something to read.
+    ///
+    /// The files are shaped like the dotfiles repo's, not like whatever is
+    /// easiest to parse: a bare `{ host = bool; }` attrset with a comment, and
+    /// the username in `vars/default.nix`. A fixture that flatters the parser
+    /// is how detection stayed green while never once working in production.
     pub fn nixos() -> Self {
         let sb = Sandbox::plain();
         sb.write("flake.nix", "{\n  description = \"test\";\n}\n");
         sb.write(
             "vars/hosts.nix",
-            "{\n  hosts = [ \"ganoslal\" \"merlin\" \"wsl\" ];\n  \
-             host_active = { ganoslal = true; merlin = true; wsl = false; };\n  \
-             username = \"gig\";\n}\n",
+            "# Per-host active status for roll-flow and other tooling.\n\
+             {\n  ganoslal = true;\n  merlin = true;\n  wsl = false;\n}\n",
         );
-        sb.git(&["add", "flake.nix", "vars/hosts.nix"]);
+        sb.write(
+            "vars/default.nix",
+            "{ lib }:\n{\n  username = \"gig\";\n  handle = \"gignsky\";\n}\n",
+        );
+        sb.git(&["add", "flake.nix", "vars"]);
         sb.git(&["commit", "-m", "nixos fixture"]);
         sb
     }
