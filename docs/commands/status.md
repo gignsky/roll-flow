@@ -102,6 +102,7 @@ The full list:
 | `PP` | [push every branch that needs it](#pp--push-everything-that-needs-it) |
 | `gg` | lazygit |
 | `c` / `i` | create a roll / integrate one into the checked-out roll |
+| `V` | verify all rolls, or a set of them |
 | `G` / `m` / `u` | graduate / promote / update from stable |
 | `b` | bump the version |
 | `d` / `x` / `t` | delete / prune / tidy branches |
@@ -207,6 +208,18 @@ The one thing it will not do is bump the version. `rf verify` offers one; here a
 failed version gate points at `[b]` instead, which is the key that already writes
 that commit. A failed host or an unsatisfied gate marks the panel as failed
 rather than passing quietly.
+
+### `[V]` — verify many at once
+
+`[V]` opens a picker — `all rolls`, `active`, `blocked`, `graduated`,
+`diverged`, `rolls with a local copy` — each with how many rolls it covers, and a
+digit runs the pass. It is `rf verify --all --state <set>` on the same core
+routine, so the rules are identical, and the one that matters is that the pass
+**checks out each roll in turn** and always returns to the branch you started
+on, whatever any roll's gates said. A dirty tree is refused in the status bar
+before the picker even opens. One job, one panel: each roll's report under its
+own header, then `N passed, M failed, K skipped`, and the panel marks failed if
+any did — see [`verify`](verify.md#verifying-many-at-once).
 
 ## Bumping the version
 

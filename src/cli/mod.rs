@@ -1,7 +1,7 @@
 pub mod clean;
 pub mod status;
 
-use crate::core::branches::RollState;
+use crate::core::branches::{RollState, VerifySet};
 use crate::core::version::BumpLevel;
 use std::io::IsTerminal;
 
@@ -159,6 +159,13 @@ pub enum Cmd {
         /// Answer yes to prompts (non-interactive).
         #[arg(long)]
         yes: bool,
+        /// Verify every roll in `--state` (default: all) in turn instead of the
+        /// current branch, switching to each and back again. Never bumps.
+        #[arg(long, conflicts_with_all = ["bump", "yes", "dry_run"])]
+        all: bool,
+        /// Which rolls `--all` covers.
+        #[arg(long, value_enum, default_value = "all", requires = "all")]
+        state: VerifySet,
     },
 
     /// Graduate the current roll branch into rolling (--no-ff merge).

@@ -1618,6 +1618,201 @@ pub(crate) fn verify(config: &Config, dry_run: bool) -> Result<VerifyOutcome> {
     })
 }
 
+/// Why a roll in a verify-many pass did not produce a plain pass.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum VerifyVerdict {
+    Passed,
+    /// The gates, hosts or version gate refused it. Carries the reason.
+    Failed(String),
+    /// Nothing was checked: no local copy, or nothing to merge. Carries why.
+    Skipped(String),
+}
+
+/// One roll's result from [`verify_many`].
+pub(crate) struct VerifyManyResult {
+    pub branch: String,
+    /// `None` when the roll was skipped before `verify` could run.
+    pub outcome: Option<VerifyOutcome>,
+    /// The dev marker this pass committed onto the roll, when it was missing.
+    pub marked: Option<Semver>,
+    pub verdict: VerifyVerdict,
+}
+
+impl VerifyManyResult {
+    fn skipped(branch: &str, why: impl Into<String>) -> Self {
+        VerifyManyResult {
+            branch: branch.to_string(),
+            outcome: None,
+            marked: None,
+            verdict: VerifyVerdict::Skipped(why.into()),
+        }
+    }
+
+    fn failed(branch: &str, marked: Option<Semver>, why: impl Into<String>) -> Self {
+        VerifyManyResult {
+            branch: branch.to_string(),
+            outcome: None,
+            marked,
+            verdict: VerifyVerdict::Failed(why.into()),
+        }
+    }
+}
+
+/// Why the checked-out roll's version numbers are behind stable's, if they are.
+///
+/// Numbers only — the marker is ignored on both sides. A roll's `-roll<N>`
+/// always sorts below the same release, so comparing whole versions would call
+/// every freshly-updated roll "behind"; what matters is a roll still on
+/// `0.2.3-roll13` after stable released `0.2.7`, which has missed a release and
+/// would carry a stale version into rolling. `rf update` is the remedy: the
+/// merge driver keeps the roll's marker and takes stable's higher numbers.
+///
+/// `None` when there is nothing to compare: the gate is off, there is no
+/// `Cargo.toml` on either side, or stable cannot be resolved.
+fn version_behind_stable(config: &Config) -> Result<Option<String>> {
+    if !config.version_gate {
+        return Ok(None);
+    }
+    let repo = &config.repo_root;
+    let Some(head) = version::read_version(repo)? else {
+        return Ok(None);
+    };
+    let Some(stable_ref) = git::resolve_branch(repo, &config.stable_branch) else {
+        return Ok(None);
+    };
+    let Some(stable) = git::show_file_at_ref(repo, &stable_ref, version::VERSION_FILE)?
+        .as_deref()
+        .and_then(version::parse_version)
+    else {
+        return Ok(None);
+    };
+    if head.release() >= stable.release() {
+        return Ok(None);
+    }
+    Ok(Some(format!(
+        "version {head} is behind '{}' ({stable}); run `rf update` (or [u] in the TUI) \
+         to bring it up to date",
+        config.stable_branch
+    )))
+}
+
+/// The verdict `verify`'s outcome amounts to, so the CLI's `rf verify`, the
+/// TUI's `[v]` and [`verify_many`] all draw the line in the same place.
+pub(crate) fn verify_verdict(outcome: &VerifyOutcome) -> VerifyVerdict {
+    if !outcome.failed_hosts.is_empty() {
+        return VerifyVerdict::Failed(format!(
+            "host verification failed: {}",
+            outcome.failed_hosts.join(", ")
+        ));
+    }
+    if !outcome.version.is_satisfied() {
+        return VerifyVerdict::Failed(
+            version_gate_error(&outcome.version, &outcome.source, &outcome.target).to_string(),
+        );
+    }
+    VerifyVerdict::Passed
+}
+
+/// Verify several rolls in one pass, returning a result per branch in the
+/// order given.
+///
+/// `verify` judges the checked-out branch and runs the gates in the working
+/// tree, so this has to check each roll out in turn — which is the whole
+/// design problem. The rules that make it safe:
+///
+/// - A dirty tree is refused up front, before the first switch, rather than
+///   discovered halfway through with HEAD somewhere else.
+/// - The starting branch is recorded first and restored **unconditionally** at
+///   the end: after a failed gate, after a `verify` error, after a roll that
+///   would not even check out. A pass that leaves HEAD on roll 3 because roll 3
+///   failed has turned a report into a surprise.
+/// - A roll with no local copy is skipped with a reason, never fetched: nothing
+///   here writes to or reads from the remote, and a switch that would create a
+///   branch from `origin/` is a side effect the user did not ask for.
+/// - "Nothing to merge" is a skip, not a failure: the roll has nothing to be
+///   judged on, which is not the same as failing judgement.
+/// - Each roll's version gets what a single `rf verify` gives it: a missing
+///   `-roll<N>` marker is committed first (before the `--locked` gates, for the
+///   same lockfile reason), and then a roll whose numbers are behind stable's
+///   fails without running its gates — a version problem should cost
+///   milliseconds, not a gate run. The marker is the one commit this pass
+///   makes; it never bumps.
+///
+/// Every gate's output still streams through `core::proc`'s sink as it runs,
+/// so the caller sees each roll's gates as they happen; this returns only the
+/// structured summary.
+pub(crate) fn verify_many(config: &Config, branches: &[String]) -> Result<Vec<VerifyManyResult>> {
+    ensure_clean_state(config)?;
+    let repo = &config.repo_root;
+    let start = git::current_branch(repo)?;
+
+    let mut results = Vec::with_capacity(branches.len());
+    for branch in branches {
+        if !git::ref_exists(repo, branch) {
+            results.push(VerifyManyResult::skipped(
+                branch,
+                "no local copy — pull it first",
+            ));
+            continue;
+        }
+        if let Err(err) = git::run_git(repo, &["switch", "--quiet", branch]) {
+            results.push(VerifyManyResult::skipped(
+                branch,
+                format!("could not switch to it: {err}"),
+            ));
+            continue;
+        }
+        let marked = match apply_dev_version_for_branch(config, branch) {
+            Ok(marked) => marked,
+            Err(err) => {
+                results.push(VerifyManyResult::failed(
+                    branch,
+                    None,
+                    format!("could not apply its dev marker: {err}"),
+                ));
+                continue;
+            }
+        };
+        match version_behind_stable(config) {
+            Ok(None) => {}
+            Ok(Some(why)) => {
+                results.push(VerifyManyResult::failed(branch, marked, why));
+                continue;
+            }
+            Err(err) => {
+                results.push(VerifyManyResult::failed(
+                    branch,
+                    marked,
+                    format!("could not compare its version with stable: {err}"),
+                ));
+                continue;
+            }
+        }
+        results.push(match verify(config, false) {
+            Ok(outcome) => {
+                let verdict = verify_verdict(&outcome);
+                VerifyManyResult {
+                    branch: branch.clone(),
+                    outcome: Some(outcome),
+                    marked,
+                    verdict,
+                }
+            }
+            Err(err) if err.to_string().starts_with("nothing to merge") => VerifyManyResult {
+                marked,
+                ..VerifyManyResult::skipped(branch, err.to_string())
+            },
+            Err(err) => VerifyManyResult::failed(branch, marked, err.to_string()),
+        });
+    }
+
+    // Unconditional, and the one error this function refuses to swallow: a
+    // report that cannot say where it left HEAD is worse than no report.
+    git::run_git(repo, &["switch", "--quiet", &start])
+        .with_context(|| format!("verified, but could not switch back to '{start}'"))?;
+    Ok(results)
+}
+
 // ── graduate ────────────────────────────────────────────────────────────────
 
 /// Outcome of graduating a roll into the rolling branch.
