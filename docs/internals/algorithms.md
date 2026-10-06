@@ -87,12 +87,32 @@ The token it returns is not validated against the roll prefix, and does not need
 to be: every caller either compares it to a real roll branch name or runs it
 through `parse_roll_number`, so a candidate that is not a roll matches nothing.
 
+**Dependency chain.** The detail view (`[enter]`) walks `deps` transitively —
+roll 12 depends on 9, which depends on 8, which depends on 7 — through
+`tui::rolls::dep_chain`. Each level is exactly `dep_rows` of its parent, so there
+is one definition of a direct dependency row and the chain only adds depth. A
+roll reached a second time (a diamond, or a cycle if hand-written merge subjects
+ever produce one) is listed once more as `↑ shown above` and not descended into,
+so the walk is finite and every roll's own dependencies appear exactly once.
+Each link keeps both of `DepRow`'s markers, and both are its *parent's* judgement
+— `⚠ reintegrate` on a deep link reads the parent's `stale_deps`, since the
+parent is who integrated it, not the selected roll.
+The table's `deps` column stays direct-only; widening it for transitive counts
+would cost the `branch` column, which has nothing to spare.
+
 One consequence worth knowing, since `[i]` makes roll-into-roll merges cheap: the
 graduated scan below has a second pass *without* `--first-parent`, so once M
 graduates, N's integrate merge is reachable from rolling and N reports as
 graduated too. That is accurate — N's commits really are on rolling, carried in by
 M — and the `⛔ blocked` gate is what keeps it from happening out of order. It is
-only reachable at all via `rf graduate --force`.
+reachable in two ways: `rf graduate --force`, and — deliberately — a dependency
+cycle's carrier (see [Dependency cycles](#dependency-cycles) below). Either way
+the merge that pass finds lives on M's branch, not on rolling's mainline, so
+`scan_graduated` re-anchors N's graduation commit to where it actually *landed*
+(`landing_point`: the oldest first-parent commit of rolling that descends from
+it, i.e. M's graduation merge). That is the commit `rf promote --roll N`
+advances stable to, so stable still only ever moves to points rolling stood at;
+`plan_roll_steps` then folds rolls that share a graduation commit into one step.
 
 Integrating the rolling branch itself (`[I]`, see
 [integrate](../commands/integrate.md#i--integrate-rolling)) is the one case Method
@@ -137,9 +157,65 @@ stale, which is precisely the case that matters before merging a batch of
 dependent rolls against a dependency someone keeps pushing to — each dependent
 needs to say whether it has that dependency's latest work, not just whether
 the dependency has graduated. The plain table surfaces the same signal with a
-`⚠` suffix on the dep number (`branches::format_deps_with_staleness`), and
+`⚠` suffix on the dep number (`branches::format_deps`), and
 `rf list/status --json` carries it as `stale_deps`, so the check does not
 require opening the detail view.
+
+### Dependency cycles
+
+Method 2b reads integrations, and nothing stops two rolls integrating each
+other — the real case was roll 14 built on roll 15, then 15 folding 14 in. Each
+then depends on the other; under the plain rule both are `⛔ blocked` on a roll
+that is blocked on them, and `ops::dependency_chain` (which graduates
+dependencies first) has no post-order to offer. Before this was handled, the
+only way out was `--force`.
+
+**Detection.** `branches::dependency_cycles` is Tarjan's strongly connected
+components over the dependency graph — every node and edge visited once, so it
+cannot loop — and `assign_cycles` runs it in `list_rolls` over rolls that still
+need graduating (`Active`, `Diverged`; an edge to a graduated roll orders
+nothing, so a cycle through one is already broken). `Reverted` is excluded on
+purpose: its remedy is reverting the revert, which no carrier merge performs.
+Each member gets the same `RollInfo::cycle` (`branches::DepCycle`).
+
+**Resolution by containment, not order.** The ordering constraint exists so a
+dependency's commits reach rolling *before or with* its dependent. A member
+whose tip contains every other member's tip (`tip_contains`, a plain
+`merge-base --is-ancestor`) lands all of them in its own graduation merge, so
+it is the cycle's **carrier** (`DepCycle::carrier`):
+
+- its fellow members do not block it; it is still blocked by any ungraduated
+  dependency *outside* the cycle of *any* member, since its merge is what lands
+  those members;
+- every other member stays `⛔ blocked` on the carrier, like on any dependency;
+- for graduation, `dependency_chain` plans the whole cycle as one node: every
+  member's outside dependencies first, then a single `ChainStep` for the
+  carrier with the rest in `ChainStep::carries`. Asking for a carried member
+  plans the carrier in its place. The carrier is an ordinary `ops::graduate`;
+  afterwards the carried members read graduated through the second
+  `scan_graduated` pass, re-anchored as described above.
+
+This is narrower than "a dependency whose tip is already contained does not
+block", on purpose. Outside a cycle there is always an order in which N
+graduates first, with its own graduation merge (which per-roll promotion
+relies on) — so the plain rule keeps it. Only inside a cycle, where no order
+exists, is containment the way through.
+
+**No carrier.** When no member contains the others — each moved on after
+integrating the other — any graduation lands a partial copy of some member, so
+nothing is offered as graduatable and every member stays blocked. That is a
+refusal with a remedy, not a deadlock: `pick_carrier` names the member missing
+the fewest tips (highest number on a tie) and exactly which, and
+`DepCycle::advice` turns that into "on X run `rf integrate Y`, then graduate X".
+One integrate per missing tip makes X the carrier. The same advice sentence is
+the planner's refusal, the plain tables' footnote, the TUI detail view's note
+and the `--json` `cycle.advice`, so all four say the same thing.
+
+**Promotion.** A cycle orders nothing for promotion: members that graduated
+together share a graduation commit and per-roll promotion is ordered by
+rolling's history anyway. So the `ChainKind::Promote` walk skips an edge back
+into its current path instead of refusing it — it terminates, and
+`plan_roll_steps` collapses the shared commit to one merge.
 
 **Method 3 — file overlap**: if rolls modify the same files and the other roll has a
 lower number, it's a dependency. Uses `--first-parent --no-merges` on the other roll
@@ -212,7 +288,17 @@ Phases:
 2. **Candidates** — gather roll branches, filter to eligible (ungraduated/diverged for
    graduate; ready/verified for promote)
 3. **Selection** — interactive numbered table, or `--all`, or explicit branch args
-4. **Dependency resolution** — topological sort selected rolls with their deps
+4. **Dependency resolution** — topological sort selected rolls with their deps.
+   `ops::dependency_chain` is that sort: a pure post-order over `RollInfo::deps`
+   that emits every roll after what it integrated, target last, plans a
+   dependency cycle as its carrier's single step (see
+   [Dependency cycles](#dependency-cycles)), and refuses a cycle with no
+   carrier, unknown dependency numbers, and (for graduation) dependencies with no
+   local copy. `ChainKind` picks which dependencies count — not-yet-graduated for
+   graduation, graduated-but-unpromoted for promotion; anything already past that
+   point is history and is not walked further. Both the CLI and the TUI drive the
+   same planner and the same per-step `ops::graduate`, so a chain is exactly
+   what N hand-run graduations would be
 5. **Pre-merge checks** — uncommitted changes, dep graduation status, verification,
    divergence, flake check per roll
 6. **Confirmation** — show merge plan, require y/N
@@ -221,6 +307,22 @@ Phases:
 
 The interactive selection table columns: `#`, `roll`, `loc` (L/R/B/-), `dev` (↑↓✓⚠=),
 `blk` (🔒 if blocked), `scope` (NHFD flags), then per-host verification columns (✓⌛✗—).
+
+## Conflict diagnosis (`core/ops.rs`)
+
+When a `--no-ff` merge in `run_merge` or `merge_gated` fails, the conflicted
+paths are read (`git diff --name-only --diff-filter=U`) **before** `git merge
+--abort` — afterwards there is nothing to read. Each path is then attributed by
+walking the target's first-parent history since the merge base for that path
+(`git log --first-parent <base>..<target> -- <path>`): every commit is a
+culprit, and a merge whose subject names a branch (via
+`branches::extract_graduated_branch`, the single reader of merge subjects) is a
+culprit *roll*. A merge naming the source itself — its own earlier graduation,
+on re-graduation — is dropped. The result is a typed `ops::MergeConflict`
+error carrying a `ConflictReport`, raised only after the unwind so the repo is
+clean by the time anyone acts on it; a merge that failed with no conflicted
+paths keeps the plain error. Diagnosis never errors: it runs on a failing path
+and must not hide the failure it explains.
 
 ## Merge commit message format
 
@@ -292,9 +394,11 @@ sense. `Semver`'s own `Ord` is then also derived, comparing
 `(major, minor, patch, marker)` in that field order, so the numbers dominate
 the marker exactly as the gate needs.
 
-The merge driver (`core::merge_driver::resolve`, wired up by `rf init`) states
-one rule for every direction a `Cargo.toml` version line gets merged: **keep
-`ours`'s marker; take the higher of the two sides' numbers.** It is correct
+The merge driver (`core::merge_driver::resolve`, wired up by `rf init` and
+before every `rf` merge) states one rule for every direction the crate's own
+version gets merged — `Cargo.toml`'s `version` line and the same value in
+`Cargo.lock`'s own `[[package]]` entry alike: **keep `ours`'s marker; take the
+higher of the two sides' numbers.** It is correct
 as-is for `[i]`/`[I]`/`rf update` (a roll's own `-roll<N>` is already set by
 `rf start`, so "ours" already carries the right marker going in). `ops::graduate`
 does **not** use it, though — the very first graduation ever, rolling has never
@@ -307,6 +411,45 @@ common "only the roll changed the line" trivial case the driver never even
 sees). Once rolling has graduated once, its own `ours` marker *is* `-dev`, so
 the driver's generic rule and `ops::graduate`'s own computation agree from then
 on — the special-casing matters only for bootstrapping.
+
+**Making a version-only conflict impossible.** A driver that only covers one
+of the two files, or that is only configured in clones that happened to run
+`rf init`, still lets a marker-vs-marker merge stop — which is exactly what
+happened to `rf integrate` from one roll into another: the lockfile repeated
+both markers, and the clone had never had the driver configured at all. Three
+layers close that, each covering a gap in the one before:
+
+1. **Both files.** `merge_driver::VersionFile` is `Manifest` or `Lockfile`;
+   git passes `%P` so the driver knows which. In the lockfile only the
+   `[[package]]` entry named after `Cargo.toml`'s `package.name` *with no
+   `source` key* is touched (`version::replace_lock_package_version`) — a
+   registry crate never has an empty source, and an ambiguous match counts as
+   none. The driver doctors *all three* sides (ancestor too) to the resolved
+   value before `git merge-file`, so the line is unchanged everywhere and
+   cannot crowd an edit on a neighbouring line into a conflict; whatever still
+   conflicts is real. Every version rewrite also syncs that lockfile entry
+   directly (`ops::sync_lockfile_own_entry`, ahead of the best-effort `cargo
+   update`), so the two files never drift apart when cargo cannot run.
+2. **Wired whenever `rf` merges.** `ops::wire_version_merge_driver` writes the
+   attribute lines to the clone's own `info/attributes` (via `git rev-parse
+   --git-path`, shared by linked worktrees) and the driver command to local
+   git config — both clone-local, neither in the tree. `run_merge`,
+   `merge_gated` and `ops::integrate` call it quietly before merging, so every
+   `rf` merge (integrate, `[i]`/`[I]`, update, graduate, promote, hotfix land)
+   is covered on a clone that never ran `rf init`. `info/attributes` rather
+   than a committed `.gitattributes` because the latter applies only on
+   branches that carry it, and writing it lazily would leave an uncommitted
+   file on whatever happened to be checked out.
+3. **Settled in-process.** If git stops anyway — `rf` not on the `PATH` git
+   sees, a read-only config — `ops::settle_version_only_conflicts` reads the
+   index's conflict stages (`:1:`/`:2:`/`:3:`) for every unmerged path and
+   runs the same `merge_driver::merge_texts`. It is all-or-nothing: any
+   unmerged path that is not a version file, or that still conflicts with the
+   version line agreed, and it touches nothing. `run_merge`/`ops::integrate`
+   then commit (`--cleanup=strip`, to drop git's `# Conflicts:` comment);
+   `merge_gated` just carries on to its gates, since a settled merge is
+   indistinguishable from a clean `--no-commit` one — which is also why
+   graduation's `reconcile_staged_version` still has the last word.
 
 A dev marker of either kind must never reach stable, and is refused **before**
 the numbers are compared, not by them: `0.2.5-roll9`/`0.2.5-dev` are
