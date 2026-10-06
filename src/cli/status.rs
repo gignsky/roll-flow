@@ -3,7 +3,7 @@ use std::io::IsTerminal;
 use anyhow::Result;
 
 use crate::core::{
-    branches::{self, BranchLocation, RollInfo},
+    branches::{self, BranchLocation, HotfixInfo, RollInfo},
     config::Config,
     git,
 };
@@ -27,10 +27,11 @@ pub fn run(no_tui: bool, show_deps: bool) -> Result<()> {
     print_current_roll_line(&config, &current_roll);
     println!();
 
-    if rolls.is_empty() {
+    let hotfixes = branches::list_hotfixes(&config)?;
+    if rolls.is_empty() && hotfixes.is_empty() {
         println!("  (no roll branches found)");
     } else {
-        print_rolls_table(&config, &rolls, show_deps);
+        print_rolls_table(&config, &rolls, &hotfixes, show_deps);
     }
 
     Ok(())
@@ -69,11 +70,18 @@ fn print_current_roll_line(config: &Config, current_roll: &Option<String>) {
 
 // ── Roll table ────────────────────────────────────────────────────────────────
 
-fn print_rolls_table(config: &Config, rolls: &[RollInfo], show_deps: bool) {
-    // Compute column widths dynamically.
+fn print_rolls_table(
+    config: &Config,
+    rolls: &[RollInfo],
+    hotfixes: &[HotfixInfo],
+    show_deps: bool,
+) {
+    // Compute column widths dynamically — over the hotfix names too, since
+    // they share the columns.
     let name_w = rolls
         .iter()
         .map(|r| r.branch.len())
+        .chain(hotfixes.iter().map(|h| h.branch.len()))
         .max()
         .unwrap_or(4)
         .max(4);
@@ -146,7 +154,7 @@ fn print_rolls_table(config: &Config, rolls: &[RollInfo], show_deps: bool) {
         let deps_col = if show_deps {
             format!(
                 "  {:<dep_w$}  {}",
-                branches::format_deps_with_staleness(&roll.deps, &roll.stale_deps),
+                branches::format_deps(roll),
                 branches::format_roll_numbers(&roll.dependents),
             )
         } else {
@@ -165,6 +173,7 @@ fn print_rolls_table(config: &Config, rolls: &[RollInfo], show_deps: bool) {
             sw = state_w,
         );
     }
+    crate::print_hotfix_rows(hotfixes, name_w, state_w);
     println!();
     println!("  loc: L=local  R=remote  B=both");
     if show_deps {
@@ -172,6 +181,14 @@ fn print_rolls_table(config: &Config, rolls: &[RollInfo], show_deps: bool) {
         println!(
             "  ⚠ after a dep number: it has moved since this roll integrated it — reintegrate"
         );
+        if !branches::distinct_cycles(rolls).is_empty() {
+            println!("  ↻ after a dep number: it integrated this roll back — a dependency cycle");
+        }
+    }
+    // Printed with or without `--no-deps`: it is what explains a `⛔ blocked`
+    // that would otherwise be waiting on a roll that is waiting on it.
+    for cycle in branches::distinct_cycles(rolls) {
+        println!("  {}", cycle.advice(rolls));
     }
 }
 

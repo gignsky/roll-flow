@@ -1,7 +1,7 @@
 pub mod clean;
 pub mod status;
 
-use crate::core::branches::RollState;
+use crate::core::branches::{RollState, VerifySet};
 use crate::core::version::BumpLevel;
 use std::io::IsTerminal;
 
@@ -19,6 +19,27 @@ pub(crate) fn prompt_yes(msg: &str) -> anyhow::Result<bool> {
     std::io::stdin().read_line(&mut line)?;
     let ans = line.trim().to_ascii_lowercase();
     Ok(ans == "y" || ans == "yes")
+}
+
+/// Prompt for one of `1..=max`, returning `default` on an empty line. Any
+/// other answer re-prompts, so a stray keypress never picks an option.
+pub(crate) fn prompt_choice(max: usize, default: usize) -> anyhow::Result<usize> {
+    use std::io::Write;
+    loop {
+        print!("Choose [1-{max}, default {default}]: ");
+        std::io::stdout().flush()?;
+        let mut line = String::new();
+        std::io::stdin().read_line(&mut line)?;
+        let ans = line.trim();
+        if ans.is_empty() {
+            return Ok(default);
+        }
+        if let Ok(n) = ans.parse::<usize>() {
+            if (1..=max).contains(&n) {
+                return Ok(n);
+            }
+        }
+    }
 }
 
 /// How a destructive command's confirmation resolved.
@@ -138,6 +159,13 @@ pub enum Cmd {
         /// Answer yes to prompts (non-interactive).
         #[arg(long)]
         yes: bool,
+        /// Verify every roll in `--state` (default: all) in turn instead of the
+        /// current branch, switching to each and back again. Never bumps.
+        #[arg(long, conflicts_with_all = ["bump", "yes", "dry_run"])]
+        all: bool,
+        /// Which rolls `--all` covers.
+        #[arg(long, value_enum, default_value = "all", requires = "all")]
+        state: VerifySet,
     },
 
     /// Graduate the current roll branch into rolling (--no-ff merge).
@@ -154,8 +182,12 @@ pub enum Cmd {
         /// Skip creating the `v<X.Y.Z>-dev` tag on rolling's new tip.
         #[arg(long)]
         no_tag: bool,
-        /// Answer yes to prompts (non-interactive): pushes the dev tag without
-        /// asking.
+        /// Answer yes to prompts (non-interactive): graduates ungraduated
+        /// dependencies first, pushes the dev tag, and — when the merge
+        /// conflicts — takes the recommended way forward (integrating the
+        /// conflicting roll(s) into this one) without asking. Without it a
+        /// multi-roll plan is shown and confirmed; unattended, it is shown
+        /// and nothing is merged.
         #[arg(long)]
         yes: bool,
     },
@@ -338,9 +370,10 @@ pub enum Cmd {
     /// Print program version.
     Version,
 
-    /// Internal: git merge driver for Cargo.toml's `version` line. Invoked by
-    /// git itself (wired up by `rf init` via `.gitattributes` and git config)
-    /// — never meant to be run by hand. Hidden from `--help`.
+    /// Internal: git merge driver for the crate's own version in Cargo.toml and
+    /// Cargo.lock. Invoked by git itself (wired up by `rf init` and before every
+    /// `rf` merge, via clone-local attributes and git config) — never meant to
+    /// be run by hand. Hidden from `--help`.
     #[command(name = "__merge-driver-version", hide = true)]
     MergeDriverVersion {
         /// Git's `%O`: the common ancestor's content.
@@ -349,6 +382,10 @@ pub enum Cmd {
         ours: std::path::PathBuf,
         /// Git's `%B`: their side.
         theirs: std::path::PathBuf,
+        /// Git's `%P`: the file's repo-relative path, which says whether this is
+        /// the manifest or the lockfile. Optional so a clone still configured
+        /// with the older three-argument command keeps resolving Cargo.toml.
+        path: Option<std::path::PathBuf>,
     },
 }
 
