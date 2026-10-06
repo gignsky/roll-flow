@@ -137,3 +137,71 @@ fn promoting_one_roll_promotes_the_dependency_it_graduated_behind() {
     assert_eq!(sb.roll_state(ALPHA).as_deref(), Some("✓ promoted"));
     assert_eq!(sb.roll_state(BETA).as_deref(), Some("✓ promoted"));
 }
+
+#[test]
+fn a_conflicting_dependency_step_does_not_offer_to_integrate_the_requested_roll() {
+    // beta depends on alpha, and it is alpha's own graduation that conflicts
+    // — not beta's. The CLI must not offer the interactive "integrate, then
+    // retry" choice for that: `ops::integrate` merges into HEAD, and HEAD
+    // stays on beta throughout (`ops::graduate` restores whatever was checked
+    // out before each step). Integrating the conflict into beta would be
+    // integrating the wrong branch, so the fallback — print the commands,
+    // change nothing — is the only sound choice here, even with `--yes`.
+    let sb = Sandbox::plain();
+    sb.init();
+
+    // charlie graduates first and touches clash.txt, so the later conflict is
+    // attributable to a real roll rather than a direct edit on rolling —
+    // `can_integrate` would be false either way for a direct edit, which
+    // would not exercise the fix this test is for.
+    sb.create_roll("charlie", "0610");
+    sb.commit_file("clash.txt", "charlie's line\n", "charlie edits clash");
+    let out = sb.rf(&["graduate"]);
+    assert!(out.success, "graduate charlie: {}", out.combined());
+
+    sb.git(&["checkout", "main"]);
+    let out = sb.create_roll("alpha", "0611"); // roll number 2, charlie took 1
+    assert!(out.success, "create alpha: {}", out.combined());
+    let alpha = sb.current_branch();
+    sb.commit_file(
+        "clash.txt",
+        "alpha's line\n",
+        "alpha edits clash differently",
+    );
+
+    sb.git(&["checkout", "main"]);
+    let out = sb.create_roll("beta", "0612");
+    assert!(out.success, "create beta: {}", out.combined());
+    let beta = sb.current_branch();
+    sb.commit_file("beta.txt", "b\n", "beta work");
+    let out = sb.rf(&["integrate", &alpha]);
+    assert!(out.success, "integrate: {}", out.combined());
+    assert_eq!(sb.roll_state(&beta).as_deref(), Some("⛔ blocked"));
+
+    let out = sb.rf(&["graduate", "--yes"]);
+    assert!(
+        !out.success,
+        "a conflicting dependency must fail the chain: {}",
+        out.combined()
+    );
+    let text = out.combined();
+    assert!(text.contains("clash.txt"), "{text}");
+    assert!(
+        text.contains("charlie"),
+        "the conflict's culprit should still be named: {text}"
+    );
+    assert!(
+        !text.contains("integrating"),
+        "must not attempt to integrate anything into beta: {text}"
+    );
+    assert!(!sb.exists(".git/MERGE_HEAD"), "left mid-merge: {text}");
+    assert_eq!(
+        sb.current_branch(),
+        beta,
+        "HEAD must stay on the requested roll"
+    );
+    assert!(
+        !sb.has_commit_subject("rolling", &format!("Graduate {alpha}")),
+        "alpha must not have graduated: {text}"
+    );
+}

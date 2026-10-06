@@ -59,16 +59,29 @@ each member's row the same `cycle` object (`null` outside a cycle): `members`,
 [graduate](graduate.md#dependency-cycles).
 
 Press `[enter]` on a roll for the detail overlay, which breaks the same two
-relationships out with per-dependency markers, and the two are independent —
-a dep can be both at once: `⛔ blocker` for a dep that has not graduated yet
-(it gates this roll's graduation), and `⚠ reintegrate` for one whose branch
-has moved since this roll integrated it (the same `⚠` as the plain table),
-whatever its own state — a dependency does not need to have graduated and
-diverged to be stale; it only needs to have kept moving after it was
-integrated. A cycle carrier's fellow members read `↻ carried` rather than
+relationships out with per-dependency markers. Its dependency list follows the
+chain all the way down — roll 12 depends on 9, which depends on 8, which
+depends on 7 — one indented line per link; a roll reached twice (a diamond) is
+shown once more as `↑ shown above` and not expanded again. The two markers are
+independent — a dep can be both at once: `⛔ blocker` for a dep that has not
+graduated yet (it gates its parent's graduation), and `⚠ reintegrate` for one
+whose branch has moved since its parent integrated it (the same `⚠` as the
+plain table), whatever its own state — a dependency does not need to have
+graduated and diverged to be stale; it only needs to have kept moving after it
+was integrated. A cycle carrier's fellow members read `↻ carried` rather than
 `⛔ blocker`, and a roll in a cycle gets the same advice line as the tables at
 the top of its dependencies. See
 [divergence after integration](../internals/algorithms.md#dependency-detection-coredependenciesrs).
+
+The overlay is a place to dig, not just read. `j`/`k` walk the linked rolls —
+every chain link, then the dependents — and `[enter]` (or `l`) opens the one
+under the cursor as its own pane, with a breadcrumb (`#12 → #9 → #8`) showing
+the path taken. `[backspace]` (or `h`) comes back up one level, and closes when
+there is nowhere further up, so the key never dead-ends; `[esc]` closes outright
+from any depth. Each pane is the same view the table's `[enter]` would open for
+that roll, divergence included, so digging from 12 to 7 shows exactly what
+selecting 7 would have. These keys belong to the overlay, not the table, so they
+are listed in its own footer rather than in the `?` keymap below.
 
 The TUI table pins the stable and rolling branches above the rolls, so `[space]`
 switches to them the same way it switches to a roll. A base branch that exists
@@ -125,6 +138,7 @@ The full list:
 | `PP` | [push every branch that needs it](#pp--push-everything-that-needs-it) |
 | `gg` | lazygit |
 | `c` / `i` | create a roll / integrate one into the checked-out roll |
+| `V` | verify all rolls, or a set of them |
 | `G` / `m` / `u` | graduate / promote / update from stable |
 | `b` | bump the version |
 | `d` / `x` / `t` | delete / prune / tidy branches |
@@ -230,6 +244,18 @@ The one thing it will not do is bump the version. `rf verify` offers one; here a
 failed version gate points at `[b]` instead, which is the key that already writes
 that commit. A failed host or an unsatisfied gate marks the panel as failed
 rather than passing quietly.
+
+### `[V]` — verify many at once
+
+`[V]` opens a picker — `all rolls`, `active`, `blocked`, `graduated`,
+`diverged`, `rolls with a local copy` — each with how many rolls it covers, and a
+digit runs the pass. It is `rf verify --all --state <set>` on the same core
+routine, so the rules are identical, and the one that matters is that the pass
+**checks out each roll in turn** and always returns to the branch you started
+on, whatever any roll's gates said. A dirty tree is refused in the status bar
+before the picker even opens. One job, one panel: each roll's report under its
+own header, then `N passed, M failed, K skipped`, and the panel marks failed if
+any did — see [`verify`](verify.md#verifying-many-at-once).
 
 ## Bumping the version
 

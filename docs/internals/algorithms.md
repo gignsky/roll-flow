@@ -87,6 +87,19 @@ The token it returns is not validated against the roll prefix, and does not need
 to be: every caller either compares it to a real roll branch name or runs it
 through `parse_roll_number`, so a candidate that is not a roll matches nothing.
 
+**Dependency chain.** The detail view (`[enter]`) walks `deps` transitively —
+roll 12 depends on 9, which depends on 8, which depends on 7 — through
+`tui::rolls::dep_chain`. Each level is exactly `dep_rows` of its parent, so there
+is one definition of a direct dependency row and the chain only adds depth. A
+roll reached a second time (a diamond, or a cycle if hand-written merge subjects
+ever produce one) is listed once more as `↑ shown above` and not descended into,
+so the walk is finite and every roll's own dependencies appear exactly once.
+Each link keeps both of `DepRow`'s markers, and both are its *parent's* judgement
+— `⚠ reintegrate` on a deep link reads the parent's `stale_deps`, since the
+parent is who integrated it, not the selected roll.
+The table's `deps` column stays direct-only; widening it for transitive counts
+would cost the `branch` column, which has nothing to spare.
+
 One consequence worth knowing, since `[i]` makes roll-into-roll merges cheap: the
 graduated scan below has a second pass *without* `--first-parent`, so once M
 graduates, N's integrate merge is reachable from rolling and N reports as
@@ -295,6 +308,22 @@ Phases:
 The interactive selection table columns: `#`, `roll`, `loc` (L/R/B/-), `dev` (↑↓✓⚠=),
 `blk` (🔒 if blocked), `scope` (NHFD flags), then per-host verification columns (✓⌛✗—).
 
+## Conflict diagnosis (`core/ops.rs`)
+
+When a `--no-ff` merge in `run_merge` or `merge_gated` fails, the conflicted
+paths are read (`git diff --name-only --diff-filter=U`) **before** `git merge
+--abort` — afterwards there is nothing to read. Each path is then attributed by
+walking the target's first-parent history since the merge base for that path
+(`git log --first-parent <base>..<target> -- <path>`): every commit is a
+culprit, and a merge whose subject names a branch (via
+`branches::extract_graduated_branch`, the single reader of merge subjects) is a
+culprit *roll*. A merge naming the source itself — its own earlier graduation,
+on re-graduation — is dropped. The result is a typed `ops::MergeConflict`
+error carrying a `ConflictReport`, raised only after the unwind so the repo is
+clean by the time anyone acts on it; a merge that failed with no conflicted
+paths keeps the plain error. Diagnosis never errors: it runs on a failing path
+and must not hide the failure it explains.
+
 ## Merge commit message format
 
 Graduation:
@@ -365,9 +394,11 @@ sense. `Semver`'s own `Ord` is then also derived, comparing
 `(major, minor, patch, marker)` in that field order, so the numbers dominate
 the marker exactly as the gate needs.
 
-The merge driver (`core::merge_driver::resolve`, wired up by `rf init`) states
-one rule for every direction a `Cargo.toml` version line gets merged: **keep
-`ours`'s marker; take the higher of the two sides' numbers.** It is correct
+The merge driver (`core::merge_driver::resolve`, wired up by `rf init` and
+before every `rf` merge) states one rule for every direction the crate's own
+version gets merged — `Cargo.toml`'s `version` line and the same value in
+`Cargo.lock`'s own `[[package]]` entry alike: **keep `ours`'s marker; take the
+higher of the two sides' numbers.** It is correct
 as-is for `[i]`/`[I]`/`rf update` (a roll's own `-roll<N>` is already set by
 `rf start`, so "ours" already carries the right marker going in). `ops::graduate`
 does **not** use it, though — the very first graduation ever, rolling has never
@@ -380,6 +411,45 @@ common "only the roll changed the line" trivial case the driver never even
 sees). Once rolling has graduated once, its own `ours` marker *is* `-dev`, so
 the driver's generic rule and `ops::graduate`'s own computation agree from then
 on — the special-casing matters only for bootstrapping.
+
+**Making a version-only conflict impossible.** A driver that only covers one
+of the two files, or that is only configured in clones that happened to run
+`rf init`, still lets a marker-vs-marker merge stop — which is exactly what
+happened to `rf integrate` from one roll into another: the lockfile repeated
+both markers, and the clone had never had the driver configured at all. Three
+layers close that, each covering a gap in the one before:
+
+1. **Both files.** `merge_driver::VersionFile` is `Manifest` or `Lockfile`;
+   git passes `%P` so the driver knows which. In the lockfile only the
+   `[[package]]` entry named after `Cargo.toml`'s `package.name` *with no
+   `source` key* is touched (`version::replace_lock_package_version`) — a
+   registry crate never has an empty source, and an ambiguous match counts as
+   none. The driver doctors *all three* sides (ancestor too) to the resolved
+   value before `git merge-file`, so the line is unchanged everywhere and
+   cannot crowd an edit on a neighbouring line into a conflict; whatever still
+   conflicts is real. Every version rewrite also syncs that lockfile entry
+   directly (`ops::sync_lockfile_own_entry`, ahead of the best-effort `cargo
+   update`), so the two files never drift apart when cargo cannot run.
+2. **Wired whenever `rf` merges.** `ops::wire_version_merge_driver` writes the
+   attribute lines to the clone's own `info/attributes` (via `git rev-parse
+   --git-path`, shared by linked worktrees) and the driver command to local
+   git config — both clone-local, neither in the tree. `run_merge`,
+   `merge_gated` and `ops::integrate` call it quietly before merging, so every
+   `rf` merge (integrate, `[i]`/`[I]`, update, graduate, promote, hotfix land)
+   is covered on a clone that never ran `rf init`. `info/attributes` rather
+   than a committed `.gitattributes` because the latter applies only on
+   branches that carry it, and writing it lazily would leave an uncommitted
+   file on whatever happened to be checked out.
+3. **Settled in-process.** If git stops anyway — `rf` not on the `PATH` git
+   sees, a read-only config — `ops::settle_version_only_conflicts` reads the
+   index's conflict stages (`:1:`/`:2:`/`:3:`) for every unmerged path and
+   runs the same `merge_driver::merge_texts`. It is all-or-nothing: any
+   unmerged path that is not a version file, or that still conflicts with the
+   version line agreed, and it touches nothing. `run_merge`/`ops::integrate`
+   then commit (`--cleanup=strip`, to drop git's `# Conflicts:` comment);
+   `merge_gated` just carries on to its gates, since a settled merge is
+   indistinguishable from a clean `--no-commit` one — which is also why
+   graduation's `reconcile_staged_version` still has the last word.
 
 A dev marker of either kind must never reach stable, and is refused **before**
 the numbers are compared, not by them: `0.2.5-roll9`/`0.2.5-dev` are

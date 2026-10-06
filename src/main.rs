@@ -68,7 +68,19 @@ fn main() -> Result<()> {
                 }
             }
         }
-        Cmd::Verify { dry_run, bump, yes } => cmd_verify(dry_run, bump, yes)?,
+        Cmd::Verify {
+            dry_run,
+            bump,
+            yes,
+            all,
+            state,
+        } => {
+            if all {
+                cmd_verify_all(state)?
+            } else {
+                cmd_verify(dry_run, bump, yes)?
+            }
+        }
         Cmd::Graduate {
             dry_run,
             force,
@@ -141,8 +153,9 @@ fn main() -> Result<()> {
             ancestor,
             ours,
             theirs,
+            path,
         } => {
-            let resolved = core::merge_driver::run(&ancestor, &ours, &theirs)?;
+            let resolved = core::merge_driver::run(&ancestor, &ours, &theirs, path.as_deref())?;
             std::process::exit(if resolved { 0 } else { 1 });
         }
     }
@@ -180,7 +193,7 @@ fn cmd_init(
     // `ops::ensure_version_merge_driver`), so a repo whose config is already
     // up to date on a fresh clone still needs this wired up here.
     if ops::ensure_version_merge_driver(&config)? {
-        println!("Configured the version merge driver for Cargo.toml");
+        println!("Configured the version merge driver for Cargo.toml and Cargo.lock");
     }
 
     // Resolve the workflow mode (issue #18): an explicit `--mode` always wins;
@@ -399,6 +412,73 @@ fn cmd_verify(dry_run: bool, bump: Option<BumpLevel>, yes: bool) -> Result<()> {
         "Verification passed: {} -> {}",
         outcome.source, outcome.target
     );
+    Ok(())
+}
+
+/// `rf verify --all [--state <set>]` — verify every roll in the set in turn.
+///
+/// A thin renderer over `ops::verify_many`, which owns the switch-and-return
+/// discipline; the TUI's `[V]` sits on the same routine so the two agree on
+/// every rule — including the per-roll version check and dev marker. No bump
+/// offer: a bump is a commit on one branch, and this pass walks many.
+fn cmd_verify_all(set: branches::VerifySet) -> Result<()> {
+    let config = Config::load()?;
+    let rolls = branches::list_rolls(&config)?;
+    let selected = set.select(&rolls);
+    if selected.is_empty() {
+        println!("no rolls to verify ({})", set.label());
+        return Ok(());
+    }
+    println!(
+        "Verifying {} roll{} ({})",
+        selected.len(),
+        if selected.len() == 1 { "" } else { "s" },
+        set.label()
+    );
+
+    let results = ops::verify_many(&config, &selected)?;
+    let mut failed = Vec::new();
+    let mut passed = 0;
+    let mut skipped = 0;
+    for result in &results {
+        println!("\n── {} ──", result.branch);
+        if let Some(dev) = result.marked {
+            println!("version marked {dev}");
+        }
+        if let Some(outcome) = &result.outcome {
+            if outcome.diverged_note {
+                println!(
+                    "note: '{}' has commits not in '{}'; graduation/promotion will create a --no-ff merge",
+                    outcome.target, outcome.source
+                );
+            }
+            render_version_check(&outcome.version, &outcome.source, &outcome.target);
+            render_gate_notices(&outcome.gate_notices);
+            render_gate_notices(&outcome.host_notices);
+            render_host_results(&outcome.host_results);
+        }
+        match &result.verdict {
+            ops::VerifyVerdict::Passed => {
+                passed += 1;
+                println!("PASSED");
+            }
+            ops::VerifyVerdict::Failed(why) => {
+                failed.push(result.branch.clone());
+                println!("FAILED: {why}");
+            }
+            ops::VerifyVerdict::Skipped(why) => {
+                skipped += 1;
+                println!("skipped: {why}");
+            }
+        }
+    }
+    println!(
+        "\n{passed} passed, {} failed, {skipped} skipped",
+        failed.len()
+    );
+    if !failed.is_empty() {
+        bail!("verification failed for: {}", failed.join(", "));
+    }
     Ok(())
 }
 
@@ -634,7 +714,8 @@ fn cmd_graduate(
     }
     // `ops::graduate` checks the dev marker belongs to this roll and runs the
     // gates, merge, and dev-tag creation — shared with the `rf promote`
-    // fall-through and the TUI's `[G]`; this wrapper adds the dependency chain.
+    // fall-through and the TUI's `[G]`; this wrapper adds the dependency chain
+    // and, per step, the same conflict diagnosis a lone `rf graduate` always had.
     graduate_with_deps(&config, &current, dry_run, &force, tag, yes)
 }
 
@@ -698,7 +779,27 @@ fn graduate_with_deps(
         }
     }
 
-    let outcomes = ops::graduate_chain(config, &chain, dry_run, force, tag)?;
+    // Each step is offered the same conflict diagnosis a lone `rf graduate`
+    // always had — but the interactive "integrate, then retry" choice is only
+    // sound for the step that merges `roll` itself: `ops::integrate` merges
+    // into HEAD, and HEAD is `roll` throughout this call (`ops::graduate`
+    // checks out whatever step it is running, then restores it on failure).
+    // A dependency step, or the carrier step planned for a carried member,
+    // never matches `roll`, so it falls back to printing the commands by
+    // hand rather than offering to integrate the wrong branch.
+    let outcomes = ops::graduate_chain(
+        config,
+        &chain,
+        dry_run,
+        force,
+        tag,
+        |config, branch, dry_run, force, tag| {
+            let integrate_into = (branch == roll).then_some(roll);
+            with_conflict_handling(config, yes, integrate_into, || {
+                ops::graduate(config, branch, dry_run, force, tag)
+            })
+        },
+    )?;
     for (step, outcome) in chain.iter().zip(&outcomes) {
         print_graduate(outcome);
         if !step.carries.is_empty() {
@@ -808,14 +909,10 @@ fn cmd_promote(
             }
             None => None,
         };
-        let outcome = ops::promote(
-            &config,
-            &ops::PromoteTarget::Rolls(rolls),
-            dry_run,
-            &force,
-            tag,
-            level,
-        )?;
+        let target = ops::PromoteTarget::Rolls(rolls);
+        let outcome = with_conflict_handling(&config, yes, None, || {
+            ops::promote(&config, &target, dry_run, &force, tag, level)
+        })?;
         print_promote(&outcome);
         offer_step_tag_pushes(&config, &outcome, yes)?;
         if !dry_run {
@@ -841,20 +938,222 @@ fn cmd_promote(
             // gets merged, and so it precedes the `--locked` cargo gates.
             resolve_version_gate(&config, bump, yes, forced, dry_run)?;
 
-            let outcome = ops::promote(
-                &config,
-                &ops::PromoteTarget::Rolling,
-                dry_run,
-                &force,
-                tag,
-                None,
-            )?;
+            let outcome = with_conflict_handling(&config, yes, None, || {
+                ops::promote(
+                    &config,
+                    &ops::PromoteTarget::Rolling,
+                    dry_run,
+                    &force,
+                    tag,
+                    None,
+                )
+            })?;
             print_promote(&outcome);
             offer_step_tag_pushes(&config, &outcome, yes)?;
         }
         None => return Err(ops::not_promotable_error(&config, &current)),
     }
     Ok(())
+}
+
+// ── Merge conflicts ─────────────────────────────────────────────────────────
+
+/// What the user chose to do about a merge that stopped on conflicts.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ConflictChoice {
+    /// Integrate the culprit rolls into the source, taking the conflict onto
+    /// the roll branch where it can be resolved and committed.
+    Integrate,
+    /// Print the commands and change nothing.
+    Manual,
+    /// Re-run the merge on the target and leave the conflict in the tree.
+    Stage,
+}
+
+/// How [`handle_merge_conflict`] left things.
+enum ConflictOutcome {
+    /// The culprits merged cleanly into the source — the caller may retry.
+    Retry,
+    /// Something is now mid-merge, by the user's choice; the message says what.
+    Stopped(String),
+}
+
+/// Decide what to do about a conflict, honouring `--yes` and unattended runs.
+///
+/// `--yes` takes the recommended option; an unattended run without it changes
+/// nothing, the same rule `cli::confirm` applies — a command that lands in
+/// someone's CI must report, never leave a repo mid-merge.
+fn choose_conflict_action(yes: bool, can_integrate: bool) -> Result<ConflictChoice> {
+    let recommended = if can_integrate {
+        ConflictChoice::Integrate
+    } else {
+        ConflictChoice::Manual
+    };
+    if yes {
+        return Ok(recommended);
+    }
+    if !std::io::stdin().is_terminal() {
+        return Ok(ConflictChoice::Manual);
+    }
+    let options: Vec<ConflictChoice> = if can_integrate {
+        vec![
+            ConflictChoice::Integrate,
+            ConflictChoice::Manual,
+            ConflictChoice::Stage,
+        ]
+    } else {
+        vec![ConflictChoice::Manual, ConflictChoice::Stage]
+    };
+    let default = options.iter().position(|c| *c == recommended).unwrap_or(0) + 1;
+    let picked = cli::prompt_choice(options.len(), default)?;
+    Ok(options[picked - 1])
+}
+
+/// Print the diagnosis of a conflicting merge, offer the ways forward, and
+/// carry out the one chosen.
+///
+/// `integrate_into` is the checked-out roll when the failed merge was a
+/// graduation — the one case where the conflict can be taken onto the source
+/// side with `rf integrate`. It is the recommended choice because it is the
+/// workflow's own way of saying "this roll now depends on that one": the
+/// integrate merge leaves the same conflict on the roll branch, where it is
+/// resolved and committed like any other, and the dependency shows in
+/// `rf status` from then on. Promotion has no such option — its source is a
+/// commit on rolling, and the fix for a hotfix-vs-rolling conflict is to
+/// resolve it on the branch it landed on.
+fn handle_merge_conflict(
+    config: &Config,
+    conflict: &ops::MergeConflict,
+    yes: bool,
+    integrate_into: Option<&str>,
+) -> Result<ConflictOutcome> {
+    let report = &conflict.report;
+    let culprits = report.culprit_rolls();
+    println!("{conflict}");
+    println!();
+    for line in report.render() {
+        println!("{line}");
+    }
+    println!();
+    if culprits.is_empty() {
+        println!(
+            "Nothing on '{}' since the merge base is attributable to a roll; the \
+             conflicting change was made there directly.",
+            report.target
+        );
+    } else {
+        println!(
+            "The conflicting change is already on '{}' — it came in with {}.",
+            report.target,
+            culprits.join(", ")
+        );
+    }
+
+    let can_integrate = integrate_into.is_some() && !culprits.is_empty();
+    println!();
+    println!("Ways forward:");
+    let mut n = 0;
+    if can_integrate {
+        n += 1;
+        println!(
+            "  {n}) integrate {} into '{}' now, resolve there, then re-run rf graduate   [recommended]",
+            culprits.join(" and "),
+            integrate_into.unwrap_or_default()
+        );
+    }
+    n += 1;
+    println!(
+        "  {n}) nothing now; print the commands to do it by hand{}",
+        if can_integrate {
+            ""
+        } else {
+            "   [recommended]"
+        }
+    );
+    n += 1;
+    println!(
+        "  {n}) re-run the merge and leave the conflict in the working tree on '{}' for lazygit",
+        report.target
+    );
+
+    match choose_conflict_action(yes, can_integrate)? {
+        ConflictChoice::Integrate => {
+            let roll = integrate_into.unwrap_or_default();
+            for culprit in &culprits {
+                println!();
+                println!("integrating {culprit} into {roll}");
+                if let Err(err) = ops::integrate(config, culprit) {
+                    if git::ref_exists(&config.repo_root, "MERGE_HEAD") {
+                        return Ok(ConflictOutcome::Stopped(format!(
+                            "'{roll}' is now mid-merge with '{culprit}': resolve the conflicts \
+                             and commit, then run rf graduate again (gg in the TUI opens \
+                             lazygit; `git merge --abort` backs out)"
+                        )));
+                    }
+                    return Err(err);
+                }
+                println!("integrated {culprit} into {roll} cleanly");
+            }
+            Ok(ConflictOutcome::Retry)
+        }
+        ConflictChoice::Manual => {
+            println!();
+            println!("To resolve on '{}':", report.target);
+            println!(
+                "  git checkout {} && git merge --no-ff {}",
+                report.target, report.source
+            );
+            if let (Some(roll), false) = (integrate_into, culprits.is_empty()) {
+                println!("Or take the conflict onto '{roll}' (from '{roll}'):");
+                for culprit in &culprits {
+                    println!("  rf integrate {culprit}");
+                }
+            }
+            Ok(ConflictOutcome::Stopped(format!(
+                "'{}' was not merged into '{}'",
+                report.source, report.target
+            )))
+        }
+        ConflictChoice::Stage => {
+            if ops::stage_conflict(config, &report.source, &report.target)? {
+                Ok(ConflictOutcome::Stopped(format!(
+                    "'{}' is now checked out mid-merge with '{}': resolve the conflicts and \
+                     commit (gg in the TUI opens lazygit), or `git merge --abort` to back out",
+                    report.target, report.source
+                )))
+            } else {
+                Ok(ConflictOutcome::Stopped(format!(
+                    "the merge of '{}' into '{}' went through cleanly this time and is \
+                     committed; run the command again to finish",
+                    report.source, report.target
+                )))
+            }
+        }
+    }
+}
+
+/// Run a merge-performing operation, and if it stops on conflicts, diagnose,
+/// offer choices, and retry once when the choice made a retry possible.
+fn with_conflict_handling<T>(
+    config: &Config,
+    yes: bool,
+    integrate_into: Option<&str>,
+    mut op: impl FnMut() -> Result<T>,
+) -> Result<T> {
+    match op() {
+        Ok(value) => Ok(value),
+        Err(err) => match err.downcast::<ops::MergeConflict>() {
+            Ok(conflict) => match handle_merge_conflict(config, &conflict, yes, integrate_into)? {
+                ConflictOutcome::Retry => {
+                    println!();
+                    println!("retrying");
+                    op()
+                }
+                ConflictOutcome::Stopped(message) => bail!("{message}"),
+            },
+            Err(err) => Err(err),
+        },
+    }
 }
 
 /// Gate every real promotion on an explicit "is this final?" before anything
