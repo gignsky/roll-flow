@@ -65,6 +65,23 @@ unasked — each is promoted by its own step, so no step drags another along. A
 `--dry-run` prints the same list as `would also land:` lines instead of asking,
 and a real promotion reports what it landed as `also landed:`. The TUI's `[m]`
 on a roll row shows the same list inside its confirmation modal.
+A `--roll` that depends on rolls which have graduated but not yet promoted
+promotes those first, each as its own step, and says so before asking:
+
+```text
+  roll/7-0918-verify-button  (dependency of 8, ✓ graduated)
+(dependencies added ahead of what was named)
+
+Promote these in order? [y/N]
+```
+
+`--yes` confirms; unattended, the plan is printed and nothing is merged. Since a
+per-roll promotion advances stable to a graduation commit that already carries
+everything graduated before it, the dependency step often reports
+`already contained` once the first merge lands — that is correct, and the point
+of ordering them. A dependency that has not graduated is refused outright: there
+is nothing on rolling to advance stable to. `[m]` on a roll row in the TUI
+performs the same expansion and lists it in its confirm modal.
 
 Each `--roll` is its own merge behind its own gate run, so a two-roll promotion
 runs the gates twice and verifies both intermediate states of stable. Promoting

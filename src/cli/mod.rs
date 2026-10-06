@@ -154,8 +154,10 @@ pub enum Cmd {
         /// Skip creating the `v<X.Y.Z>-dev` tag on rolling's new tip.
         #[arg(long)]
         no_tag: bool,
-        /// Answer yes to prompts (non-interactive): pushes the dev tag without
-        /// asking.
+        /// Answer yes to prompts (non-interactive): graduates ungraduated
+        /// dependencies first and pushes the dev tag without asking. Without
+        /// it a multi-roll plan is shown and confirmed; unattended, it is
+        /// shown and nothing is merged.
         #[arg(long)]
         yes: bool,
     },
