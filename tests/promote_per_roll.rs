@@ -483,9 +483,11 @@ fn yes_takes_the_patch_default_for_a_per_roll_promotion() {
 #[test]
 fn an_unattended_per_roll_promotion_names_the_roll_not_a_sha() {
     // No --bump, no --yes, no terminal: refused — but the refusal must name
-    // the roll and a fix that actually works.
+    // the roll and a fix that actually works. `--final` answers only the
+    // finalize prompt, so the bump refusal this test is about is still
+    // reached (plain `--yes` would also take the automatic patch bump).
     let (sb, alpha) = one_graduated_cargo_roll();
-    let out = sb.rf(&["promote", "--roll", &alpha]);
+    let out = sb.rf(&["promote", "--roll", &alpha, "--final"]);
     assert!(!out.success, "should refuse: {}", out.combined());
     assert!(
         out.combined().contains(&alpha),

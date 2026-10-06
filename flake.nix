@@ -46,7 +46,7 @@
         in
         {
           default = p.callPackage ./package.nix { };
-          roll-flow = p.callPackage ./package.nix { };
+          # roll-flow = p.callPackage ./package.nix { };
         }
       );
 
@@ -114,8 +114,8 @@
         '';
       };
 
-      homeManagerModules.roll-flow = import ./modules/home-manager/roll-flow.nix;
-      nixosModules.roll-flow = import ./modules/nixos/roll-flow.nix;
+      # homeManagerModules.roll-flow = import ./modules/home-manager/roll-flow.nix;
+      # nixosModules.roll-flow = import ./modules/nixos/roll-flow.nix;
 
       # Both modules evaluated against a stub of the option tree they need, so
       # `nix flake check` catches a broken module without needing a full Home

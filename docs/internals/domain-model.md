@@ -17,6 +17,11 @@ Branch names are configurable. Defaults: `rolling_branch = "rolling"`, `stable_b
 - **graduated** — merged to rolling (by merge commit or Graduate commit)
 - **promoted** — merged to main, stable
 - **diverged** — graduated but branch has commits after the merge point (needs re-graduation)
+- **reverted** — graduated, but a `git revert` later undid that merge on rolling (needs
+  re-graduation — see [Revert detection](algorithms.md#revert-detection-corebranchesrs))
+- **demoted** — promoted, but a `git revert` later undid that merge on the stable branch
+  (needs re-promotion — detected but not automated, see
+  [Revert detection](algorithms.md#revert-detection-corebranchesrs))
 - **blocked** — has ungraduated dependencies that must graduate first
 
 ## Quasi-rolls

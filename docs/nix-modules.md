@@ -7,6 +7,11 @@ inputs.roll-flow.homeManagerModules.roll-flow
 inputs.roll-flow.nixosModules.roll-flow
 ```
 
+> **Currently not exported.** `main` commented both outputs out of `flake.nix`
+> (49fc386, "removed flake outputs"); the module files and their `nix flake check`
+> checks (`checks` in `flake.nix`) remain. Uncomment the two lines in `flake.nix` to export them
+> again — everything in this file assumes they are.
+
 Both live under `programs.roll-flow` and both default `package` to the
 consumer's `pkgs.roll-flow` when it has one (gigpkgs' overlay provides it),
 building from this flake's own source only when it does not.

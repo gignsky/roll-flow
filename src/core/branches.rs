@@ -41,7 +41,9 @@ pub enum RollState {
     Active,    // not yet merged to rolling
     Graduated, // merged to rolling, no new commits since
     Diverged,  // merged to rolling, but has new commits since (needs re-graduation)
+    Reverted,  // merged to rolling, but that merge was later reverted there (needs re-graduation)
     Promoted,  // merged to main
+    Demoted,   // merged to main, but that merge was later reverted there (needs re-promotion)
     Blocked,   // active but has ungraduated dependencies
 }
 
@@ -51,7 +53,9 @@ impl RollState {
             RollState::Active => "active",
             RollState::Graduated => "✓ graduated",
             RollState::Diverged => "⚠ diverged",
+            RollState::Reverted => "↩ reverted",
             RollState::Promoted => "✓ promoted",
+            RollState::Demoted => "↩ demoted",
             RollState::Blocked => "⛔ blocked",
         }
     }
@@ -72,6 +76,17 @@ pub struct RollInfo {
     /// roll. Precomputed in [`list_rolls`] from a single reverse index so
     /// renderers never rescan the whole list per row.
     pub dependents: Vec<u32>,
+    /// The subset of [`deps`](Self::deps) whose current branch tip is **not**
+    /// an ancestor of this roll — i.e. this roll integrated them at some point,
+    /// but they have since moved on and this roll's copy is stale. This is a
+    /// direct `git merge-base --is-ancestor` check, so unlike [`state`]'s
+    /// `Diverged` it fires regardless of the dependency's own state: an
+    /// `Active` dependency that keeps gaining commits after being integrated is
+    /// just as stale as a `Diverged` one that graduated and then moved. That
+    /// matters before merging a batch of dependents — each one that integrated
+    /// an older copy of a still-moving dependency needs to say so, not just the
+    /// ones whose dependency happens to have graduated.
+    pub stale_deps: Vec<u32>,
     /// Hash of this roll's graduation merge on the rolling branch, or `None`
     /// when it has not graduated. This is the commit `rf promote --roll` merges
     /// into stable: advancing stable to it promotes exactly this roll (and
@@ -87,6 +102,27 @@ pub struct RollInfo {
 pub fn format_roll_numbers(nums: &[u32]) -> String {
     nums.iter()
         .map(|n| n.to_string())
+        .collect::<Vec<_>>()
+        .join(",")
+}
+
+/// Render the `deps` column like [`format_roll_numbers`], but suffix a number
+/// with `⚠` when it is also in `stale` — i.e. `RollInfo::stale_deps` — so a
+/// dependency that has moved since this roll integrated it is visible from the
+/// plain table, not only the detail view. This is what matters before
+/// reintegrating or merging a batch of dependents against a still-moving
+/// dependency: `2,3⚠` says dep 3 has new commits to pick up, dep 2 does not.
+/// Never applied to `dependants`: staleness is a property of what this roll
+/// integrated, not of who integrated this roll.
+pub fn format_deps_with_staleness(nums: &[u32], stale: &[u32]) -> String {
+    nums.iter()
+        .map(|n| {
+            if stale.contains(n) {
+                format!("{n}⚠")
+            } else {
+                n.to_string()
+            }
+        })
         .collect::<Vec<_>>()
         .join(",")
 }
@@ -145,10 +181,22 @@ pub fn list_rolls(config: &Config) -> Result<Vec<RollInfo>, RfError> {
         let is_graduated = graduation_commit.is_some();
 
         let state = if is_promoted {
-            RollState::Promoted
+            // Only revert-check promoted rolls; a roll that never promoted has
+            // nothing on stable to have been reverted.
+            if check_promotion_reverted(repo, &branch, &config.stable_branch) {
+                RollState::Demoted
+            } else {
+                RollState::Promoted
+            }
         } else if is_graduated {
-            // Only divergence-check graduated (not-yet-promoted) rolls.
-            if check_diverged(repo, &branch, &config.rolling_branch) {
+            // Only revert/divergence-check graduated (not-yet-promoted) rolls.
+            // Reverted takes priority over Diverged: a roll can gain new
+            // commits on its own branch at any point regardless of whether its
+            // graduation merge is still standing, and "the graduation was
+            // undone" is the more urgent fact to surface.
+            if check_reverted(repo, &branch, &config.rolling_branch) {
+                RollState::Reverted
+            } else if check_diverged(repo, &branch, &config.rolling_branch) {
                 RollState::Diverged
             } else {
                 RollState::Graduated
@@ -165,6 +213,7 @@ pub fn list_rolls(config: &Config) -> Result<Vec<RollInfo>, RfError> {
             location,
             deps: Vec::new(),
             dependents: Vec::new(),
+            stale_deps: Vec::new(),
             graduation_commit,
         });
     }
@@ -176,7 +225,8 @@ pub fn list_rolls(config: &Config) -> Result<Vec<RollInfo>, RfError> {
     // `rf integrate` — detected from its own first-parent merge history. File
     // overlap and broad ancestry are deliberately NOT used here: in a dotfiles
     // repo nearly every roll touches flake.lock, which made them spuriously
-    // block one another.
+    // block one another. The one exception is a merge of the rolling branch
+    // itself (`[I]` / `rf integrate <rolling>`): see `integration_deps`.
     //
     // Blocking, by contrast, only applies to Active rolls: an ungraduated
     // integration holds a roll back from graduating, but once the roll itself
@@ -189,7 +239,23 @@ pub fn list_rolls(config: &Config) -> Result<Vec<RollInfo>, RfError> {
             roll.number,
             &config.roll_prefix,
             &deps_base_ref(roll, &config.stable_branch),
+            &config.rolling_branch,
+            &graduated,
         );
+        // A dependency this roll integrated may have kept moving since — an
+        // ancestry check, not a state lookup, so it fires however the
+        // dependency's own state reads (Active, Diverged, whatever).
+        roll.stale_deps = roll
+            .deps
+            .iter()
+            .copied()
+            .filter(|dep_num| {
+                snapshot
+                    .iter()
+                    .find(|r| r.number == *dep_num)
+                    .is_some_and(|dep| dep_tip_missing(repo, &dep.branch, &roll.branch))
+            })
+            .collect();
         if roll.state == RollState::Active {
             let blocked = roll.deps.iter().any(|dep| {
                 snapshot
@@ -242,7 +308,8 @@ fn deps_base_ref(roll: &RollInfo, stable_ref: &str) -> String {
 // ── Per-roll checks (exposed for use in graduate/promote commands) ─────────────
 
 /// True if the roll has a graduation (merge) commit on the rolling branch.
-/// Checks both `Merge branch 'roll/N-...'` and `Graduate roll/N-...` formats.
+/// Every merge-subject shape [`extract_graduated_branch`] knows is checked,
+/// including the hand-written ones a conflicted merge leaves behind.
 pub fn check_graduated(repo: &Path, roll_branch: &str, rolling_ref: &str) -> bool {
     let rolling = match git::resolve_branch(repo, rolling_ref) {
         Some(r) => r,
@@ -282,6 +349,54 @@ pub fn check_diverged(repo: &Path, roll_branch: &str, rolling_ref: &str) -> bool
         .and_then(|s| s.trim().parse::<u32>().ok())
         .map(|n| n > 0)
         .unwrap_or(false)
+}
+
+/// True if the roll's graduation onto `rolling_ref` was later undone there by
+/// a `git revert`. See [`find_reverted_graduation`] for the commit that would
+/// need reverting *again* to restore it — the actual re-graduation, since the
+/// roll branch's own tip remains an ancestor of rolling either way (a revert
+/// adds a commit on top; it does not remove anything from history), so an
+/// ordinary `--no-ff` re-merge of the roll has nothing new to bring in and
+/// cannot undo the revert.
+pub fn check_reverted(repo: &Path, roll_branch: &str, rolling_ref: &str) -> bool {
+    find_reverted_graduation(repo, roll_branch, rolling_ref).is_some()
+}
+
+/// If `roll_branch`'s graduation onto `rolling_ref` is currently reverted
+/// there, the hash of the commit to revert *now* to restore it. `None` when
+/// the roll never graduated, or its graduation is currently in effect
+/// (never reverted, or reverted an even number of times — see
+/// [`find_active_revert_in_range`]).
+pub fn find_reverted_graduation(
+    repo: &Path,
+    roll_branch: &str,
+    rolling_ref: &str,
+) -> Option<String> {
+    let rolling = git::resolve_branch(repo, rolling_ref)?;
+    let merge_hash = find_graduation_commit(repo, roll_branch, &rolling)?;
+    find_active_revert_in_range(repo, &merge_hash, &rolling)
+}
+
+/// True if `roll_branch`'s single-roll promotion (`Promote <roll> to
+/// <stable>`, the `rf promote --roll` shape) onto `stable_ref` was later
+/// undone there by a `git revert`.
+///
+/// Deliberately narrower than [`check_reverted`]: it only recognizes the
+/// single-roll promotion shape ([`scan_promotion_commits`]), not the
+/// multi-roll `Promote <rolling> to <stable>` shape that can carry several
+/// rolls in one merge — a revert of a bundled promotion is not attributed to
+/// any one roll here. Detect-only: nothing currently automates the fix the
+/// way [`find_reverted_graduation`] does for a reverted graduation, since
+/// that would mean teaching the per-roll promotion pipeline (version gate,
+/// release tags, carried-rolls disclosure) a second kind of step.
+pub fn check_promotion_reverted(repo: &Path, roll_branch: &str, stable_ref: &str) -> bool {
+    let Some(stable) = git::resolve_branch(repo, stable_ref) else {
+        return false;
+    };
+    let Some(hash) = scan_promotion_commits(repo, &stable).remove(roll_branch) else {
+        return false;
+    };
+    find_active_revert_in_range(repo, &hash, &stable).is_some()
 }
 
 /// True if the roll has been promoted to the stable branch.
@@ -386,28 +501,91 @@ fn scan_promoted(repo: &Path, stable_ref: &str) -> HashSet<String> {
     promoted
 }
 
+/// The ref to read a branch's file content at: its own tip when there is a
+/// local copy, `origin/<branch>` when the branch only exists on the remote.
+///
+/// The same local-first order as [`git::resolve_branch`], in one place, because
+/// the TUI table and both plain tables all have to agree about which commit a
+/// branch's version was read from.
+pub fn content_ref(branch: &str, location: &BranchLocation) -> String {
+    match location {
+        BranchLocation::Remote => format!("origin/{branch}"),
+        _ => branch.to_string(),
+    }
+}
+
 /// Extract the branch name from a graduation subject line. Handles the three
 /// merge-subject shapes a roll can land through:
 /// - `Merge branch 'roll/N-...'[ into ...]` — a local `git merge --no-ff`.
 /// - `Graduate roll/N-... [...]` — an `rf graduate` structured merge.
 /// - `Merge pull request #M from OWNER/roll/N-...` — a GitHub PR merge, which is
 ///   how PR-based repos (including roll-flow dogfooding itself) land rolls.
+/// - anything else beginning with `merge` that names a branch — see the fallback.
+///
+/// Matching is case-insensitive, and that is not cosmetic. A merge that
+/// conflicts drops the user in an editor, and what comes back is whatever they
+/// wrote: `merge branch 'roll/8-0918-help-menu'`, lowercase and without the
+/// `into` clause, is in this repo's own history. The anchored, case-sensitive
+/// match this replaced returned `None` for it, and since this one function is
+/// how *every* consumer reads a merge subject, that single miss took the roll's
+/// dependency, its graduation and its graduation commit with it.
 fn extract_graduated_branch(subject: &str) -> Option<String> {
-    if let Some(rest) = subject.strip_prefix("Merge branch '") {
-        // e.g. "roll/5-theme'" or "roll/5-theme' into rolling"
-        rest.split('\'').next().map(|b| b.to_string())
-    } else if let Some(rest) = subject.strip_prefix("Graduate ") {
-        // e.g. "roll/5-theme into rolling"
-        rest.split_whitespace().next().map(|b| b.to_string())
-    } else if subject.starts_with("Merge pull request #") {
-        // "Merge pull request #M from OWNER/BRANCH" — split off the owner only,
-        // since BRANCH itself contains '/' (e.g. "gignsky/roll/5-theme").
-        subject
+    // Cut the ` into ` clause first. It names the merge *target*, never the
+    // source, and dropping it is what makes the lenient fallback below safe:
+    // `Merge branch 'roll/8-x' into roll/7-y` must never yield roll/7, because
+    // on the rolling branch that reads as "roll/7 graduated" — a far worse
+    // failure than missing a dependency.
+    let subject = before_into(subject);
+
+    // The PR shape is tried first because its token carries the owner
+    // (`OWNER/roll/N-…`), which the fallback would hand back verbatim.
+    if let Some(rest) = strip_prefix_ci(subject, "Merge pull request #") {
+        return rest
             .split_once(" from ")
             .and_then(|(_, owner_branch)| owner_branch.split_once('/'))
-            .map(|(_owner, branch)| branch.trim().to_string())
-    } else {
-        None
+            .map(|(_owner, branch)| branch.trim().to_string());
+    }
+    if let Some(rest) = strip_prefix_ci(subject, "Merge branch '") {
+        // e.g. "roll/5-theme'" or "roll/5-theme' into rolling"
+        return rest.split('\'').next().map(|b| b.to_string());
+    }
+    if let Some(rest) = strip_prefix_ci(subject, "Graduate ") {
+        // e.g. "roll/5-theme into rolling"
+        return rest.split_whitespace().next().map(|b| b.to_string());
+    }
+
+    // Hand-written merges: `merge roll/8-0918-help-menu`, `Merged roll/8-x`.
+    // Gated on the subject still announcing itself as a merge, which is what
+    // keeps `Revert "Merge branch 'roll/8-x'"` from reading as a graduation.
+    // The token is returned unvalidated on purpose — every caller already
+    // matches it against real roll branch names or runs it through
+    // `parse_roll_number`, so a candidate that is not a roll simply never
+    // matches anything.
+    strip_prefix_ci(subject, "merge")?;
+    subject
+        .split_whitespace()
+        .map(|token| token.trim_matches(['\'', '"', ',', '.']))
+        .find(|token| token.contains('/'))
+        .map(|token| token.to_string())
+}
+
+/// `strip_prefix`, ignoring ASCII case.
+fn strip_prefix_ci<'a>(s: &'a str, prefix: &str) -> Option<&'a str> {
+    s.get(..prefix.len())
+        .filter(|head| head.eq_ignore_ascii_case(prefix))
+        .map(|head| &s[head.len()..])
+}
+
+/// The part of `subject` before a ` into ` clause, which names the merge target.
+///
+/// The index comes from an ASCII-lowercased copy, which is byte-for-byte the
+/// same length as the original — `to_ascii_lowercase` only maps `A-Z` — so it
+/// stays a valid index into `subject` even when the subject holds multi-byte
+/// characters.
+fn before_into(subject: &str) -> &str {
+    match subject.to_ascii_lowercase().find(" into ") {
+        Some(at) => &subject[..at],
+        None => subject,
     }
 }
 
@@ -433,13 +611,34 @@ fn subjects_contain_graduation(subjects: &[String], roll_branch: &str) -> bool {
 /// `rev_parse` and only falls back to branch resolution.
 ///
 /// This is the only dependency signal that gates blocking: file overlap and
-/// broad ancestry are intentionally excluded (see `list_rolls`).
+/// broad ancestry are intentionally excluded (see `list_rolls`) — with one
+/// exception. A direct merge of the rolling branch itself (`[I]` / `rf
+/// integrate <rolling>`) produces a subject naming rolling, not a roll, so the
+/// subject scan alone finds nothing — yet that merge brings in every roll
+/// already graduated onto it. When one of the merges in range names the
+/// rolling branch, `graduated` (every known graduated branch mapped to its
+/// graduation commit, already computed once by `list_rolls`) is consulted:
+/// any graduation commit newly reachable from this roll is a real dependency,
+/// acquired in that one merge.
+///
+/// "Newly reachable" is load-bearing, not merely an ancestor of the roll's
+/// tip: a graduation from months ago is an ancestor of nearly every branch
+/// created afterward, because `rf promote` folds it into stable and every
+/// roll forks from stable. Without excluding `base`'s own ancestry too, every
+/// roll that ever did an `[I]` merge reports a dependency on the *entire*
+/// graduation history of the repo — the exact "broad ancestry" explosion the
+/// paragraph above says this function avoids. Requiring the commit to be
+/// absent from `base` restricts it to graduations this merge actually
+/// introduced, matching the `base..roll` scoping the subject scan above
+/// already uses.
 fn integration_deps(
     repo: &Path,
     roll_branch: &str,
     roll_num: u32,
     prefix: &str,
     base_ref: &str,
+    rolling_branch: &str,
+    graduated: &HashMap<String, String>,
 ) -> Vec<u32> {
     let (Some(roll_ref), Some(base)) = (
         git::resolve_branch(repo, roll_branch),
@@ -454,22 +653,61 @@ fn integration_deps(
     let subjects =
         git::log_subjects(repo, &["--first-parent", "--merges", &range]).unwrap_or_default();
 
-    let mut deps: Vec<u32> = subjects
-        .iter()
-        .filter_map(|s| extract_graduated_branch(s))
-        .filter_map(|b| parse_roll_number(&b, prefix))
-        .filter(|&n| n != roll_num)
-        .collect();
+    let mut merged_rolling = false;
+    let mut deps: Vec<u32> = Vec::new();
+    for branch in subjects.iter().filter_map(|s| extract_graduated_branch(s)) {
+        match parse_roll_number(&branch, prefix) {
+            Some(n) if n != roll_num => deps.push(n),
+            Some(_) => {}
+            None if branch == rolling_branch => merged_rolling = true,
+            None => {}
+        }
+    }
+
+    if merged_rolling {
+        for (branch, commit) in graduated {
+            if branch == roll_branch {
+                continue;
+            }
+            let Some(n) = parse_roll_number(branch, prefix) else {
+                continue;
+            };
+            let newly_reachable = git::is_ancestor(repo, commit, &roll_ref).unwrap_or(false)
+                && !git::is_ancestor(repo, commit, &base).unwrap_or(true);
+            if n != roll_num && newly_reachable {
+                deps.push(n);
+            }
+        }
+    }
 
     deps.sort_unstable();
     deps.dedup();
     deps
 }
 
+/// True if `dep_branch`'s current tip is not reachable from `roll_branch` —
+/// i.e. `roll_branch` does not (yet, or any longer) contain `dep_branch`'s
+/// latest work. Used to populate [`RollInfo::stale_deps`]: this is a plain
+/// `git merge-base --is-ancestor` check against each branch's *current* ref
+/// (local preferred, `origin/<branch>` as fallback, same as every other
+/// branch lookup here), not a comparison against the point `dep_branch` was
+/// originally integrated — so it answers "is there anything new to pick up",
+/// which is what matters before reintegrating or merging a batch of
+/// dependents. Either branch failing to resolve answers `false`: no claim of
+/// staleness can be made about a branch that no longer exists.
+fn dep_tip_missing(repo: &Path, dep_branch: &str, roll_branch: &str) -> bool {
+    let (Some(dep_ref), Some(roll_ref)) = (
+        git::resolve_branch(repo, dep_branch),
+        git::resolve_branch(repo, roll_branch),
+    ) else {
+        return false;
+    };
+    !git::is_ancestor(repo, &dep_ref, &roll_ref).unwrap_or(true)
+}
+
 /// Find the git hash of the merge/graduation commit for `roll_branch` on
 /// `rolling_ref` — pass a stable ref to get the graduation once it has been
-/// promoted, which is what the future revert flow (issue #38) needs. Returns
-/// `None` if no graduation commit is found. Scans merge
+/// promoted. Returns `None` if no graduation commit is found. Scans merge
 /// commits and matches subjects through [`extract_graduated_branch`], so all
 /// three merge-subject shapes (local `Merge branch`, `Graduate`, and GitHub
 /// `Merge pull request`) are recognized from one source of truth.
@@ -485,6 +723,83 @@ fn find_graduation_commit(repo: &Path, roll_branch: &str, rolling_ref: &str) -> 
         }
     }
     None
+}
+
+/// Whether `event_hash` is currently "in effect" on `range_head`'s history,
+/// by chaining `git revert`'s own `` "This reverts commit <hash>." `` body
+/// line: a revert flips the parity, and the revert commit itself becomes the new
+/// thing a later revert-of-the-revert must reference (so a revert, undone,
+/// re-reverted, ... is tracked correctly rather than only one level deep).
+///
+/// Returns the hash to revert *now* to restore `event_hash`'s effect — its
+/// own revert, or the latest un-reverting revert still standing in the chain
+/// — or `None` when `event_hash` is currently in effect (never reverted, or
+/// reverted an even number of times).
+///
+/// Matched on the body rather than the subject: that boilerplate line is
+/// pre-filled by git itself and tends to survive even a conflicted revert's
+/// hand-edited subject (the editor opens with it already there), the same
+/// leniency [`extract_graduated_branch`] relies on for hand-written merges.
+fn find_active_revert_in_range(repo: &Path, event_hash: &str, range_head: &str) -> Option<String> {
+    let range = format!("{event_hash}..{range_head}");
+    // Oldest first, so the chain is walked in the order it actually happened.
+    let out =
+        git::capture_git(repo, &["log", "--reverse", &range, "--format=%H%x09%b%x00"]).ok()?;
+
+    let mut current = event_hash.to_string();
+    let mut reverted = false;
+    for entry in out.split('\0') {
+        let Some((hash, body)) = entry.split_once('\t') else {
+            continue;
+        };
+        let reverts_current = body.lines().any(|line| {
+            let line = line.trim_start();
+            line.starts_with("This reverts commit") && line.contains(&current)
+        });
+        if reverts_current {
+            reverted = !reverted;
+            current = hash.to_string();
+        }
+    }
+
+    reverted.then_some(current)
+}
+
+/// Scan `stable_ref`'s own mainline for `Promote <branch> to <stable>`
+/// merges — the mirror of [`scan_graduated`], but for the single-roll
+/// promotion shape (`rf promote --roll`) rather than graduation. Maps each
+/// promoted branch to the hash of that promotion commit, which is what a
+/// revert on stable would target.
+///
+/// Deliberately narrow, same caveat as [`check_promotion_reverted`]: the
+/// multi-roll `Promote <rolling> to <stable>` shape names `<rolling>`, not a
+/// roll, so it is harmlessly recorded under a key no roll branch matches.
+fn scan_promotion_commits(repo: &Path, stable_ref: &str) -> HashMap<String, String> {
+    let mut map = HashMap::new();
+    let Ok(out) = git::capture_git(
+        repo,
+        &[
+            "log",
+            "--first-parent",
+            "--merges",
+            "--format=%H%x09%s",
+            stable_ref,
+        ],
+    ) else {
+        return map;
+    };
+    for line in out.lines() {
+        let Some((hash, subject)) = line.split_once('\t') else {
+            continue;
+        };
+        if let Some(rest) = subject.strip_prefix("Promote ") {
+            if let Some(branch) = rest.split_whitespace().next() {
+                map.entry(branch.to_string())
+                    .or_insert_with(|| hash.to_string());
+            }
+        }
+    }
+    map
 }
 
 #[cfg(test)]
@@ -527,5 +842,74 @@ mod tests {
         assert_eq!(parse_roll_number("claude/some-fix", "roll/"), None);
         // Unrelated subject.
         assert_eq!(extract_graduated_branch("chore: bump version"), None);
+    }
+
+    #[test]
+    fn extracts_branch_from_a_hand_written_merge_subject() {
+        // The literal subject on roll/7 in this repo, kept as a regression
+        // fixture: the merge conflicted, so the subject was typed by hand and
+        // came back lowercase and without the `into` clause. The anchored,
+        // case-sensitive match this replaced returned `None` here, which is how
+        // roll/7 came to have no recorded dependency on roll/8.
+        assert_eq!(
+            extract_graduated_branch("merge branch 'roll/8-0918-help-menu'").as_deref(),
+            Some("roll/8-0918-help-menu")
+        );
+        // No `branch`, no quotes — still a merge, still names its source.
+        assert_eq!(
+            extract_graduated_branch("merge roll/8-0918-help-menu").as_deref(),
+            Some("roll/8-0918-help-menu")
+        );
+        assert_eq!(
+            extract_graduated_branch("Merged roll/8-0918-help-menu into the keymap").as_deref(),
+            Some("roll/8-0918-help-menu")
+        );
+        // Case is ignored on the structured shapes too.
+        assert_eq!(
+            extract_graduated_branch("graduate roll/5-0611-theme into develop").as_deref(),
+            Some("roll/5-0611-theme")
+        );
+    }
+
+    #[test]
+    fn a_merge_subject_never_yields_its_target() {
+        // The safety property the lenient fallback rests on. Reporting the
+        // target would mark an unmerged roll as graduated, which is far worse
+        // than missing a dependency — so the ` into ` clause is cut before
+        // anything else looks at the subject.
+        for subject in [
+            "Merge branch 'roll/8-x' into roll/7-y",
+            "merge branch 'roll/8-x' INTO roll/7-y",
+            "merge roll/8-x into roll/7-y",
+        ] {
+            assert_eq!(
+                extract_graduated_branch(subject).as_deref(),
+                Some("roll/8-x"),
+                "{subject}"
+            );
+        }
+        // A merge whose source is not a roll yields the source, not the target,
+        // and simply matches no roll downstream.
+        assert_eq!(
+            extract_graduated_branch("Merge branch 'feature/x' into roll/7-y").as_deref(),
+            Some("feature/x")
+        );
+        assert_eq!(parse_roll_number("feature/x", "roll/"), None);
+    }
+
+    #[test]
+    fn a_revert_is_not_a_graduation() {
+        // The fallback is gated on the subject announcing itself as a merge.
+        // Without that gate this reads as "roll/8 graduated" — the exact
+        // opposite of what the commit did.
+        assert_eq!(
+            extract_graduated_branch(r#"Revert "Merge branch 'roll/8-0918-help-menu'""#),
+            None
+        );
+        // And an ordinary subject that happens to mention a branch is untouched.
+        assert_eq!(
+            extract_graduated_branch("docs: explain roll/8-0918-help-menu"),
+            None
+        );
     }
 }
