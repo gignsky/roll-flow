@@ -278,20 +278,40 @@ impl Sandbox {
         self.rf_at(args, env)
     }
 
-    /// `rf` with a `PATH` holding nothing but `git` itself, so a bare `rf`
-    /// lookup resolves to nothing.
+    /// `rf` with a `PATH` holding nothing but a symlink to `git` itself, so a
+    /// bare `rf` lookup resolves to nothing.
     ///
     /// The version merge driver is configured as `rf __merge-driver-version
     /// ...`, which git looks up on `PATH` mid-merge; this is how a test models
     /// a clone where that lookup fails (`rf` run via `cargo run`, or a stale
     /// install) and only `rf`'s own in-process fallback stands between a
     /// version-only conflict and a stopped merge.
+    ///
+    /// Deliberately an isolated directory holding *only* a `git` symlink,
+    /// rather than whatever directory the real `git` happens to live in: on a
+    /// machine where `rf` is itself installed system-wide (this project's own
+    /// dev machine, via gigpkgs), `git` and a real `rf` commonly resolve to
+    /// the same directory (a Nix profile's `bin/`), which would silently
+    /// satisfy git's own PATH lookup for the driver command with *that* `rf`
+    /// — defeating the very thing this test exists to simulate.
     pub fn rf_without_driver_on_path(&self, args: &[&str]) -> RfOutput {
-        let git_dir = std::env::var_os("PATH")
-            .and_then(|paths| std::env::split_paths(&paths).find(|dir| dir.join("git").is_file()))
+        let git_path = std::env::var_os("PATH")
+            .and_then(|paths| {
+                std::env::split_paths(&paths)
+                    .map(|dir| dir.join("git"))
+                    .find(|p| p.is_file())
+            })
             .expect("git on PATH");
-        let git_dir = git_dir.to_str().expect("git dir").to_string();
-        self.rf_at(args, &[("PATH", &git_dir)])
+        let isolated = tempfile::tempdir().expect("isolated path dir");
+        #[cfg(unix)]
+        std::os::unix::fs::symlink(&git_path, isolated.path().join("git")).expect("symlink git");
+        self.rf_at(
+            args,
+            &[(
+                "PATH",
+                isolated.path().to_str().expect("isolated path is utf-8"),
+            )],
+        )
     }
 
     fn rf_at(&self, args: &[&str], env: &[(&str, &str)]) -> RfOutput {
@@ -314,6 +334,18 @@ impl Sandbox {
                 cmd.env("PATH", joined);
             }
         }
+        // Isolate every sandboxed run from this machine's *real* global
+        // config (`~/.config/roll-flow/config.toml`) by default: a developer
+        // whose own dotfiles already run `rf` (this project's own dev
+        // machine, via gigpkgs) has one populated, and the layered-config
+        // feature (roll/19) would otherwise fill in whatever a test deletes
+        // from the repo-local file to prove it's required. Set first, so a
+        // test that explicitly wants to exercise the global config (already
+        // passing its own `XDG_CONFIG_HOME` via `env`) still wins below.
+        cmd.env(
+            "XDG_CONFIG_HOME",
+            self.path().join(".xdg-config-isolated-by-harness"),
+        );
         for (key, value) in env {
             cmd.env(key, value);
         }
