@@ -355,9 +355,39 @@ pub fn panel_rect(area: Rect, content_lines: usize) -> Rect {
     }
 }
 
-/// Draw `panel` over the bottom-right of `area`.
-pub fn render(f: &mut Frame, area: Rect, panel: &Panel) {
-    let rect = panel_rect(area, panel.lines.len());
+/// Inset `area` by a couple of cells on every side, for a maximized panel.
+///
+/// Unlike [`panel_rect`] this ignores content length — maximizing is about
+/// giving a long result room to breathe, not shrinking to fit it. Clamped the
+/// same way `panel_rect` is, so a tiny frame still yields a rect that fits
+/// inside it rather than panicking in the renderer.
+pub fn expanded_rect(area: Rect) -> Rect {
+    const MARGIN: u16 = 2;
+    let width = area.width.saturating_sub(MARGIN * 2).max(1).min(area.width);
+    let height = area
+        .height
+        .saturating_sub(MARGIN * 2)
+        .max(1)
+        .min(area.height);
+    let x = area.x + (area.width.saturating_sub(width)) / 2;
+    let y = area.y + (area.height.saturating_sub(height)) / 2;
+    Rect {
+        x,
+        y,
+        width,
+        height,
+    }
+}
+
+/// Draw `panel` over `area`, anchored bottom-right unless `maximized`, in
+/// which case it fills most of the frame. Returns the rect it drew into, so
+/// the caller can hit-test a later mouse click against it.
+pub fn render(f: &mut Frame, area: Rect, panel: &Panel, maximized: bool) -> Rect {
+    let rect = if maximized {
+        expanded_rect(area)
+    } else {
+        panel_rect(area, panel.lines.len())
+    };
     let spinner = SPINNER[(panel.tick / 3) % SPINNER.len()];
     let (color, mark) = status_style(panel.status, spinner);
 
@@ -390,6 +420,7 @@ pub fn render(f: &mut Frame, area: Rect, panel: &Panel) {
 
     f.render_widget(Clear, rect);
     f.render_widget(Paragraph::new(lines).block(block), rect);
+    rect
 }
 
 #[cfg(test)]
@@ -516,6 +547,50 @@ mod tests {
     }
 
     #[test]
+    fn expanded_rect_fills_most_of_the_frame() {
+        let area = Rect {
+            x: 0,
+            y: 0,
+            width: 100,
+            height: 40,
+        };
+        let r = expanded_rect(area);
+        assert!(r.width > 80, "width {} should dominate the frame", r.width);
+        assert!(
+            r.height > 30,
+            "height {} should dominate the frame",
+            r.height
+        );
+        assert!(r.x >= area.x);
+        assert!(r.y >= area.y);
+        assert!(r.x + r.width <= area.x + area.width);
+        assert!(r.y + r.height <= area.y + area.height);
+    }
+
+    #[test]
+    fn expanded_rect_fits_inside_tiny_frames() {
+        for (w, h) in [(10u16, 4u16), (1, 1), (0, 0), (100, 2)] {
+            let area = Rect {
+                x: 2,
+                y: 3,
+                width: w,
+                height: h,
+            };
+            let r = expanded_rect(area);
+            assert!(r.width <= area.width, "{w}x{h} width {}", r.width);
+            assert!(r.height <= area.height, "{w}x{h} height {}", r.height);
+            assert!(
+                r.x + r.width <= area.x + area.width,
+                "{w}x{h} overflows right"
+            );
+            assert!(
+                r.y + r.height <= area.y + area.height,
+                "{w}x{h} overflows bottom"
+            );
+        }
+    }
+
+    #[test]
     fn a_tiny_area_yields_a_rect_that_still_fits_inside_it() {
         // A panel wider than its frame would panic inside ratatui rather than
         // clipping, so the clamp has to hold at every size.
@@ -538,6 +613,35 @@ mod tests {
                 "{w}x{h} overflows bottom"
             );
         }
+    }
+
+    #[test]
+    fn render_returns_the_small_rect_unless_maximized() {
+        use ratatui::{backend::TestBackend, Terminal};
+
+        let panel = panel_with(3);
+        let area = Rect {
+            x: 0,
+            y: 0,
+            width: 100,
+            height: 40,
+        };
+        let mut term = Terminal::new(TestBackend::new(100, 40)).unwrap();
+
+        let small = term
+            .draw(|f| {
+                let r = render(f, area, &panel, false);
+                assert_eq!(r, panel_rect(area, panel.lines.len()));
+            })
+            .unwrap();
+        let _ = small;
+
+        term.draw(|f| {
+            let r = render(f, area, &panel, true);
+            assert_eq!(r, expanded_rect(area));
+            assert_ne!(r, panel_rect(area, panel.lines.len()));
+        })
+        .unwrap();
     }
 
     #[test]
