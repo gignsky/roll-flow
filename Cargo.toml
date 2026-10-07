@@ -1,6 +1,6 @@
 [package]
 name = "roll-flow"
-version = "0.2.8-dev"
+version = "0.2.9"
 edition = "2021"
 
 [[bin]]
