@@ -1,4 +1,4 @@
-use std::collections::{HashMap, HashSet};
+use std::collections::{hash_map::Entry, HashMap, HashSet};
 use std::path::Path;
 
 use crate::core::{config::Config, git};
@@ -41,7 +41,9 @@ pub enum RollState {
     Active,    // not yet merged to rolling
     Graduated, // merged to rolling, no new commits since
     Diverged,  // merged to rolling, but has new commits since (needs re-graduation)
+    Reverted,  // merged to rolling, but that merge was later reverted there (needs re-graduation)
     Promoted,  // merged to main
+    Demoted,   // merged to main, but that merge was later reverted there (needs re-promotion)
     Blocked,   // active but has ungraduated dependencies
 }
 
@@ -51,7 +53,9 @@ impl RollState {
             RollState::Active => "active",
             RollState::Graduated => "✓ graduated",
             RollState::Diverged => "⚠ diverged",
+            RollState::Reverted => "↩ reverted",
             RollState::Promoted => "✓ promoted",
+            RollState::Demoted => "↩ demoted",
             RollState::Blocked => "⛔ blocked",
         }
     }
@@ -72,11 +76,172 @@ pub struct RollInfo {
     /// roll. Precomputed in [`list_rolls`] from a single reverse index so
     /// renderers never rescan the whole list per row.
     pub dependents: Vec<u32>,
+    /// The subset of [`deps`](Self::deps) whose current branch tip is **not**
+    /// an ancestor of this roll — i.e. this roll integrated them at some point,
+    /// but they have since moved on and this roll's copy is stale. This is a
+    /// direct `git merge-base --is-ancestor` check, so unlike [`state`]'s
+    /// `Diverged` it fires regardless of the dependency's own state: an
+    /// `Active` dependency that keeps gaining commits after being integrated is
+    /// just as stale as a `Diverged` one that graduated and then moved. That
+    /// matters before merging a batch of dependents — each one that integrated
+    /// an older copy of a still-moving dependency needs to say so, not just the
+    /// ones whose dependency happens to have graduated.
+    pub stale_deps: Vec<u32>,
     /// Hash of this roll's graduation merge on the rolling branch, or `None`
     /// when it has not graduated. This is the commit `rf promote --roll` merges
     /// into stable: advancing stable to it promotes exactly this roll (and
     /// whatever graduated before it), which keeps stable a prefix of rolling.
     pub graduation_commit: Option<String>,
+    /// The dependency cycle this roll is part of, if any — see [`DepCycle`].
+    /// Only cycles among rolls that still need graduating are recorded: once
+    /// a member has graduated, edges to it no longer order anything, so the
+    /// cycle is history rather than something to resolve.
+    pub cycle: Option<DepCycle>,
+}
+
+/// A set of ungraduated rolls that (transitively) integrated each other, so no
+/// order of separate graduations satisfies every member's dependencies — the
+/// state that left rolls 14 and 15 both `⛔ blocked` on each other for good.
+///
+/// The way out is containment, not ordering. The constraint `⛔ blocked`
+/// enforces exists so a dependency's commits reach rolling *before or with*
+/// the roll that integrated them; a member whose tip already contains every
+/// other member's tip lands all of them in its own graduation merge. That
+/// member is the cycle's *carrier*: it graduates (and carries the rest), and
+/// every other member waits on it like any other dependency.
+///
+/// When no member contains all the others — each moved on after integrating
+/// the other — any graduation would land a partial copy of some member, so
+/// nothing graduates; instead the cycle names the member closest to being a
+/// carrier ([`suggested`](Self::suggested)) and exactly which tips it lacks,
+/// so one `rf integrate` per missing tip turns it into one. That is a refusal
+/// with a remedy, never a deadlock.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DepCycle {
+    /// Every roll in the cycle, ascending — this roll included.
+    pub members: Vec<u32>,
+    /// The carrier when [`lacks`](Self::lacks) is empty; otherwise the member
+    /// that needs the fewest integrations to become one (ties go to the
+    /// highest number, the roll most likely to be the one folding the others
+    /// in, as 15 did with 14).
+    pub suggested: u32,
+    /// Members whose current tip `suggested` does not contain. Empty exactly
+    /// when `suggested` is a carrier.
+    pub lacks: Vec<u32>,
+}
+
+impl DepCycle {
+    /// The member whose graduation lands the whole cycle, if there is one.
+    pub fn carrier(&self) -> Option<u32> {
+        self.lacks.is_empty().then_some(self.suggested)
+    }
+
+    pub fn contains(&self, number: u32) -> bool {
+        self.members.contains(&number)
+    }
+
+    /// The members other than [`suggested`](Self::suggested): what its
+    /// graduation takes along.
+    pub fn carried(&self) -> Vec<u32> {
+        self.members
+            .iter()
+            .copied()
+            .filter(|n| *n != self.suggested)
+            .collect()
+    }
+
+    /// One line saying what to do about this cycle, naming branches so it can
+    /// be acted on as written. Shared by the plain tables' footnote, `--json`,
+    /// the TUI detail view and the graduation planner's refusal, so all four
+    /// give the same instruction.
+    pub fn advice(&self, rolls: &[RollInfo]) -> String {
+        let branch = |n: u32| {
+            rolls
+                .iter()
+                .find(|r| r.number == n)
+                .map(|r| r.branch.clone())
+                .unwrap_or_else(|| format!("roll {n}"))
+        };
+        let members = self
+            .members
+            .iter()
+            .map(u32::to_string)
+            .collect::<Vec<_>>()
+            .join(" ⇄ ");
+        let carried = format_roll_numbers(&self.carried());
+        let suggested = branch(self.suggested);
+        if self.lacks.is_empty() {
+            format!(
+                "↻ rolls {members} integrated each other: {suggested} contains the others' \
+                 latest work — graduate {suggested} and it carries {carried} to rolling"
+            )
+        } else {
+            let integrates = self
+                .lacks
+                .iter()
+                .map(|n| format!("`rf integrate {}`", branch(*n)))
+                .collect::<Vec<_>>()
+                .join(" and ");
+            format!(
+                "↻ rolls {members} integrated each other and none contains the others' \
+                 latest work — on {suggested} run {integrates}, then graduate {suggested} \
+                 and it carries {carried} to rolling"
+            )
+        }
+    }
+}
+
+/// The distinct cycles among `rolls`, once each, in roll-number order — for a
+/// footnote under the plain tables, where one line per cycle (not per member)
+/// is what reads well.
+pub fn distinct_cycles(rolls: &[RollInfo]) -> Vec<&DepCycle> {
+    let mut seen: Vec<&DepCycle> = Vec::new();
+    for cycle in rolls.iter().filter_map(|r| r.cycle.as_ref()) {
+        if !seen.iter().any(|c| c.members == cycle.members) {
+            seen.push(cycle);
+        }
+    }
+    seen
+}
+
+/// Prefix of the hotfix tier, which carries its own numbering independent of
+/// rolls. Lives here rather than in `ops` because listing hotfixes is a
+/// branch-level concern the tables need, not only the landing op.
+pub const HOTFIX_PREFIX: &str = "hotfix/";
+
+/// Where a hotfix is in its short life: branched off stable, or landed on it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum HotfixState {
+    /// Exists, not yet merged into the stable branch.
+    Open,
+    /// Its landing merge is on the stable branch.
+    Landed,
+}
+
+impl HotfixState {
+    pub fn label(&self) -> &'static str {
+        match self {
+            HotfixState::Open => "hotfix",
+            HotfixState::Landed => "✓ landed",
+        }
+    }
+}
+
+/// A `hotfix/N-MMDD-slug` branch as the tables show it.
+///
+/// Its own type rather than a [`RollInfo`] with a kind flag: a hotfix has no
+/// dependencies, no graduation commit and no place in the roll numbering (a
+/// `hotfix/1` and a `roll/1` coexist), so sharing `RollInfo` would either carry
+/// three meaningless fields or force every dependency scan in [`list_rolls`] to
+/// filter by kind. Keeping the roll list purely rolls is what keeps those scans
+/// simple.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct HotfixInfo {
+    pub branch: String,
+    pub number: u32,
+    pub state: HotfixState,
+    pub location: BranchLocation,
+    pub is_current: bool,
 }
 
 // ── Public API ────────────────────────────────────────────────────────────────
@@ -87,6 +252,38 @@ pub struct RollInfo {
 pub fn format_roll_numbers(nums: &[u32]) -> String {
     nums.iter()
         .map(|n| n.to_string())
+        .collect::<Vec<_>>()
+        .join(",")
+}
+
+/// Render a roll's `deps` column like [`format_roll_numbers`], with two
+/// suffixes, so what the detail view knows is visible from every table:
+///
+/// - `⚠` when the dependency is also in `RollInfo::stale_deps` — it has moved
+///   since this roll integrated it. This is what matters before reintegrating
+///   or merging a batch of dependents against a still-moving dependency:
+///   `2,3⚠` says dep 3 has new commits to pick up, dep 2 does not.
+/// - `↻` when it is in the same [`DepCycle`] as this roll — it integrated this
+///   roll back. What the cycle means, which member to graduate, is spelled out
+///   once per cycle under the table by [`DepCycle::advice`].
+///
+/// So `8,15⚠↻` reads "8 is an ordinary dependency; 15 integrated this roll
+/// back and has moved since". Never applied to `dependants`: both marks are
+/// properties of what this roll integrated, not of who integrated it. Shared
+/// by the TUI table and both plain tables, so they cannot drift apart.
+pub fn format_deps(roll: &RollInfo) -> String {
+    roll.deps
+        .iter()
+        .map(|n| {
+            let mut cell = n.to_string();
+            if roll.stale_deps.contains(n) {
+                cell.push('⚠');
+            }
+            if roll.cycle.as_ref().is_some_and(|c| c.contains(*n)) {
+                cell.push('↻');
+            }
+            cell
+        })
         .collect::<Vec<_>>()
         .join(",")
 }
@@ -145,10 +342,22 @@ pub fn list_rolls(config: &Config) -> Result<Vec<RollInfo>, RfError> {
         let is_graduated = graduation_commit.is_some();
 
         let state = if is_promoted {
-            RollState::Promoted
+            // Only revert-check promoted rolls; a roll that never promoted has
+            // nothing on stable to have been reverted.
+            if check_promotion_reverted(repo, &branch, &config.stable_branch) {
+                RollState::Demoted
+            } else {
+                RollState::Promoted
+            }
         } else if is_graduated {
-            // Only divergence-check graduated (not-yet-promoted) rolls.
-            if check_diverged(repo, &branch, &config.rolling_branch) {
+            // Only revert/divergence-check graduated (not-yet-promoted) rolls.
+            // Reverted takes priority over Diverged: a roll can gain new
+            // commits on its own branch at any point regardless of whether its
+            // graduation merge is still standing, and "the graduation was
+            // undone" is the more urgent fact to surface.
+            if check_reverted(repo, &branch, &config.rolling_branch) {
+                RollState::Reverted
+            } else if check_diverged(repo, &branch, &config.rolling_branch) {
                 RollState::Diverged
             } else {
                 RollState::Graduated
@@ -165,7 +374,9 @@ pub fn list_rolls(config: &Config) -> Result<Vec<RollInfo>, RfError> {
             location,
             deps: Vec::new(),
             dependents: Vec::new(),
+            stale_deps: Vec::new(),
             graduation_commit,
+            cycle: None,
         });
     }
 
@@ -176,11 +387,16 @@ pub fn list_rolls(config: &Config) -> Result<Vec<RollInfo>, RfError> {
     // `rf integrate` — detected from its own first-parent merge history. File
     // overlap and broad ancestry are deliberately NOT used here: in a dotfiles
     // repo nearly every roll touches flake.lock, which made them spuriously
-    // block one another.
+    // block one another. The one exception is a merge of the rolling branch
+    // itself (`[I]` / `rf integrate <rolling>`): see `integration_deps`.
     //
     // Blocking, by contrast, only applies to Active rolls: an ungraduated
     // integration holds a roll back from graduating, but once the roll itself
     // has graduated the relationship is history, not a blocker.
+    //
+    // Three passes, because each needs the previous one finished for every
+    // roll: deps (and staleness), then cycles over those deps, then blocking,
+    // which reads both.
     let snapshot = rolls.clone();
     for roll in &mut rolls {
         roll.deps = integration_deps(
@@ -189,18 +405,58 @@ pub fn list_rolls(config: &Config) -> Result<Vec<RollInfo>, RfError> {
             roll.number,
             &config.roll_prefix,
             &deps_base_ref(roll, &config.stable_branch),
+            &config.rolling_branch,
+            &graduated,
         );
-        if roll.state == RollState::Active {
-            let blocked = roll.deps.iter().any(|dep| {
+        // A dependency this roll integrated may have kept moving since — an
+        // ancestry check, not a state lookup, so it fires however the
+        // dependency's own state reads (Active, Diverged, whatever).
+        roll.stale_deps = roll
+            .deps
+            .iter()
+            .copied()
+            .filter(|dep_num| {
                 snapshot
                     .iter()
-                    .find(|r| r.number == *dep)
-                    .map(|r| matches!(r.state, RollState::Active | RollState::Blocked))
-                    .unwrap_or(false)
-            });
-            if blocked {
-                roll.state = RollState::Blocked;
+                    .find(|r| r.number == *dep_num)
+                    .is_some_and(|dep| dep_tip_missing(repo, &dep.branch, &roll.branch))
+            })
+            .collect();
+    }
+
+    assign_cycles(repo, &mut rolls);
+
+    // A dependency blocks while it is ungraduated — except, for a cycle's
+    // carrier, a fellow member: the carrier contains its tip, so graduating
+    // the carrier lands it too (see `DepCycle`). The carrier still answers for
+    // every member's dependencies *outside* the cycle, since its graduation is
+    // the one that lands those members, and with them whatever they integrated.
+    // Every other member stays blocked on the carrier like on any dependency.
+    let snapshot = rolls.clone();
+    for roll in &mut rolls {
+        if roll.state != RollState::Active {
+            continue;
+        }
+        let mut gating = roll.deps.clone();
+        if let Some(cycle) = roll
+            .cycle
+            .as_ref()
+            .filter(|c| c.carrier() == Some(roll.number))
+        {
+            for member in snapshot.iter().filter(|r| cycle.contains(r.number)) {
+                gating.extend(&member.deps);
             }
+            gating.retain(|n| !cycle.contains(*n));
+        }
+        let blocked = gating.iter().any(|dep| {
+            snapshot
+                .iter()
+                .find(|r| r.number == *dep)
+                .map(|r| matches!(r.state, RollState::Active | RollState::Blocked))
+                .unwrap_or(false)
+        });
+        if blocked {
+            roll.state = RollState::Blocked;
         }
     }
 
@@ -242,7 +498,8 @@ fn deps_base_ref(roll: &RollInfo, stable_ref: &str) -> String {
 // ── Per-roll checks (exposed for use in graduate/promote commands) ─────────────
 
 /// True if the roll has a graduation (merge) commit on the rolling branch.
-/// Checks both `Merge branch 'roll/N-...'` and `Graduate roll/N-...` formats.
+/// Every merge-subject shape [`extract_graduated_branch`] knows is checked,
+/// including the hand-written ones a conflicted merge leaves behind.
 pub fn check_graduated(repo: &Path, roll_branch: &str, rolling_ref: &str) -> bool {
     let rolling = match git::resolve_branch(repo, rolling_ref) {
         Some(r) => r,
@@ -282,6 +539,54 @@ pub fn check_diverged(repo: &Path, roll_branch: &str, rolling_ref: &str) -> bool
         .and_then(|s| s.trim().parse::<u32>().ok())
         .map(|n| n > 0)
         .unwrap_or(false)
+}
+
+/// True if the roll's graduation onto `rolling_ref` was later undone there by
+/// a `git revert`. See [`find_reverted_graduation`] for the commit that would
+/// need reverting *again* to restore it — the actual re-graduation, since the
+/// roll branch's own tip remains an ancestor of rolling either way (a revert
+/// adds a commit on top; it does not remove anything from history), so an
+/// ordinary `--no-ff` re-merge of the roll has nothing new to bring in and
+/// cannot undo the revert.
+pub fn check_reverted(repo: &Path, roll_branch: &str, rolling_ref: &str) -> bool {
+    find_reverted_graduation(repo, roll_branch, rolling_ref).is_some()
+}
+
+/// If `roll_branch`'s graduation onto `rolling_ref` is currently reverted
+/// there, the hash of the commit to revert *now* to restore it. `None` when
+/// the roll never graduated, or its graduation is currently in effect
+/// (never reverted, or reverted an even number of times — see
+/// [`find_active_revert_in_range`]).
+pub fn find_reverted_graduation(
+    repo: &Path,
+    roll_branch: &str,
+    rolling_ref: &str,
+) -> Option<String> {
+    let rolling = git::resolve_branch(repo, rolling_ref)?;
+    let merge_hash = find_graduation_commit(repo, roll_branch, &rolling)?;
+    find_active_revert_in_range(repo, &merge_hash, &rolling)
+}
+
+/// True if `roll_branch`'s single-roll promotion (`Promote <roll> to
+/// <stable>`, the `rf promote --roll` shape) onto `stable_ref` was later
+/// undone there by a `git revert`.
+///
+/// Deliberately narrower than [`check_reverted`]: it only recognizes the
+/// single-roll promotion shape ([`scan_promotion_commits`]), not the
+/// multi-roll `Promote <rolling> to <stable>` shape that can carry several
+/// rolls in one merge — a revert of a bundled promotion is not attributed to
+/// any one roll here. Detect-only: nothing currently automates the fix the
+/// way [`find_reverted_graduation`] does for a reverted graduation, since
+/// that would mean teaching the per-roll promotion pipeline (version gate,
+/// release tags, carried-rolls disclosure) a second kind of step.
+pub fn check_promotion_reverted(repo: &Path, roll_branch: &str, stable_ref: &str) -> bool {
+    let Some(stable) = git::resolve_branch(repo, stable_ref) else {
+        return false;
+    };
+    let Some(hash) = scan_promotion_commits(repo, &stable).remove(roll_branch) else {
+        return false;
+    };
+    find_active_revert_in_range(repo, &hash, &stable).is_some()
 }
 
 /// True if the roll has been promoted to the stable branch.
@@ -327,7 +632,8 @@ fn scan_graduated(repo: &Path, rolling_ref: &str) -> HashMap<String, String> {
     };
 
     let mut graduated = HashMap::new();
-    for args in [
+    let mut carried: Vec<String> = Vec::new();
+    for (pass, args) in [
         vec![
             "log",
             "--first-parent",
@@ -336,7 +642,10 @@ fn scan_graduated(repo: &Path, rolling_ref: &str) -> HashMap<String, String> {
             &rolling,
         ],
         vec!["log", "--merges", "--format=%H%x09%s", &rolling],
-    ] {
+    ]
+    .into_iter()
+    .enumerate()
+    {
         let Ok(out) = git::capture_git(repo, &args) else {
             continue;
         };
@@ -345,11 +654,152 @@ fn scan_graduated(repo: &Path, rolling_ref: &str) -> HashMap<String, String> {
                 continue;
             };
             if let Some(branch) = extract_graduated_branch(subject) {
-                graduated.entry(branch).or_insert_with(|| hash.to_string());
+                if let Entry::Vacant(slot) = graduated.entry(branch) {
+                    if pass == 1 {
+                        carried.push(slot.key().clone());
+                    }
+                    slot.insert(hash.to_string());
+                }
+            }
+        }
+    }
+
+    // A pass-2 hit is a merge *inside* some roll's history — an `rf integrate`
+    // merge in the roll that carried this one onto rolling (a dependency
+    // cycle's carrier, or a `--force` graduation). That commit lives on a roll
+    // branch, not on rolling's mainline, so promoting it would advance stable
+    // to a point rolling never stood at. The graduation commit that means
+    // something is where the roll actually *landed*: the oldest mainline
+    // commit that descends from it, i.e. the carrier's own graduation merge.
+    if !carried.is_empty() {
+        let mainline: Vec<String> =
+            git::capture_git(repo, &["rev-list", "--first-parent", &rolling])
+                .map(|out| out.lines().map(str::to_string).collect())
+                .unwrap_or_default();
+        for branch in carried {
+            let hash = graduated[&branch].clone();
+            if let Some(landing) = landing_point(repo, &hash, &rolling, &mainline) {
+                graduated.insert(branch, landing);
             }
         }
     }
     graduated
+}
+
+/// Short reference form used in hotfix merge subjects: the branch
+/// `hotfix/N-MMDD-slug` renders as `hotfix/N-slug` (date dropped).
+pub fn hotfix_short_name(branch: &str) -> Option<String> {
+    let rest = branch.strip_prefix(HOTFIX_PREFIX)?;
+    let mut parts = rest.splitn(3, '-');
+    let number = parts.next()?;
+    let _mmdd = parts.next()?;
+    let slug = parts.next()?;
+    if number.is_empty() || slug.is_empty() {
+        return None;
+    }
+    Some(format!("{HOTFIX_PREFIX}{number}-{slug}"))
+}
+
+/// Collect every hotfix branch (local + remote, deduplicated) with its state,
+/// sorted ascending by number. A hotfix is landed once its merge is on the
+/// stable branch — read from merge subjects exactly as promotion is.
+pub fn list_hotfixes(config: &Config) -> Result<Vec<HotfixInfo>, RfError> {
+    let repo = &config.repo_root;
+    let current = git::current_branch(repo).unwrap_or_default();
+    let pattern = format!("{HOTFIX_PREFIX}*");
+
+    let mut names = git::local_branches(repo, &pattern)?;
+    names.extend(git::remote_branches(repo, &pattern)?);
+    names.sort();
+    names.dedup();
+
+    let landed = scan_landed_hotfixes(repo, &config.stable_branch);
+
+    let mut hotfixes = Vec::new();
+    for branch in names {
+        let Some(number) = parse_roll_number(&branch, HOTFIX_PREFIX) else {
+            continue;
+        };
+        let location = match (
+            git::ref_exists(repo, &branch),
+            git::ref_exists(repo, &format!("origin/{branch}")),
+        ) {
+            (true, true) => BranchLocation::Both,
+            (true, false) => BranchLocation::Local,
+            (false, true) => BranchLocation::Remote,
+            _ => BranchLocation::Neither,
+        };
+        // The landing subject names the *short* form; a hand-made
+        // `Merge branch 'hotfix/…'` names the full one. Either counts.
+        let is_landed = landed.contains(&branch)
+            || hotfix_short_name(&branch)
+                .map(|short| landed.contains(&short))
+                .unwrap_or(false);
+        hotfixes.push(HotfixInfo {
+            is_current: branch == current,
+            branch,
+            number,
+            state: if is_landed {
+                HotfixState::Landed
+            } else {
+                HotfixState::Open
+            },
+            location,
+        });
+    }
+    hotfixes.sort_by_key(|h| h.number);
+    Ok(hotfixes)
+}
+
+/// Names (short or full) of hotfixes whose landing merge is reachable from
+/// `stable_ref`. One log pass, like [`scan_promoted`].
+fn scan_landed_hotfixes(repo: &Path, stable_ref: &str) -> HashSet<String> {
+    let Some(stable) = git::resolve_branch(repo, stable_ref) else {
+        return HashSet::new();
+    };
+    let subjects = git::log_subjects(repo, &["--merges", &stable]).unwrap_or_default();
+    subjects
+        .iter()
+        .filter_map(|s| extract_landed_hotfix(s).or_else(|| extract_graduated_branch(s)))
+        .filter(|name| name.starts_with(HOTFIX_PREFIX))
+        .collect()
+}
+
+/// Extract the hotfix named as the *source* of a landing subject:
+/// `Hotfix hotfix/N-slug into main` yields `hotfix/N-slug`.
+///
+/// A small parallel to [`extract_graduated_branch`] rather than a new arm in
+/// it, because that function answers "which roll graduated" and this answers a
+/// different question with a different vocabulary. It keeps the same rule,
+/// though: the ` into ` clause names the target and is cut first, so a subject
+/// can never be read as landing the branch it landed *on*.
+fn extract_landed_hotfix(subject: &str) -> Option<String> {
+    let head = match subject.find(" into ") {
+        Some(at) => &subject[..at],
+        None => subject,
+    };
+    let rest = head.strip_prefix("Hotfix ")?;
+    let name = rest.split_whitespace().next()?;
+    name.starts_with(HOTFIX_PREFIX).then(|| name.to_string())
+}
+
+/// The oldest commit of `mainline` (rolling's first-parent history, newest
+/// first) that descends from `commit` — where a commit reached only through a
+/// side branch first became part of rolling. `None` when it cannot be told,
+/// which leaves the caller's original answer in place.
+fn landing_point(repo: &Path, commit: &str, rolling: &str, mainline: &[String]) -> Option<String> {
+    let range = format!("{commit}..{rolling}");
+    let descendants: HashSet<String> =
+        git::capture_git(repo, &["rev-list", "--ancestry-path", &range])
+            .ok()?
+            .lines()
+            .map(str::to_string)
+            .collect();
+    mainline
+        .iter()
+        .rev()
+        .find(|c| descendants.contains(*c))
+        .cloned()
 }
 
 /// Scan stable log once, returning the set of branch names that have been
@@ -386,28 +836,151 @@ fn scan_promoted(repo: &Path, stable_ref: &str) -> HashSet<String> {
     promoted
 }
 
+/// Which rolls a "verify many" pass covers. A user-facing menu shared by
+/// `rf verify --all --state` and the TUI's `[V]`, so the two can never offer
+/// different sets. `Local` is a location, not a state: it exists because
+/// verification runs in the working tree, so a remote-only roll can only ever be
+/// skipped, and a user with many of those wants a set that never mentions them.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, clap::ValueEnum)]
+#[clap(rename_all = "lowercase")]
+pub enum VerifySet {
+    All,
+    Active,
+    Blocked,
+    Graduated,
+    Diverged,
+    Local,
+}
+
+impl VerifySet {
+    /// Every set, in the order menus list them.
+    pub const ALL: [VerifySet; 6] = [
+        VerifySet::All,
+        VerifySet::Active,
+        VerifySet::Blocked,
+        VerifySet::Graduated,
+        VerifySet::Diverged,
+        VerifySet::Local,
+    ];
+
+    pub fn label(self) -> &'static str {
+        match self {
+            VerifySet::All => "all rolls",
+            VerifySet::Active => "active",
+            VerifySet::Blocked => "blocked",
+            VerifySet::Graduated => "graduated",
+            VerifySet::Diverged => "diverged",
+            VerifySet::Local => "rolls with a local copy",
+        }
+    }
+
+    /// The branches in this set, in table order. Promoted rolls are never
+    /// included: they have nowhere left to go, and `ops::verify` would only
+    /// report "nothing to merge" for each one.
+    pub fn select(self, rolls: &[RollInfo]) -> Vec<String> {
+        rolls
+            .iter()
+            .filter(|r| r.state != RollState::Promoted)
+            .filter(|r| match self {
+                VerifySet::All => true,
+                VerifySet::Active => r.state == RollState::Active,
+                VerifySet::Blocked => r.state == RollState::Blocked,
+                VerifySet::Graduated => r.state == RollState::Graduated,
+                VerifySet::Diverged => r.state == RollState::Diverged,
+                VerifySet::Local => {
+                    matches!(r.location, BranchLocation::Local | BranchLocation::Both)
+                }
+            })
+            .map(|r| r.branch.clone())
+            .collect()
+    }
+}
+
+/// The ref to read a branch's file content at: its own tip when there is a
+/// local copy, `origin/<branch>` when the branch only exists on the remote.
+///
+/// The same local-first order as [`git::resolve_branch`], in one place, because
+/// the TUI table and both plain tables all have to agree about which commit a
+/// branch's version was read from.
+pub fn content_ref(branch: &str, location: &BranchLocation) -> String {
+    match location {
+        BranchLocation::Remote => format!("origin/{branch}"),
+        _ => branch.to_string(),
+    }
+}
+
 /// Extract the branch name from a graduation subject line. Handles the three
 /// merge-subject shapes a roll can land through:
 /// - `Merge branch 'roll/N-...'[ into ...]` — a local `git merge --no-ff`.
 /// - `Graduate roll/N-... [...]` — an `rf graduate` structured merge.
 /// - `Merge pull request #M from OWNER/roll/N-...` — a GitHub PR merge, which is
 ///   how PR-based repos (including roll-flow dogfooding itself) land rolls.
-fn extract_graduated_branch(subject: &str) -> Option<String> {
-    if let Some(rest) = subject.strip_prefix("Merge branch '") {
-        // e.g. "roll/5-theme'" or "roll/5-theme' into rolling"
-        rest.split('\'').next().map(|b| b.to_string())
-    } else if let Some(rest) = subject.strip_prefix("Graduate ") {
-        // e.g. "roll/5-theme into rolling"
-        rest.split_whitespace().next().map(|b| b.to_string())
-    } else if subject.starts_with("Merge pull request #") {
-        // "Merge pull request #M from OWNER/BRANCH" — split off the owner only,
-        // since BRANCH itself contains '/' (e.g. "gignsky/roll/5-theme").
-        subject
+/// - anything else beginning with `merge` that names a branch — see the fallback.
+///
+/// Matching is case-insensitive, and that is not cosmetic. A merge that
+/// conflicts drops the user in an editor, and what comes back is whatever they
+/// wrote: `merge branch 'roll/8-0918-help-menu'`, lowercase and without the
+/// `into` clause, is in this repo's own history. The anchored, case-sensitive
+/// match this replaced returned `None` for it, and since this one function is
+/// how *every* consumer reads a merge subject, that single miss took the roll's
+/// dependency, its graduation and its graduation commit with it.
+pub(crate) fn extract_graduated_branch(subject: &str) -> Option<String> {
+    // Cut the ` into ` clause first. It names the merge *target*, never the
+    // source, and dropping it is what makes the lenient fallback below safe:
+    // `Merge branch 'roll/8-x' into roll/7-y` must never yield roll/7, because
+    // on the rolling branch that reads as "roll/7 graduated" — a far worse
+    // failure than missing a dependency.
+    let subject = before_into(subject);
+
+    // The PR shape is tried first because its token carries the owner
+    // (`OWNER/roll/N-…`), which the fallback would hand back verbatim.
+    if let Some(rest) = strip_prefix_ci(subject, "Merge pull request #") {
+        return rest
             .split_once(" from ")
             .and_then(|(_, owner_branch)| owner_branch.split_once('/'))
-            .map(|(_owner, branch)| branch.trim().to_string())
-    } else {
-        None
+            .map(|(_owner, branch)| branch.trim().to_string());
+    }
+    if let Some(rest) = strip_prefix_ci(subject, "Merge branch '") {
+        // e.g. "roll/5-theme'" or "roll/5-theme' into rolling"
+        return rest.split('\'').next().map(|b| b.to_string());
+    }
+    if let Some(rest) = strip_prefix_ci(subject, "Graduate ") {
+        // e.g. "roll/5-theme into rolling"
+        return rest.split_whitespace().next().map(|b| b.to_string());
+    }
+
+    // Hand-written merges: `merge roll/8-0918-help-menu`, `Merged roll/8-x`.
+    // Gated on the subject still announcing itself as a merge, which is what
+    // keeps `Revert "Merge branch 'roll/8-x'"` from reading as a graduation.
+    // The token is returned unvalidated on purpose — every caller already
+    // matches it against real roll branch names or runs it through
+    // `parse_roll_number`, so a candidate that is not a roll simply never
+    // matches anything.
+    strip_prefix_ci(subject, "merge")?;
+    subject
+        .split_whitespace()
+        .map(|token| token.trim_matches(['\'', '"', ',', '.']))
+        .find(|token| token.contains('/'))
+        .map(|token| token.to_string())
+}
+
+/// `strip_prefix`, ignoring ASCII case.
+fn strip_prefix_ci<'a>(s: &'a str, prefix: &str) -> Option<&'a str> {
+    s.get(..prefix.len())
+        .filter(|head| head.eq_ignore_ascii_case(prefix))
+        .map(|head| &s[head.len()..])
+}
+
+/// The part of `subject` before a ` into ` clause, which names the merge target.
+///
+/// The index comes from an ASCII-lowercased copy, which is byte-for-byte the
+/// same length as the original — `to_ascii_lowercase` only maps `A-Z` — so it
+/// stays a valid index into `subject` even when the subject holds multi-byte
+/// characters.
+fn before_into(subject: &str) -> &str {
+    match subject.to_ascii_lowercase().find(" into ") {
+        Some(at) => &subject[..at],
+        None => subject,
     }
 }
 
@@ -433,13 +1006,34 @@ fn subjects_contain_graduation(subjects: &[String], roll_branch: &str) -> bool {
 /// `rev_parse` and only falls back to branch resolution.
 ///
 /// This is the only dependency signal that gates blocking: file overlap and
-/// broad ancestry are intentionally excluded (see `list_rolls`).
+/// broad ancestry are intentionally excluded (see `list_rolls`) — with one
+/// exception. A direct merge of the rolling branch itself (`[I]` / `rf
+/// integrate <rolling>`) produces a subject naming rolling, not a roll, so the
+/// subject scan alone finds nothing — yet that merge brings in every roll
+/// already graduated onto it. When one of the merges in range names the
+/// rolling branch, `graduated` (every known graduated branch mapped to its
+/// graduation commit, already computed once by `list_rolls`) is consulted:
+/// any graduation commit newly reachable from this roll is a real dependency,
+/// acquired in that one merge.
+///
+/// "Newly reachable" is load-bearing, not merely an ancestor of the roll's
+/// tip: a graduation from months ago is an ancestor of nearly every branch
+/// created afterward, because `rf promote` folds it into stable and every
+/// roll forks from stable. Without excluding `base`'s own ancestry too, every
+/// roll that ever did an `[I]` merge reports a dependency on the *entire*
+/// graduation history of the repo — the exact "broad ancestry" explosion the
+/// paragraph above says this function avoids. Requiring the commit to be
+/// absent from `base` restricts it to graduations this merge actually
+/// introduced, matching the `base..roll` scoping the subject scan above
+/// already uses.
 fn integration_deps(
     repo: &Path,
     roll_branch: &str,
     roll_num: u32,
     prefix: &str,
     base_ref: &str,
+    rolling_branch: &str,
+    graduated: &HashMap<String, String>,
 ) -> Vec<u32> {
     let (Some(roll_ref), Some(base)) = (
         git::resolve_branch(repo, roll_branch),
@@ -454,22 +1048,247 @@ fn integration_deps(
     let subjects =
         git::log_subjects(repo, &["--first-parent", "--merges", &range]).unwrap_or_default();
 
-    let mut deps: Vec<u32> = subjects
-        .iter()
-        .filter_map(|s| extract_graduated_branch(s))
-        .filter_map(|b| parse_roll_number(&b, prefix))
-        .filter(|&n| n != roll_num)
-        .collect();
+    let mut merged_rolling = false;
+    let mut deps: Vec<u32> = Vec::new();
+    for branch in subjects.iter().filter_map(|s| extract_graduated_branch(s)) {
+        match parse_roll_number(&branch, prefix) {
+            Some(n) if n != roll_num => deps.push(n),
+            Some(_) => {}
+            None if branch == rolling_branch => merged_rolling = true,
+            None => {}
+        }
+    }
+
+    if merged_rolling {
+        for (branch, commit) in graduated {
+            if branch == roll_branch {
+                continue;
+            }
+            let Some(n) = parse_roll_number(branch, prefix) else {
+                continue;
+            };
+            let newly_reachable = git::is_ancestor(repo, commit, &roll_ref).unwrap_or(false)
+                && !git::is_ancestor(repo, commit, &base).unwrap_or(true);
+            if n != roll_num && newly_reachable {
+                deps.push(n);
+            }
+        }
+    }
 
     deps.sort_unstable();
     deps.dedup();
     deps
 }
 
+/// True if `dep_branch`'s current tip is not reachable from `roll_branch` —
+/// i.e. `roll_branch` does not (yet, or any longer) contain `dep_branch`'s
+/// latest work. Used to populate [`RollInfo::stale_deps`]: this is a plain
+/// `git merge-base --is-ancestor` check against each branch's *current* ref
+/// (local preferred, `origin/<branch>` as fallback, same as every other
+/// branch lookup here), not a comparison against the point `dep_branch` was
+/// originally integrated — so it answers "is there anything new to pick up",
+/// which is what matters before reintegrating or merging a batch of
+/// dependents. Either branch failing to resolve answers `false`: no claim of
+/// staleness can be made about a branch that no longer exists.
+fn dep_tip_missing(repo: &Path, dep_branch: &str, roll_branch: &str) -> bool {
+    let (Some(dep_ref), Some(roll_ref)) = (
+        git::resolve_branch(repo, dep_branch),
+        git::resolve_branch(repo, roll_branch),
+    ) else {
+        return false;
+    };
+    !git::is_ancestor(repo, &dep_ref, &roll_ref).unwrap_or(true)
+}
+
+/// True only when both branches resolve and `other`'s tip is an ancestor of
+/// `holder`'s — i.e. graduating `holder` would land every commit `other` has.
+///
+/// Deliberately not `!dep_tip_missing(..)`: that answers "no staleness can be
+/// claimed" for a branch that does not resolve, which is the right default for
+/// a warning but the wrong one here. Containment is what lets a carrier
+/// graduate past a fellow cycle member, so an unknown answer must be "no".
+fn tip_contains(repo: &Path, holder: &str, other: &str) -> bool {
+    let (Some(holder_ref), Some(other_ref)) = (
+        git::resolve_branch(repo, holder),
+        git::resolve_branch(repo, other),
+    ) else {
+        return false;
+    };
+    git::is_ancestor(repo, &other_ref, &holder_ref).unwrap_or(false)
+}
+
+/// Record a [`DepCycle`] on every roll that is part of one.
+///
+/// Cycles are looked for only among rolls that still need graduating (`Active`
+/// or `Diverged`, read before blocking is decided), over edges between such
+/// rolls: an edge to a graduated roll orders nothing, so a cycle through one is
+/// already broken. `Reverted` is left out on purpose — its remedy is reverting
+/// the revert, which a carrier's merge cannot do (its commits are already
+/// ancestors of rolling), so carrying it would silently leave it reverted.
+///
+/// Containment is a handful of `merge-base --is-ancestor` calls per cycle, and
+/// cycles are rare and small, so it is computed eagerly here rather than
+/// leaving every renderer to rediscover which member to graduate.
+fn assign_cycles(repo: &Path, rolls: &mut [RollInfo]) {
+    let pending = |r: &RollInfo| matches!(r.state, RollState::Active | RollState::Diverged);
+    let pending_numbers: HashSet<u32> = rolls
+        .iter()
+        .filter(|r| pending(r))
+        .map(|r| r.number)
+        .collect();
+    let graph: Vec<(u32, Vec<u32>)> = rolls
+        .iter()
+        .filter(|r| pending(r))
+        .map(|r| {
+            let deps = r
+                .deps
+                .iter()
+                .copied()
+                .filter(|d| pending_numbers.contains(d))
+                .collect();
+            (r.number, deps)
+        })
+        .collect();
+
+    for members in dependency_cycles(&graph) {
+        let branch_of = |n: u32| {
+            rolls
+                .iter()
+                .find(|r| r.number == n)
+                .map(|r| r.branch.clone())
+                .unwrap_or_default()
+        };
+        let (suggested, lacks) = pick_carrier(&members, |holder, other| {
+            tip_contains(repo, &branch_of(holder), &branch_of(other))
+        });
+        let cycle = DepCycle {
+            members: members.clone(),
+            suggested,
+            lacks,
+        };
+        for roll in rolls.iter_mut().filter(|r| members.contains(&r.number)) {
+            roll.cycle = Some(cycle.clone());
+        }
+    }
+}
+
+/// Choose the member of a cycle to graduate: the one whose tip contains every
+/// other member's (`contains(holder, other)`), or failing that, the one that
+/// lacks the fewest — returned with the members it lacks, so the advice can
+/// name exactly the integrations that make it a carrier. Ties go to the highest
+/// number: when several members contain each other (identical tips), any of
+/// them lands the cycle and determinism is all that matters; when none does,
+/// the newest roll is the likeliest to be the one folding the others in.
+///
+/// Pure over the containment answer, so the choice is unit-tested without a
+/// repository.
+pub(crate) fn pick_carrier(
+    members: &[u32],
+    contains: impl Fn(u32, u32) -> bool,
+) -> (u32, Vec<u32>) {
+    members
+        .iter()
+        .map(|&holder| {
+            let lacks: Vec<u32> = members
+                .iter()
+                .copied()
+                .filter(|&other| other != holder && !contains(holder, other))
+                .collect();
+            (holder, lacks)
+        })
+        .min_by(|(a, a_lacks), (b, b_lacks)| {
+            a_lacks.len().cmp(&b_lacks.len()).then_with(|| b.cmp(a))
+        })
+        .unwrap_or((0, Vec::new()))
+}
+
+/// The cycles in a dependency graph: every strongly connected component with
+/// more than one member, each sorted ascending, ordered by smallest member.
+///
+/// Tarjan's algorithm, so every node and edge is visited once and a cycle can
+/// never send it round forever — the property every dependency walk needs and
+/// the reason cycle detection is done here, once, rather than discovered by
+/// whichever walk happens to trip over one. Edges to numbers that are not
+/// nodes of the graph are ignored, and a self-edge is not a cycle (a roll's own
+/// subject is already filtered out of its deps). Pure, for unit testing.
+pub(crate) fn dependency_cycles(graph: &[(u32, Vec<u32>)]) -> Vec<Vec<u32>> {
+    struct Tarjan<'a> {
+        graph: &'a [(u32, Vec<u32>)],
+        index: HashMap<u32, usize>,
+        lowlink: HashMap<u32, usize>,
+        stack: Vec<u32>,
+        on_stack: HashSet<u32>,
+        next: usize,
+        found: Vec<Vec<u32>>,
+    }
+
+    impl Tarjan<'_> {
+        fn visit(&mut self, node: u32) {
+            self.index.insert(node, self.next);
+            self.lowlink.insert(node, self.next);
+            self.next += 1;
+            self.stack.push(node);
+            self.on_stack.insert(node);
+
+            let edges = self
+                .graph
+                .iter()
+                .find(|(n, _)| *n == node)
+                .map(|(_, deps)| deps.clone())
+                .unwrap_or_default();
+            for dep in edges {
+                if !self.graph.iter().any(|(n, _)| *n == dep) {
+                    continue;
+                }
+                if !self.index.contains_key(&dep) {
+                    self.visit(dep);
+                    let low = self.lowlink[&node].min(self.lowlink[&dep]);
+                    self.lowlink.insert(node, low);
+                } else if self.on_stack.contains(&dep) {
+                    let low = self.lowlink[&node].min(self.index[&dep]);
+                    self.lowlink.insert(node, low);
+                }
+            }
+
+            if self.lowlink[&node] == self.index[&node] {
+                let mut component = Vec::new();
+                while let Some(top) = self.stack.pop() {
+                    self.on_stack.remove(&top);
+                    component.push(top);
+                    if top == node {
+                        break;
+                    }
+                }
+                if component.len() > 1 {
+                    component.sort_unstable();
+                    self.found.push(component);
+                }
+            }
+        }
+    }
+
+    let mut tarjan = Tarjan {
+        graph,
+        index: HashMap::new(),
+        lowlink: HashMap::new(),
+        stack: Vec::new(),
+        on_stack: HashSet::new(),
+        next: 0,
+        found: Vec::new(),
+    };
+    for (node, _) in graph {
+        if !tarjan.index.contains_key(node) {
+            tarjan.visit(*node);
+        }
+    }
+    let mut found = tarjan.found;
+    found.sort();
+    found
+}
+
 /// Find the git hash of the merge/graduation commit for `roll_branch` on
 /// `rolling_ref` — pass a stable ref to get the graduation once it has been
-/// promoted, which is what the future revert flow (issue #38) needs. Returns
-/// `None` if no graduation commit is found. Scans merge
+/// promoted. Returns `None` if no graduation commit is found. Scans merge
 /// commits and matches subjects through [`extract_graduated_branch`], so all
 /// three merge-subject shapes (local `Merge branch`, `Graduate`, and GitHub
 /// `Merge pull request`) are recognized from one source of truth.
@@ -487,9 +1306,119 @@ fn find_graduation_commit(repo: &Path, roll_branch: &str, rolling_ref: &str) -> 
     None
 }
 
+/// Whether `event_hash` is currently "in effect" on `range_head`'s history,
+/// by chaining `git revert`'s own `` "This reverts commit <hash>." `` body
+/// line: a revert flips the parity, and the revert commit itself becomes the new
+/// thing a later revert-of-the-revert must reference (so a revert, undone,
+/// re-reverted, ... is tracked correctly rather than only one level deep).
+///
+/// Returns the hash to revert *now* to restore `event_hash`'s effect — its
+/// own revert, or the latest un-reverting revert still standing in the chain
+/// — or `None` when `event_hash` is currently in effect (never reverted, or
+/// reverted an even number of times).
+///
+/// Matched on the body rather than the subject: that boilerplate line is
+/// pre-filled by git itself and tends to survive even a conflicted revert's
+/// hand-edited subject (the editor opens with it already there), the same
+/// leniency [`extract_graduated_branch`] relies on for hand-written merges.
+fn find_active_revert_in_range(repo: &Path, event_hash: &str, range_head: &str) -> Option<String> {
+    let range = format!("{event_hash}..{range_head}");
+    // Oldest first, so the chain is walked in the order it actually happened.
+    let out =
+        git::capture_git(repo, &["log", "--reverse", &range, "--format=%H%x09%b%x00"]).ok()?;
+
+    let mut current = event_hash.to_string();
+    let mut reverted = false;
+    for entry in out.split('\0') {
+        let Some((hash, body)) = entry.split_once('\t') else {
+            continue;
+        };
+        let reverts_current = body.lines().any(|line| {
+            let line = line.trim_start();
+            line.starts_with("This reverts commit") && line.contains(&current)
+        });
+        if reverts_current {
+            reverted = !reverted;
+            current = hash.to_string();
+        }
+    }
+
+    reverted.then_some(current)
+}
+
+/// Scan `stable_ref`'s own mainline for `Promote <branch> to <stable>`
+/// merges — the mirror of [`scan_graduated`], but for the single-roll
+/// promotion shape (`rf promote --roll`) rather than graduation. Maps each
+/// promoted branch to the hash of that promotion commit, which is what a
+/// revert on stable would target.
+///
+/// Deliberately narrow, same caveat as [`check_promotion_reverted`]: the
+/// multi-roll `Promote <rolling> to <stable>` shape names `<rolling>`, not a
+/// roll, so it is harmlessly recorded under a key no roll branch matches.
+fn scan_promotion_commits(repo: &Path, stable_ref: &str) -> HashMap<String, String> {
+    let mut map = HashMap::new();
+    let Ok(out) = git::capture_git(
+        repo,
+        &[
+            "log",
+            "--first-parent",
+            "--merges",
+            "--format=%H%x09%s",
+            stable_ref,
+        ],
+    ) else {
+        return map;
+    };
+    for line in out.lines() {
+        let Some((hash, subject)) = line.split_once('\t') else {
+            continue;
+        };
+        if let Some(rest) = subject.strip_prefix("Promote ") {
+            if let Some(branch) = rest.split_whitespace().next() {
+                map.entry(branch.to_string())
+                    .or_insert_with(|| hash.to_string());
+            }
+        }
+    }
+    map
+}
+
 #[cfg(test)]
 mod tests {
-    use super::{extract_graduated_branch, parse_roll_number};
+    use super::{
+        extract_graduated_branch, extract_landed_hotfix, hotfix_short_name, parse_roll_number,
+        HOTFIX_PREFIX,
+    };
+
+    #[test]
+    fn hotfix_names_parse_and_shorten() {
+        assert_eq!(
+            parse_roll_number("hotfix/3-0720-urgent", HOTFIX_PREFIX),
+            Some(3)
+        );
+        assert_eq!(
+            hotfix_short_name("hotfix/3-0720-urgent-fix").as_deref(),
+            Some("hotfix/3-urgent-fix")
+        );
+        assert_eq!(hotfix_short_name("hotfix/3-0720"), None);
+        assert_eq!(hotfix_short_name("roll/3-0720-x"), None);
+    }
+
+    #[test]
+    fn a_landing_subject_names_its_source_never_its_target() {
+        assert_eq!(
+            extract_landed_hotfix("Hotfix hotfix/1-urgent into main").as_deref(),
+            Some("hotfix/1-urgent")
+        );
+        // The reintegration merge that follows a landing names stable as its
+        // source and must not read as a landed hotfix.
+        assert_eq!(
+            extract_landed_hotfix("Reintegrate main into rolling (hotfix hotfix/1-urgent)"),
+            None
+        );
+        assert_eq!(extract_landed_hotfix("Hotfix roll/1-x into main"), None);
+        assert_eq!(extract_landed_hotfix("chore: bump"), None);
+    }
 
     #[test]
     fn parses_roll_number() {
@@ -527,5 +1456,195 @@ mod tests {
         assert_eq!(parse_roll_number("claude/some-fix", "roll/"), None);
         // Unrelated subject.
         assert_eq!(extract_graduated_branch("chore: bump version"), None);
+    }
+
+    #[test]
+    fn extracts_branch_from_a_hand_written_merge_subject() {
+        // The literal subject on roll/7 in this repo, kept as a regression
+        // fixture: the merge conflicted, so the subject was typed by hand and
+        // came back lowercase and without the `into` clause. The anchored,
+        // case-sensitive match this replaced returned `None` here, which is how
+        // roll/7 came to have no recorded dependency on roll/8.
+        assert_eq!(
+            extract_graduated_branch("merge branch 'roll/8-0918-help-menu'").as_deref(),
+            Some("roll/8-0918-help-menu")
+        );
+        // No `branch`, no quotes — still a merge, still names its source.
+        assert_eq!(
+            extract_graduated_branch("merge roll/8-0918-help-menu").as_deref(),
+            Some("roll/8-0918-help-menu")
+        );
+        assert_eq!(
+            extract_graduated_branch("Merged roll/8-0918-help-menu into the keymap").as_deref(),
+            Some("roll/8-0918-help-menu")
+        );
+        // Case is ignored on the structured shapes too.
+        assert_eq!(
+            extract_graduated_branch("graduate roll/5-0611-theme into develop").as_deref(),
+            Some("roll/5-0611-theme")
+        );
+    }
+
+    #[test]
+    fn a_merge_subject_never_yields_its_target() {
+        // The safety property the lenient fallback rests on. Reporting the
+        // target would mark an unmerged roll as graduated, which is far worse
+        // than missing a dependency — so the ` into ` clause is cut before
+        // anything else looks at the subject.
+        for subject in [
+            "Merge branch 'roll/8-x' into roll/7-y",
+            "merge branch 'roll/8-x' INTO roll/7-y",
+            "merge roll/8-x into roll/7-y",
+        ] {
+            assert_eq!(
+                extract_graduated_branch(subject).as_deref(),
+                Some("roll/8-x"),
+                "{subject}"
+            );
+        }
+        // A merge whose source is not a roll yields the source, not the target,
+        // and simply matches no roll downstream.
+        assert_eq!(
+            extract_graduated_branch("Merge branch 'feature/x' into roll/7-y").as_deref(),
+            Some("feature/x")
+        );
+        assert_eq!(parse_roll_number("feature/x", "roll/"), None);
+    }
+
+    #[test]
+    fn a_revert_is_not_a_graduation() {
+        // The fallback is gated on the subject announcing itself as a merge.
+        // Without that gate this reads as "roll/8 graduated" — the exact
+        // opposite of what the commit did.
+        assert_eq!(
+            extract_graduated_branch(r#"Revert "Merge branch 'roll/8-0918-help-menu'""#),
+            None
+        );
+        // And an ordinary subject that happens to mention a branch is untouched.
+        assert_eq!(
+            extract_graduated_branch("docs: explain roll/8-0918-help-menu"),
+            None
+        );
+    }
+
+    mod cycles {
+        use super::super::{
+            dependency_cycles, format_deps, pick_carrier, BranchLocation, DepCycle, RollInfo,
+            RollState,
+        };
+
+        fn graph(edges: &[(u32, &[u32])]) -> Vec<(u32, Vec<u32>)> {
+            edges.iter().map(|(n, d)| (*n, d.to_vec())).collect()
+        }
+
+        #[test]
+        fn an_acyclic_graph_has_no_cycles() {
+            // 9 -> 8 -> 7, and a diamond: 8 and 6 both on 5.
+            let g = graph(&[(5, &[]), (6, &[5]), (7, &[]), (8, &[7, 5]), (9, &[8, 6])]);
+            assert!(dependency_cycles(&g).is_empty());
+        }
+
+        #[test]
+        fn two_rolls_that_integrated_each_other_are_one_cycle() {
+            // The 14/15 shape, with the shared dependency 8 outside the cycle.
+            let g = graph(&[(8, &[]), (14, &[8, 15]), (15, &[8, 14])]);
+            assert_eq!(dependency_cycles(&g), vec![vec![14, 15]]);
+        }
+
+        #[test]
+        fn a_longer_cycle_and_a_separate_one_are_each_found_once() {
+            let g = graph(&[
+                (1, &[2]),
+                (2, &[3]),
+                (3, &[1]),
+                (4, &[1]), // depends on the cycle, is not in it
+                (5, &[6]),
+                (6, &[5]),
+            ]);
+            assert_eq!(dependency_cycles(&g), vec![vec![1, 2, 3], vec![5, 6]]);
+        }
+
+        #[test]
+        fn edges_to_unknown_rolls_and_self_edges_are_not_cycles() {
+            let g = graph(&[(1, &[1, 99]), (2, &[1])]);
+            assert!(dependency_cycles(&g).is_empty());
+        }
+
+        #[test]
+        fn the_carrier_is_the_member_that_contains_every_other() {
+            // 15 contains 14; 14 does not contain 15.
+            let (carrier, lacks) = pick_carrier(&[14, 15], |holder, _| holder == 15);
+            assert_eq!((carrier, lacks), (15, vec![]));
+            // Mirror image: the lower number can carry too.
+            let (carrier, lacks) = pick_carrier(&[14, 15], |holder, _| holder == 14);
+            assert_eq!((carrier, lacks), (14, vec![]));
+        }
+
+        #[test]
+        fn with_no_carrier_the_suggestion_lacks_the_fewest_and_ties_go_high() {
+            // Neither contains the other: tie, so 15, which lacks 14.
+            let (s, lacks) = pick_carrier(&[14, 15], |_, _| false);
+            assert_eq!((s, lacks), (15, vec![14]));
+            // Three members: 2 already contains 1 and lacks only 3.
+            let (s, lacks) = pick_carrier(&[1, 2, 3], |holder, other| holder == 2 && other == 1);
+            assert_eq!((s, lacks), (2, vec![3]));
+            // Identical tips: everyone contains everyone, highest wins.
+            let (s, lacks) = pick_carrier(&[1, 2], |_, _| true);
+            assert_eq!((s, lacks), (2, vec![]));
+        }
+
+        fn roll(n: u32, deps: &[u32], cycle: Option<DepCycle>) -> RollInfo {
+            RollInfo {
+                branch: format!("roll/{n}-0919-r{n}"),
+                number: n,
+                state: RollState::Active,
+                location: BranchLocation::Local,
+                is_current: false,
+                deps: deps.to_vec(),
+                dependents: Vec::new(),
+                stale_deps: Vec::new(),
+                graduation_commit: None,
+                cycle,
+            }
+        }
+
+        #[test]
+        fn advice_names_the_branch_to_graduate_or_the_integrate_to_run() {
+            let carried = DepCycle {
+                members: vec![14, 15],
+                suggested: 15,
+                lacks: vec![],
+            };
+            let rolls = vec![roll(14, &[15], None), roll(15, &[14], None)];
+            let advice = carried.advice(&rolls);
+            assert!(advice.contains("14 ⇄ 15"), "{advice}");
+            assert!(advice.contains("graduate roll/15-0919-r15"), "{advice}");
+            assert!(advice.contains("carries 14"), "{advice}");
+            assert_eq!(carried.carrier(), Some(15));
+
+            let stuck = DepCycle {
+                lacks: vec![14],
+                ..carried
+            };
+            let advice = stuck.advice(&rolls);
+            assert_eq!(stuck.carrier(), None);
+            assert!(
+                advice.contains("on roll/15-0919-r15 run `rf integrate roll/14-0919-r14`"),
+                "{advice}"
+            );
+        }
+
+        #[test]
+        fn the_deps_cell_marks_cycle_members_after_staleness() {
+            let cycle = DepCycle {
+                members: vec![14, 15],
+                suggested: 15,
+                lacks: vec![],
+            };
+            let mut r14 = roll(14, &[8, 15], Some(cycle));
+            r14.stale_deps = vec![15];
+            assert_eq!(format_deps(&r14), "8,15⚠↻");
+            assert_eq!(format_deps(&roll(9, &[8], None)), "8");
+        }
     }
 }

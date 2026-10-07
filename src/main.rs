@@ -3,6 +3,7 @@ mod core;
 mod error;
 mod tui;
 
+use std::collections::HashMap;
 use std::io::IsTerminal;
 
 use anyhow::{bail, Context, Result};
@@ -10,7 +11,7 @@ use clap::Parser;
 use serde::Serialize;
 
 use cli::{Cli, Cmd};
-use core::version::{BumpLevel, VersionCheck, VersionStatus};
+use core::version::{self, BumpLevel, VersionCheck, VersionStatus};
 use core::{branches, config::Config, git, ops};
 
 fn main() -> Result<()> {
@@ -47,7 +48,8 @@ fn main() -> Result<()> {
             slug,
             date,
             dry_run,
-        } => cmd_create(&slug, date, dry_run)?,
+            no_dev_version,
+        } => cmd_create(&slug, date, dry_run, no_dev_version)?,
         Cmd::Integrate { branch } => cmd_integrate(&branch)?,
         Cmd::Hotfix {
             slug,
@@ -66,12 +68,26 @@ fn main() -> Result<()> {
                 }
             }
         }
-        Cmd::Verify { dry_run, bump, yes } => cmd_verify(dry_run, bump, yes)?,
+        Cmd::Verify {
+            dry_run,
+            bump,
+            yes,
+            all,
+            state,
+        } => {
+            if all {
+                cmd_verify_all(state)?
+            } else {
+                cmd_verify(dry_run, bump, yes)?
+            }
+        }
         Cmd::Graduate {
             dry_run,
             force,
             reason,
-        } => cmd_graduate(dry_run, force, reason)?,
+            no_tag,
+            yes,
+        } => cmd_graduate(dry_run, force, reason, !no_tag, yes)?,
         Cmd::Promote {
             roll,
             dry_run,
@@ -79,8 +95,9 @@ fn main() -> Result<()> {
             reason,
             bump,
             no_tag,
+            finalize,
             yes,
-        } => cmd_promote(roll, dry_run, force, reason, bump, !no_tag, yes)?,
+        } => cmd_promote(roll, dry_run, force, reason, bump, !no_tag, finalize, yes)?,
         Cmd::Status {
             no_tui,
             no_deps,
@@ -99,7 +116,7 @@ fn main() -> Result<()> {
                 cmd_list_text(no_tui, deps)?;
             }
         }
-        Cmd::Update { dry_run } => cmd_update(dry_run)?,
+        Cmd::Update { roll, dry_run } => cmd_update(roll, dry_run)?,
         Cmd::Prune {
             dry_run,
             local,
@@ -132,6 +149,15 @@ fn main() -> Result<()> {
             no_fetch,
         } => cli::clean::run(dry_run, yes, force, with_remote, no_fetch)?,
         Cmd::Version => println!("{}", env!("CARGO_PKG_VERSION")),
+        Cmd::MergeDriverVersion {
+            ancestor,
+            ours,
+            theirs,
+            path,
+        } => {
+            let resolved = core::merge_driver::run(&ancestor, &ours, &theirs, path.as_deref())?;
+            std::process::exit(if resolved { 0 } else { 1 });
+        }
     }
 
     Ok(())
@@ -148,85 +174,205 @@ fn cmd_init(
     force: bool,
     yes: bool,
 ) -> Result<()> {
-    let mut config = Config::auto_detect()?;
-    config = config.with_overrides(rolling_branch, stable_branch, roll_prefix, username, hosts);
+    let detected = Config::auto_detect()?;
+    let overridden = detected.with_overrides(
+        rolling_branch.clone(),
+        stable_branch.clone(),
+        roll_prefix.clone(),
+        username.clone(),
+        hosts.clone(),
+    );
+    let mode = mode.map(|m| core::config::Mode::parse(&m)).transpose()?;
 
-    let cfg_path = Config::config_path(&config.repo_root);
-    if !git::ref_exists(&config.repo_root, &config.stable_branch) {
-        bail!("stable branch '{}' not found", config.stable_branch);
+    let cfg_path = Config::config_path(&overridden.repo_root);
+    if !git::ref_exists(&overridden.repo_root, &overridden.stable_branch) {
+        bail!("stable branch '{}' not found", overridden.stable_branch);
     }
-    if !git::ref_exists(&config.repo_root, &config.rolling_branch) {
+    if !git::ref_exists(&overridden.repo_root, &overridden.rolling_branch) {
         git::run_git(
-            &config.repo_root,
-            &["branch", &config.rolling_branch, &config.stable_branch],
+            &overridden.repo_root,
+            &[
+                "branch",
+                &overridden.rolling_branch,
+                &overridden.stable_branch,
+            ],
         )?;
     }
 
-    // Resolve the workflow mode (issue #18): an explicit `--mode` always wins;
-    // otherwise, if a config already exists, preserve its mode so a bare re-init
-    // never silently resets it (and stays idempotent). Absent both, the field's
-    // serde default (`manage`) applies via `auto_detect`.
-    if let Some(m) = mode {
-        config.mode = core::config::Mode::parse(&m)?;
-    } else if cfg_path.exists() {
-        if let Ok(existing) = std::fs::read_to_string(&cfg_path) {
-            if let Ok(existing_cfg) = toml::from_str::<Config>(&existing) {
-                config.mode = existing_cfg.mode;
-            }
-        }
+    // Runs on every `rf init`, independent of whether `.roll-flow.toml` itself
+    // needs updating: the git-config half of this is local to the clone (see
+    // `ops::ensure_version_merge_driver`), so a repo whose config is already
+    // up to date on a fresh clone still needs this wired up here.
+    if ops::ensure_version_merge_driver(&overridden)? {
+        println!("Configured the version merge driver for Cargo.toml and Cargo.lock");
     }
 
-    // Re-running `rf init` is idempotent and non-destructive: it regenerates the
-    // config from the repo's actual detected state and only rewrites the file
-    // when the result differs. Serialize both sides through the same renderer
-    // (`to_toml_string`) so an unchanged re-run is a true no-op — no rewrite,
-    // and no `--force` required (issue #16).
-    let regenerated = config.to_toml_string()?;
-    if cfg_path.exists() {
-        let existing = std::fs::read_to_string(&cfg_path)
-            .with_context(|| format!("reading existing config at {}", cfg_path.display()))?;
-        if existing == regenerated {
-            if !force {
-                println!("roll-flow config already up to date (no changes)");
-                return Ok(());
-            }
-            // Identical content but `--force`: rewrite anyway, matching prior
-            // `--force` semantics.
-            config.save()?;
-            println!("Updated {} from detected state", cfg_path.display());
-            return Ok(());
-        }
-
-        // The regenerated config differs from what's on disk. Rather than
-        // silently overwriting, show the change and decide non-destructively
-        // (issue #17).
-        println!("Detected config changes for {}:", cfg_path.display());
-        print!("{}", config_diff(&existing, &regenerated));
-
-        let apply = if force || yes {
-            true
-        } else if std::io::stdin().is_terminal() {
-            cli::prompt_yes("Apply these changes to .roll-flow.toml? [y/N] ")?
-        } else {
-            // Non-interactive without --yes/--force: default to keeping the
-            // existing file. Nothing is written; exit 0.
-            false
-        };
-
-        if apply {
-            config.save()?;
-            println!("Updated {} from detected state", cfg_path.display());
-        } else {
-            if !std::io::stdin().is_terminal() {
-                println!("Changes detected but not applied. Run with --yes to apply, or --force.");
-            }
-            println!("Kept existing config at {}", cfg_path.display());
-        }
-    } else {
+    // A fresh file is the detected state rendered whole.
+    if !cfg_path.exists() {
+        let mut config = overridden;
+        config.mode = mode.unwrap_or_default();
         config.save()?;
         println!("Initialized roll-flow at {}", cfg_path.display());
+        return Ok(());
+    }
+
+    // An existing file is edited in place, never regenerated. Regenerating from
+    // the detected state was how `rf init --yes` used to delete every gate
+    // array, every `clean_protect` entry and every comment the user had written
+    // — detection knows nothing about those, so they came back empty. The rule
+    // now: detected keys are refreshed, missing keys are added with their
+    // defaults, and everything else is left exactly as it was typed.
+    let existing = std::fs::read_to_string(&cfg_path)
+        .with_context(|| format!("reading existing config at {}", cfg_path.display()))?;
+    let merged = merge_init(
+        &existing,
+        &overridden,
+        InitOverrides {
+            roll_prefix: roll_prefix.is_some(),
+            username: username.is_some(),
+            hosts: hosts.is_some(),
+            mode,
+        },
+    )?;
+
+    if existing == merged {
+        if !force {
+            println!("roll-flow config already up to date (no changes)");
+            return Ok(());
+        }
+        // Identical content but `--force`: rewrite anyway, matching prior
+        // `--force` semantics.
+        std::fs::write(&cfg_path, &merged)?;
+        println!("Updated {} from detected state", cfg_path.display());
+        return Ok(());
+    }
+
+    // The merged config differs from what's on disk. Rather than silently
+    // overwriting, show the change and decide non-destructively (issue #17).
+    println!("Detected config changes for {}:", cfg_path.display());
+    print!("{}", config_diff(&existing, &merged));
+
+    let apply = if force || yes {
+        true
+    } else if std::io::stdin().is_terminal() {
+        cli::prompt_yes("Apply these changes to .roll-flow.toml? [y/N] ")?
+    } else {
+        // Non-interactive without --yes/--force: default to keeping the
+        // existing file. Nothing is written; exit 0.
+        false
+    };
+
+    if apply {
+        std::fs::write(&cfg_path, &merged)?;
+        println!("Updated {} from detected state", cfg_path.display());
+    } else {
+        if !std::io::stdin().is_terminal() {
+            println!("Changes detected but not applied. Run with --yes to apply, or --force.");
+        }
+        println!("Kept existing config at {}", cfg_path.display());
     }
     Ok(())
+}
+
+/// Which `rf init` flags were given explicitly, so a flag beats the file where
+/// detection alone would not.
+struct InitOverrides {
+    roll_prefix: bool,
+    username: bool,
+    hosts: bool,
+    mode: Option<core::config::Mode>,
+}
+
+/// Fold the detected state into an existing config's text, preserving
+/// everything detection has no opinion on: comments, key order, gate arrays,
+/// `clean_protect`, the release flags, and `config_version`.
+///
+/// Edited as a `toml_edit` document rather than round-tripped through the
+/// struct, because the struct cannot carry comments and a re-render would
+/// reorder keys — and because new keys inserted into the root table are
+/// rendered ahead of `[host_active]` by construction, which is the one place a
+/// hand-appended key silently becomes a host name.
+fn merge_init(existing: &str, detected: &Config, overrides: InitOverrides) -> Result<String> {
+    use toml_edit::DocumentMut;
+
+    let mut doc: DocumentMut = existing
+        .parse()
+        .context("parsing the existing .roll-flow.toml")?;
+    let defaults: DocumentMut = detected
+        .to_toml_string()?
+        .parse()
+        .context("rendering the detected config")?;
+    let take = |key: &str| defaults[key].clone();
+
+    // Always refreshed: these are what init is for, and both are read from the
+    // repo itself rather than guessed.
+    doc["repo_root"] = take("repo_root");
+    doc["rolling_branch"] = take("rolling_branch");
+    doc["stable_branch"] = take("stable_branch");
+
+    // Hosts are *added*, never replaced. `vars/hosts.nix` seeds the table, but
+    // the file is where the user records what is true right now — the dotfiles
+    // config flips a host off with a comment saying why, and `rf init` refreshing
+    // that back to the seed would undo a deliberate edit every time it ran. So
+    // a host the table already names keeps its value and its comments; a host
+    // detection found that the table lacks is appended with its detected
+    // value. `--hosts` on the command line is the one thing that replaces.
+    if overrides.hosts {
+        doc["hosts"] = take("hosts");
+    } else if !detected.hosts.is_empty() {
+        let mut hosts = doc
+            .get("hosts")
+            .and_then(|h| h.as_array())
+            .cloned()
+            .unwrap_or_default();
+        let listed: Vec<String> = hosts
+            .iter()
+            .filter_map(|v| v.as_str().map(String::from))
+            .collect();
+        for host in &detected.hosts {
+            if !listed.contains(host) {
+                hosts.push(host.as_str());
+            }
+        }
+        doc["hosts"] = toml_edit::value(hosts);
+    }
+    if !detected.host_active.is_empty() {
+        if doc.get("host_active").is_none() {
+            doc["host_active"] = take("host_active");
+        } else if let Some(table) = doc["host_active"].as_table_like_mut() {
+            for (host, active) in &detected.host_active {
+                if table.get(host).is_none() {
+                    table.insert(host, toml_edit::value(*active));
+                }
+            }
+        }
+    }
+    if overrides.username || !detected.username.is_empty() {
+        doc["username"] = take("username");
+    }
+    if overrides.roll_prefix || doc.get("roll_prefix").is_none() {
+        doc["roll_prefix"] = take("roll_prefix");
+    }
+    if let Some(mode) = overrides.mode {
+        doc["mode"] = toml_edit::value(match mode {
+            core::config::Mode::Manage => "manage",
+            core::config::Mode::Assist => "assist",
+        });
+    }
+
+    // Everything else: present stays as written, absent gets its default —
+    // except `config_version`, which is the file's own statement about itself
+    // and is warned about on load rather than silently rewritten here.
+    for key in Config::KEYS {
+        if doc.get(key).is_none() && *key != "config_version" {
+            doc[key] = take(key);
+        }
+    }
+    if doc.get("config_version").is_none() {
+        doc["config_version"] = toml_edit::value(i64::from(core::config::CONFIG_VERSION));
+    }
+
+    Ok(doc.to_string())
 }
 
 /// A dependency-free, line-based diff of two config renderings: lines only in
@@ -248,11 +394,20 @@ fn config_diff(current: &str, detected: &str) -> String {
     out
 }
 
-fn cmd_create(slug: &str, date: Option<String>, dry_run: bool) -> Result<()> {
+fn cmd_create(slug: &str, date: Option<String>, dry_run: bool, no_dev_version: bool) -> Result<()> {
     let config = Config::load()?;
     ops::ensure_clean_state(&config)?;
     let outcome = ops::create(&config, slug, date, dry_run)?;
     print_create(&outcome);
+
+    // After the branch exists, and only on a real run: the mark is a commit, so
+    // a dry run must not leave one behind. A repo with no `Cargo.toml` reports
+    // `None` and nothing is said.
+    if !dry_run && config.dev_versions && !no_dev_version {
+        if let Some(dev) = ops::apply_dev_version(&config, outcome.number)? {
+            println!("version marked {dev}");
+        }
+    }
     Ok(())
 }
 
@@ -323,6 +478,18 @@ fn cmd_verify(dry_run: bool, bump: Option<BumpLevel>, yes: bool) -> Result<()> {
     let config = Config::load()?;
     ops::ensure_clean_state(&config)?;
 
+    // On a roll branch, verify is also where a missing dev marker gets applied:
+    // a roll created before the marker existed, or with `--no-dev-version`, can
+    // be brought in line without a manual edit. Same sequencing as the bump
+    // below and for the same reason — it is a commit that touches Cargo.lock,
+    // so it has to land before the `--locked` gates run. A dry run leaves it.
+    let current = git::current_branch(&config.repo_root)?;
+    if !dry_run {
+        if let Some(dev) = ops::apply_dev_version_for_branch(&config, &current)? {
+            println!("version marked {dev}");
+        }
+    }
+
     // Resolved before `ops::verify` so an accepted bump is already committed by
     // the time the gates (and their `--locked` cargo commands) run.
     resolve_version_gate(&config, bump, yes, false, dry_run)?;
@@ -357,6 +524,73 @@ fn cmd_verify(dry_run: bool, bump: Option<BumpLevel>, yes: bool) -> Result<()> {
         "Verification passed: {} -> {}",
         outcome.source, outcome.target
     );
+    Ok(())
+}
+
+/// `rf verify --all [--state <set>]` — verify every roll in the set in turn.
+///
+/// A thin renderer over `ops::verify_many`, which owns the switch-and-return
+/// discipline; the TUI's `[V]` sits on the same routine so the two agree on
+/// every rule — including the per-roll version check and dev marker. No bump
+/// offer: a bump is a commit on one branch, and this pass walks many.
+fn cmd_verify_all(set: branches::VerifySet) -> Result<()> {
+    let config = Config::load()?;
+    let rolls = branches::list_rolls(&config)?;
+    let selected = set.select(&rolls);
+    if selected.is_empty() {
+        println!("no rolls to verify ({})", set.label());
+        return Ok(());
+    }
+    println!(
+        "Verifying {} roll{} ({})",
+        selected.len(),
+        if selected.len() == 1 { "" } else { "s" },
+        set.label()
+    );
+
+    let results = ops::verify_many(&config, &selected)?;
+    let mut failed = Vec::new();
+    let mut passed = 0;
+    let mut skipped = 0;
+    for result in &results {
+        println!("\n── {} ──", result.branch);
+        if let Some(dev) = result.marked {
+            println!("version marked {dev}");
+        }
+        if let Some(outcome) = &result.outcome {
+            if outcome.diverged_note {
+                println!(
+                    "note: '{}' has commits not in '{}'; graduation/promotion will create a --no-ff merge",
+                    outcome.target, outcome.source
+                );
+            }
+            render_version_check(&outcome.version, &outcome.source, &outcome.target);
+            render_gate_notices(&outcome.gate_notices);
+            render_gate_notices(&outcome.host_notices);
+            render_host_results(&outcome.host_results);
+        }
+        match &result.verdict {
+            ops::VerifyVerdict::Passed => {
+                passed += 1;
+                println!("PASSED");
+            }
+            ops::VerifyVerdict::Failed(why) => {
+                failed.push(result.branch.clone());
+                println!("FAILED: {why}");
+            }
+            ops::VerifyVerdict::Skipped(why) => {
+                skipped += 1;
+                println!("skipped: {why}");
+            }
+        }
+    }
+    println!(
+        "\n{passed} passed, {} failed, {skipped} skipped",
+        failed.len()
+    );
+    if !failed.is_empty() {
+        bail!("verification failed for: {}", failed.join(", "));
+    }
     Ok(())
 }
 
@@ -405,8 +639,39 @@ fn resolve_version_gate(
         return Ok(());
     };
 
-    let check = ops::version_check(config, &source, &target_ref)?;
+    // A *final* promotion must land a bare version on stable, never `-dev` —
+    // so the gate below is run against the *finalized* value rolling will
+    // carry once the marker is stripped, not the raw `-dev` one still on
+    // disk: comparing the raw value would report `VersionStatus::DevVersion`
+    // on every single ordinary promotion, since rolling's steady state now
+    // always carries one. Nothing is written yet; the actual strip is only
+    // committed once this function has decided to proceed — either here, if
+    // the finalized value alone already satisfies the gate, or immediately
+    // before the bump below, so a promotion that ultimately fails (no bump
+    // resolved) doesn't leave rolling finalized with nothing to show for it.
+    let needs_finalize = config.dev_versions
+        && version::read_version(&config.repo_root)?.is_some_and(|v| v.has_marker());
+    let check = if !config.version_gate {
+        VersionCheck::not_applicable()
+    } else if config.dev_versions {
+        let finalized_head = version::read_version(&config.repo_root)?.map(|v| v.release());
+        version::check_against(&config.repo_root, finalized_head, &target_ref)?
+    } else {
+        ops::version_check(config, &source, &target_ref)?
+    };
+
+    let finalize_now = |dry_run: bool| -> Result<()> {
+        if !needs_finalize || dry_run {
+            return Ok(());
+        }
+        if let Some((from, to)) = ops::finalize_rolling(config)? {
+            println!("Finalized {from} -> {to} (chore(release) commit on '{source}')");
+        }
+        Ok(())
+    };
+
     if check.is_satisfied() {
+        finalize_now(dry_run)?;
         return Ok(());
     }
 
@@ -423,6 +688,9 @@ fn resolve_version_gate(
     println!("Version: {head} on '{source}' is unchanged from '{target}'; a bump is required");
 
     if dry_run {
+        if needs_finalize {
+            println!("Dry-run: would also finalize the release before bumping");
+        }
         println!("Dry-run: not bumping the version");
         return Ok(());
     }
@@ -453,9 +721,11 @@ fn resolve_version_gate(
         if forced {
             eprintln!("warning: version not bumped, continuing under --force");
         }
+        finalize_now(false)?;
         return Ok(());
     };
 
+    finalize_now(false)?;
     let (from, to) = ops::apply_version_bump(config, level, &source)?;
     println!("Bumped version {from} -> {to} (chore(release) commit on '{current}')");
     Ok(())
@@ -497,6 +767,7 @@ fn render_version_check(check: &VersionCheck, source: &str, target: &str) {
         VersionStatus::Unchanged => "UNCHANGED",
         VersionStatus::Lower => "LOWER",
         VersionStatus::Unreadable => "UNREADABLE",
+        VersionStatus::DevVersion => "DEV",
         VersionStatus::NotApplicable => return,
     };
     println!("Version: {head} on '{source}' (base '{target}' {base}) {verdict}");
@@ -533,7 +804,13 @@ fn offer_tag_push(config: &Config, tag: &str, yes: bool) -> Result<()> {
     Ok(())
 }
 
-fn cmd_graduate(dry_run: bool, force: bool, reason: Option<String>) -> Result<()> {
+fn cmd_graduate(
+    dry_run: bool,
+    force: bool,
+    reason: Option<String>,
+    tag: bool,
+    yes: bool,
+) -> Result<()> {
     let force = ops::ForceOpts::new(force, reason)?;
     let config = Config::load()?;
     ops::ensure_clean_state(&config)?;
@@ -547,11 +824,130 @@ fn cmd_graduate(dry_run: bool, force: bool, reason: Option<String>) -> Result<()
             config.stable_branch
         );
     }
-    let outcome = ops::graduate(&config, &current, dry_run, &force)?;
-    print_graduate(&outcome);
+    // `ops::graduate` checks the dev marker belongs to this roll and runs the
+    // gates, merge, and dev-tag creation — shared with the `rf promote`
+    // fall-through and the TUI's `[G]`; this wrapper adds the dependency chain
+    // and, per step, the same conflict diagnosis a lone `rf graduate` always had.
+    graduate_with_deps(&config, &current, dry_run, &force, tag, yes)
+}
+
+/// Graduate `roll`, after any ungraduated roll it depends on.
+///
+/// A roll alone is what `rf graduate` always did, and runs without a word. A
+/// chain is shown first and confirmed, because it merges more than the branch
+/// the user is standing on; `--yes` takes it as read, and an unattended run
+/// prints the plan and merges nothing, the same shape every other confirmation
+/// here has. `--dry-run` prints the plan and previews each step.
+fn graduate_with_deps(
+    config: &Config,
+    roll: &str,
+    dry_run: bool,
+    force: &ops::ForceOpts,
+    tag: bool,
+    yes: bool,
+) -> Result<()> {
+    let rolls = branches::list_rolls(config)?;
+    let chain = ops::dependency_chain(&rolls, roll, ops::ChainKind::Graduate)?;
+    let roll_number = rolls.iter().find(|r| r.branch == roll).map(|r| r.number);
+
+    if !ops::chain_is_lone(&chain, roll) {
+        // Counted over what lands, not over steps: a cycle's carrier is one
+        // step but every roll it carries is a dependency landing with it.
+        let mut landing: Vec<u32> = chain
+            .iter()
+            .flat_map(|s| std::iter::once(s.number).chain(s.carries.iter().copied()))
+            .filter(|n| Some(*n) != roll_number)
+            .collect();
+        landing.sort_unstable();
+        landing.dedup();
+        println!(
+            "'{}' depends on {} ungraduated roll{}; graduating in order:",
+            roll,
+            landing.len(),
+            if landing.len() == 1 { "" } else { "s" }
+        );
+        for (i, step) in chain.iter().enumerate() {
+            println!("  {}. {}", i + 1, step.describe());
+        }
+        if !dry_run {
+            match cli::confirm(yes, "\nGraduate these in order? [y/N] ")? {
+                cli::Confirm::Yes => {}
+                cli::Confirm::Declined => {
+                    println!("Nothing graduated.");
+                    return Ok(());
+                }
+                cli::Confirm::Unattended => {
+                    println!("\nNothing graduated. Re-run with --yes to graduate them in order.");
+                    return Ok(());
+                }
+            }
+        }
+        println!();
+    } else if let [step] = chain.as_slice() {
+        // Merges only the branch the user is on, so no prompt — but it lands
+        // rolls they did not name, which is worth a line before it happens.
+        if !step.carries.is_empty() {
+            println!("{}\n", step.describe());
+        }
+    }
+
+    // Each step is offered the same conflict diagnosis a lone `rf graduate`
+    // always had — but the interactive "integrate, then retry" choice is only
+    // sound for the step that merges `roll` itself: `ops::integrate` merges
+    // into HEAD, and HEAD is `roll` throughout this call (`ops::graduate`
+    // checks out whatever step it is running, then restores it on failure).
+    // A dependency step, or the carrier step planned for a carried member,
+    // never matches `roll`, so it falls back to printing the commands by
+    // hand rather than offering to integrate the wrong branch.
+    let outcomes = ops::graduate_chain(
+        config,
+        &chain,
+        dry_run,
+        force,
+        tag,
+        |config, branch, dry_run, force, tag| {
+            let integrate_into = (branch == roll).then_some(roll);
+            with_conflict_handling(config, yes, integrate_into, || {
+                ops::graduate(config, branch, dry_run, force, tag)
+            })
+        },
+    )?;
+    for (step, outcome) in chain.iter().zip(&outcomes) {
+        print_graduate(outcome);
+        if !step.carries.is_empty() {
+            println!("{}", step.carried_line(&rolls, dry_run));
+        }
+        if !dry_run {
+            offer_graduate_tag_push(config, outcome, yes)?;
+        }
+    }
     Ok(())
 }
 
+/// Expand each `--roll` into itself plus any graduated-but-unpromoted roll it
+/// depends on, dependencies first, so a per-roll promotion is never asked to
+/// land a roll ahead of what it integrated. Duplicates across the named rolls
+/// collapse to one step. Returns the ordered branch list and whether it grew.
+fn promote_rolls_with_deps(config: &Config, named: &[String]) -> Result<(Vec<String>, bool)> {
+    let rolls = branches::list_rolls(config)?;
+    let mut ordered: Vec<String> = Vec::new();
+    let mut grew = false;
+    for name in named {
+        for step in ops::dependency_chain(&rolls, name, ops::ChainKind::Promote)? {
+            if ordered.contains(&step.branch) {
+                continue;
+            }
+            if step.reason != ops::ChainReason::Requested && !named.contains(&step.branch) {
+                println!("  {}", step.describe());
+                grew = true;
+            }
+            ordered.push(step.branch);
+        }
+    }
+    Ok((ordered, grew))
+}
+
+#[allow(clippy::too_many_arguments)]
 fn cmd_promote(
     rolls: Vec<String>,
     dry_run: bool,
@@ -559,6 +955,7 @@ fn cmd_promote(
     reason: Option<String>,
     bump: Option<BumpLevel>,
     tag: bool,
+    finalize: bool,
     yes: bool,
 ) -> Result<()> {
     let forced = force;
@@ -570,6 +967,30 @@ fn cmd_promote(
     // and deliberately works from any branch, rather than being redirected to
     // graduate because HEAD happens to sit on a roll.
     if !rolls.is_empty() {
+        if !confirm_final_promotion(&config, dry_run, finalize, yes)? {
+            return Ok(());
+        }
+        // Dependencies that have graduated but not promoted come first, each
+        // its own step. The expansion is printed as it is found so the plan
+        // reads top to bottom, then confirmed — it merges more than was named.
+        let (rolls, grew) = promote_rolls_with_deps(&config, &rolls)?;
+        if grew {
+            println!("(dependencies added ahead of what was named)");
+            if !dry_run {
+                match cli::confirm(yes, "\nPromote these in order? [y/N] ")? {
+                    cli::Confirm::Yes => {}
+                    cli::Confirm::Declined => {
+                        println!("Nothing promoted.");
+                        return Ok(());
+                    }
+                    cli::Confirm::Unattended => {
+                        println!("\nNothing promoted. Re-run with --yes to promote them in order.");
+                        return Ok(());
+                    }
+                }
+            }
+            println!();
+        }
         // Advancing stable to a roll's graduation commit lands whatever
         // graduated ahead of it too (see `ops::PromoteTarget::Rolls`). That is
         // how the route keeps stable a prefix of rolling, but it is not what
@@ -600,14 +1021,10 @@ fn cmd_promote(
             }
             None => None,
         };
-        let outcome = ops::promote(
-            &config,
-            &ops::PromoteTarget::Rolls(rolls),
-            dry_run,
-            &force,
-            tag,
-            level,
-        )?;
+        let target = ops::PromoteTarget::Rolls(rolls);
+        let outcome = with_conflict_handling(&config, yes, None, || {
+            ops::promote(&config, &target, dry_run, &force, tag, level)
+        })?;
         print_promote(&outcome);
         offer_step_tag_pushes(&config, &outcome, yes)?;
         if !dry_run {
@@ -623,28 +1040,277 @@ fn cmd_promote(
                 "note: '{}' is a roll branch; graduating into '{}' — use rf graduate directly next time",
                 roll, config.rolling_branch
             );
-            let outcome = ops::graduate(&config, &roll, dry_run, &force)?;
-            print_graduate(&outcome);
+            graduate_with_deps(&config, &roll, dry_run, &force, tag, yes)?;
         }
         Some(ops::Route::Promote) => {
+            if !confirm_final_promotion(&config, dry_run, finalize, yes)? {
+                return Ok(());
+            }
             // Resolved before `ops::promote` so the bump commit is part of what
             // gets merged, and so it precedes the `--locked` cargo gates.
             resolve_version_gate(&config, bump, yes, forced, dry_run)?;
 
-            let outcome = ops::promote(
-                &config,
-                &ops::PromoteTarget::Rolling,
-                dry_run,
-                &force,
-                tag,
-                None,
-            )?;
+            let outcome = with_conflict_handling(&config, yes, None, || {
+                ops::promote(
+                    &config,
+                    &ops::PromoteTarget::Rolling,
+                    dry_run,
+                    &force,
+                    tag,
+                    None,
+                )
+            })?;
             print_promote(&outcome);
             offer_step_tag_pushes(&config, &outcome, yes)?;
         }
         None => return Err(ops::not_promotable_error(&config, &current)),
     }
     Ok(())
+}
+
+// ── Merge conflicts ─────────────────────────────────────────────────────────
+
+/// What the user chose to do about a merge that stopped on conflicts.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ConflictChoice {
+    /// Integrate the culprit rolls into the source, taking the conflict onto
+    /// the roll branch where it can be resolved and committed.
+    Integrate,
+    /// Print the commands and change nothing.
+    Manual,
+    /// Re-run the merge on the target and leave the conflict in the tree.
+    Stage,
+}
+
+/// How [`handle_merge_conflict`] left things.
+enum ConflictOutcome {
+    /// The culprits merged cleanly into the source — the caller may retry.
+    Retry,
+    /// Something is now mid-merge, by the user's choice; the message says what.
+    Stopped(String),
+}
+
+/// Decide what to do about a conflict, honouring `--yes` and unattended runs.
+///
+/// `--yes` takes the recommended option; an unattended run without it changes
+/// nothing, the same rule `cli::confirm` applies — a command that lands in
+/// someone's CI must report, never leave a repo mid-merge.
+fn choose_conflict_action(yes: bool, can_integrate: bool) -> Result<ConflictChoice> {
+    let recommended = if can_integrate {
+        ConflictChoice::Integrate
+    } else {
+        ConflictChoice::Manual
+    };
+    if yes {
+        return Ok(recommended);
+    }
+    if !std::io::stdin().is_terminal() {
+        return Ok(ConflictChoice::Manual);
+    }
+    let options: Vec<ConflictChoice> = if can_integrate {
+        vec![
+            ConflictChoice::Integrate,
+            ConflictChoice::Manual,
+            ConflictChoice::Stage,
+        ]
+    } else {
+        vec![ConflictChoice::Manual, ConflictChoice::Stage]
+    };
+    let default = options.iter().position(|c| *c == recommended).unwrap_or(0) + 1;
+    let picked = cli::prompt_choice(options.len(), default)?;
+    Ok(options[picked - 1])
+}
+
+/// Print the diagnosis of a conflicting merge, offer the ways forward, and
+/// carry out the one chosen.
+///
+/// `integrate_into` is the checked-out roll when the failed merge was a
+/// graduation — the one case where the conflict can be taken onto the source
+/// side with `rf integrate`. It is the recommended choice because it is the
+/// workflow's own way of saying "this roll now depends on that one": the
+/// integrate merge leaves the same conflict on the roll branch, where it is
+/// resolved and committed like any other, and the dependency shows in
+/// `rf status` from then on. Promotion has no such option — its source is a
+/// commit on rolling, and the fix for a hotfix-vs-rolling conflict is to
+/// resolve it on the branch it landed on.
+fn handle_merge_conflict(
+    config: &Config,
+    conflict: &ops::MergeConflict,
+    yes: bool,
+    integrate_into: Option<&str>,
+) -> Result<ConflictOutcome> {
+    let report = &conflict.report;
+    let culprits = report.culprit_rolls();
+    println!("{conflict}");
+    println!();
+    for line in report.render() {
+        println!("{line}");
+    }
+    println!();
+    if culprits.is_empty() {
+        println!(
+            "Nothing on '{}' since the merge base is attributable to a roll; the \
+             conflicting change was made there directly.",
+            report.target
+        );
+    } else {
+        println!(
+            "The conflicting change is already on '{}' — it came in with {}.",
+            report.target,
+            culprits.join(", ")
+        );
+    }
+
+    let can_integrate = integrate_into.is_some() && !culprits.is_empty();
+    println!();
+    println!("Ways forward:");
+    let mut n = 0;
+    if can_integrate {
+        n += 1;
+        println!(
+            "  {n}) integrate {} into '{}' now, resolve there, then re-run rf graduate   [recommended]",
+            culprits.join(" and "),
+            integrate_into.unwrap_or_default()
+        );
+    }
+    n += 1;
+    println!(
+        "  {n}) nothing now; print the commands to do it by hand{}",
+        if can_integrate {
+            ""
+        } else {
+            "   [recommended]"
+        }
+    );
+    n += 1;
+    println!(
+        "  {n}) re-run the merge and leave the conflict in the working tree on '{}' for lazygit",
+        report.target
+    );
+
+    match choose_conflict_action(yes, can_integrate)? {
+        ConflictChoice::Integrate => {
+            let roll = integrate_into.unwrap_or_default();
+            for culprit in &culprits {
+                println!();
+                println!("integrating {culprit} into {roll}");
+                if let Err(err) = ops::integrate(config, culprit) {
+                    if git::ref_exists(&config.repo_root, "MERGE_HEAD") {
+                        return Ok(ConflictOutcome::Stopped(format!(
+                            "'{roll}' is now mid-merge with '{culprit}': resolve the conflicts \
+                             and commit, then run rf graduate again (gg in the TUI opens \
+                             lazygit; `git merge --abort` backs out)"
+                        )));
+                    }
+                    return Err(err);
+                }
+                println!("integrated {culprit} into {roll} cleanly");
+            }
+            Ok(ConflictOutcome::Retry)
+        }
+        ConflictChoice::Manual => {
+            println!();
+            println!("To resolve on '{}':", report.target);
+            println!(
+                "  git checkout {} && git merge --no-ff {}",
+                report.target, report.source
+            );
+            if let (Some(roll), false) = (integrate_into, culprits.is_empty()) {
+                println!("Or take the conflict onto '{roll}' (from '{roll}'):");
+                for culprit in &culprits {
+                    println!("  rf integrate {culprit}");
+                }
+            }
+            Ok(ConflictOutcome::Stopped(format!(
+                "'{}' was not merged into '{}'",
+                report.source, report.target
+            )))
+        }
+        ConflictChoice::Stage => {
+            if ops::stage_conflict(config, &report.source, &report.target)? {
+                Ok(ConflictOutcome::Stopped(format!(
+                    "'{}' is now checked out mid-merge with '{}': resolve the conflicts and \
+                     commit (gg in the TUI opens lazygit), or `git merge --abort` to back out",
+                    report.target, report.source
+                )))
+            } else {
+                Ok(ConflictOutcome::Stopped(format!(
+                    "the merge of '{}' into '{}' went through cleanly this time and is \
+                     committed; run the command again to finish",
+                    report.source, report.target
+                )))
+            }
+        }
+    }
+}
+
+/// Run a merge-performing operation, and if it stops on conflicts, diagnose,
+/// offer choices, and retry once when the choice made a retry possible.
+fn with_conflict_handling<T>(
+    config: &Config,
+    yes: bool,
+    integrate_into: Option<&str>,
+    mut op: impl FnMut() -> Result<T>,
+) -> Result<T> {
+    match op() {
+        Ok(value) => Ok(value),
+        Err(err) => match err.downcast::<ops::MergeConflict>() {
+            Ok(conflict) => match handle_merge_conflict(config, &conflict, yes, integrate_into)? {
+                ConflictOutcome::Retry => {
+                    println!();
+                    println!("retrying");
+                    op()
+                }
+                ConflictOutcome::Stopped(message) => bail!("{message}"),
+            },
+            Err(err) => Err(err),
+        },
+    }
+}
+
+/// Gate every real promotion on an explicit "is this final?" before anything
+/// is touched — declining aborts the whole command, landing nothing. Only
+/// meaningful when `dev_versions` is on *and* the repo actually has a
+/// `Cargo.toml` to version: a repo without one (the dotfiles repo this tool
+/// was built for) must remain entirely unaffected, matching every other
+/// version-related feature here, so it is checked explicitly rather than
+/// assumed from the config flag alone. A dry run changes nothing to gate
+/// either, and `--final` is its own dedicated escape hatch — the same shape
+/// `--bump <level>` already gives the bump prompt, so this question can be
+/// answered on its own without also accepting the tag-push prompt the way a
+/// blanket `--yes` does.
+///
+/// Unattended without `--final`/`--yes` fails rather than silently finalizing
+/// a release nobody confirmed — the same shape [`confirm_carried_rolls`] uses
+/// for its own irreversible-if-unnoticed default.
+fn confirm_final_promotion(
+    config: &Config,
+    dry_run: bool,
+    finalize: bool,
+    yes: bool,
+) -> Result<bool> {
+    let has_version = version::read_version(&config.repo_root)?.is_some();
+    if dry_run || !config.dev_versions || !has_version || finalize {
+        return Ok(true);
+    }
+    match cli::confirm(
+        yes,
+        &format!(
+            "Finalize this release? This drops the -dev marker before merging into '{}'. [y/N] ",
+            config.stable_branch
+        ),
+    )? {
+        cli::Confirm::Yes => Ok(true),
+        cli::Confirm::Declined => {
+            println!("Promotion cancelled; nothing was touched.");
+            Ok(false)
+        }
+        cli::Confirm::Unattended => bail!(
+            "promoting to '{}' finalizes the release (drops the -dev marker); \
+             re-run with --yes to confirm, or run interactively",
+            config.stable_branch
+        ),
+    }
 }
 
 /// Show the rolls a per-roll promotion would carry besides the ones named, and
@@ -731,7 +1397,9 @@ fn offer_update(config: &Config, yes: bool) -> Result<()> {
             config.stable_branch
         ),
     )? {
-        cli::Confirm::Yes => print_update(ops::update(config, false)?),
+        cli::Confirm::Yes => {
+            print_update(ops::update(config, &ops::UpdateTarget::AllActive, false)?)
+        }
         cli::Confirm::Declined => {}
         cli::Confirm::Unattended => {
             println!(
@@ -805,14 +1473,37 @@ fn offer_step_tag_pushes(config: &Config, outcome: &ops::PromoteOutcome, yes: bo
 
 fn print_graduate(outcome: &ops::GraduateOutcome) {
     render_gate_notices(&outcome.gate_notices);
-    if outcome.dry_run {
-        println!(
+    match (outcome.restored, outcome.dry_run) {
+        (true, true) => println!(
+            "Dry-run: would revert the revert, restoring '{}' on '{}'",
+            outcome.roll, outcome.rolling
+        ),
+        (true, false) => println!(
+            "Restored '{}' on '{}' (reverted the revert)",
+            outcome.roll, outcome.rolling
+        ),
+        (false, true) => println!(
             "Dry-run: would graduate '{}' into '{}' (--no-ff)",
             outcome.roll, outcome.rolling
-        );
-    } else {
-        println!("Graduated '{}' into '{}'", outcome.roll, outcome.rolling);
+        ),
+        (false, false) => println!("Graduated '{}' into '{}'", outcome.roll, outcome.rolling),
     }
+    if let Some(line) = outcome.tag.describe() {
+        println!("{line}");
+    }
+}
+
+/// Offer to push the dev tag a graduation just created, mirroring
+/// [`offer_step_tag_pushes`]'s shape one tier down.
+fn offer_graduate_tag_push(
+    config: &Config,
+    outcome: &ops::GraduateOutcome,
+    yes: bool,
+) -> Result<()> {
+    if let Some(tag) = outcome.tag.created_tag() {
+        offer_tag_push(config, tag, yes)?;
+    }
+    Ok(())
 }
 
 /// Render the roll-flow status lines that `ops::run_gates` collects instead of
@@ -851,6 +1542,7 @@ fn cmd_status_json() -> Result<()> {
     let detached = git::is_detached_head(&config.repo_root)?;
     let clean = ops::workflow_clean(&config)?;
     let rolls = branches::list_rolls(&config)?;
+    let hotfixes = branches::list_hotfixes(&config)?;
     let tier = ops::branch_tier(&config, &current, detached);
 
     let readiness = ops::promotion_readiness(&config, &current, clean, detached);
@@ -866,6 +1558,20 @@ fn cmd_status_json() -> Result<()> {
         tier,
         clean_working_tree: clean,
         pending_roll_branches: rolls.into_iter().map(|r| r.branch).collect(),
+        hotfixes: hotfixes
+            .into_iter()
+            .map(|h| JsonHotfix {
+                branch: h.branch,
+                number: h.number,
+                state: match h.state {
+                    branches::HotfixState::Open => "open",
+                    branches::HotfixState::Landed => "landed",
+                }
+                .to_string(),
+                location: h.location.symbol().to_string(),
+                is_current: h.is_current,
+            })
+            .collect(),
         promotion,
     };
     println!("{}", serde_json::to_string_pretty(&payload)?);
@@ -875,13 +1581,21 @@ fn cmd_status_json() -> Result<()> {
 fn cmd_list_json() -> Result<()> {
     let config = Config::load()?;
     let rolls = branches::list_rolls(&config)?;
-    println!("{}", serde_json::to_string_pretty(&rolls_for_json(rolls))?);
+    println!(
+        "{}",
+        serde_json::to_string_pretty(&rolls_for_json(&config, rolls))?
+    );
     Ok(())
 }
 
-fn cmd_update(dry_run: bool) -> Result<()> {
+fn cmd_update(rolls: Vec<String>, dry_run: bool) -> Result<()> {
     let config = Config::load()?;
-    print_update(ops::update(&config, dry_run)?);
+    let target = if rolls.is_empty() {
+        ops::UpdateTarget::AllActive
+    } else {
+        ops::UpdateTarget::Rolls(rolls)
+    };
+    print_update(ops::update(&config, &target, dry_run)?);
     Ok(())
 }
 
@@ -938,12 +1652,15 @@ fn cmd_prune(
     let plan = ops::prune_plan(&config, &scope)?;
 
     if plan.is_empty() {
-        println!("no promoted roll branches to prune");
+        println!("no promoted roll branches or landed hotfixes to prune");
         render_prune_skips(&plan.skipped);
         return Ok(());
     }
 
-    render_prune_plan(&plan, "Promoted roll branches to prune:");
+    render_prune_plan(
+        &plan,
+        "Promoted roll branches and landed hotfixes to prune:",
+    );
     render_prune_skips(&plan.skipped);
 
     if dry_run {
@@ -1009,12 +1726,15 @@ fn cmd_tidy(
         .join(", ");
 
     if plan.is_empty() {
-        println!("no local roll branches to tidy ({wanted})");
+        println!("no local roll branches or hotfixes to tidy ({wanted})");
         render_prune_skips(&plan.skipped);
         return Ok(());
     }
 
-    render_prune_plan(&plan, &format!("Local roll branches to tidy ({wanted}):"));
+    render_prune_plan(
+        &plan,
+        &format!("Local roll branches and hotfixes to tidy ({wanted}):"),
+    );
     render_prune_skips(&plan.skipped);
 
     if dry_run {
@@ -1146,7 +1866,11 @@ fn render_prune_plan(plan: &ops::PrunePlan, title: &str) {
         };
         println!(
             "  {num:>3}  {name:<nw$}  {target}",
-            num = candidate.number,
+            num = if candidate.hotfix {
+                format!("h{}", candidate.number)
+            } else {
+                candidate.number.to_string()
+            },
             name = candidate.branch,
             nw = name_w,
         );
@@ -1205,7 +1929,8 @@ fn cmd_list_text(no_tui: bool, deps: bool) -> Result<()> {
         return tui::rolls::run(config, current, rolls, deps);
     }
 
-    if rolls.is_empty() {
+    let hotfixes = branches::list_hotfixes(&config)?;
+    if rolls.is_empty() && hotfixes.is_empty() {
         println!("(no roll branches)");
         return Ok(());
     }
@@ -1213,19 +1938,29 @@ fn cmd_list_text(no_tui: bool, deps: bool) -> Result<()> {
     let name_w = rolls
         .iter()
         .map(|r| r.branch.len())
+        .chain(hotfixes.iter().map(|h| h.branch.len()))
         .max()
         .unwrap_or(6)
         .max(6);
     let state_w = "⛔ blocked".len();
 
     let (dep_w, dependant_w) = dep_column_widths(&rolls);
+    // Empty in a repo with no `Cargo.toml`, which drops the column entirely.
+    let (versions, ver_w) = version_column(&config, &rolls);
 
     println!(
-        "  {num:>3}  {name:<nw$}  {loc:<3}  {state:<sw$}{deps_hdr}",
+        "  {num:>3}  {name:<nw$}  {loc:<3}  {state:<sw$}{ver_hdr}{deps_hdr}",
         num = "#",
         name = "branch",
         loc = "loc",
         state = "state",
+        ver_hdr = if versions.is_empty() {
+            String::new()
+        } else if deps {
+            format!("  {VERSION_HDR:<ver_w$}")
+        } else {
+            format!("  {VERSION_HDR}")
+        },
         deps_hdr = if deps {
             format!("  {DEPS_HDR:<dep_w$}  {DEPENDANTS_HDR}")
         } else {
@@ -1235,9 +1970,14 @@ fn cmd_list_text(no_tui: bool, deps: bool) -> Result<()> {
         sw = state_w,
     );
     println!(
-        "  ───  {sep_e}  ───  {sep_s}{sep_d}",
+        "  ───  {sep_e}  ───  {sep_s}{sep_v}{sep_d}",
         sep_e = "─".repeat(name_w),
         sep_s = "─".repeat(state_w),
+        sep_v = if versions.is_empty() {
+            String::new()
+        } else {
+            format!("  {}", "─".repeat(ver_w))
+        },
         sep_d = if deps {
             format!("  {}  {}", "─".repeat(dep_w), "─".repeat(dependant_w))
         } else {
@@ -1250,14 +1990,29 @@ fn cmd_list_text(no_tui: bool, deps: bool) -> Result<()> {
         let deps_col = if deps {
             format!(
                 "  {:<dep_w$}  {}",
-                branches::format_roll_numbers(&roll.deps),
+                branches::format_deps(roll),
                 branches::format_roll_numbers(&roll.dependents),
             )
         } else {
             String::new()
         };
+        // Padded only when the deps columns follow it, so a last column leaves
+        // no trailing whitespace — the same rule `dependants` follows.
+        let ver_col = if versions.is_empty() {
+            String::new()
+        } else {
+            let v = versions
+                .get(&roll.branch)
+                .map(String::as_str)
+                .unwrap_or("—");
+            if deps {
+                format!("  {v:<ver_w$}")
+            } else {
+                format!("  {v}")
+            }
+        };
         println!(
-            "{cur} {num:>3}  {name:<nw$}  {loc:<3}  {state:<sw$}{deps_col}",
+            "{cur} {num:>3}  {name:<nw$}  {loc:<3}  {state:<sw$}{ver_col}{deps_col}",
             num = roll.number,
             name = roll.branch,
             loc = roll.location.symbol(),
@@ -1266,8 +2021,88 @@ fn cmd_list_text(no_tui: bool, deps: bool) -> Result<()> {
             sw = state_w,
         );
     }
+    print_hotfix_rows(&hotfixes, name_w, state_w);
+
+    // The same footnote `rf status --no-tui` prints, with or without `--deps`:
+    // a cycle is what explains two rows each `⛔ blocked` on the other.
+    let cycles = branches::distinct_cycles(&rolls);
+    if !cycles.is_empty() {
+        println!();
+        for cycle in cycles {
+            println!("  {}", cycle.advice(&rolls));
+        }
+    }
 
     Ok(())
+}
+
+/// Append the `hotfix/*` rows under a plain roll table, in the same columns.
+///
+/// Shared by `rf status --no-tui` and `rf list --no-tui` so the two read
+/// identically. Numbered `h<N>`: hotfixes number independently of rolls, and a
+/// bare `1` under a roll `1` would read as a duplicate. Widths are the caller's
+/// so the columns line up with the rolls above; a hotfix name wider than every
+/// roll's simply runs long, which beats re-measuring the whole table for a tier
+/// that is usually empty.
+pub(crate) fn print_hotfix_rows(hotfixes: &[branches::HotfixInfo], name_w: usize, state_w: usize) {
+    // A thin rule between the tiers, as the TUI draws: rolls and hotfixes
+    // number independently, so a roll 1 and an h1 should not read as one list.
+    if !hotfixes.is_empty() {
+        println!("  {}", "┄".repeat(3 + 2 + name_w + 2 + 3 + 2 + state_w));
+    }
+    for hotfix in hotfixes {
+        let cur = if hotfix.is_current { ">" } else { " " };
+        println!(
+            "{cur} {num:>3}  {name:<nw$}  {loc:<3}  {state:<sw$}",
+            num = format!("h{}", hotfix.number),
+            name = hotfix.branch,
+            loc = hotfix.location.symbol(),
+            state = hotfix.state.label(),
+            nw = name_w,
+            sw = state_w,
+        );
+    }
+}
+
+/// Header for the per-branch crate version, shared by both plain tables.
+pub(crate) const VERSION_HDR: &str = "version";
+
+/// The version string to print per roll, keyed by branch, plus the column width.
+///
+/// An empty map means "no column": either the repo has no `Cargo.toml` at all —
+/// every dotfiles repo — or nothing readable was found, and in both cases the
+/// table is better off without a column of dashes. The same rule the TUI table
+/// and the header version follow.
+///
+/// Versions are read at [`branches::content_ref`] per roll, so the plain tables
+/// and the TUI report the same commit's manifest.
+pub(crate) fn version_column(
+    config: &Config,
+    rolls: &[branches::RollInfo],
+) -> (HashMap<String, String>, usize) {
+    let refs: Vec<String> = rolls
+        .iter()
+        .map(|r| branches::content_ref(&r.branch, &r.location))
+        .collect();
+    let by_ref = version::versions_at(&config.repo_root, &refs);
+
+    let by_branch: HashMap<String, String> = rolls
+        .iter()
+        .zip(refs.iter())
+        .filter_map(|(roll, refspec)| {
+            let v = by_ref.get(refspec)?;
+            // Through `Display`, dev marker included — see `tui::rolls::version_cell`.
+            Some((roll.branch.clone(), v.to_string()))
+        })
+        .collect();
+
+    let width = by_branch
+        .values()
+        .map(|v| v.chars().count())
+        .max()
+        .unwrap_or(0)
+        .max(VERSION_HDR.chars().count());
+    (by_branch, width)
 }
 
 /// Column headers for the dependency pair, shared by `rf list --no-tui --deps`
@@ -1278,20 +2113,23 @@ pub(crate) const DEPENDANTS_HDR: &str = "dependants";
 /// Widths for the `deps` / `dependants` columns: wide enough for the header and
 /// for the longest comma-joined number list in the table. Trailing whitespace on
 /// the last column is trimmed by the caller's format, so only `deps` needs a
-/// computed width — `dependants` is returned for the separator rule.
+/// computed width — `dependants` is returned for the separator rule. `deps`
+/// measures [`branches::format_deps`] rather than the plain
+/// listing, so a `⚠` suffix never gets truncated by a width computed without it.
 pub(crate) fn dep_column_widths(rolls: &[branches::RollInfo]) -> (usize, usize) {
-    let widest = |pick: fn(&branches::RollInfo) -> &Vec<u32>, hdr: &str| {
-        rolls
-            .iter()
-            .map(|r| branches::format_roll_numbers(pick(r)).chars().count())
-            .max()
-            .unwrap_or(0)
-            .max(hdr.chars().count())
-    };
-    (
-        widest(|r| &r.deps, DEPS_HDR),
-        widest(|r| &r.dependents, DEPENDANTS_HDR),
-    )
+    let deps_w = rolls
+        .iter()
+        .map(|r| branches::format_deps(r).chars().count())
+        .max()
+        .unwrap_or(0)
+        .max(DEPS_HDR.chars().count());
+    let dependants_w = rolls
+        .iter()
+        .map(|r| branches::format_roll_numbers(&r.dependents).chars().count())
+        .max()
+        .unwrap_or(0)
+        .max(DEPENDANTS_HDR.chars().count());
+    (deps_w, dependants_w)
 }
 
 #[derive(Serialize)]
@@ -1301,7 +2139,21 @@ struct StatusPayload {
     tier: String,
     clean_working_tree: bool,
     pending_roll_branches: Vec<String>,
+    /// Every `hotfix/*` branch, open or landed. Added as its own array rather
+    /// than folded into the roll list, so scripted consumers reading rolls are
+    /// not handed a branch with no roll number.
+    hotfixes: Vec<JsonHotfix>,
     promotion: PromotionReadiness,
+}
+
+#[derive(Serialize)]
+struct JsonHotfix {
+    branch: String,
+    number: u32,
+    /// `open` until the landing merge is on stable, then `landed`.
+    state: String,
+    location: String,
+    is_current: bool,
 }
 
 #[derive(Serialize)]
@@ -1322,12 +2174,58 @@ struct JsonRoll {
     /// consumers see the same dependency graph the TUI draws.
     deps: Vec<u32>,
     dependants: Vec<u32>,
+    /// The `[package]` version at this roll's tip. `null` in repos with no
+    /// `Cargo.toml`, which is the same absence the tables render as a dash.
+    version: Option<String>,
+    /// Subset of `deps` whose current tip this roll has not integrated — the
+    /// ancestry check behind the TUI's `⚠ reintegrate` marker, exposed so a
+    /// script deciding whether to merge a batch of dependent rolls can check
+    /// each one is caught up with a still-moving dependency before doing so,
+    /// rather than inferring it from `state` (which only answers whether the
+    /// dependency has graduated, not whether it has moved since).
+    stale_deps: Vec<u32>,
+    /// The dependency cycle this roll is in, or `null` — see
+    /// [`branches::DepCycle`]. Every member's row carries the same object, so
+    /// a script can tell which member graduates without re-deriving it.
+    cycle: Option<JsonCycle>,
 }
 
-fn rolls_for_json(rolls: Vec<branches::RollInfo>) -> Vec<JsonRoll> {
+#[derive(Serialize)]
+struct JsonCycle {
+    /// Every roll in the cycle, ascending, this one included.
+    members: Vec<u32>,
+    /// The member whose graduation lands the whole cycle, or `null` when none
+    /// contains the others' latest work yet.
+    carrier: Option<u32>,
+    /// The carrier, or — with none — the member `advice` says to integrate the
+    /// others into.
+    suggested: u32,
+    /// Members whose tip `suggested` lacks; empty exactly when it is the carrier.
+    lacks: Vec<u32>,
+    /// The same instruction the plain tables print under the table.
+    advice: String,
+}
+
+fn rolls_for_json(config: &Config, rolls: Vec<branches::RollInfo>) -> Vec<JsonRoll> {
+    let (versions, _) = version_column(config, &rolls);
+    let cycles: Vec<Option<JsonCycle>> = rolls
+        .iter()
+        .map(|r| {
+            r.cycle.as_ref().map(|c| JsonCycle {
+                members: c.members.clone(),
+                carrier: c.carrier(),
+                suggested: c.suggested,
+                lacks: c.lacks.clone(),
+                advice: c.advice(&rolls),
+            })
+        })
+        .collect();
     rolls
         .into_iter()
-        .map(|r| JsonRoll {
+        .zip(cycles)
+        .map(|(r, cycle)| JsonRoll {
+            cycle,
+            version: versions.get(&r.branch).cloned(),
             branch: r.branch,
             number: r.number,
             state: r.state.label().to_string(),
@@ -1335,6 +2233,7 @@ fn rolls_for_json(rolls: Vec<branches::RollInfo>) -> Vec<JsonRoll> {
             is_current: r.is_current,
             deps: r.deps,
             dependants: r.dependents,
+            stale_deps: r.stale_deps,
         })
         .collect()
 }

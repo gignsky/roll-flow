@@ -3,7 +3,7 @@ use std::io::IsTerminal;
 use anyhow::Result;
 
 use crate::core::{
-    branches::{self, BranchLocation, RollInfo},
+    branches::{self, BranchLocation, HotfixInfo, RollInfo},
     config::Config,
     git,
 };
@@ -27,10 +27,11 @@ pub fn run(no_tui: bool, show_deps: bool) -> Result<()> {
     print_current_roll_line(&config, &current_roll);
     println!();
 
-    if rolls.is_empty() {
+    let hotfixes = branches::list_hotfixes(&config)?;
+    if rolls.is_empty() && hotfixes.is_empty() {
         println!("  (no roll branches found)");
     } else {
-        print_rolls_table(&rolls, show_deps);
+        print_rolls_table(&config, &rolls, &hotfixes, show_deps);
     }
 
     Ok(())
@@ -69,11 +70,18 @@ fn print_current_roll_line(config: &Config, current_roll: &Option<String>) {
 
 // ── Roll table ────────────────────────────────────────────────────────────────
 
-fn print_rolls_table(rolls: &[RollInfo], show_deps: bool) {
-    // Compute column widths dynamically.
+fn print_rolls_table(
+    config: &Config,
+    rolls: &[RollInfo],
+    hotfixes: &[HotfixInfo],
+    show_deps: bool,
+) {
+    // Compute column widths dynamically — over the hotfix names too, since
+    // they share the columns.
     let name_w = rolls
         .iter()
         .map(|r| r.branch.len())
+        .chain(hotfixes.iter().map(|h| h.branch.len()))
         .max()
         .unwrap_or(4)
         .max(4);
@@ -85,14 +93,36 @@ fn print_rolls_table(rolls: &[RollInfo], show_deps: bool) {
         .max(1);
     let state_w = "✓ graduated".len(); // longest label
     let (dep_w, dependant_w) = crate::dep_column_widths(rolls);
+    // Empty in a repo with no `Cargo.toml`, which drops the column entirely.
+    let (versions, ver_w) = crate::version_column(config, rolls);
+    // Padded only when the deps columns follow it. Like `dependants`, a last
+    // column is left unpadded so rows carry no trailing whitespace.
+    let version_col = |branch: &str| {
+        if versions.is_empty() {
+            return String::new();
+        }
+        let v = versions.get(branch).map(String::as_str).unwrap_or("—");
+        if show_deps {
+            format!("  {v:<ver_w$}")
+        } else {
+            format!("  {v}")
+        }
+    };
 
     // Header
     println!(
-        "  {num:>nw$}  {name:<ew$}  {loc:<3}  {state:<sw$}{deps_hdr}",
+        "  {num:>nw$}  {name:<ew$}  {loc:<3}  {state:<sw$}{ver_hdr}{deps_hdr}",
         num = "#",
         name = "roll",
         loc = "loc",
         state = "state",
+        ver_hdr = if versions.is_empty() {
+            String::new()
+        } else if show_deps {
+            format!("  {:<ver_w$}", crate::VERSION_HDR)
+        } else {
+            format!("  {}", crate::VERSION_HDR)
+        },
         deps_hdr = if show_deps {
             format!("  {:<dep_w$}  {}", crate::DEPS_HDR, crate::DEPENDANTS_HDR)
         } else {
@@ -103,10 +133,15 @@ fn print_rolls_table(rolls: &[RollInfo], show_deps: bool) {
         sw = state_w,
     );
     println!(
-        "  {sep_n}  {sep_e}  ───  {sep_s}{sep_d}",
+        "  {sep_n}  {sep_e}  ───  {sep_s}{sep_v}{sep_d}",
         sep_n = "─".repeat(num_w),
         sep_e = "─".repeat(name_w),
         sep_s = "─".repeat(state_w),
+        sep_v = if versions.is_empty() {
+            String::new()
+        } else {
+            format!("  {}", "─".repeat(ver_w))
+        },
         sep_d = if show_deps {
             format!("  {}  {}", "─".repeat(dep_w), "─".repeat(dependant_w))
         } else {
@@ -119,15 +154,16 @@ fn print_rolls_table(rolls: &[RollInfo], show_deps: bool) {
         let deps_col = if show_deps {
             format!(
                 "  {:<dep_w$}  {}",
-                branches::format_roll_numbers(&roll.deps),
+                branches::format_deps(roll),
                 branches::format_roll_numbers(&roll.dependents),
             )
         } else {
             String::new()
         };
         println!(
-            "{cur} {num:>nw$}  {name:<ew$}  {loc:<3}  {state:<sw$}{deps_col}",
+            "{cur} {num:>nw$}  {name:<ew$}  {loc:<3}  {state:<sw$}{ver_col}{deps_col}",
             cur = cur_marker,
+            ver_col = version_col(&roll.branch),
             num = roll.number,
             name = roll.branch,
             loc = location_symbol(&roll.location),
@@ -137,10 +173,22 @@ fn print_rolls_table(rolls: &[RollInfo], show_deps: bool) {
             sw = state_w,
         );
     }
+    crate::print_hotfix_rows(hotfixes, name_w, state_w);
     println!();
     println!("  loc: L=local  R=remote  B=both");
     if show_deps {
         println!("  deps: rolls this one integrated  |  dependants: rolls that integrated it");
+        println!(
+            "  ⚠ after a dep number: it has moved since this roll integrated it — reintegrate"
+        );
+        if !branches::distinct_cycles(rolls).is_empty() {
+            println!("  ↻ after a dep number: it integrated this roll back — a dependency cycle");
+        }
+    }
+    // Printed with or without `--no-deps`: it is what explains a `⛔ blocked`
+    // that would otherwise be waiting on a roll that is waiting on it.
+    for cycle in branches::distinct_cycles(rolls) {
+        println!("  {}", cycle.advice(rolls));
     }
 }
 
