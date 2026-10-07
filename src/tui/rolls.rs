@@ -7182,6 +7182,7 @@ mod tests {
             panel: None,
             pending_g: false,
             pending_push: None,
+            command_history: Vec::new(),
         };
         let out = draw(|f, area| app.render_table(f, area));
 
