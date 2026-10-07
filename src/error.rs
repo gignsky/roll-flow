@@ -14,7 +14,6 @@ pub enum RfError {
     #[error("branch not found: {0}")]
     BranchNotFound(String),
 
-    #[allow(dead_code)]
     #[error("parse error: {0}")]
     Parse(String),
 

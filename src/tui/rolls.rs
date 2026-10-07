@@ -17,7 +17,8 @@ use std::time::{Duration, Instant};
 
 use anyhow::{anyhow, bail, Result};
 use crossterm::event::{
-    self, Event, KeyCode, KeyEventKind, MouseButton, MouseEvent, MouseEventKind,
+    self, Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers, MouseButton, MouseEvent,
+    MouseEventKind,
 };
 use ratatui::{
     layout::{Alignment, Constraint, Layout, Rect},
@@ -32,7 +33,7 @@ use crate::core::{
     branches::{self, BranchLocation, HotfixInfo, HotfixState, RollInfo, RollState, VerifySet},
     config::Config,
     git::{self, TrackState},
-    ops,
+    history, ops, proc,
     sync::{self, PullPlan, PushOutcome, SyncTarget},
     version::{self, BumpLevel, Semver, VersionCheck, VersionStatus},
 };
@@ -324,6 +325,24 @@ enum Mode {
         branch: String,
         remote: String,
     },
+    /// `:`: the lazygit-style command prompt.
+    Command {
+        /// What the user actually typed. Filters the history list, and
+        /// nothing else — `Up`/`Down` never touch it, only character edits do
+        /// (resetting `cursor` to 0, same as `Help`'s `query`). Keeping this
+        /// apart from `input` is what lets Up/Down cycle through more than one
+        /// suggestion: filtering against `input` instead would, after the
+        /// first pick, filter history against a full command string rather
+        /// than what was actually typed, collapsing the candidate list.
+        query: String,
+        /// What `enter` runs. Starts equal to `query` and is overwritten by
+        /// `Up`/`Down` picking a suggestion (reverse-search-style); any
+        /// further character edit resets it back to `query`.
+        input: String,
+        /// Indexes the fuzzy-filtered (by `query`) history list below the
+        /// prompt.
+        cursor: usize,
+    },
 }
 
 /// What the slug-input modal creates. One modal for both, because the input
@@ -614,6 +633,9 @@ struct StatusApp {
     /// When a bare `P` was pressed, waiting to see whether it becomes `PP`.
     /// Unlike `pending_g` this *is* timed — see [`PUSH_CHORD_WINDOW`].
     pending_push: Option<Instant>,
+    /// Commands run through `:`, most-recent-first. Loaded once at startup
+    /// from [`history::load`] and saved back after every run.
+    command_history: Vec<String>,
 }
 
 /// Entry point. Takes ownership of the data so the app can rebuild it after an
@@ -1120,6 +1142,17 @@ pub(crate) const BINDINGS: &[Binding] = &[
         // replay, so there is nothing to add here for that.
         replay: &[KeyCode::Char('z')],
     },
+    Binding {
+        keys: ":",
+        label: "run a shell command",
+        group: "output",
+        // Not a `hint`: the status bar is capped at five curated basics (see
+        // `the_status_bar_carries_only_the_basics_and_points_at_the_rest`),
+        // and `?` already makes every other binding, this one included,
+        // discoverable by name.
+        hint: None,
+        replay: &[KeyCode::Char(':')],
+    },
 ];
 
 /// Score `needle` against `haystack` as a fuzzy subsequence match, `None` when
@@ -1196,6 +1229,19 @@ pub(crate) fn filter_bindings(query: &str) -> Vec<usize> {
     scored.into_iter().map(|(i, _)| i).collect()
 }
 
+/// The commands in `history` matching `query`, best first, as indices into
+/// `history`. Exactly [`filter_bindings`]'s shape against a different list —
+/// one fuzzy matcher, reused rather than written twice.
+pub(crate) fn filter_history(history: &[String], query: &str) -> Vec<usize> {
+    let mut scored: Vec<(usize, i32)> = history
+        .iter()
+        .enumerate()
+        .filter_map(|(i, cmd)| fuzzy_score(cmd, query).map(|score| (i, score)))
+        .collect();
+    scored.sort_by_key(|&(_, score)| std::cmp::Reverse(score));
+    scored.into_iter().map(|(i, _)| i).collect()
+}
+
 /// What a keypress in the `?` list does.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum HelpOutcome {
@@ -1250,6 +1296,100 @@ pub(crate) fn handle_help_key(
         }
         _ => HelpOutcome::Continue,
     }
+}
+
+/// What a keypress in the `:` command prompt does.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum CommandOutcome {
+    /// Input or cursor changed (or the key meant nothing); keep the prompt open.
+    Continue,
+    Close,
+    /// Run the current input in the panel.
+    Run,
+    /// Run the current input in the real shell instead (`alt+enter`, or
+    /// `shift+enter` where the terminal reports it distinguishably).
+    RunInShell,
+}
+
+/// Apply one keystroke to the `:` prompt, mutating `input` and `cursor` in
+/// place. `alt` carries whether the modifier was held on `Enter` — the pure
+/// function takes it as a plain bool rather than a `KeyEvent` so the whole
+/// interaction is testable without constructing one.
+///
+/// Up/Down are reverse-search-style, unlike the `?` list's cursor: there is no
+/// separate "list" to look at here, so moving the highlight also copies that
+/// entry straight into `input`, the way a shell's history search does. Typing
+/// resets the highlight to the top match, same as `?`.
+pub(crate) fn handle_command_key(
+    query: &mut String,
+    input: &mut String,
+    cursor: &mut usize,
+    history: &[String],
+    code: KeyCode,
+    alt: bool,
+) -> CommandOutcome {
+    match code {
+        KeyCode::Esc => CommandOutcome::Close,
+        KeyCode::Enter if alt => CommandOutcome::RunInShell,
+        KeyCode::Enter => {
+            if input.trim().is_empty() {
+                CommandOutcome::Continue
+            } else {
+                CommandOutcome::Run
+            }
+        }
+        KeyCode::Down => {
+            let matches = filter_history(history, query);
+            if !matches.is_empty() {
+                // `input == query` means nothing has been picked yet (every
+                // character edit resets them to match), so the first press
+                // lands on the top suggestion rather than skipping straight to
+                // the second.
+                *cursor = if *input == *query {
+                    0
+                } else {
+                    (*cursor + 1).min(matches.len() - 1)
+                };
+                *input = history[matches[*cursor]].clone();
+            }
+            CommandOutcome::Continue
+        }
+        KeyCode::Up => {
+            let matches = filter_history(history, query);
+            if !matches.is_empty() {
+                *cursor = if *input == *query {
+                    0
+                } else {
+                    cursor.saturating_sub(1)
+                };
+                *input = history[matches[*cursor]].clone();
+            }
+            CommandOutcome::Continue
+        }
+        KeyCode::Backspace => {
+            query.pop();
+            *input = query.clone();
+            *cursor = 0;
+            CommandOutcome::Continue
+        }
+        KeyCode::Char(c) if !c.is_control() => {
+            query.push(c);
+            *input = query.clone();
+            *cursor = 0;
+            CommandOutcome::Continue
+        }
+        _ => CommandOutcome::Continue,
+    }
+}
+
+/// Build a `<shell> -c <input>` command. The user's own shell (`$SHELL`,
+/// falling back to `sh` only when it's unset) rather than a hardcoded `sh`:
+/// the whole point of "the shell that launched rf" is that it may not be a
+/// POSIX shell at all — this project's own developer runs Nushell.
+fn shell_command(shell: &str, input: &str) -> std::process::Command {
+    let mut cmd = std::process::Command::new(shell);
+    cmd.arg("-c").arg(input);
+    cmd
 }
 
 /// The route `[v]` would check, as `(source, target)`, or `None` when the
@@ -1546,6 +1686,55 @@ fn hotfix_color(state: HotfixState) -> Color {
         HotfixState::Open => Color::LightRed,
         HotfixState::Landed => Color::DarkGray,
     }
+}
+
+/// The two-lane glyph pair (`main_lane`, `rolling_lane`) for a roll's graph
+/// column cell, read left-to-right in the same order the pinned base rows are
+/// listed (stable, then rolling).
+///
+/// Deliberately two *fixed* lanes rather than a dynamic multi-lane layout: a
+/// dependency between two rolls already has a home (the `deps`/`dependants`
+/// columns and their `⚠` stale markers), and the `branch` column has no width
+/// to spare for a packer that would need unbounded space in pathological
+/// cases. This column re-renders facts `RollState` already carries — it adds
+/// no new ones — as the lane position a glance reads as "how settled is
+/// this": further right (rolling) is further from landing, `●` in the main
+/// lane means it is on stable. See docs/internals/algorithms.md.
+pub(crate) fn graph_glyphs(state: &RollState) -> (char, char) {
+    match state {
+        RollState::Active => ('│', '○'),
+        RollState::Blocked => ('│', '◌'),
+        RollState::Diverged => ('│', '◐'),
+        RollState::Reverted => ('│', '↺'),
+        RollState::Graduated => ('│', '●'),
+        RollState::Promoted => ('●', '●'),
+        RollState::Demoted => ('◐', '●'),
+    }
+}
+
+/// Same lane pair for a hotfix row: a hotfix lands directly into both stable
+/// and rolling in one step (`[H]`), so it has no `Graduated`-only state of its
+/// own — it is either still open (not yet on either lane) or landed (on both).
+pub(crate) fn hotfix_graph_glyphs(state: HotfixState) -> (char, char) {
+    match state {
+        HotfixState::Open => ('│', '○'),
+        HotfixState::Landed => ('●', '●'),
+    }
+}
+
+/// The graph column's own two rows: stable sits on the main lane with nothing
+/// yet in rolling's; rolling sits on its own lane, with the main lane passing
+/// through underneath it since a later promotion still has to reach stable.
+pub(crate) fn base_graph_glyphs(role: BaseRole) -> (char, char) {
+    match role {
+        BaseRole::Stable => ('●', ' '),
+        BaseRole::Rolling => ('│', '●'),
+    }
+}
+
+/// Render a lane pair as the graph column's cell text.
+fn graph_cell(glyphs: (char, char)) -> String {
+    format!("{}{}", glyphs.0, glyphs.1)
 }
 
 /// What `[p]` should promote, given the current selection.
@@ -1940,6 +2129,7 @@ impl StatusApp {
             panel_rect: None,
             pending_g: false,
             pending_push: None,
+            command_history: history::load(),
         }
     }
 
@@ -1990,6 +2180,11 @@ impl StatusApp {
                         if self.handle_help(terminal, key.code)? {
                             break;
                         }
+                    } else if matches!(self.mode, Mode::Command { .. }) {
+                        // Takes the whole `KeyEvent`, not just the code: telling
+                        // `alt+enter` apart from a plain `enter` needs the
+                        // modifiers, which every other mode's dispatch discards.
+                        self.handle_command(terminal, key)?;
                     } else if self.handle_browsing(terminal, key.code)? {
                         break;
                     }
@@ -2148,6 +2343,16 @@ impl StatusApp {
             KeyCode::PageDown => self.scroll_panel(PanelScroll::Down),
             KeyCode::End => self.scroll_panel(PanelScroll::End),
             KeyCode::Char('z') => self.toggle_maximize(),
+            KeyCode::Char(':') => {
+                if self.busy() {
+                    return Ok(false);
+                }
+                self.mode = Mode::Command {
+                    query: String::new(),
+                    input: String::new(),
+                    cursor: 0,
+                };
+            }
             KeyCode::Char('r') => {
                 self.reload()?;
                 self.message = Some("refreshed".to_string());
@@ -2376,6 +2581,119 @@ impl StatusApp {
                 Ok(false)
             }
         }
+    }
+
+    /// Dispatch one keystroke to the `:` prompt. Unlike every other mode's
+    /// handler this takes the whole `KeyEvent` rather than just its `code` —
+    /// `alt+enter` has to be told apart from a plain `enter`, which needs the
+    /// modifiers.
+    fn handle_command(&mut self, terminal: &mut super::Tui, key: KeyEvent) -> Result<()> {
+        // Cloned rather than borrowed: `handle_command_key` needs it alongside
+        // a mutable borrow of `self.mode` for `input`/`cursor`, and the history
+        // list is short enough that cloning it once per keystroke is cheaper
+        // than fighting the borrow checker over two fields of `self`.
+        let history = self.command_history.clone();
+        let alt = key
+            .modifiers
+            .intersects(KeyModifiers::ALT | KeyModifiers::SHIFT);
+        let outcome = {
+            let Mode::Command {
+                query,
+                input,
+                cursor,
+            } = &mut self.mode
+            else {
+                return Ok(());
+            };
+            handle_command_key(query, input, cursor, &history, key.code, alt)
+        };
+        match outcome {
+            CommandOutcome::Continue => Ok(()),
+            CommandOutcome::Close => {
+                self.mode = Mode::Browsing;
+                Ok(())
+            }
+            CommandOutcome::Run => {
+                let input = self.take_command_input();
+                self.execute_command(input);
+                Ok(())
+            }
+            CommandOutcome::RunInShell => {
+                let input = self.take_command_input();
+                self.run_command_in_shell(terminal, input)
+            }
+        }
+    }
+
+    /// Close the `:` prompt and hand back the text it held, or an empty string
+    /// if the mode has already moved on (defensive; the two callers only ever
+    /// reach this from inside `Mode::Command`).
+    fn take_command_input(&mut self) -> String {
+        match std::mem::replace(&mut self.mode, Mode::Browsing) {
+            Mode::Command { input, .. } => input,
+            other => {
+                self.mode = other;
+                String::new()
+            }
+        }
+    }
+
+    /// `enter` in the `:` prompt: run `input` as a background job, the same
+    /// path every other mutating action uses — its output streams into the
+    /// floating panel while the table stays navigable.
+    fn execute_command(&mut self, input: String) {
+        history::record(&mut self.command_history, &input);
+        // Best-effort: a command the user just ran is worth more than a
+        // history write that failed because, say, `$HOME` is unset.
+        let _ = history::save(&self.command_history);
+        let shell = std::env::var("SHELL").unwrap_or_else(|_| "sh".to_string());
+        let title = input.clone();
+        self.start_job(title, move || {
+            let status = proc::run(&mut shell_command(&shell, &input))?;
+            Ok(JobDone::lines(if status.success() {
+                Vec::new()
+            } else {
+                vec![format!("exited with {status}")]
+            }))
+        });
+    }
+
+    /// `alt+enter` (or `shift+enter`, where the terminal reports it
+    /// distinguishably) in the `:` prompt: suspend the terminal and run
+    /// `input` with inherited stdio, the same shape [`Self::launch_lazygit`]
+    /// uses — a shell command may be interactive (an editor, a pager, a
+    /// prompt of its own) in a way a piped job never could be.
+    fn run_command_in_shell(&mut self, terminal: &mut super::Tui, input: String) -> Result<()> {
+        if self.busy() {
+            return Ok(());
+        }
+        history::record(&mut self.command_history, &input);
+        let _ = history::save(&self.command_history);
+        let shell = std::env::var("SHELL").unwrap_or_else(|_| "sh".to_string());
+
+        super::suspend(terminal)?;
+        let spawned = shell_command(&shell, &input).status();
+        if spawned.is_ok() {
+            // Unlike lazygit's own full-screen takeover, a one-shot shell
+            // command returns the instant it exits — without this pause,
+            // `resume`'s `terminal.clear()` would wipe output nobody had a
+            // chance to read.
+            println!("\npress enter to return to rf...");
+            let mut discard = String::new();
+            let _ = std::io::stdin().read_line(&mut discard);
+        }
+        super::resume(terminal)?;
+
+        match spawned {
+            Ok(status) if status.success() => self.message = None,
+            Ok(status) => self.message = Some(format!("'{input}' exited with {status}")),
+            Err(err) => {
+                let mut panel = output::Panel::new(input.clone());
+                panel.fail(vec![format!("could not run '{input}': {err}")]);
+                self.panel = Some(panel);
+            }
+        }
+        self.reload()
     }
 
     /// Total number of table rows: the pinned base branches plus the rolls.
@@ -3349,6 +3667,11 @@ impl StatusApp {
             } => render_conflict_modal(f, area, source, target, culprits, *can_integrate),
             Mode::PushAll { plan } => render_push_all_modal(f, area, plan),
             Mode::Help { query, cursor } => render_help(f, area, query, *cursor),
+            Mode::Command {
+                query,
+                input,
+                cursor,
+            } => render_command(f, area, query, input, *cursor, &self.command_history),
             Mode::Browsing => {}
         }
     }
@@ -3389,6 +3712,9 @@ impl StatusApp {
             // The current-branch chevron, narrow and always present so the
             // columns after it do not shift as HEAD moves.
             Constraint::Length(1),
+            // The graph column: two lane glyphs (main, rolling) plus a cell of
+            // breathing room. TUI-only — see graph_glyphs' doc comment.
+            Constraint::Length(3),
             Constraint::Length(4),
             Constraint::Fill(1),
             Constraint::Length(3),
@@ -3422,6 +3748,7 @@ impl StatusApp {
 
         let bold = Style::default().add_modifier(Modifier::BOLD);
         let mut header_cells = vec![
+            Cell::from(""),
             Cell::from(""),
             Cell::from("#").style(bold),
             Cell::from("branch").style(bold),
@@ -3464,6 +3791,7 @@ impl StatusApp {
                             .fg(Color::Green)
                             .add_modifier(Modifier::BOLD),
                     ),
+                    Cell::from(graph_cell(base_graph_glyphs(base.role))),
                     Cell::from(""),
                     Cell::from(base.branch.clone()).style(base_style.fg(base.role.color())),
                     Cell::from(base.location.symbol()).style(base_style),
@@ -3497,6 +3825,7 @@ impl StatusApp {
                         .fg(Color::Green)
                         .add_modifier(Modifier::BOLD),
                 ),
+                Cell::from(graph_cell(graph_glyphs(&roll.state))),
                 Cell::from(roll.number.to_string()).style(base_style),
                 Cell::from(roll.branch.clone()).style(base_style),
                 Cell::from(roll.location.symbol()).style(base_style),
@@ -3531,6 +3860,7 @@ impl StatusApp {
                         .fg(Color::Green)
                         .add_modifier(Modifier::BOLD),
                 ),
+                Cell::from(graph_cell(hotfix_graph_glyphs(hotfix.state))),
                 Cell::from(format!("h{}", hotfix.number)).style(base_style.fg(color)),
                 Cell::from(hotfix.branch.clone()).style(base_style.fg(color)),
                 Cell::from(hotfix.location.symbol()).style(base_style),
@@ -4773,6 +5103,75 @@ fn column_width<'a>(values: impl Iterator<Item = &'a str>) -> usize {
     values.map(|v| v.chars().count()).max().unwrap_or(0)
 }
 
+/// Render the `:` command prompt: the input line on top, the fuzzy-matched
+/// history below it. Exactly [`render_help`]'s shape against a plain list of
+/// strings instead of [`BINDINGS`].
+fn render_command(
+    f: &mut Frame,
+    area: Rect,
+    query: &str,
+    input: &str,
+    cursor: usize,
+    history: &[String],
+) {
+    // The list is filtered by `query` (what was typed), not `input` (what
+    // will run) — after an Up/Down pick they differ, and filtering by the
+    // picked command instead would collapse the candidate list to just itself.
+    let matches = filter_history(history, query);
+    let dim = Style::default().fg(Color::DarkGray);
+
+    let visible = (area.height.saturating_sub(8) as usize).max(1);
+    let rows = matches.len().min(visible);
+    let first = cursor.saturating_sub(rows.saturating_sub(1));
+
+    let mut lines = vec![
+        Line::from(vec![
+            Span::styled(": ", Style::default().fg(Color::Cyan)),
+            Span::raw(input.to_string()),
+            Span::styled("_", Style::default().fg(Color::Cyan)),
+        ]),
+        Line::from(""),
+    ];
+
+    if matches.is_empty() {
+        lines.push(Line::from(Span::styled("no history yet", dim)));
+    }
+    for (row, &index) in matches.iter().enumerate().skip(first).take(rows) {
+        let selected = row == cursor;
+        let style = if selected {
+            Style::default().add_modifier(Modifier::REVERSED)
+        } else {
+            Style::default()
+        };
+        lines.push(Line::from(vec![
+            Span::raw(if selected { "▶ " } else { "  " }),
+            Span::styled(history[index].clone(), style),
+        ]));
+    }
+    if matches.len() > rows {
+        lines.push(Line::from(Span::styled(
+            format!("… {} more, keep typing", matches.len() - rows),
+            dim,
+        )));
+    }
+
+    lines.push(Line::from(""));
+    lines.push(Line::from(Span::styled(
+        "[↑/↓] history   [enter] run here   [alt+enter] run in shell   [esc] cancel",
+        dim,
+    )));
+
+    let width = lines.iter().map(|l| l.width()).max().unwrap_or(40) as u16 + 4;
+    let height = lines.len() as u16 + 2;
+    let modal = centered_rect(area, width.max(60), height);
+
+    f.render_widget(Clear, modal);
+    f.render_widget(
+        Paragraph::new(lines).block(Block::bordered().title(" : ")),
+        modal,
+    );
+}
+
 /// Render the centered slug-input popup for creating a new roll. Shows the
 /// prompt, the current buffer with a trailing caret, and the key hints.
 fn render_create_input(f: &mut Frame, area: Rect, config: &Config, buffer: &str, kind: CreateKind) {
@@ -5810,6 +6209,239 @@ mod tests {
     }
 
     #[test]
+    fn filter_history_ranks_the_best_match_first_and_respects_order_on_ties() {
+        let history = vec![
+            "git status".to_string(),
+            "git push".to_string(),
+            "ls -la".to_string(),
+        ];
+        let matches = filter_history(&history, "git");
+        assert_eq!(matches, vec![0, 1]);
+        // An empty query is everything, in history order (most-recent-first,
+        // since that is the order the caller stores it in).
+        assert_eq!(filter_history(&history, ""), vec![0, 1, 2]);
+        assert!(filter_history(&history, "zzzz").is_empty());
+    }
+
+    #[test]
+    fn typing_in_the_command_prompt_fills_the_buffer() {
+        let mut query = String::new();
+        let mut input = String::new();
+        let mut cursor = 0;
+        let history: Vec<String> = Vec::new();
+        for c in "git st".chars() {
+            assert_eq!(
+                handle_command_key(
+                    &mut query,
+                    &mut input,
+                    &mut cursor,
+                    &history,
+                    KeyCode::Char(c),
+                    false
+                ),
+                CommandOutcome::Continue
+            );
+        }
+        assert_eq!(query, "git st");
+        // Nothing has been picked from history, so `input` (what `enter` would
+        // run) tracks the typed text exactly.
+        assert_eq!(input, "git st");
+    }
+
+    #[test]
+    fn enter_on_a_blank_prompt_does_nothing() {
+        let mut query = String::new();
+        let mut input = String::new();
+        let mut cursor = 0;
+        let history: Vec<String> = Vec::new();
+        assert_eq!(
+            handle_command_key(
+                &mut query,
+                &mut input,
+                &mut cursor,
+                &history,
+                KeyCode::Enter,
+                false
+            ),
+            CommandOutcome::Continue
+        );
+    }
+
+    #[test]
+    fn enter_on_a_typed_command_runs_it() {
+        let mut query = "echo hi".to_string();
+        let mut input = "echo hi".to_string();
+        let mut cursor = 0;
+        let history: Vec<String> = Vec::new();
+        assert_eq!(
+            handle_command_key(
+                &mut query,
+                &mut input,
+                &mut cursor,
+                &history,
+                KeyCode::Enter,
+                false
+            ),
+            CommandOutcome::Run
+        );
+    }
+
+    #[test]
+    fn alt_enter_runs_in_the_shell_instead() {
+        let mut query = "vim".to_string();
+        let mut input = "vim".to_string();
+        let mut cursor = 0;
+        let history: Vec<String> = Vec::new();
+        assert_eq!(
+            handle_command_key(
+                &mut query,
+                &mut input,
+                &mut cursor,
+                &history,
+                KeyCode::Enter,
+                true
+            ),
+            CommandOutcome::RunInShell
+        );
+    }
+
+    #[test]
+    fn esc_closes_the_prompt() {
+        let mut query = "anything".to_string();
+        let mut input = "anything".to_string();
+        let mut cursor = 0;
+        let history: Vec<String> = Vec::new();
+        assert_eq!(
+            handle_command_key(
+                &mut query,
+                &mut input,
+                &mut cursor,
+                &history,
+                KeyCode::Esc,
+                false
+            ),
+            CommandOutcome::Close
+        );
+    }
+
+    #[test]
+    fn up_and_down_fill_the_input_from_the_highlighted_history_entry() {
+        let history = vec!["git push".to_string(), "git status".to_string()];
+        let mut query = "git".to_string();
+        let mut input = "git".to_string();
+        let mut cursor = 0;
+
+        // The first press lands on the top suggestion.
+        handle_command_key(
+            &mut query,
+            &mut input,
+            &mut cursor,
+            &history,
+            KeyCode::Down,
+            false,
+        );
+        assert_eq!(cursor, 0);
+        assert_eq!(input, "git push");
+        // The query itself — what's filtered against — is untouched by the pick.
+        assert_eq!(query, "git");
+
+        handle_command_key(
+            &mut query,
+            &mut input,
+            &mut cursor,
+            &history,
+            KeyCode::Down,
+            false,
+        );
+        assert_eq!(cursor, 1);
+        assert_eq!(input, "git status");
+
+        handle_command_key(
+            &mut query,
+            &mut input,
+            &mut cursor,
+            &history,
+            KeyCode::Up,
+            false,
+        );
+        assert_eq!(cursor, 0);
+        assert_eq!(input, "git push");
+
+        // Cannot walk off either end.
+        handle_command_key(
+            &mut query,
+            &mut input,
+            &mut cursor,
+            &history,
+            KeyCode::Up,
+            false,
+        );
+        assert_eq!(cursor, 0);
+        assert_eq!(input, "git push");
+    }
+
+    #[test]
+    fn cycling_through_more_than_two_history_entries_does_not_collapse_the_list() {
+        // The bug this guards against: filtering by `input` (the just-picked
+        // command) instead of `query` (what was actually typed) would shrink
+        // the candidate list to one entry after the first pick, so a second
+        // `Down` could never reach a third match.
+        let history = vec![
+            "git push".to_string(),
+            "git status".to_string(),
+            "git log".to_string(),
+        ];
+        let mut query = "git".to_string();
+        let mut input = "git".to_string();
+        let mut cursor = 0;
+
+        for expected in ["git push", "git status", "git log"] {
+            handle_command_key(
+                &mut query,
+                &mut input,
+                &mut cursor,
+                &history,
+                KeyCode::Down,
+                false,
+            );
+            assert_eq!(input, expected);
+        }
+        assert_eq!(query, "git", "query must stay exactly what was typed");
+    }
+
+    #[test]
+    fn typing_after_a_history_pick_resets_the_highlight_and_the_input() {
+        let history = vec!["git push".to_string(), "git status".to_string()];
+        let mut query = "git".to_string();
+        let mut input = "git".to_string();
+        let mut cursor = 0;
+        handle_command_key(
+            &mut query,
+            &mut input,
+            &mut cursor,
+            &history,
+            KeyCode::Down,
+            false,
+        );
+        assert_eq!(cursor, 0);
+        assert_eq!(input, "git push");
+
+        handle_command_key(
+            &mut query,
+            &mut input,
+            &mut cursor,
+            &history,
+            KeyCode::Char('x'),
+            false,
+        );
+        assert_eq!(cursor, 0);
+        assert_eq!(query, "gitx");
+        // Typing overrides whatever was picked — it no longer reflects the
+        // history entry that was highlighted a moment ago.
+        assert_eq!(input, "gitx");
+    }
+
+    #[test]
     fn esc_closes_the_list_and_stray_keys_leave_it_open() {
         let mut query = String::new();
         let mut cursor = 0;
@@ -6741,6 +7373,123 @@ mod tests {
         assert!(!prune_scope_for(DeleteScope::Both, false).force);
     }
 
+    // ── graph column ────────────────────────────────────────────────────
+
+    #[test]
+    fn graph_glyphs_place_an_open_marker_on_the_rolling_lane_while_active() {
+        assert_eq!(graph_glyphs(&RollState::Active), ('│', '○'));
+        assert_eq!(graph_glyphs(&RollState::Blocked), ('│', '◌'));
+    }
+
+    #[test]
+    fn graph_glyphs_fill_the_rolling_lane_once_graduated() {
+        assert_eq!(graph_glyphs(&RollState::Graduated), ('│', '●'));
+    }
+
+    #[test]
+    fn graph_glyphs_mark_divergence_and_reversion_on_the_rolling_lane() {
+        assert_eq!(graph_glyphs(&RollState::Diverged), ('│', '◐'));
+        assert_eq!(graph_glyphs(&RollState::Reverted), ('│', '↺'));
+    }
+
+    #[test]
+    fn graph_glyphs_fill_both_lanes_once_promoted() {
+        assert_eq!(graph_glyphs(&RollState::Promoted), ('●', '●'));
+    }
+
+    #[test]
+    fn graph_glyphs_mark_a_demoted_main_lane_without_losing_the_rolling_fill() {
+        // Demoted means stable's copy was reverted; the roll's content is
+        // still on rolling, so only the main lane changes from `Promoted`.
+        assert_eq!(graph_glyphs(&RollState::Demoted), ('◐', '●'));
+    }
+
+    #[test]
+    fn hotfix_graph_glyphs_distinguish_open_from_landed() {
+        assert_eq!(hotfix_graph_glyphs(HotfixState::Open), ('│', '○'));
+        assert_eq!(hotfix_graph_glyphs(HotfixState::Landed), ('●', '●'));
+    }
+
+    #[test]
+    fn base_graph_glyphs_put_stable_on_main_and_rolling_behind_a_passthrough() {
+        assert_eq!(base_graph_glyphs(BaseRole::Stable), ('●', ' '));
+        assert_eq!(base_graph_glyphs(BaseRole::Rolling), ('│', '●'));
+    }
+
+    #[test]
+    fn the_graph_column_sits_left_of_the_roll_number_for_every_row_kind() {
+        let bases = vec![
+            BaseBranch {
+                role: BaseRole::Stable,
+                branch: "main".to_string(),
+                location: BranchLocation::Local,
+                is_current: false,
+            },
+            BaseBranch {
+                role: BaseRole::Rolling,
+                branch: "rolling".to_string(),
+                location: BranchLocation::Local,
+                is_current: false,
+            },
+        ];
+        let mut app = StatusApp {
+            config: config("main", "rolling"),
+            current_branch: "main".to_string(),
+            bases,
+            rolls: vec![roll_n(1, RollState::Active), roll_n(2, RollState::Promoted)],
+            hotfixes: Vec::new(),
+            show_deps: false,
+            tracking: HashMap::new(),
+            versions: HashMap::new(),
+            version: None,
+            table: TableState::default(),
+            mode: Mode::Browsing,
+            message: None,
+            job: None,
+            panel: None,
+            pending_g: false,
+            pending_push: None,
+            command_history: Vec::new(),
+        };
+        let out = draw(|f, area| app.render_table(f, area));
+
+        let stable = out
+            .lines()
+            .find(|l| l.contains("main"))
+            .expect("stable row");
+        assert!(
+            stable.contains("● "),
+            "stable row missing its glyph: {stable}"
+        );
+
+        let rolling = out
+            .lines()
+            .find(|l| l.contains("rolling") && !l.contains("roll/"))
+            .expect("rolling row");
+        assert!(
+            rolling.contains("│●"),
+            "rolling row missing its glyph: {rolling}"
+        );
+
+        let active = out
+            .lines()
+            .find(|l| l.contains("roll/1-0101-x"))
+            .expect("active roll row");
+        assert!(
+            active.contains("│○"),
+            "active roll missing its glyph: {active}"
+        );
+
+        let promoted = out
+            .lines()
+            .find(|l| l.contains("roll/2-0101-x"))
+            .expect("promoted roll row");
+        assert!(
+            promoted.contains("●●"),
+            "promoted roll missing its glyph: {promoted}"
+        );
+    }
+
     // ── rendering ───────────────────────────────────────────────────────
 
     /// Draw `f` into an 80x24 test terminal and return its text, one row per
@@ -7058,6 +7807,7 @@ mod tests {
             panel_rect: None,
             pending_g: false,
             pending_push: None,
+            command_history: Vec::new(),
         };
 
         let out = draw(|f, area| app.render_table(f, area));
@@ -7109,6 +7859,7 @@ mod tests {
             panel_rect: None,
             pending_g: false,
             pending_push: None,
+            command_history: Vec::new(),
         };
         let out = draw(|f, area| app.render_table(f, area));
 
@@ -7142,6 +7893,7 @@ mod tests {
             panel_rect: None,
             pending_g: false,
             pending_push: None,
+            command_history: Vec::new(),
         };
         let out = draw(|f, area| app.render_table(f, area));
         assert!(!out.contains("version"), "column shown anyway:\n{out}");
@@ -7187,6 +7939,7 @@ mod tests {
             panel_rect: None,
             pending_g: false,
             pending_push: None,
+            command_history: Vec::new(),
         };
         let out = draw(|f, area| app.render_table(f, area));
         let row = out
@@ -7992,6 +8745,7 @@ mod tests {
             panel_rect: None,
             pending_g: false,
             pending_push: None,
+            command_history: Vec::new(),
         };
         let out = draw(|f, area| app.render_table(f, area));
         let lines: Vec<&str> = out.lines().collect();
@@ -8058,6 +8812,7 @@ mod tests {
             panel_rect: None,
             pending_g: false,
             pending_push: None,
+            command_history: Vec::new(),
         };
 
         // Tall enough for the header, three table rows and the five-line status

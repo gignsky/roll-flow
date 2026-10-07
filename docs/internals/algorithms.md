@@ -518,3 +518,42 @@ and commits only if they pass. This is why a gate that rewrites tracked files
 aborts the promotion — `git commit` would drop those changes and record a merge
 whose content the gates never saw. Graduation still uses `run_merge`, which
 merges and commits in one step.
+
+## Roll graph column (`tui/rolls.rs`)
+
+The leftmost table column (right after the current-branch chevron, left of
+`#`) shows two fixed lanes — main, then rolling — rather than a dynamic
+multi-lane `git log --graph` layout. `graph_glyphs(&RollState) -> (char,
+char)` is a pure mapping from state to the `(main_lane, rolling_lane)` glyph
+pair; `base_graph_glyphs`/`hotfix_graph_glyphs` give the same shape for the
+pinned base rows and hotfix rows:
+
+| row | main lane | rolling lane |
+|---|---|---|
+| stable (base row) | `●` | ` ` |
+| rolling (base row) | `│` | `●` |
+| `Active` | `│` | `○` |
+| `Blocked` | `│` | `◌` |
+| `Diverged` | `│` | `◐` |
+| `Reverted` | `│` | `↺` |
+| `Graduated` | `│` | `●` |
+| `Promoted` | `●` | `●` |
+| `Demoted` | `◐` | `●` |
+| hotfix, open | `│` | `○` |
+| hotfix, landed | `●` | `●` |
+
+**Deliberately not a dependency graph.** A roll that integrated another
+(`[i]`) already has a home for that fact — the `deps`/`dependants` columns and
+their `⚠` stale markers (see [Dependency detection](#dependency-detection-coredependenciesrs)
+above) — so this column does not draw crossing lines between arbitrary rows
+for it. Two reasons: the `branch` column already "has nothing to spare" for a
+wider deps column, and true lane packing needs unbounded width in the
+pathological case (a long chain of integrations), which a fixed two-column
+budget cannot offer. This column re-renders facts `RollState` already carries
+spatially — `●` closer to main reads as "more settled" — it does not add new
+ones. A future roll that wants real integration lines needs a new design, not
+an extension of this table: that would be a genuine multi-lane layout problem,
+not a glyph lookup.
+
+TUI-only: there is no plain-table or `--json` equivalent, the same scoping the
+existing columns already apply to narrow terminal real estate.
