@@ -1511,6 +1511,55 @@ fn hotfix_color(state: HotfixState) -> Color {
     }
 }
 
+/// The two-lane glyph pair (`main_lane`, `rolling_lane`) for a roll's graph
+/// column cell, read left-to-right in the same order the pinned base rows are
+/// listed (stable, then rolling).
+///
+/// Deliberately two *fixed* lanes rather than a dynamic multi-lane layout: a
+/// dependency between two rolls already has a home (the `deps`/`dependants`
+/// columns and their `⚠` stale markers), and the `branch` column has no width
+/// to spare for a packer that would need unbounded space in pathological
+/// cases. This column re-renders facts `RollState` already carries — it adds
+/// no new ones — as the lane position a glance reads as "how settled is
+/// this": further right (rolling) is further from landing, `●` in the main
+/// lane means it is on stable. See docs/internals/algorithms.md.
+pub(crate) fn graph_glyphs(state: &RollState) -> (char, char) {
+    match state {
+        RollState::Active => ('│', '○'),
+        RollState::Blocked => ('│', '◌'),
+        RollState::Diverged => ('│', '◐'),
+        RollState::Reverted => ('│', '↺'),
+        RollState::Graduated => ('│', '●'),
+        RollState::Promoted => ('●', '●'),
+        RollState::Demoted => ('◐', '●'),
+    }
+}
+
+/// Same lane pair for a hotfix row: a hotfix lands directly into both stable
+/// and rolling in one step (`[H]`), so it has no `Graduated`-only state of its
+/// own — it is either still open (not yet on either lane) or landed (on both).
+pub(crate) fn hotfix_graph_glyphs(state: HotfixState) -> (char, char) {
+    match state {
+        HotfixState::Open => ('│', '○'),
+        HotfixState::Landed => ('●', '●'),
+    }
+}
+
+/// The graph column's own two rows: stable sits on the main lane with nothing
+/// yet in rolling's; rolling sits on its own lane, with the main lane passing
+/// through underneath it since a later promotion still has to reach stable.
+pub(crate) fn base_graph_glyphs(role: BaseRole) -> (char, char) {
+    match role {
+        BaseRole::Stable => ('●', ' '),
+        BaseRole::Rolling => ('│', '●'),
+    }
+}
+
+/// Render a lane pair as the graph column's cell text.
+fn graph_cell(glyphs: (char, char)) -> String {
+    format!("{}{}", glyphs.0, glyphs.1)
+}
+
 /// What `[p]` should promote, given the current selection.
 ///
 /// `Ok(None)` means the whole rolling branch — one merge behind one gate run,
@@ -3291,6 +3340,9 @@ impl StatusApp {
             // The current-branch chevron, narrow and always present so the
             // columns after it do not shift as HEAD moves.
             Constraint::Length(1),
+            // The graph column: two lane glyphs (main, rolling) plus a cell of
+            // breathing room. TUI-only — see graph_glyphs' doc comment.
+            Constraint::Length(3),
             Constraint::Length(4),
             Constraint::Fill(1),
             Constraint::Length(3),
@@ -3324,6 +3376,7 @@ impl StatusApp {
 
         let bold = Style::default().add_modifier(Modifier::BOLD);
         let mut header_cells = vec![
+            Cell::from(""),
             Cell::from(""),
             Cell::from("#").style(bold),
             Cell::from("branch").style(bold),
@@ -3366,6 +3419,7 @@ impl StatusApp {
                             .fg(Color::Green)
                             .add_modifier(Modifier::BOLD),
                     ),
+                    Cell::from(graph_cell(base_graph_glyphs(base.role))),
                     Cell::from(""),
                     Cell::from(base.branch.clone()).style(base_style.fg(base.role.color())),
                     Cell::from(base.location.symbol()).style(base_style),
@@ -3399,6 +3453,7 @@ impl StatusApp {
                         .fg(Color::Green)
                         .add_modifier(Modifier::BOLD),
                 ),
+                Cell::from(graph_cell(graph_glyphs(&roll.state))),
                 Cell::from(roll.number.to_string()).style(base_style),
                 Cell::from(roll.branch.clone()).style(base_style),
                 Cell::from(roll.location.symbol()).style(base_style),
@@ -3433,6 +3488,7 @@ impl StatusApp {
                         .fg(Color::Green)
                         .add_modifier(Modifier::BOLD),
                 ),
+                Cell::from(graph_cell(hotfix_graph_glyphs(hotfix.state))),
                 Cell::from(format!("h{}", hotfix.number)).style(base_style.fg(color)),
                 Cell::from(hotfix.branch.clone()).style(base_style.fg(color)),
                 Cell::from(hotfix.location.symbol()).style(base_style),
@@ -6473,6 +6529,122 @@ mod tests {
         assert!(both.local && both.remote && both.fetch);
         assert!(both.force, "force passes through to the plan");
         assert!(!prune_scope_for(DeleteScope::Both, false).force);
+    }
+
+    // ── graph column ────────────────────────────────────────────────────
+
+    #[test]
+    fn graph_glyphs_place_an_open_marker_on_the_rolling_lane_while_active() {
+        assert_eq!(graph_glyphs(&RollState::Active), ('│', '○'));
+        assert_eq!(graph_glyphs(&RollState::Blocked), ('│', '◌'));
+    }
+
+    #[test]
+    fn graph_glyphs_fill_the_rolling_lane_once_graduated() {
+        assert_eq!(graph_glyphs(&RollState::Graduated), ('│', '●'));
+    }
+
+    #[test]
+    fn graph_glyphs_mark_divergence_and_reversion_on_the_rolling_lane() {
+        assert_eq!(graph_glyphs(&RollState::Diverged), ('│', '◐'));
+        assert_eq!(graph_glyphs(&RollState::Reverted), ('│', '↺'));
+    }
+
+    #[test]
+    fn graph_glyphs_fill_both_lanes_once_promoted() {
+        assert_eq!(graph_glyphs(&RollState::Promoted), ('●', '●'));
+    }
+
+    #[test]
+    fn graph_glyphs_mark_a_demoted_main_lane_without_losing_the_rolling_fill() {
+        // Demoted means stable's copy was reverted; the roll's content is
+        // still on rolling, so only the main lane changes from `Promoted`.
+        assert_eq!(graph_glyphs(&RollState::Demoted), ('◐', '●'));
+    }
+
+    #[test]
+    fn hotfix_graph_glyphs_distinguish_open_from_landed() {
+        assert_eq!(hotfix_graph_glyphs(HotfixState::Open), ('│', '○'));
+        assert_eq!(hotfix_graph_glyphs(HotfixState::Landed), ('●', '●'));
+    }
+
+    #[test]
+    fn base_graph_glyphs_put_stable_on_main_and_rolling_behind_a_passthrough() {
+        assert_eq!(base_graph_glyphs(BaseRole::Stable), ('●', ' '));
+        assert_eq!(base_graph_glyphs(BaseRole::Rolling), ('│', '●'));
+    }
+
+    #[test]
+    fn the_graph_column_sits_left_of_the_roll_number_for_every_row_kind() {
+        let bases = vec![
+            BaseBranch {
+                role: BaseRole::Stable,
+                branch: "main".to_string(),
+                location: BranchLocation::Local,
+                is_current: false,
+            },
+            BaseBranch {
+                role: BaseRole::Rolling,
+                branch: "rolling".to_string(),
+                location: BranchLocation::Local,
+                is_current: false,
+            },
+        ];
+        let mut app = StatusApp {
+            config: config("main", "rolling"),
+            current_branch: "main".to_string(),
+            bases,
+            rolls: vec![roll_n(1, RollState::Active), roll_n(2, RollState::Promoted)],
+            hotfixes: Vec::new(),
+            show_deps: false,
+            tracking: HashMap::new(),
+            versions: HashMap::new(),
+            version: None,
+            table: TableState::default(),
+            mode: Mode::Browsing,
+            message: None,
+            job: None,
+            panel: None,
+            pending_g: false,
+            pending_push: None,
+        };
+        let out = draw(|f, area| app.render_table(f, area));
+
+        let stable = out
+            .lines()
+            .find(|l| l.contains("main"))
+            .expect("stable row");
+        assert!(
+            stable.contains("● "),
+            "stable row missing its glyph: {stable}"
+        );
+
+        let rolling = out
+            .lines()
+            .find(|l| l.contains("rolling") && !l.contains("roll/"))
+            .expect("rolling row");
+        assert!(
+            rolling.contains("│●"),
+            "rolling row missing its glyph: {rolling}"
+        );
+
+        let active = out
+            .lines()
+            .find(|l| l.contains("roll/1-0101-x"))
+            .expect("active roll row");
+        assert!(
+            active.contains("│○"),
+            "active roll missing its glyph: {active}"
+        );
+
+        let promoted = out
+            .lines()
+            .find(|l| l.contains("roll/2-0101-x"))
+            .expect("promoted roll row");
+        assert!(
+            promoted.contains("●●"),
+            "promoted roll missing its glyph: {promoted}"
+        );
     }
 
     // ── rendering ───────────────────────────────────────────────────────
