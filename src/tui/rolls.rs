@@ -16,7 +16,9 @@ use std::collections::{HashMap, HashSet};
 use std::time::{Duration, Instant};
 
 use anyhow::{anyhow, bail, Result};
-use crossterm::event::{self, Event, KeyCode, KeyEventKind};
+use crossterm::event::{
+    self, Event, KeyCode, KeyEventKind, MouseButton, MouseEvent, MouseEventKind,
+};
 use ratatui::{
     layout::{Alignment, Constraint, Layout, Rect},
     style::{Color, Modifier, Style},
@@ -599,6 +601,13 @@ struct StatusApp {
     job: Option<output::Job>,
     /// The output log. Outlives its job so a result stays readable until `esc`.
     panel: Option<output::Panel>,
+    /// Whether the panel fills most of the frame instead of its usual
+    /// bottom-right corner. Not folded into `Mode`: like `panel` itself, this
+    /// is orthogonal state that must not steal input routing from `Browsing`.
+    panel_maximized: bool,
+    /// The panel's rect as of the last render, for hit-testing a mouse click
+    /// against. `None` whenever no panel is shown.
+    panel_rect: Option<Rect>,
     /// True after a bare `g`, waiting to see whether the next key makes it `gg`.
     /// `g` has no action of its own, so this needs no timeout.
     pending_g: bool,
@@ -624,6 +633,24 @@ pub fn run(
 }
 
 // ── Pure decision logic (unit-tested) ───────────────────────────────────────
+
+/// Whether `(x, y)` falls inside `rect`.
+fn point_in_rect(x: u16, y: u16, rect: Rect) -> bool {
+    x >= rect.x && x < rect.x + rect.width && y >= rect.y && y < rect.y + rect.height
+}
+
+/// Whether a left-click at `(x, y)` against the panel's last-drawn `rect`
+/// should leave it maximized.
+///
+/// No `maximized` input needed: "click on it to maximize, click off of it to
+/// restore" is symmetric in both directions — a click inside the small panel
+/// should maximize it, a click inside the already-maximized one should leave
+/// it maximized, and a click outside either should not. All three collapse to
+/// the same rule: maximized afterward iff the click landed inside whatever
+/// rect was last drawn.
+pub(crate) fn click_maximizes(x: u16, y: u16, rect: Rect) -> bool {
+    point_in_rect(x, y, rect)
+}
 
 /// A roll can graduate while it is active, blocked (its ungraduated
 /// dependencies graduate first, as a chain), or needs re-graduation (diverged,
@@ -1057,7 +1084,7 @@ pub(crate) const BINDINGS: &[Binding] = &[
     },
     Binding {
         keys: "esc",
-        label: "close the output panel",
+        label: "restore, then close, the output panel",
         group: "output",
         hint: None,
         replay: &[KeyCode::Esc],
@@ -1082,6 +1109,16 @@ pub(crate) const BINDINGS: &[Binding] = &[
         group: "output",
         hint: None,
         replay: &[KeyCode::End],
+    },
+    Binding {
+        keys: "z",
+        label: "maximize or restore the output panel",
+        group: "output",
+        hint: None,
+        // Also reachable by clicking the panel (to maximize) or clicking
+        // outside it while maximized (to restore) — not something `?` can
+        // replay, so there is nothing to add here for that.
+        replay: &[KeyCode::Char('z')],
     },
 ];
 
@@ -1899,6 +1936,8 @@ impl StatusApp {
             message: None,
             job: None,
             panel: None,
+            panel_maximized: false,
+            panel_rect: None,
             pending_g: false,
             pending_push: None,
         }
@@ -1913,7 +1952,17 @@ impl StatusApp {
             self.resolve_lapsed_push();
 
             if event::poll(Duration::from_millis(50))? {
-                if let Event::Key(key) = event::read()? {
+                let event = event::read()?;
+                if let Event::Mouse(mouse) = event {
+                    // Clicks only drive the panel, and only while nothing else
+                    // is already claiming input — a modal's own keys take
+                    // precedence, same as every mutating key already does.
+                    if matches!(self.mode, Mode::Browsing) {
+                        self.handle_mouse(mouse);
+                    }
+                    continue;
+                }
+                if let Event::Key(key) = event {
                     if key.kind != KeyEventKind::Press {
                         continue;
                     }
@@ -2007,7 +2056,16 @@ impl StatusApp {
         body: impl FnOnce() -> Result<JobDone> + Send + 'static,
     ) {
         self.panel = Some(output::Panel::new(title));
+        self.panel_maximized = false;
         self.job = Some(output::Job::spawn(body));
+    }
+
+    /// Toggle the panel between its usual corner and filling most of the
+    /// frame. A no-op with no panel up.
+    fn toggle_maximize(&mut self) {
+        if self.panel.is_some() {
+            self.panel_maximized = !self.panel_maximized;
+        }
     }
 
     /// Refuse a mutating key while a job is in flight, so two commands cannot
@@ -2023,6 +2081,27 @@ impl StatusApp {
     /// Handle a keypress while browsing. Returns `Ok(true)` to quit.
     fn handle_browsing(&mut self, terminal: &mut super::Tui, code: KeyCode) -> Result<bool> {
         self.message = None;
+
+        // Maximized, the table sits hidden behind the panel: `j`/`k` and the
+        // page keys scroll it instead of moving a selection nobody can see,
+        // and everything else beyond `z`/`esc`/`q` is swallowed rather than
+        // falling through to a table-nav binding that would act blind.
+        if self.panel_maximized {
+            match code {
+                KeyCode::Char('z') => self.toggle_maximize(),
+                // Restores first; a second `esc` (now un-maximized) closes
+                // the panel via the ordinary arm below.
+                KeyCode::Esc => self.panel_maximized = false,
+                KeyCode::Char('j') | KeyCode::Down => self.scroll_panel(PanelScroll::Down),
+                KeyCode::Char('k') | KeyCode::Up => self.scroll_panel(PanelScroll::Up),
+                KeyCode::PageUp => self.scroll_panel(PanelScroll::Up),
+                KeyCode::PageDown => self.scroll_panel(PanelScroll::Down),
+                KeyCode::End => self.scroll_panel(PanelScroll::End),
+                KeyCode::Char('q') => return Ok(true),
+                _ => {}
+            }
+            return Ok(false);
+        }
 
         // `gg` opens lazygit. `g` alone does nothing, so a pending `g` needs no
         // timeout: any other key clears it and is then handled normally.
@@ -2068,6 +2147,7 @@ impl StatusApp {
             KeyCode::PageUp => self.scroll_panel(PanelScroll::Up),
             KeyCode::PageDown => self.scroll_panel(PanelScroll::Down),
             KeyCode::End => self.scroll_panel(PanelScroll::End),
+            KeyCode::Char('z') => self.toggle_maximize(),
             KeyCode::Char('r') => {
                 self.reload()?;
                 self.message = Some("refreshed".to_string());
@@ -3025,6 +3105,22 @@ impl StatusApp {
         self.reload()
     }
 
+    /// Route a mouse event to the output panel. A no-op with no panel up —
+    /// there is nothing else on this view a click or scroll drives.
+    fn handle_mouse(&mut self, mouse: MouseEvent) {
+        let Some(rect) = self.panel_rect else {
+            return;
+        };
+        match mouse.kind {
+            MouseEventKind::Down(MouseButton::Left) => {
+                self.panel_maximized = click_maximizes(mouse.column, mouse.row, rect);
+            }
+            MouseEventKind::ScrollUp => self.scroll_panel(PanelScroll::Up),
+            MouseEventKind::ScrollDown => self.scroll_panel(PanelScroll::Down),
+            _ => {}
+        }
+    }
+
     /// Move the output panel's scrollback, if one is up.
     fn scroll_panel(&mut self, how: PanelScroll) {
         let Some(panel) = self.panel.as_mut() else {
@@ -3200,10 +3296,12 @@ impl StatusApp {
         self.render_status_bar(f, chunks[2]);
 
         // Over the table, never over the hints: the panel is passed the table's
-        // area so the keymap stays readable while a job runs.
-        if let Some(panel) = &self.panel {
-            output::render(f, chunks[1], panel);
-        }
+        // area so the keymap stays readable while a job runs. Maximized, it
+        // still only grows into this area, never over the header/status bar.
+        self.panel_rect = self
+            .panel
+            .as_ref()
+            .map(|panel| output::render(f, chunks[1], panel, self.panel_maximized));
 
         match &self.mode {
             Mode::Confirm {
@@ -5039,6 +5137,174 @@ mod tests {
     }
 
     #[test]
+    fn a_click_inside_the_small_panel_maximizes_it() {
+        let rect = Rect {
+            x: 50,
+            y: 20,
+            width: 30,
+            height: 10,
+        };
+        assert!(click_maximizes(55, 22, rect));
+        assert!(click_maximizes(50, 20, rect), "top-left corner is inside");
+        assert!(
+            click_maximizes(79, 29, rect),
+            "bottom-right-most cell is inside"
+        );
+    }
+
+    #[test]
+    fn a_click_outside_the_panel_rect_does_not_maximize() {
+        let rect = Rect {
+            x: 50,
+            y: 20,
+            width: 30,
+            height: 10,
+        };
+        assert!(!click_maximizes(0, 0, rect));
+        assert!(!click_maximizes(80, 20, rect), "one past the right edge");
+        assert!(!click_maximizes(50, 30, rect), "one past the bottom edge");
+    }
+
+    #[test]
+    fn a_click_outside_the_maximized_rect_restores_it() {
+        // Same rule, different rect: `render` passes the *expanded* rect once
+        // maximized, so a click outside that larger area is what restores it
+        // — `click_maximizes` does not need to know it was ever maximized.
+        let expanded = Rect {
+            x: 2,
+            y: 2,
+            width: 96,
+            height: 36,
+        };
+        assert!(click_maximizes(50, 20, expanded));
+        assert!(!click_maximizes(0, 0, expanded));
+    }
+
+    #[test]
+    fn clicking_the_panel_maximizes_it_and_clicking_off_restores_it() {
+        let cfg = config("main", "develop");
+        let mut app = StatusApp {
+            config: cfg,
+            current_branch: "main".to_string(),
+            bases: Vec::new(),
+            rolls: Vec::new(),
+            hotfixes: Vec::new(),
+            show_deps: false,
+            tracking: HashMap::new(),
+            versions: HashMap::new(),
+            version: None,
+            table: TableState::default(),
+            mode: Mode::Browsing,
+            message: None,
+            job: None,
+            panel: Some(output::Panel::new("test")),
+            panel_maximized: false,
+            panel_rect: Some(Rect {
+                x: 50,
+                y: 20,
+                width: 30,
+                height: 10,
+            }),
+            pending_g: false,
+            pending_push: None,
+        };
+
+        app.handle_mouse(MouseEvent {
+            kind: MouseEventKind::Down(MouseButton::Left),
+            column: 55,
+            row: 22,
+            modifiers: crossterm::event::KeyModifiers::NONE,
+        });
+        assert!(
+            app.panel_maximized,
+            "click inside the panel should maximize it"
+        );
+
+        // The rect `handle_mouse` tests against is whatever was last drawn —
+        // standing in for `render` having drawn the expanded rect once
+        // maximized.
+        app.panel_rect = Some(Rect {
+            x: 2,
+            y: 2,
+            width: 96,
+            height: 36,
+        });
+        app.handle_mouse(MouseEvent {
+            kind: MouseEventKind::Down(MouseButton::Left),
+            column: 0,
+            row: 0,
+            modifiers: crossterm::event::KeyModifiers::NONE,
+        });
+        assert!(!app.panel_maximized, "click outside should restore it");
+    }
+
+    #[test]
+    fn mouse_clicks_are_a_no_op_with_no_panel_up() {
+        let cfg = config("main", "develop");
+        let mut app = StatusApp {
+            config: cfg,
+            current_branch: "main".to_string(),
+            bases: Vec::new(),
+            rolls: Vec::new(),
+            hotfixes: Vec::new(),
+            show_deps: false,
+            tracking: HashMap::new(),
+            versions: HashMap::new(),
+            version: None,
+            table: TableState::default(),
+            mode: Mode::Browsing,
+            message: None,
+            job: None,
+            panel: None,
+            panel_maximized: false,
+            panel_rect: None,
+            pending_g: false,
+            pending_push: None,
+        };
+
+        app.handle_mouse(MouseEvent {
+            kind: MouseEventKind::Down(MouseButton::Left),
+            column: 5,
+            row: 5,
+            modifiers: crossterm::event::KeyModifiers::NONE,
+        });
+        assert!(!app.panel_maximized);
+    }
+
+    #[test]
+    fn toggle_maximize_is_a_no_op_with_no_panel() {
+        let cfg = config("main", "develop");
+        let mut app = StatusApp {
+            config: cfg,
+            current_branch: "main".to_string(),
+            bases: Vec::new(),
+            rolls: Vec::new(),
+            hotfixes: Vec::new(),
+            show_deps: false,
+            tracking: HashMap::new(),
+            versions: HashMap::new(),
+            version: None,
+            table: TableState::default(),
+            mode: Mode::Browsing,
+            message: None,
+            job: None,
+            panel: None,
+            panel_maximized: false,
+            panel_rect: None,
+            pending_g: false,
+            pending_push: None,
+        };
+        app.toggle_maximize();
+        assert!(!app.panel_maximized, "nothing to maximize");
+
+        app.panel = Some(output::Panel::new("test"));
+        app.toggle_maximize();
+        assert!(app.panel_maximized);
+        app.toggle_maximize();
+        assert!(!app.panel_maximized);
+    }
+
+    #[test]
     fn run_verify_applies_the_dev_marker_like_cmd_verify_does() {
         // Regression test: `run_verify`'s doc comment claims a "line for line"
         // mirror of `cmd_verify`, but the dev-marker step was missing — a roll
@@ -6788,6 +7054,8 @@ mod tests {
             message: None,
             job: None,
             panel: None,
+            panel_maximized: false,
+            panel_rect: None,
             pending_g: false,
             pending_push: None,
         };
@@ -6837,6 +7105,8 @@ mod tests {
             message: None,
             job: None,
             panel: None,
+            panel_maximized: false,
+            panel_rect: None,
             pending_g: false,
             pending_push: None,
         };
@@ -6868,6 +7138,8 @@ mod tests {
             message: None,
             job: None,
             panel: None,
+            panel_maximized: false,
+            panel_rect: None,
             pending_g: false,
             pending_push: None,
         };
@@ -6911,6 +7183,8 @@ mod tests {
             message: None,
             job: None,
             panel: None,
+            panel_maximized: false,
+            panel_rect: None,
             pending_g: false,
             pending_push: None,
         };
@@ -7714,6 +7988,8 @@ mod tests {
             message: None,
             job: None,
             panel: None,
+            panel_maximized: false,
+            panel_rect: None,
             pending_g: false,
             pending_push: None,
         };
@@ -7778,6 +8054,8 @@ mod tests {
             message: None,
             job: None,
             panel: None,
+            panel_maximized: false,
+            panel_rect: None,
             pending_g: false,
             pending_push: None,
         };
