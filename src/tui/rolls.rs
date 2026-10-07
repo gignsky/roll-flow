@@ -5606,6 +5606,7 @@ mod tests {
             }),
             pending_g: false,
             pending_push: None,
+            command_history: Vec::new(),
         };
 
         app.handle_mouse(MouseEvent {
@@ -5659,6 +5660,7 @@ mod tests {
             panel_rect: None,
             pending_g: false,
             pending_push: None,
+            command_history: Vec::new(),
         };
 
         app.handle_mouse(MouseEvent {
@@ -5692,6 +5694,7 @@ mod tests {
             panel_rect: None,
             pending_g: false,
             pending_push: None,
+            command_history: Vec::new(),
         };
         app.toggle_maximize();
         assert!(!app.panel_maximized, "nothing to maximize");
@@ -7447,6 +7450,8 @@ mod tests {
             message: None,
             job: None,
             panel: None,
+            panel_maximized: false,
+            panel_rect: None,
             pending_g: false,
             pending_push: None,
             command_history: Vec::new(),
