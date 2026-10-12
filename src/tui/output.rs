@@ -93,8 +93,9 @@ pub struct Job {
 pub enum JobProgress {
     /// Still running; any output received has been appended to the panel.
     Running,
-    /// Finished. Carries the follow-up, if the job asked for one.
-    Finished(Option<Followup>),
+    /// Finished. `ok` is false for an error or a panic — what holds the
+    /// queue behind it — and `next` is the follow-up, if the job asked for one.
+    Finished { ok: bool, next: Option<Followup> },
 }
 
 impl Job {
@@ -127,7 +128,10 @@ impl Job {
             // report.
             Err(TryRecvError::Disconnected) => {
                 panel.finish_failed(vec!["the operation panicked".to_string()]);
-                JobProgress::Finished(None)
+                JobProgress::Finished {
+                    ok: false,
+                    next: None,
+                }
             }
             Ok(result) => {
                 // Both senders are dropped by now, so this terminates at
@@ -138,11 +142,17 @@ impl Job {
                 match result {
                     Ok(done) => {
                         panel.finish_ok(done.lines);
-                        JobProgress::Finished(done.next)
+                        JobProgress::Finished {
+                            ok: true,
+                            next: done.next,
+                        }
                     }
                     Err(err) => {
                         panel.finish_failed(error_lines(&err));
-                        JobProgress::Finished(None)
+                        JobProgress::Finished {
+                            ok: false,
+                            next: None,
+                        }
                     }
                 }
             }
@@ -175,6 +185,8 @@ enum Kind {
     Stderr,
     Result,
     Error,
+    /// The divider a queued command opens with when it continues a panel.
+    Header,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -207,6 +219,21 @@ impl Panel {
             autoscroll: true,
             tick: 0,
         }
+    }
+
+    /// Continue this panel with the next queued command rather than replacing
+    /// it: the previous command's output stays above a divider naming the new
+    /// one, and the border goes back to running.
+    ///
+    /// A chain is one plan the user made, so it reads as one log — replacing
+    /// the panel would wipe each step's result the instant the next began. The
+    /// border still means what it always did, *this* command's state; a
+    /// failure ends the chain, so a red panel always ends with the failure.
+    pub fn chain(&mut self, title: impl Into<String>) {
+        self.title = title.into();
+        self.push(Kind::Header, format!("── {} ──", self.title));
+        self.status = Status::Running;
+        self.scroll_to_end();
     }
 
     /// Read only by tests today; the renderer reaches `self.status` directly.
@@ -380,9 +407,17 @@ pub fn expanded_rect(area: Rect) -> Rect {
 }
 
 /// Draw `panel` over `area`, anchored bottom-right unless `maximized`, in
-/// which case it fills most of the frame. Returns the rect it drew into, so
-/// the caller can hit-test a later mouse click against it.
-pub fn render(f: &mut Frame, area: Rect, panel: &Panel, maximized: bool) -> Rect {
+/// which case it fills most of the frame. `footer`, when given, replaces the
+/// default bottom hint — the queue's state is the caller's to describe.
+/// Returns the rect it drew into, so the caller can hit-test a later mouse
+/// click against it.
+pub fn render(
+    f: &mut Frame,
+    area: Rect,
+    panel: &Panel,
+    maximized: bool,
+    footer: Option<String>,
+) -> Rect {
     let rect = if maximized {
         expanded_rect(area)
     } else {
@@ -400,15 +435,18 @@ pub fn render(f: &mut Frame, area: Rect, panel: &Panel, maximized: bool) -> Rect
                 Kind::Stderr => Style::default().fg(Color::Gray),
                 Kind::Result => Style::default().fg(Color::Green),
                 Kind::Error => Style::default().fg(Color::Red),
+                Kind::Header => Style::default()
+                    .fg(Color::Cyan)
+                    .add_modifier(Modifier::BOLD),
             };
             Line::from(Span::styled(line.text.clone(), style))
         })
         .collect();
 
-    let hint = if panel.is_running() {
-        String::new()
-    } else {
-        " [esc] close ".to_string()
+    let hint = match footer {
+        Some(footer) => format!(" {footer} "),
+        None if panel.is_running() => String::new(),
+        None => " [esc] close ".to_string(),
     };
     let block = Block::bordered()
         .border_style(Style::default().fg(color))
@@ -490,6 +528,24 @@ mod tests {
         let p = panel_with(SCROLLBACK + 5);
         assert_eq!(p.lines.len(), SCROLLBACK);
         assert_eq!(p.lines.front().unwrap().text, "line 5");
+    }
+
+    #[test]
+    fn chaining_keeps_the_previous_output_and_runs_again() {
+        let mut p = panel_with(2);
+        p.finish_ok(vec!["done".to_string()]);
+        p.scroll_up(1);
+        p.chain("rf create");
+        assert_eq!(p.title, "rf create");
+        assert_eq!(p.status(), Status::Running);
+        assert_eq!(
+            texts(&p, 10),
+            vec!["line 0", "line 1", "done", "── rf create ──"],
+            "the earlier command's output must survive the chain"
+        );
+        // And the view follows the new command, not the old scroll position.
+        p.push(Kind::Stdout, "new".to_string());
+        assert_eq!(texts(&p, 1), vec!["new"]);
     }
 
     #[test]
@@ -630,14 +686,14 @@ mod tests {
 
         let small = term
             .draw(|f| {
-                let r = render(f, area, &panel, false);
+                let r = render(f, area, &panel, false, None);
                 assert_eq!(r, panel_rect(area, panel.lines.len()));
             })
             .unwrap();
         let _ = small;
 
         term.draw(|f| {
-            let r = render(f, area, &panel, true);
+            let r = render(f, area, &panel, true, None);
             assert_eq!(r, expanded_rect(area));
             assert_ne!(r, panel_rect(area, panel.lines.len()));
         })
@@ -693,7 +749,7 @@ mod tests {
         let next = loop {
             match job.drain(&mut panel) {
                 JobProgress::Running => std::thread::yield_now(),
-                JobProgress::Finished(next) => break next,
+                JobProgress::Finished { next, .. } => break next,
             }
         };
 
@@ -712,12 +768,13 @@ mod tests {
     fn a_failing_job_lands_as_a_failed_panel_carrying_the_error() {
         let mut panel = Panel::new("test");
         let mut job = Job::spawn(|| anyhow::bail!("nope"));
-        loop {
-            if let JobProgress::Finished(_) = job.drain(&mut panel) {
-                break;
+        let ok = loop {
+            if let JobProgress::Finished { ok, .. } = job.drain(&mut panel) {
+                break ok;
             }
             std::thread::yield_now();
-        }
+        };
+        assert!(!ok, "a failure must report as one, or the queue runs on");
         assert_eq!(panel.status(), Status::Failed);
         assert!(panel.lines.back().unwrap().text.contains("nope"));
     }
@@ -727,9 +784,10 @@ mod tests {
         let mut panel = Panel::new("test");
         let mut job = Job::spawn(|| panic!("boom"));
         // Without the Disconnected arm this loop would never terminate, and the
-        // view would refuse every mutating key forever.
+        // view would never start another command — the queue would wait on it
+        // forever.
         loop {
-            if let JobProgress::Finished(_) = job.drain(&mut panel) {
+            if let JobProgress::Finished { .. } = job.drain(&mut panel) {
                 break;
             }
             std::thread::yield_now();
@@ -750,7 +808,7 @@ mod tests {
             ))
         });
         let next = loop {
-            if let JobProgress::Finished(next) = job.drain(&mut panel) {
+            if let JobProgress::Finished { next, .. } = job.drain(&mut panel) {
                 break next;
             }
             std::thread::yield_now();

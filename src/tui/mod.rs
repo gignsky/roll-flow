@@ -13,6 +13,7 @@ use std::panic;
 use std::sync::OnceLock;
 
 pub mod output;
+pub mod queue;
 pub mod rolls;
 
 pub type Tui = Terminal<CrosstermBackend<Stdout>>;
