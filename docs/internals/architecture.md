@@ -34,6 +34,7 @@ src/
     sync.rs            pull/push/fetch planning and execution
     clean.rs           stale-branch detection across all remotes
     version.rs         version gate and release tags
+    merge_driver.rs    git merge driver resolving the version in Cargo.toml/.lock
 ```
 
 Three notes on that layout:

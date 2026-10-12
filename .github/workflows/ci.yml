@@ -21,6 +21,37 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
+      # Cheap and needs no Rust toolchain, so it runs first: a roll branch
+      # should only ever wear its own `-roll<N>` dev marker (what
+      # `apply_dev_version` writes and `rf graduate` strips). One that doesn't
+      # match means the version history got mixed with another roll's
+      # somewhere upstream — mirrors `check_dev_marker_ownership` in
+      # src/core/ops.rs, so keep the two in sync.
+      - name: Dev marker belongs to this roll
+        run: |
+          set -euo pipefail
+          branch="${GITHUB_HEAD_REF:-$GITHUB_REF_NAME}"
+          case "$branch" in
+            roll/*) ;;
+            *) echo "not a roll branch ($branch) — nothing to check"; exit 0 ;;
+          esac
+          number="$(echo "$branch" | sed -E 's#^roll/([0-9]+)-.*#\1#')"
+          version="$(grep -m1 -E '^version[[:space:]]*=' Cargo.toml \
+            | sed -E 's/^version[[:space:]]*=[[:space:]]*"([^"]+)".*/\1/')"
+          case "$version" in
+            *-roll*)
+              marker="${version##*-roll}"
+              if [ "$marker" != "$number" ]; then
+                echo "::error::Cargo.toml version ($version) carries roll $marker's dev marker, not '$branch's (roll $number)"
+                exit 1
+              fi
+              echo "OK: $version belongs to $branch"
+              ;;
+            *)
+              echo "no dev marker on $branch ($version) — nothing to check"
+              ;;
+          esac
+
       # Honors rust-toolchain.toml (channel + rustfmt/clippy components).
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@stable

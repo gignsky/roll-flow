@@ -108,7 +108,7 @@ fn dependency_and_dependant_survive_promotion() {
     assert!(sb.rf(&["graduate"]).success, "graduate beta");
 
     sb.git(&["checkout", "rolling"]);
-    let out = sb.rf(&["promote"]);
+    let out = sb.rf(&["promote", "--yes"]);
     assert!(out.success, "promote: {}", out.combined());
 
     assert_eq!(
@@ -175,7 +175,10 @@ fn integrating_rolling_does_not_claim_a_dependency_already_baked_in_via_stable()
     sb.commit_file("alpha.txt", "a\n", "alpha work");
     assert!(sb.rf(&["graduate"]).success, "graduate alpha");
     sb.git(&["checkout", "rolling"]);
-    assert!(sb.rf(&["promote"]).success, "promote alpha to stable");
+    assert!(
+        sb.rf(&["promote", "--yes"]).success,
+        "promote alpha to stable"
+    );
 
     // beta forks from stable *after* the promotion, so alpha's commit is
     // already its ancestor — unrelated to anything beta merges from rolling.
