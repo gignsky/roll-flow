@@ -7070,6 +7070,11 @@ mod tests {
             mode: Mode::Browsing,
             message: None,
             job: None,
+            job_title: String::new(),
+            job_moves_head: false,
+            queue: Queue::default(),
+            quit_armed: false,
+            deferred_mode: None,
             panel: None,
             pending_g: false,
             pending_push: None,
@@ -7101,6 +7106,11 @@ mod tests {
             mode: Mode::Browsing,
             message: None,
             job: None,
+            job_title: String::new(),
+            job_moves_head: false,
+            queue: Queue::default(),
+            quit_armed: false,
+            deferred_mode: None,
             panel: None,
             pending_g: false,
             pending_push: None,
@@ -7896,8 +7906,10 @@ mod tests {
             current_branch: "roll/1-0101-x".to_string(),
             bases: Vec::new(),
             rolls: Vec::new(),
+            hotfixes: Vec::new(),
             show_deps: false,
             tracking: HashMap::new(),
+            versions: HashMap::new(),
             version: None,
             table: TableState::default(),
             mode: Mode::Browsing,
@@ -8126,11 +8138,12 @@ mod tests {
         });
         app.mode = Mode::CreateInput {
             slug: "half-typ".to_string(),
+            kind: CreateKind::Roll,
         };
         settle(&mut app);
         app.open_deferred_mode();
         assert!(
-            matches!(&app.mode, Mode::CreateInput { slug } if slug == "half-typ"),
+            matches!(&app.mode, Mode::CreateInput { slug, .. } if slug == "half-typ"),
             "the slug being typed must survive"
         );
 
@@ -8226,6 +8239,11 @@ mod tests {
             mode: Mode::Browsing,
             message: None,
             job: None,
+            job_title: String::new(),
+            job_moves_head: false,
+            queue: Queue::default(),
+            quit_armed: false,
+            deferred_mode: None,
             panel: None,
             pending_g: false,
             pending_push: None,
