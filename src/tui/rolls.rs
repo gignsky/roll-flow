@@ -3270,19 +3270,34 @@ impl StatusApp {
                 Style::default().fg(Color::Green),
             ),
         ];
+        let repo_name = self
+            .config
+            .repo_root
+            .file_name()
+            .map(|n| n.to_string_lossy().into_owned())
+            .unwrap_or_else(|| self.config.repo_root.display().to_string());
         // The corner names the binary that is running, not the checked-out
         // branch's manifest. The two used to be conflated, and the corner would
         // change on every `[space]` — in a repo that *is* roll-flow it read as
         // the roll's dev version, in any other repo as whatever that repo ships.
         // Neither is what "which rf is this" asks. The per-branch versions have
         // their own column; the bump modal shows the manifest it will raise.
-        let block = Block::bordered().title(" roll-flow ").title_top(
-            Line::from(Span::styled(
-                format!(" rf v{} ", env!("CARGO_PKG_VERSION")),
-                Style::default().fg(Color::Magenta),
-            ))
-            .right_aligned(),
-        );
+        let block = Block::bordered()
+            .title(
+                Line::from(Span::styled(
+                    format!(" {repo_name} @ {} ", current_hostname()),
+                    Style::default().fg(Color::Yellow),
+                ))
+                .left_aligned(),
+            )
+            .title(Line::from(" roll-flow ").centered())
+            .title_top(
+                Line::from(Span::styled(
+                    format!(" rf v{} ", env!("CARGO_PKG_VERSION")),
+                    Style::default().fg(Color::Magenta),
+                ))
+                .right_aligned(),
+            );
         f.render_widget(Paragraph::new(Line::from(spans)).block(block), area);
     }
 
@@ -4193,6 +4208,24 @@ fn plural(n: u32) -> &'static str {
     } else {
         "s"
     }
+}
+
+/// The machine's own name, for the header corner — not a configured `hosts`
+/// entry, which names a *verification target* and may not be the host `rf` is
+/// currently running on. `/proc/sys/kernel/hostname` exists on every target
+/// this binary ships for (NixOS and WSL2 are both real Linux kernels);
+/// `HOSTNAME` is tried first since it's cheaper and some shells export it.
+fn current_hostname() -> String {
+    std::env::var("HOSTNAME")
+        .ok()
+        .filter(|h| !h.trim().is_empty())
+        .or_else(|| {
+            std::fs::read_to_string("/proc/sys/kernel/hostname")
+                .ok()
+                .map(|h| h.trim().to_string())
+                .filter(|h| !h.is_empty())
+        })
+        .unwrap_or_else(|| "unknown-host".to_string())
 }
 
 /// Everything the confirm modal reads, gathered so the renderer takes one
