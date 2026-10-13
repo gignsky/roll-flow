@@ -298,7 +298,22 @@ Phases:
    graduation, graduated-but-unpromoted for promotion; anything already past that
    point is history and is not walked further. Both the CLI and the TUI drive the
    same planner and the same per-step `ops::graduate`, so a chain is exactly
-   what N hand-run graduations would be
+   what N hand-run graduations would be.
+
+   `dependency_chain` also takes a `force: bool`. When `true` and `kind` is
+   `ChainKind::Graduate`, an *unknown* dependency — a roll number nothing in
+   the list carries, typically because it graduated, promoted, and was pruned
+   — is skipped rather than refused: no step is planned for it, and it is
+   recorded on the emitted step's `ChainStep::missing` as `(dependent, dep)`,
+   so the merge that actually lands without it can say so in its own commit
+   (`ops::MissingDeps`, a `Missing-Dependency:` / `Missing-Dependency-Reason:`
+   trailer independent of `ForceOpts`, since the TUI's confirm-modal escape
+   hatch for this never sets `ForceOpts.enabled` — that stays reserved for the
+   CLI's `--force` bypassing a failing gate). Every other refusal in this list
+   — the no-carrier cycle, an origin-only dependency, promotion's own
+   dependency-state checks — is unaffected by `force`; only this one shape,
+   and only for graduation, has an escape hatch (see
+   [graduate](../commands/graduate.md#a-dependency-whose-branch-is-gone)).
 5. **Pre-merge checks** — uncommitted changes, dep graduation status, verification,
    divergence, flake check per roll
 6. **Confirmation** — show merge plan, require y/N

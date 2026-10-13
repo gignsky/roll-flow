@@ -266,6 +266,20 @@ on, whatever any roll's gates said. A dirty tree is refused in the status bar
 before the picker even opens. One job, one panel: each roll's report under its
 own header, then `N passed, M failed, K skipped`, and the panel marks failed if
 any did — see [`verify`](verify.md#verifying-many-at-once).
+
+### Graduating past a missing dependency
+
+`[G]` on a roll whose dependency's branch no longer exists (see
+[graduate](graduate.md#a-dependency-whose-branch-is-gone)) opens the confirm
+modal as usual rather than refusing the key outright — the plan lists the
+missing roll alongside whatever else would land. Pressing `[y]` there does not
+graduate: it advances to a second, explicit stage naming the missing roll and
+asking again, the same two-stage shape `[d]elete` uses for an uncontained
+branch. Only a fresh `[y]` on *that* stage graduates, skipping the missing
+dependency; `[n]`/`[esc]` at either stage cancels. This is the TUI's only way
+to force anything — no key here bypasses a failing gate, which `rf graduate
+--force` can still do from the CLI.
+
 ## Hotfixes
 
 `[h]` opens the same slug modal as `[c]reate` and runs `rf hotfix <slug>`,
