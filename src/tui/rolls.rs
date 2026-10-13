@@ -250,6 +250,20 @@ enum Mode {
         /// action. The modal states them because advancing stable to one roll's
         /// graduation commit is not what "promote this roll" sounds like.
         carried: Vec<String>,
+        /// For `Action::Graduate`: dependencies the chain would skip because
+        /// no branch for them exists any more — `(dependent, missing)` pairs,
+        /// read once when the modal opens, the same way `carried` is. Empty
+        /// for every other action, and empty here too when graduating does
+        /// not need it.
+        missing: Vec<(u32, u32)>,
+        /// Whether the user has already answered the force-confirm stage
+        /// `missing` being non-empty opens. Starts `false`; `[y]` on that
+        /// stage flips it instead of executing, and *that* flip — never an
+        /// ordinary `[y]` — is what lets `run_op` plan with `force: true`.
+        /// This is the modal's own second, separate confirmation; nothing
+        /// here ever sets `ForceOpts.enabled`, which stays reserved for
+        /// bypassing gate failures under the CLI's `--force`.
+        force_confirmed: bool,
     },
     /// Read-only drill-down for a single roll: its identity plus its dependency
     /// rows (issue #61). A snapshot of the selected roll is captured on open so
@@ -1964,8 +1978,12 @@ pub(crate) fn validate_action(
             // A blocked roll graduates after its dependencies; the planner's
             // refusals (a cycle, a dependency with no local copy) are the
             // reasons worth showing, so they are surfaced here rather than
-            // discovered mid-run.
-            ops::dependency_chain(rolls, &sel.branch, ops::ChainKind::Graduate)
+            // discovered mid-run. Planned with `force: true` so a roll whose
+            // dependency has no branch any more does not get refused here —
+            // that case opens the modal instead, which states it and asks for
+            // the extra confirmation force needs (`request`/`handle_confirm`);
+            // nothing here ever sets `ForceOpts.enabled`.
+            ops::dependency_chain(rolls, &sel.branch, ops::ChainKind::Graduate, true)
                 .map(|_| ())
                 .map_err(|e| e.to_string())
         }
@@ -2728,13 +2746,40 @@ impl StatusApp {
     }
 
     /// Handle a keypress while the confirm modal is open.
+    ///
+    /// A `[y]` while `missing` is non-empty and not yet `force_confirmed`
+    /// never executes — it only flips `force_confirmed` and keeps the modal
+    /// open, the same two-stage shape `DeletePrompt::ForceConfirm` uses for
+    /// an uncontained delete. Only the *second*, fresh `[y]` that follows
+    /// executes, and only then is `missing` carried into the job — the one
+    /// thing that lets `run_op` plan with `force: true`.
     fn handle_confirm(&mut self, code: KeyCode) {
         match code {
             KeyCode::Char('y') | KeyCode::Char('Y') => {
-                if let Mode::Confirm { action, target, .. } =
-                    std::mem::replace(&mut self.mode, Mode::Browsing)
+                if let Mode::Confirm {
+                    missing,
+                    force_confirmed,
+                    ..
+                } = &self.mode
                 {
-                    self.execute(action, target);
+                    if !missing.is_empty() && !force_confirmed {
+                        if let Mode::Confirm {
+                            force_confirmed, ..
+                        } = &mut self.mode
+                        {
+                            *force_confirmed = true;
+                        }
+                        return;
+                    }
+                }
+                if let Mode::Confirm {
+                    action,
+                    target,
+                    missing,
+                    ..
+                } = std::mem::replace(&mut self.mode, Mode::Browsing)
+                {
+                    self.execute(action, target, missing);
                 }
             }
             KeyCode::Char('n') | KeyCode::Char('N') | KeyCode::Esc => {
@@ -2949,12 +2994,30 @@ impl StatusApp {
             (Action::Promote, Some(roll)) => carried_by_promoting(&self.config, &self.rolls, roll),
             _ => Vec::new(),
         };
+        // Read once, here, the same way `carried` is: the chain that force
+        // would need to skip anything for. Empty for every action but
+        // Graduate, and empty there too when nothing needs skipping.
+        let missing = match (action, &target) {
+            (Action::Graduate, Some(roll)) => {
+                ops::dependency_chain(&self.rolls, roll, ops::ChainKind::Graduate, true)
+                    .map(|chain| {
+                        chain
+                            .iter()
+                            .flat_map(|s| s.missing.iter().copied())
+                            .collect()
+                    })
+                    .unwrap_or_default()
+            }
+            _ => Vec::new(),
+        };
         match validation {
             Ok(()) => {
                 self.mode = Mode::Confirm {
                     action,
                     target,
                     carried,
+                    missing,
+                    force_confirmed: false,
                 }
             }
             Err(msg) => self.message = Some(msg),
@@ -2998,6 +3061,8 @@ impl StatusApp {
                     action: Action::Integrate,
                     target: Some(branch),
                     carried: Vec::new(),
+                    missing: Vec::new(),
+                    force_confirmed: false,
                 }
             }
             Err(msg) => self.message = Some(msg),
@@ -3022,6 +3087,8 @@ impl StatusApp {
                     action: Action::Integrate,
                     target: Some(branch),
                     carried: Vec::new(),
+                    missing: Vec::new(),
+                    force_confirmed: false,
                 }
             }
             Err(msg) => self.message = Some(msg),
@@ -3230,13 +3297,16 @@ impl StatusApp {
         self.table.select(Some(prev));
     }
 
-    /// Run a workflow op as a background job.
-    fn execute(&mut self, action: Action, target: Option<String>) {
+    /// Run a workflow op as a background job. `missing` is the dependency
+    /// chain's missing pairs the confirm modal's force-confirm stage
+    /// accepted, empty for every action but a force-confirmed `Graduate`; see
+    /// [`run_op`] for how it is re-checked rather than trusted blindly.
+    fn execute(&mut self, action: Action, target: Option<String>, missing: Vec<(u32, u32)>) {
         let config = self.config.clone();
         let title = action.job_title(target.as_deref());
         let current = self.current_branch.clone();
         self.start_job(title, move || {
-            match run_op(&config, action, target.as_deref()) {
+            match run_op(&config, action, target.as_deref(), &missing) {
                 Ok(lines) => Ok(JobDone::lines(lines)),
                 // A conflict is an expected answer to act on, not an error to
                 // stop at — the same treatment a rejected push gets. The repo is
@@ -3738,7 +3808,14 @@ impl StatusApp {
             }
             lines.push("every culprit merged cleanly; retrying the graduation".to_string());
             let force = ops::ForceOpts::new(false, None)?;
-            let o = ops::graduate(&config, &source, false, &force, true)?;
+            let o = ops::graduate(
+                &config,
+                &source,
+                false,
+                &force,
+                true,
+                &ops::MissingDeps::default(),
+            )?;
             push_gate_notices(&mut lines, &o.gate_notices);
             lines.push(format!("Graduated '{}' into '{}'", o.roll, o.rolling));
             if let Some(line) = o.tag.describe() {
@@ -3838,6 +3915,8 @@ impl StatusApp {
                 action,
                 target,
                 carried,
+                missing,
+                force_confirmed,
             } => {
                 render_modal(
                     f,
@@ -3847,6 +3926,8 @@ impl StatusApp {
                         action: *action,
                         target: target.as_deref(),
                         carried,
+                        missing,
+                        force_confirmed: *force_confirmed,
                         rolls: &self.rolls,
                         hotfixes: &self.hotfixes,
                         current_branch: &self.current_branch,
@@ -4301,8 +4382,25 @@ fn run_verify(config: &Config) -> Result<Vec<String>> {
 }
 
 /// Drive a workflow operation through `core::ops`, rendering its structured
-/// outcome into printable lines. Never runs dry and never forces.
-fn run_op(config: &Config, action: Action, target: Option<&str>) -> Result<Vec<String>> {
+/// outcome into printable lines. Never runs dry and never forces a gate —
+/// `ForceOpts.enabled` stays `false` unconditionally, even for a
+/// force-confirmed `Graduate`, since that confirmation only ever answers for
+/// a missing dependency (see [`StatusApp::execute`]).
+///
+/// `confirmed_missing` is what the confirm modal's force-confirm stage
+/// accepted, for `Action::Graduate` — empty otherwise. It is never trusted
+/// blindly: `dependency_chain` is only planned with `force: true` when it is
+/// non-empty, and the plan that comes back must then skip *exactly* those
+/// pairs, not more or fewer. A queued prune or tidy job can run between the
+/// modal opening and this executing and change what is actually missing —
+/// deleting the one dependency that made graduating safe, say — so a
+/// mismatch refuses rather than silently acting on a plan the user never saw.
+fn run_op(
+    config: &Config,
+    action: Action,
+    target: Option<&str>,
+    confirmed_missing: &[(u32, u32)],
+) -> Result<Vec<String>> {
     let force = ops::ForceOpts::new(false, None)?;
     let mut lines = Vec::new();
     match action {
@@ -4313,8 +4411,42 @@ fn run_op(config: &Config, action: Action, target: Option<&str>) -> Result<Vec<S
             // step is the ordinary graduation with its own gate run; a failure
             // partway names what landed and what did not.
             let rolls = branches::list_rolls(config)?;
-            let chain = ops::dependency_chain(&rolls, roll, ops::ChainKind::Graduate)?;
-            let outcomes = ops::graduate_chain(config, &chain, false, &force, true, ops::graduate)?;
+            let chain = ops::dependency_chain(
+                &rolls,
+                roll,
+                ops::ChainKind::Graduate,
+                !confirmed_missing.is_empty(),
+            )?;
+            let mut actual: Vec<(u32, u32)> = chain
+                .iter()
+                .flat_map(|s| s.missing.iter().copied())
+                .collect();
+            actual.sort_unstable();
+            let mut confirmed = confirmed_missing.to_vec();
+            confirmed.sort_unstable();
+            if actual != confirmed {
+                bail!(
+                    "what '{roll}' is missing changed since this was confirmed \
+                     (now: {actual:?}; confirmed: {confirmed:?}) — open the confirmation again"
+                );
+            }
+            for (of, dep) in &actual {
+                lines.push(format!(
+                    "note: roll {of} depends on roll {dep}, but no branch for it exists any \
+                     more (likely already landed and pruned) — graduated without it"
+                ));
+            }
+            let outcomes = ops::graduate_chain(
+                config,
+                &chain,
+                false,
+                &force,
+                true,
+                |config, branch, dry_run, force, tag, missing| {
+                    let missing = ops::MissingDeps::new(missing.to_vec(), "confirmed in the TUI");
+                    ops::graduate(config, branch, dry_run, force, tag, &missing)
+                },
+            )?;
             for (step, o) in chain.iter().zip(&outcomes) {
                 push_gate_notices(&mut lines, &o.gate_notices);
                 if o.restored {
@@ -4350,7 +4482,8 @@ fn run_op(config: &Config, action: Action, target: Option<&str>) -> Result<Vec<S
                 // step — the same expansion `rf promote --roll` performs.
                 Some(roll) => {
                     let rolls = branches::list_rolls(config)?;
-                    let chain = ops::dependency_chain(&rolls, roll, ops::ChainKind::Promote)?;
+                    let chain =
+                        ops::dependency_chain(&rolls, roll, ops::ChainKind::Promote, false)?;
                     ops::PromoteTarget::Rolls(chain.into_iter().map(|s| s.branch).collect())
                 }
                 None => ops::PromoteTarget::Rolling,
@@ -4901,6 +5034,10 @@ struct ConfirmModal<'a> {
     target: Option<&'a str>,
     /// See [`Mode::Confirm`]'s field of the same name.
     carried: &'a [String],
+    /// See [`Mode::Confirm::missing`]. Empty for every action but `Graduate`.
+    missing: &'a [(u32, u32)],
+    /// See [`Mode::Confirm::force_confirmed`].
+    force_confirmed: bool,
     rolls: &'a [RollInfo],
     /// Counted alongside `rolls` by `[x]` and `[t]`, which reach landed hotfixes.
     hotfixes: &'a [HotfixInfo],
@@ -4939,6 +5076,8 @@ fn render_modal(f: &mut Frame, area: Rect, config: &Config, modal: &ConfirmModal
         action,
         target,
         carried,
+        missing,
+        force_confirmed,
         rolls,
         hotfixes,
         current_branch,
@@ -4949,20 +5088,36 @@ fn render_modal(f: &mut Frame, area: Rect, config: &Config, modal: &ConfirmModal
     let mut detail: Vec<String> = Vec::new();
     let prompt = match action {
         Action::Graduate => {
-            match target.and_then(|t| chain_lines(rolls, t, ops::ChainKind::Graduate)) {
-                Some(lines) => {
-                    let n = lines.len();
-                    detail = lines;
-                    format!(
-                        "Graduate {n} rolls into {}, in this order?",
+            let plan = target.and_then(|t| chain_lines(rolls, t, ops::ChainKind::Graduate, true));
+            if let Some((_, lines)) = &plan {
+                detail = lines.clone();
+            }
+            if force_confirmed {
+                // The escalated stage: `missing` is guaranteed non-empty here
+                // (that is the only way this stage is reached), so the prompt
+                // can name it directly rather than re-deriving it. `detail`
+                // (above) still shows the rest of the plan for context.
+                let rolls_text = missing
+                    .iter()
+                    .map(|(_, dep)| format!("roll {dep}"))
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                format!(
+                    "Really graduate without {rolls_text}? Its state can no longer be verified."
+                )
+            } else {
+                match plan {
+                    Some((n, _)) => format!(
+                        "Graduate {n} roll{} into {}, in this order?",
+                        plural(n as u32),
                         config.rolling_branch
-                    )
+                    ),
+                    None => format!(
+                        "Graduate {} into {}?",
+                        target.unwrap_or("(selected roll)"),
+                        config.rolling_branch
+                    ),
                 }
-                None => format!(
-                    "Graduate {} into {}?",
-                    target.unwrap_or("(selected roll)"),
-                    config.rolling_branch
-                ),
             }
         }
         Action::Integrate => format!(
@@ -4974,9 +5129,8 @@ fn render_modal(f: &mut Frame, area: Rect, config: &Config, modal: &ConfirmModal
         // `None` for a whole-branch promotion — the prompt must say which,
         // because the two differ enormously in what they land on stable.
         Action::Promote => match target {
-            Some(roll) => match chain_lines(rolls, roll, ops::ChainKind::Promote) {
-                Some(lines) => {
-                    let n = lines.len();
+            Some(roll) => match chain_lines(rolls, roll, ops::ChainKind::Promote, false) {
+                Some((n, lines)) => {
                     detail = lines;
                     format!(
                         "Promote {n} rolls into {}, in this order?",
@@ -5025,7 +5179,15 @@ fn render_modal(f: &mut Frame, area: Rect, config: &Config, modal: &ConfirmModal
             current_branch, config.stable_branch, config.rolling_branch
         ),
     };
-    let hint = "[y] confirm    [n] cancel";
+    // A `[y]` on a non-empty `missing` is never the one that forces — it
+    // only ever advances to the escalated stage above, which then needs its
+    // own fresh `[y]` (see invariants.md's deletion-safety rule: a second,
+    // separate confirmation is the only thing that sets force).
+    let hint = match (action, missing.is_empty(), force_confirmed) {
+        (Action::Graduate, false, false) => "[y] continue    [n] cancel",
+        (Action::Graduate, false, true) => "[y] force graduate    [n] cancel",
+        _ => "[y] confirm    [n] cancel",
+    };
 
     let mut lines = vec![Line::from(prompt)];
     lines.extend(detail.into_iter().map(Line::from));
@@ -5051,24 +5213,55 @@ fn render_modal(f: &mut Frame, area: Rect, config: &Config, modal: &ConfirmModal
     f.render_widget(body, modal);
 }
 
-/// The numbered steps of a chain that lands more than `target` alone, or `None`
-/// when it is just the one roll (or cannot be planned — validation has already
-/// said why, and the modal is not the place to repeat it).
-fn chain_lines(rolls: &[RollInfo], target: &str, kind: ops::ChainKind) -> Option<Vec<String>> {
-    let chain = ops::dependency_chain(rolls, target, kind).ok()?;
+/// The numbered steps of a chain that lands more than `target` alone, or
+/// `None` when it is just the one roll with nothing else to disclose (or
+/// cannot be planned — validation has already said why, and the modal is not
+/// the place to repeat it). `n` is always the number of rolls the chain
+/// actually lands, never counting the missing-dependency warnings that may be
+/// prepended to `lines` — those are disclosure, not steps.
+///
+/// `force` is `true` for [`ops::ChainKind::Graduate`] — planning must not
+/// refuse here over a dependency with no branch any more, since that is
+/// exactly the case this modal needs to show and let the user force past —
+/// and `false` for [`ops::ChainKind::Promote`], which keeps its stricter
+/// refusal regardless (see [`ops::dependency_chain`]).
+fn chain_lines(
+    rolls: &[RollInfo],
+    target: &str,
+    kind: ops::ChainKind,
+    force: bool,
+) -> Option<(usize, Vec<String>)> {
+    let chain = ops::dependency_chain(rolls, target, kind, force).ok()?;
+    let missing: Vec<(u32, u32)> = chain
+        .iter()
+        .flat_map(|s| s.missing.iter().copied())
+        .collect();
     // A lone step is still worth listing when it is not `target` (a carried
-    // cycle member graduates by way of its carrier) or carries other rolls:
-    // either way more lands than the row under the cursor.
-    if ops::chain_is_lone(&chain, target) && chain.iter().all(|s| s.carries.is_empty()) {
+    // cycle member graduates by way of its carrier), carries other rolls, or
+    // skipped a missing dependency — all three land or disclose more than
+    // just the row under the cursor.
+    if ops::chain_is_lone(&chain, target)
+        && chain.iter().all(|s| s.carries.is_empty())
+        && missing.is_empty()
+    {
         return None;
     }
-    Some(
+    let mut lines: Vec<String> = missing
+        .iter()
+        .map(|(of, dep)| {
+            format!(
+                "⚠ roll {dep} no longer has a branch (likely already landed and pruned) \
+                 — roll {of} will graduate without it"
+            )
+        })
+        .collect();
+    lines.extend(
         chain
             .iter()
             .enumerate()
-            .map(|(i, step)| format!("{}. {}", i + 1, step.describe()))
-            .collect(),
-    )
+            .map(|(i, step)| format!("{}. {}", i + 1, step.describe())),
+    );
+    Some((chain.len(), lines))
 }
 
 /// The rolls that `[m]` on `roll` would land on stable besides `roll` itself
@@ -5081,7 +5274,7 @@ fn chain_lines(rolls: &[RollInfo], target: &str, kind: ops::ChainKind) -> Option
 /// the disclosure could not be computed would be the worse trade.
 fn carried_by_promoting(config: &Config, rolls: &[RollInfo], roll: &str) -> Vec<String> {
     // The same expansion `run_op` promotes, so the disclosure matches the merge.
-    let named: Vec<String> = ops::dependency_chain(rolls, roll, ops::ChainKind::Promote)
+    let named: Vec<String> = ops::dependency_chain(rolls, roll, ops::ChainKind::Promote, false)
         .map(|chain| chain.into_iter().map(|s| s.branch).collect())
         .unwrap_or_else(|_| vec![roll.to_string()]);
     ops::preview_roll_promotion(config, &named)
@@ -7990,6 +8183,8 @@ mod tests {
                     action: Action::LandHotfix,
                     target: None,
                     carried: &[],
+                    missing: &[],
+                    force_confirmed: false,
                     rolls: &[],
                     hotfixes: &[],
                     current_branch: "hotfix/1-0720-urgent",
@@ -8852,6 +9047,8 @@ mod tests {
                     action: Action::Graduate,
                     target: Some("roll/9-0102-target"),
                     carried: &[],
+                    missing: &[],
+                    force_confirmed: false,
                     rolls: &rolls,
                     hotfixes: &[],
                     current_branch: "roll/9-0102-target",
@@ -8891,6 +9088,8 @@ mod tests {
                     action: Action::Integrate,
                     target: Some("roll/1-0101-alpha"),
                     carried: &[],
+                    missing: &[],
+                    force_confirmed: false,
                     rolls: &[],
                     hotfixes: &[],
                     current_branch: "roll/2-0102-beta",
@@ -8922,6 +9121,8 @@ mod tests {
                     action: Action::Promote,
                     target: Some("roll/8-0918-help-menu"),
                     carried: &carried,
+                    missing: &[],
+                    force_confirmed: false,
                     rolls: &[],
                     hotfixes: &[],
                     current_branch: "rolling",
@@ -8957,6 +9158,8 @@ mod tests {
                     action: Action::Tidy,
                     target: None,
                     carried: &[],
+                    missing: &[],
+                    force_confirmed: false,
                     rolls: &rolls,
                     hotfixes: &[],
                     current_branch: "main",
@@ -8977,6 +9180,8 @@ mod tests {
                     action: Action::Prune,
                     target: None,
                     carried: &[],
+                    missing: &[],
+                    force_confirmed: false,
                     rolls: &rolls,
                     hotfixes: &[],
                     current_branch: "main",
@@ -9491,8 +9696,9 @@ mod tests {
         // A one-step chain, but not of the row under the cursor — so the
         // modal must say what will actually merge.
         let all = cycle_14_15(&[]);
-        let lines = chain_lines(&all, "roll/14-0101-x", ops::ChainKind::Graduate)
+        let (n, lines) = chain_lines(&all, "roll/14-0101-x", ops::ChainKind::Graduate, true)
             .expect("the plan is listed");
+        assert_eq!(n, 1);
         assert_eq!(lines.len(), 1);
         assert!(lines[0].contains("roll/15-0101-x"), "{lines:?}");
         assert!(lines[0].contains("carries 14"), "{lines:?}");
@@ -9507,6 +9713,134 @@ mod tests {
                 validate_action(Action::Graduate, Some(sel), &all, "main", "roll/").unwrap_err();
             assert!(err.contains("`rf integrate roll/14-0101-x`"), "{err}");
         }
+    }
+
+    fn roll_with_missing_dep() -> RollInfo {
+        let mut r = roll_n(9, RollState::Blocked);
+        r.deps = vec![4];
+        r
+    }
+
+    #[test]
+    fn chain_lines_discloses_a_missing_dependency_even_when_otherwise_lone() {
+        // roll 29's own shape: one roll, one step, nothing to carry — the old
+        // early return (lone chain, nothing else to disclose) would have
+        // hidden the warning entirely.
+        let rolls = vec![roll_with_missing_dep()];
+        let (n, lines) = chain_lines(&rolls, "roll/9-0101-x", ops::ChainKind::Graduate, true)
+            .expect("a missing dependency is always disclosed");
+        assert_eq!(n, 1, "one roll actually lands");
+        assert!(lines.iter().any(|l| l.contains("⚠ roll 4")), "{lines:?}");
+        assert!(
+            lines.iter().any(|l| l.contains("1. roll/9-0101-x")),
+            "{lines:?}"
+        );
+    }
+
+    /// `Mode::Confirm` for `Action::Graduate` with `missing` set, as `request`
+    /// would build it for a roll 29 shape.
+    fn confirm_with_missing_dep() -> Mode {
+        Mode::Confirm {
+            action: Action::Graduate,
+            target: Some("roll/9-0101-x".to_string()),
+            carried: Vec::new(),
+            missing: vec![(9, 4)],
+            force_confirmed: false,
+        }
+    }
+
+    #[test]
+    fn an_ordinary_y_on_a_missing_dependency_only_advances_to_the_force_stage() {
+        // The property this whole design exists for: `[y]` never forces by
+        // itself. It must only flip `force_confirmed`, never start a job.
+        let mut app = StatusApp::new(test_config(), "main".to_string(), Vec::new(), false);
+        app.mode = confirm_with_missing_dep();
+
+        app.handle_confirm(KeyCode::Char('y'));
+
+        match &app.mode {
+            Mode::Confirm {
+                force_confirmed,
+                missing,
+                ..
+            } => {
+                assert!(*force_confirmed, "the first [y] must flip the stage");
+                assert_eq!(missing, &vec![(9, 4)]);
+            }
+            _ => panic!("expected the modal to stay open"),
+        }
+        assert!(app.job.is_none(), "a single [y] must not start a job");
+    }
+
+    #[test]
+    fn cancelling_either_stage_of_a_missing_dependency_confirm_closes_it() {
+        for code in [KeyCode::Char('n'), KeyCode::Esc] {
+            let mut app = StatusApp::new(test_config(), "main".to_string(), Vec::new(), false);
+            app.mode = confirm_with_missing_dep();
+            app.handle_confirm(code);
+            assert!(matches!(app.mode, Mode::Browsing), "{code:?} at stage one");
+
+            let mut app = StatusApp::new(test_config(), "main".to_string(), Vec::new(), false);
+            app.mode = confirm_with_missing_dep();
+            if let Mode::Confirm {
+                force_confirmed, ..
+            } = &mut app.mode
+            {
+                *force_confirmed = true;
+            }
+            app.handle_confirm(code);
+            assert!(matches!(app.mode, Mode::Browsing), "{code:?} at stage two");
+        }
+    }
+
+    #[test]
+    fn the_missing_dependency_modal_escalates_its_prompt_and_hint_on_the_second_stage() {
+        let cfg = test_config();
+        let rolls = vec![roll_with_missing_dep()];
+
+        let first = draw(|f, area| {
+            render_modal(
+                f,
+                area,
+                &cfg,
+                &ConfirmModal {
+                    action: Action::Graduate,
+                    target: Some("roll/9-0101-x"),
+                    carried: &[],
+                    missing: &[(9, 4)],
+                    force_confirmed: false,
+                    rolls: &rolls,
+                    hotfixes: &[],
+                    current_branch: "roll/9-0101-x",
+                },
+            )
+        });
+        assert!(first.contains("⚠ roll 4"), "{first}");
+        assert!(first.contains("[y] continue"), "{first}");
+        assert!(!first.contains("Really graduate"), "{first}");
+
+        let second = draw(|f, area| {
+            render_modal(
+                f,
+                area,
+                &cfg,
+                &ConfirmModal {
+                    action: Action::Graduate,
+                    target: Some("roll/9-0101-x"),
+                    carried: &[],
+                    missing: &[(9, 4)],
+                    force_confirmed: true,
+                    rolls: &rolls,
+                    hotfixes: &[],
+                    current_branch: "roll/9-0101-x",
+                },
+            )
+        });
+        assert!(
+            second.contains("Really graduate without roll 4"),
+            "{second}"
+        );
+        assert!(second.contains("[y] force graduate"), "{second}");
     }
 
     #[test]

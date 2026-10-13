@@ -81,6 +81,19 @@ long list — that keeps two rolls adding rules in different areas from collidin
   others, nothing graduates, and every surface — the planner's refusal, both
   plain tables, the TUI detail view and `--json` — gives the same
   `DepCycle::advice`: which `rf integrate` makes a carrier. Never `--force`.
+- **An unknown dependency is forceable for graduation, but not yet for
+  promotion.** A dependency number no roll in the list carries — typically
+  one that graduated, promoted, and was pruned, so nothing is left to resolve
+  what "roll N" is — can be skipped with `rf graduate --force --reason` or
+  the TUI's own force-confirm stage on `[G]`, for `ChainKind::Graduate` only;
+  `ChainKind::Promote` keeps this refusal unconditionally for now, since
+  forcing past it there has not been built. The origin-only refusal and the
+  no-carrier cycle refusal are a different matter — each has its own remedy
+  (fetch, `rf integrate`) and is never bypassed by `force` regardless of
+  `ChainKind`. The TUI's bypass is its own second, explicit confirmation —
+  never `ForceOpts.enabled`, which stays reserved for the CLI's `--force`
+  bypassing a failing gate, so confirming past a missing dependency from a
+  keypress can never also start bypassing gates from one.
 - **Every walk over dependencies terminates.** Cycles are found once, by
   Tarjan's SCC (`branches::dependency_cycles`), and recorded on
   `RollInfo::cycle`; walks either treat a recorded cycle as one node

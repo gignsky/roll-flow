@@ -847,8 +847,20 @@ fn graduate_with_deps(
     yes: bool,
 ) -> Result<()> {
     let rolls = branches::list_rolls(config)?;
-    let chain = ops::dependency_chain(&rolls, roll, ops::ChainKind::Graduate)?;
+    let chain = ops::dependency_chain(&rolls, roll, ops::ChainKind::Graduate, force.enabled())?;
     let roll_number = rolls.iter().find(|r| r.branch == roll).map(|r| r.number);
+
+    // Printed ahead of the plan: a note about what `--force` silently
+    // skipped belongs before the decision it changes, not buried in a
+    // per-step report after the fact.
+    for step in &chain {
+        for (of, dep) in &step.missing {
+            println!(
+                "note: roll {of} depends on roll {dep}, but no branch for it exists any \
+                 more (likely already landed and pruned) — graduating without it (--force)"
+            );
+        }
+    }
 
     if !ops::chain_is_lone(&chain, roll) {
         // Counted over what lands, not over steps: a cycle's carrier is one
@@ -905,10 +917,12 @@ fn graduate_with_deps(
         dry_run,
         force,
         tag,
-        |config, branch, dry_run, force, tag| {
+        |config, branch, dry_run, force, tag, missing| {
             let integrate_into = (branch == roll).then_some(roll);
+            let missing =
+                ops::MissingDeps::new(missing.to_vec(), force.reason().unwrap_or("(none given)"));
             with_conflict_handling(config, yes, integrate_into, || {
-                ops::graduate(config, branch, dry_run, force, tag)
+                ops::graduate(config, branch, dry_run, force, tag, &missing)
             })
         },
     )?;
@@ -933,7 +947,7 @@ fn promote_rolls_with_deps(config: &Config, named: &[String]) -> Result<(Vec<Str
     let mut ordered: Vec<String> = Vec::new();
     let mut grew = false;
     for name in named {
-        for step in ops::dependency_chain(&rolls, name, ops::ChainKind::Promote)? {
+        for step in ops::dependency_chain(&rolls, name, ops::ChainKind::Promote, false)? {
             if ordered.contains(&step.branch) {
                 continue;
             }
