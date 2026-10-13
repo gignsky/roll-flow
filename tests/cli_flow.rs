@@ -454,6 +454,57 @@ fn update_with_roll_touches_only_the_named_branch() {
 }
 
 #[test]
+fn update_with_state_active_touches_every_active_local_roll() {
+    let sb = Sandbox::plain();
+    let out = sb.init();
+    assert!(out.success, "init failed: {}", out.combined());
+
+    let out = sb.create_roll("alpha", "0611");
+    assert!(out.success, "create failed: {}", out.combined());
+    sb.commit_file("alpha.txt", "a\n", "alpha work");
+
+    let out = sb.create_roll("beta", "0612");
+    assert!(out.success, "create failed: {}", out.combined());
+    sb.commit_file("beta.txt", "b\n", "beta work");
+
+    sb.git(&["checkout", "main"]);
+    sb.commit_file("stable.txt", "s\n", "advance stable");
+
+    let alpha = "roll/1-0611-alpha";
+    let beta = "roll/2-0612-beta";
+
+    let out = sb.rf(&["update", "--state", "active"]);
+    assert!(out.success, "update failed: {}", out.combined());
+
+    assert!(
+        sb.is_ancestor("main", alpha),
+        "main should merge into alpha"
+    );
+    assert!(sb.is_ancestor("main", beta), "main should merge into beta");
+}
+
+#[test]
+fn update_state_and_roll_are_mutually_exclusive() {
+    let sb = Sandbox::plain();
+    let out = sb.init();
+    assert!(out.success, "init failed: {}", out.combined());
+
+    let out = sb.rf(&[
+        "update",
+        "--roll",
+        "roll/1-0611-feature",
+        "--state",
+        "active",
+    ]);
+    assert!(!out.success, "--roll and --state should conflict");
+    assert!(
+        out.combined().contains("cannot be used with"),
+        "unexpected: {}",
+        out.combined()
+    );
+}
+
+#[test]
 fn update_with_unknown_roll_errors() {
     let sb = Sandbox::plain();
     let out = sb.init();
