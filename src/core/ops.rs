@@ -848,6 +848,20 @@ impl ForceOpts {
         Ok(Self { enabled, reason })
     }
 
+    /// Whether `--force` was passed. [`dependency_chain`] takes this as a
+    /// plain `bool` rather than a whole `ForceOpts`, since the TUI's
+    /// equivalent bypass (see [`MissingDeps`]) is confirmed through its own
+    /// modal stage and never goes through this struct at all.
+    pub(crate) fn enabled(&self) -> bool {
+        self.enabled
+    }
+
+    /// The `--reason` text, when `--force` was given. Always `Some` whenever
+    /// `enabled()` is true (`new` enforces that pairing).
+    pub(crate) fn reason(&self) -> Option<&str> {
+        self.reason.as_deref()
+    }
+
     /// Build the `Forced-Bypass:` / `Force-Reason:` trailer for a merge commit,
     /// or `None` when nothing was actually bypassed (a `--force` that hit no
     /// failing gate leaves no marker).
@@ -861,6 +875,47 @@ impl ForceOpts {
         }
         let reason = self.reason.as_deref().unwrap_or("(none given)");
         s.push_str(&format!("Force-Reason: {reason}"));
+        Some(s)
+    }
+}
+
+/// Dependencies a graduation step skipped because no branch — local or
+/// origin — carries that roll number any more, paired with why: the CLI's
+/// `--reason`, or the TUI's fixed confirmation text. Recorded on the merge
+/// that actually lands without them, independent of [`ForceOpts`] (which only
+/// ever governs gate bypass): the CLI's `--force` happens to enable both from
+/// one flag, but the TUI's confirmation enables only this one, and must not
+/// also start bypassing gates from a keypress.
+#[derive(Default)]
+pub(crate) struct MissingDeps {
+    /// `(dependent, missing)`: the roll that named the dependency, and the
+    /// dependency's own number.
+    pairs: Vec<(u32, u32)>,
+    reason: String,
+}
+
+impl MissingDeps {
+    pub(crate) fn new(pairs: Vec<(u32, u32)>, reason: impl Into<String>) -> Self {
+        Self {
+            pairs,
+            reason: reason.into(),
+        }
+    }
+
+    /// Build the `Missing-Dependency:` / `Missing-Dependency-Reason:` trailer,
+    /// or `None` when nothing was skipped. A distinct trailer key from
+    /// `ForceOpts::trailer`'s `Forced-Bypass:` so the two can appear in the
+    /// same commit body without either's reason line being ambiguous about
+    /// which bypass it explains.
+    fn trailer(&self) -> Option<String> {
+        if self.pairs.is_empty() {
+            return None;
+        }
+        let mut s = String::from("Missing-Dependency:\n");
+        for (of, dep) in &self.pairs {
+            s.push_str(&format!("  roll {dep}, depended on by roll {of}\n"));
+        }
+        s.push_str(&format!("Missing-Dependency-Reason: {}", self.reason));
         Some(s)
     }
 }
@@ -2001,12 +2056,19 @@ pub(crate) struct GraduateOutcome {
 
 /// Graduate `roll` into the rolling branch with a structured `--no-ff` merge.
 /// Shared by `rf graduate`, the `rf promote` fall-through, and the TUI's `[G]`.
+///
+/// `missing` is the dependency chain's record of rolls this merge lands
+/// without, because no branch for them exists any more (see
+/// [`ChainStep::missing`]); pass [`MissingDeps::default`] for a lone
+/// graduation outside any chain (a retry, or a direct call that never went
+/// through [`dependency_chain`] at all).
 pub(crate) fn graduate(
     config: &Config,
     roll: &str,
     dry_run: bool,
     force: &ForceOpts,
     tag: bool,
+    missing: &MissingDeps,
 ) -> Result<GraduateOutcome> {
     let repo = &config.repo_root;
     if branches::check_promoted(repo, roll, &config.stable_branch) {
@@ -2140,7 +2202,12 @@ pub(crate) fn graduate(
         }
     };
 
-    if let Some(trailer) = force.trailer(&report.bypassed) {
+    let trailer = [force.trailer(&report.bypassed), missing.trailer()]
+        .into_iter()
+        .flatten()
+        .collect::<Vec<_>>()
+        .join("\n\n");
+    if !trailer.is_empty() {
         append_commit_trailer(repo, rolling, &trailer)?;
     }
 
@@ -2286,6 +2353,16 @@ pub(crate) struct ChainStep {
     /// their tips too (see [`branches::DepCycle`]). Empty for any roll not
     /// carrying a cycle.
     pub carries: Vec<u32>,
+    /// Dependencies of this step's group (itself, or — a cycle's carrier —
+    /// any member it carries) whose branch no longer exists anywhere, local
+    /// or origin, skipped under `--force` rather than refused. Each pair is
+    /// `(member, dep)`: the roll that named the now-gone dependency, and the
+    /// dependency's own number. Always empty unless `dependency_chain` was
+    /// called with `force: true` and [`ChainKind::Graduate`] — promotion
+    /// keeps its stricter refusal regardless of `force` (see
+    /// [`chain_visit_dep`]). Carried through to [`MissingDeps`] so the merge
+    /// this step performs can record the bypass in its own commit.
+    pub missing: Vec<(u32, u32)>,
 }
 
 impl ChainStep {
@@ -2372,13 +2449,18 @@ pub(crate) fn chain_is_lone(chain: &[ChainStep], target: &str) -> bool {
 ///
 /// Pure over the roll list, so ordering, cycle detection and the refusals below
 /// are unit-tested without a repository. Refusals, all naming the roll:
-/// - a dependency number nothing in the list carries;
+/// - a dependency number nothing in the list carries — unless `force` and
+///   `kind` is [`ChainKind::Graduate`], in which case it is skipped instead
+///   and recorded on the emitted step's [`ChainStep::missing`] (see
+///   [`chain_visit_dep`]). Promotion keeps this refusal regardless of
+///   `force` — not yet supported there, unlike graduation;
 /// - a dependency cycle with no carrier (see above), or — for graduation — a
 ///   back edge `RollInfo::cycle` does not account for, which only an
-///   inconsistent roll list can produce;
-/// - for graduation, a dependency with no local copy — `ops::graduate` merges
-///   a local branch, and "branch not found" halfway through a chain is a worse
-///   place to learn that than before it starts;
+///   inconsistent roll list can produce — never bypassed by `force` (see
+///   invariants.md's "Rolls and branch resolution" section);
+/// - for graduation, a dependency that exists only on origin — a different
+///   refusal from the one above, with its own remedy (fetch it), so `force`
+///   does not touch it either;
 /// - for promotion, a dependency that has not graduated (or whose graduation
 ///   was reverted), since there is nothing on rolling to advance stable to, and
 ///   one that was demoted, since re-promotion is not automated.
@@ -2386,6 +2468,7 @@ pub(crate) fn dependency_chain(
     rolls: &[branches::RollInfo],
     target: &str,
     kind: ChainKind,
+    force: bool,
 ) -> Result<Vec<ChainStep>> {
     let root = rolls
         .iter()
@@ -2400,6 +2483,7 @@ pub(crate) fn dependency_chain(
         ChainReason::Requested,
         rolls,
         kind,
+        force,
         &mut order,
         &mut done,
         &mut visiting,
@@ -2414,11 +2498,13 @@ pub(crate) fn dependency_chain(
 /// whole cycle (see [`dependency_chain`]): `group` is every member, the
 /// dependencies walked are all of theirs that lie outside it, and the one step
 /// emitted is the carrier's.
+#[allow(clippy::too_many_arguments)]
 fn chain_visit(
     roll: &branches::RollInfo,
     reason: ChainReason,
     rolls: &[branches::RollInfo],
     kind: ChainKind,
+    force: bool,
     order: &mut Vec<ChainStep>,
     done: &mut HashSet<u32>,
     visiting: &mut Vec<u32>,
@@ -2462,6 +2548,7 @@ fn chain_visit(
         };
     visiting.extend(group.iter().map(|r| r.number));
 
+    let mut missing: Vec<(u32, u32)> = Vec::new();
     for member in &group {
         for dep in &member.deps {
             if group.iter().any(|g| g.number == *dep) {
@@ -2472,7 +2559,17 @@ fn chain_visit(
             if kind == ChainKind::Promote && visiting.contains(dep) {
                 continue;
             }
-            chain_visit_dep(member, *dep, rolls, kind, order, done, visiting)?;
+            chain_visit_dep(
+                member,
+                *dep,
+                rolls,
+                kind,
+                force,
+                order,
+                done,
+                visiting,
+                &mut missing,
+            )?;
         }
     }
 
@@ -2497,24 +2594,34 @@ fn chain_visit(
             .map(|r| r.number)
             .filter(|n| *n != emitted.number)
             .collect(),
+        missing,
     });
     Ok(())
 }
 
 /// One dependency edge of [`chain_visit`]: whether `dep` is a step for this
 /// `kind`, the refusals that apply to it, and the recursion into it.
+#[allow(clippy::too_many_arguments)]
 fn chain_visit_dep(
     roll: &branches::RollInfo,
     dep: u32,
     rolls: &[branches::RollInfo],
     kind: ChainKind,
+    force: bool,
     order: &mut Vec<ChainStep>,
     done: &mut HashSet<u32>,
     visiting: &mut Vec<u32>,
+    missing: &mut Vec<(u32, u32)>,
 ) -> Result<()> {
     use branches::{BranchLocation, RollState};
 
     let Some(dep_roll) = rolls.iter().find(|r| r.number == dep) else {
+        // Only for graduation — not yet supported for promotion, which keeps
+        // this refusal unconditionally regardless of `force` for now.
+        if force && kind == ChainKind::Graduate {
+            missing.push((roll.number, dep));
+            return Ok(());
+        }
         bail!(
             "'{}' depends on roll {dep}, which is not among the known roll branches",
             roll.branch
@@ -2571,6 +2678,7 @@ fn chain_visit_dep(
         ChainReason::Dependency { of: roll.number },
         rolls,
         kind,
+        force,
         order,
         done,
         visiting,
@@ -2601,11 +2709,18 @@ pub(crate) fn graduate_chain(
     dry_run: bool,
     force: &ForceOpts,
     tag: bool,
-    mut run_step: impl FnMut(&Config, &str, bool, &ForceOpts, bool) -> Result<GraduateOutcome>,
+    mut run_step: impl FnMut(
+        &Config,
+        &str,
+        bool,
+        &ForceOpts,
+        bool,
+        &[(u32, u32)],
+    ) -> Result<GraduateOutcome>,
 ) -> Result<Vec<GraduateOutcome>> {
     let mut outcomes = Vec::new();
     for (i, step) in steps.iter().enumerate() {
-        match run_step(config, &step.branch, dry_run, force, tag) {
+        match run_step(config, &step.branch, dry_run, force, tag, &step.missing) {
             Ok(outcome) => outcomes.push(outcome),
             Err(err) => {
                 let done: Vec<&str> = steps[..i].iter().map(|s| s.branch.as_str()).collect();
@@ -4490,14 +4605,44 @@ mod tests {
         assert_eq!(git::current_branch(&cfg.repo_root).unwrap(), "rolling");
 
         let force = ForceOpts::new(false, None).unwrap();
-        let outcome = graduate(&cfg, "roll/1-0101-x", false, &force, true)
-            .expect("the gate should see the roll's own content, merged in");
+        let outcome = graduate(
+            &cfg,
+            "roll/1-0101-x",
+            false,
+            &force,
+            true,
+            &MissingDeps::default(),
+        )
+        .expect("the gate should see the roll's own content, merged in");
         assert!(!outcome.dry_run);
 
         // Restored to whatever was checked out before the call.
         assert_eq!(git::current_branch(&cfg.repo_root).unwrap(), "rolling");
         assert!(dir.path().join("roll-only.txt").exists());
     }
+
+    #[test]
+    fn missing_deps_trailer_names_each_pair_and_the_reason() {
+        assert_eq!(MissingDeps::default().trailer(), None);
+        let missing = MissingDeps::new(vec![(29, 16), (29, 4)], "pruned after landing");
+        let trailer = missing
+            .trailer()
+            .expect("non-empty pairs produce a trailer");
+        assert!(trailer.contains("Missing-Dependency:"), "{trailer}");
+        assert!(
+            trailer.contains("roll 16, depended on by roll 29"),
+            "{trailer}"
+        );
+        assert!(
+            trailer.contains("roll 4, depended on by roll 29"),
+            "{trailer}"
+        );
+        assert!(
+            trailer.contains("Missing-Dependency-Reason: pruned after landing"),
+            "{trailer}"
+        );
+    }
+
     mod chains {
         use super::super::{dependency_chain, ChainKind, ChainReason};
         use crate::core::branches::{BranchLocation, DepCycle, RollInfo, RollState};
@@ -4531,7 +4676,7 @@ mod tests {
         }
 
         fn numbers(rolls: &[RollInfo], target: &str, kind: ChainKind) -> Vec<u32> {
-            dependency_chain(rolls, target, kind)
+            dependency_chain(rolls, target, kind, false)
                 .expect("chain plans")
                 .into_iter()
                 .map(|s| s.number)
@@ -4550,7 +4695,8 @@ mod tests {
                 numbers(&rolls, "roll/9-0101-r9", ChainKind::Graduate),
                 vec![7, 8, 9]
             );
-            let chain = dependency_chain(&rolls, "roll/9-0101-r9", ChainKind::Graduate).unwrap();
+            let chain =
+                dependency_chain(&rolls, "roll/9-0101-r9", ChainKind::Graduate, false).unwrap();
             assert_eq!(chain[0].reason, ChainReason::Dependency { of: 8 });
             assert_eq!(chain[1].reason, ChainReason::Dependency { of: 9 });
             assert_eq!(chain[2].reason, ChainReason::Requested);
@@ -4609,7 +4755,7 @@ mod tests {
                 roll(1, RollState::Blocked, &[2]),
                 roll(2, RollState::Blocked, &[1]),
             ];
-            let err = dependency_chain(&rolls, "roll/1-0101-r1", ChainKind::Graduate)
+            let err = dependency_chain(&rolls, "roll/1-0101-r1", ChainKind::Graduate, false)
                 .unwrap_err()
                 .to_string();
             assert!(err.contains("cycle"), "{err}");
@@ -4626,7 +4772,8 @@ mod tests {
             in_cycle(&mut rolls, &[14, 15], 15, &[]);
 
             // Asked for the carrier: one step, its own, carrying 14.
-            let chain = dependency_chain(&rolls, "roll/15-0101-r15", ChainKind::Graduate).unwrap();
+            let chain =
+                dependency_chain(&rolls, "roll/15-0101-r15", ChainKind::Graduate, false).unwrap();
             assert_eq!(chain.len(), 1);
             assert_eq!(chain[0].number, 15);
             assert_eq!(chain[0].reason, ChainReason::Requested);
@@ -4634,7 +4781,8 @@ mod tests {
 
             // Asked for the carried member: the same single step — 14 cannot
             // land any other way — now as a dependency of what was asked for.
-            let chain = dependency_chain(&rolls, "roll/14-0101-r14", ChainKind::Graduate).unwrap();
+            let chain =
+                dependency_chain(&rolls, "roll/14-0101-r14", ChainKind::Graduate, false).unwrap();
             assert_eq!(chain.len(), 1);
             assert_eq!(chain[0].number, 15);
             assert_eq!(chain[0].reason, ChainReason::Dependency { of: 14 });
@@ -4672,7 +4820,7 @@ mod tests {
             ];
             in_cycle(&mut rolls, &[14, 15], 15, &[14]);
             for target in ["roll/14-0101-r14", "roll/15-0101-r15"] {
-                let err = dependency_chain(&rolls, target, ChainKind::Graduate)
+                let err = dependency_chain(&rolls, target, ChainKind::Graduate, false)
                     .unwrap_err()
                     .to_string();
                 assert!(
@@ -4680,6 +4828,22 @@ mod tests {
                     "{err}"
                 );
             }
+        }
+
+        #[test]
+        fn a_cycle_with_no_carrier_is_refused_even_with_force() {
+            // invariants.md: "Never `--force`" for a carrierless cycle — the
+            // escape hatch this adds for a missing branch must not widen to
+            // cover this refusal too.
+            let mut rolls = vec![
+                roll(14, RollState::Blocked, &[15]),
+                roll(15, RollState::Blocked, &[14]),
+            ];
+            in_cycle(&mut rolls, &[14, 15], 15, &[14]);
+            let err = dependency_chain(&rolls, "roll/15-0101-r15", ChainKind::Graduate, true)
+                .unwrap_err()
+                .to_string();
+            assert!(err.contains("run `rf integrate"), "{err}");
         }
 
         #[test]
@@ -4702,7 +4866,7 @@ mod tests {
         #[test]
         fn an_unknown_dependency_and_a_remote_only_one_are_refused_before_anything_runs() {
             let rolls = vec![roll(9, RollState::Blocked, &[4])];
-            let err = dependency_chain(&rolls, "roll/9-0101-r9", ChainKind::Graduate)
+            let err = dependency_chain(&rolls, "roll/9-0101-r9", ChainKind::Graduate, false)
                 .unwrap_err()
                 .to_string();
             assert!(err.contains("roll 4"), "{err}");
@@ -4710,13 +4874,66 @@ mod tests {
             let mut remote = roll(8, RollState::Active, &[]);
             remote.location = BranchLocation::Remote;
             let rolls = vec![remote, roll(9, RollState::Blocked, &[8])];
-            let err = dependency_chain(&rolls, "roll/9-0101-r9", ChainKind::Graduate)
+            let err = dependency_chain(&rolls, "roll/9-0101-r9", ChainKind::Graduate, false)
                 .unwrap_err()
                 .to_string();
             assert!(err.contains("only on origin"), "{err}");
             assert!(err.contains("roll/8-0101-r8"), "{err}");
 
-            assert!(dependency_chain(&rolls, "roll/nope", ChainKind::Graduate).is_err());
+            assert!(dependency_chain(&rolls, "roll/nope", ChainKind::Graduate, false).is_err());
+        }
+
+        #[test]
+        fn a_remote_only_dependency_is_refused_even_with_force() {
+            // Only an unknown (fully gone) dependency is forceable — one that
+            // exists on origin has its own remedy (fetch it / [space] in the
+            // TUI), and force must not paper over that instead.
+            let mut remote = roll(8, RollState::Active, &[]);
+            remote.location = BranchLocation::Remote;
+            let rolls = vec![remote, roll(9, RollState::Blocked, &[8])];
+            let err = dependency_chain(&rolls, "roll/9-0101-r9", ChainKind::Graduate, true)
+                .unwrap_err()
+                .to_string();
+            assert!(err.contains("only on origin"), "{err}");
+        }
+
+        #[test]
+        fn an_unknown_dependency_is_skipped_under_force_and_recorded_on_the_step() {
+            let rolls = vec![roll(9, RollState::Blocked, &[4])];
+            let chain = dependency_chain(&rolls, "roll/9-0101-r9", ChainKind::Graduate, true)
+                .expect("force skips the missing dependency");
+            assert_eq!(chain.len(), 1, "no step for the ghost dependency");
+            assert_eq!(chain[0].number, 9);
+            assert_eq!(chain[0].missing, vec![(9, 4)]);
+        }
+
+        #[test]
+        fn force_skips_only_the_missing_dependency_not_a_real_one() {
+            // 9 depends on 4 (gone) and 5 (present, ungraduated): force must
+            // still plan 5's own step, and attribute only 4 as missing.
+            let rolls = vec![
+                roll(5, RollState::Active, &[]),
+                roll(9, RollState::Blocked, &[4, 5]),
+            ];
+            let chain = dependency_chain(&rolls, "roll/9-0101-r9", ChainKind::Graduate, true)
+                .expect("force skips only the missing one");
+            assert_eq!(
+                chain.iter().map(|s| s.number).collect::<Vec<_>>(),
+                vec![5, 9]
+            );
+            assert_eq!(chain[0].missing, Vec::<(u32, u32)>::new());
+            assert_eq!(chain[1].missing, vec![(9, 4)]);
+        }
+
+        #[test]
+        fn force_does_not_bypass_an_unknown_dependency_for_promotion() {
+            // The ask was graduation; promotion keeps today's stricter
+            // behaviour regardless of `force`.
+            let rolls = vec![roll(9, RollState::Graduated, &[4])];
+            let err = dependency_chain(&rolls, "roll/9-0101-r9", ChainKind::Promote, true)
+                .unwrap_err()
+                .to_string();
+            assert!(err.contains("roll 4"), "{err}");
         }
 
         #[test]
@@ -4736,7 +4953,7 @@ mod tests {
                 roll(7, RollState::Active, &[]),
                 roll(8, RollState::Graduated, &[7]),
             ];
-            let err = dependency_chain(&rolls, "roll/8-0101-r8", ChainKind::Promote)
+            let err = dependency_chain(&rolls, "roll/8-0101-r8", ChainKind::Promote, false)
                 .unwrap_err()
                 .to_string();
             assert!(err.contains("has not graduated"), "{err}");
@@ -4746,7 +4963,7 @@ mod tests {
                 (RollState::Demoted, "reverted on stable"),
             ] {
                 let rolls = vec![roll(7, state, &[]), roll(8, RollState::Graduated, &[7])];
-                let err = dependency_chain(&rolls, "roll/8-0101-r8", ChainKind::Promote)
+                let err = dependency_chain(&rolls, "roll/8-0101-r8", ChainKind::Promote, false)
                     .unwrap_err()
                     .to_string();
                 assert!(err.contains(needle), "{err}");

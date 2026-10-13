@@ -172,11 +172,14 @@ pub enum Cmd {
     Graduate {
         #[arg(long)]
         dry_run: bool,
-        /// Proceed past failing gates, recording the bypass in the merge commit.
-        /// Requires --reason.
+        /// Proceed past failing gates, and past a dependency whose branch no
+        /// longer exists (typically graduated, promoted, and pruned) —
+        /// either bypass is recorded in the merge commit. Requires --reason.
         #[arg(long)]
         force: bool,
-        /// Justification recorded as `Force-Reason:` in the merge commit.
+        /// Justification recorded in the merge commit as `Force-Reason:`
+        /// (a bypassed gate) and/or `Missing-Dependency-Reason:` (a
+        /// dependency whose branch is gone), whichever `--force` bypassed.
         #[arg(long)]
         reason: Option<String>,
         /// Skip creating the `v<X.Y.Z>-dev` tag on rolling's new tip.

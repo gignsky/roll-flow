@@ -138,6 +138,91 @@ fn promoting_one_roll_promotes_the_dependency_it_graduated_behind() {
     assert_eq!(sb.roll_state(BETA).as_deref(), Some("✓ promoted"));
 }
 
+/// alpha graduates alone, then its branch is deleted entirely — leaving beta
+/// (which integrated it afterward) depending on a roll number no branch
+/// carries any more. This is the state a dependency leaves behind once it has
+/// graduated, promoted, and been pruned: `rf graduate` can no longer resolve
+/// what "roll 1" even is, though its commits are already on rolling by way of
+/// the merge beta's own history names.
+fn missing_dependency_pair() -> Sandbox {
+    let sb = Sandbox::plain();
+    sb.init();
+
+    sb.create_roll("alpha", "0611");
+    sb.commit_file("alpha.txt", "a\n", "alpha work");
+    let out = sb.rf(&["graduate"]);
+    assert!(out.success, "graduate alpha: {}", out.combined());
+
+    sb.git(&["checkout", "main"]);
+    let out = sb.create_roll("beta", "0612");
+    assert!(out.success, "create beta: {}", out.combined());
+    sb.commit_file("beta.txt", "b\n", "beta work");
+    let out = sb.rf(&["integrate", ALPHA]);
+    assert!(out.success, "integrate: {}", out.combined());
+
+    sb.git(&["branch", "-D", ALPHA]);
+    sb
+}
+
+#[test]
+fn a_missing_dependency_refuses_graduation_without_force() {
+    let sb = missing_dependency_pair();
+
+    let out = sb.rf(&["graduate"]);
+    assert!(!out.success, "{}", out.combined());
+    let text = out.combined();
+    assert!(text.contains("roll 1"), "{text}");
+    assert!(text.contains("not among the known roll branches"), "{text}");
+    assert_eq!(sb.current_branch(), BETA);
+}
+
+#[test]
+fn a_missing_dependency_graduates_under_force_and_records_it() {
+    let sb = missing_dependency_pair();
+
+    let out = sb.rf(&[
+        "graduate",
+        "--force",
+        "--reason",
+        "roll 1 already landed; branch pruned",
+    ]);
+    assert!(out.success, "{}", out.combined());
+    assert!(
+        out.combined().contains("roll 1"),
+        "expected a note about the skipped dependency: {}",
+        out.combined()
+    );
+    assert_eq!(sb.roll_state(BETA).as_deref(), Some("✓ graduated"));
+    assert_eq!(sb.current_branch(), BETA);
+
+    let body = sb.git(&["log", "-1", "--format=%B", "rolling"]);
+    assert!(body.contains("Missing-Dependency:"), "{body}");
+    assert!(body.contains("roll 1, depended on by roll 2"), "{body}");
+    assert!(
+        body.contains("Missing-Dependency-Reason: roll 1 already landed; branch pruned"),
+        "{body}"
+    );
+}
+
+#[test]
+fn force_does_not_rescue_a_missing_dependency_for_promotion() {
+    // The ask was graduation; promotion keeps its existing, stricter
+    // behaviour even when the roll it is promoting has already graduated
+    // past a now-missing dependency.
+    let sb = missing_dependency_pair();
+    assert!(
+        sb.rf(&["graduate", "--force", "--reason", "pruned"])
+            .success
+    );
+    sb.git(&["checkout", "rolling"]);
+
+    let out = sb.rf(&[
+        "promote", "--roll", BETA, "--force", "--reason", "x", "--yes",
+    ]);
+    assert!(!out.success, "{}", out.combined());
+    assert!(out.combined().contains("roll 1"), "{}", out.combined());
+}
+
 #[test]
 fn a_conflicting_dependency_step_does_not_offer_to_integrate_the_requested_roll() {
     // beta depends on alpha, and it is alpha's own graduation that conflicts
