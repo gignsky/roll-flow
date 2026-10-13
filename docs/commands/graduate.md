@@ -10,9 +10,11 @@ Divergence between the roll and rolling is handled by the merge; a conflicting
 merge is aborted and the original branch restored, leaving the repo clean — and
 diagnosed first, see below.
 
-`--force` proceeds past failing gates and requires `--reason <text>`, which is
-recorded as a `Force-Reason:` trailer in the merge commit so the bypass stays
-auditable in git history.
+`--force` proceeds past failing gates, and past a dependency whose branch no
+longer exists (below) — and requires `--reason <text>` either way, which is
+recorded as a `Force-Reason:` and/or `Missing-Dependency-Reason:` trailer,
+whichever the run actually bypassed, so either bypass stays auditable in git
+history.
 
 ## Dependencies graduate first
 
@@ -51,8 +53,43 @@ make things worse, not better.
 
 Refused before anything runs, naming the roll: a dependency that exists only on
 `origin` (fetch it, or press `[space]` on it in the TUI), a dependency number no
-known roll carries, and a dependency cycle with no carrier (below). The TUI's
-`[G]` on a blocked roll opens the same plan in its confirm modal.
+known roll carries (unless `--force`, below), and a dependency cycle with no
+carrier (below — never bypassed by `--force`). The TUI's `[G]` on a blocked
+roll opens the same plan in its confirm modal.
+
+## A dependency whose branch is gone
+
+A roll's dependency is detected from its own history — a merge subject naming
+the branch it integrated — which survives even after that branch is deleted.
+The common way this happens: the dependency graduated, was promoted, and was
+then pruned, and nothing is left to look up what "roll N" even is any more.
+Plain `rf graduate` refuses, naming the roll:
+
+```text
+Error: 'roll/29-1001-conflict-verify' depends on roll 16, which is not among the known roll branches
+```
+
+`--force --reason <text>` graduates anyway, skipping that dependency rather
+than the gates — there is nothing left to re-verify, and the roll's own
+history already carries whatever it merged in. It is noted before the plan:
+
+```text
+note: roll 29 depends on roll 16, but no branch for it exists any more (likely already landed and pruned) — graduating without it (--force)
+```
+
+and recorded on the merge that actually lands without it, as its own
+`Missing-Dependency:` / `Missing-Dependency-Reason:` trailer — separate from
+the `Forced-Bypass:` trailer above, since the two bypass different things and
+either can happen without the other. In the TUI, `[G]` on such a roll opens
+the confirm modal as usual; pressing `[y]` there advances to a second,
+explicit confirmation naming the missing roll, and only a fresh `[y]` on
+*that* stage graduates — the same shape `[d]elete` uses for an uncontained
+branch. Nothing here ever bypasses a failing gate; the TUI has no way to do
+that at all, from any key.
+
+This is graduation-only for now: `rf promote --roll` and the TUI's `[p]`/`[m]`
+keep their existing refusal for the same shape regardless of `--force` —
+support for forcing past it there is not yet implemented.
 
 ## Dependency cycles
 
