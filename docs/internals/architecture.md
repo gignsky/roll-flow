@@ -23,6 +23,7 @@ src/
     mod.rs             terminal enter/exit, and suspend/resume for lazygit
     rolls.rs           the rolls view: state, event loop, table, modals, keymap
     output.rs          background jobs and the floating output panel
+    queue.rs           commands queued behind the running job; held on failure
   core/
     mod.rs
     config.rs          Config struct, auto-detection from flake.nix

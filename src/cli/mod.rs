@@ -1,7 +1,7 @@
 pub mod clean;
 pub mod status;
 
-use crate::core::branches::{RollState, VerifySet};
+use crate::core::branches::{RollState, UpdateSet, VerifySet};
 use crate::core::version::BumpLevel;
 use std::io::IsTerminal;
 
@@ -259,10 +259,16 @@ pub enum Cmd {
     Update {
         /// Update only this roll branch. Repeatable; with no `--roll` given,
         /// every active local roll is updated.
-        #[arg(long)]
+        #[arg(long, conflicts_with = "state")]
         roll: Vec<String>,
         #[arg(long)]
         dry_run: bool,
+        /// Narrow the default "every active local roll" to one state.
+        /// Unlike `verify --all --state`, this needs no companion `--all`
+        /// flag: `rf update` with no `--roll` is already the bulk pass, so
+        /// `--state` just picks which rolls that pass covers.
+        #[arg(long, value_enum)]
+        state: Option<UpdateSet>,
     },
 
     /// Delete roll branches already promoted to the stable branch, locally and

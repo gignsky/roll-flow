@@ -896,6 +896,112 @@ impl VerifySet {
     }
 }
 
+/// Which rolls a "pull many" pass covers — the TUI's `[pp]` picker. Mirrors
+/// [`VerifySet`]'s categories exactly rather than inventing a second
+/// vocabulary for "which rolls": `[pp]`, like `[V]`, names a lifecycle subset
+/// up front so the picker states the scope before anything runs, and a roll
+/// with nothing to pull is simply skipped when the sweep reaches it — the same
+/// way `[V]` tolerates a roll with nothing to verify.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PullSet {
+    All,
+    Active,
+    Blocked,
+    Graduated,
+    Diverged,
+    Local,
+}
+
+impl PullSet {
+    /// Every set, in the order the picker lists them — the same order as
+    /// [`VerifySet::ALL`], so the two pickers read the same way.
+    pub const ALL: [PullSet; 6] = [
+        PullSet::All,
+        PullSet::Active,
+        PullSet::Blocked,
+        PullSet::Graduated,
+        PullSet::Diverged,
+        PullSet::Local,
+    ];
+
+    pub fn label(self) -> &'static str {
+        match self {
+            PullSet::All => "all rolls",
+            PullSet::Active => "active",
+            PullSet::Blocked => "blocked",
+            PullSet::Graduated => "graduated",
+            PullSet::Diverged => "diverged",
+            PullSet::Local => "rolls with a local copy",
+        }
+    }
+
+    /// The branches in this set, in table order. Promoted rolls are never
+    /// included, matching [`VerifySet::select`] — a promoted roll has
+    /// nowhere left to go, so pulling it has nothing useful to bring in.
+    pub fn select(self, rolls: &[RollInfo]) -> Vec<String> {
+        rolls
+            .iter()
+            .filter(|r| r.state != RollState::Promoted)
+            .filter(|r| match self {
+                PullSet::All => true,
+                PullSet::Active => r.state == RollState::Active,
+                PullSet::Blocked => r.state == RollState::Blocked,
+                PullSet::Graduated => r.state == RollState::Graduated,
+                PullSet::Diverged => r.state == RollState::Diverged,
+                PullSet::Local => {
+                    matches!(r.location, BranchLocation::Local | BranchLocation::Both)
+                }
+            })
+            .map(|r| r.branch.clone())
+            .collect()
+    }
+}
+
+/// Which rolls an "update many" pass covers — the TUI's `[U]` picker, and
+/// `rf update --state`. Unlike [`VerifySet`]/[`PullSet`] this is not the same
+/// six categories: `rf update` only ever touches a roll that is `Active` or
+/// `Blocked` and has a local copy (see `ops::is_update_candidate`), so a
+/// `Graduated`/`Diverged`/`Local` entry here would always count zero
+/// candidates — the menu would be offering something that always does nothing.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, clap::ValueEnum)]
+#[clap(rename_all = "lowercase")]
+pub enum UpdateSet {
+    All,
+    Active,
+    Blocked,
+}
+
+impl UpdateSet {
+    /// Every set, in the order the picker lists them.
+    pub const ALL: [UpdateSet; 3] = [UpdateSet::All, UpdateSet::Active, UpdateSet::Blocked];
+
+    pub fn label(self) -> &'static str {
+        match self {
+            UpdateSet::All => "all active local rolls",
+            UpdateSet::Active => "active",
+            UpdateSet::Blocked => "blocked",
+        }
+    }
+
+    /// The branches in this set, in table order. Mirrors
+    /// `ops::is_update_candidate`'s eligibility rule directly rather than
+    /// calling it — that function is private to `ops`, and the rule is two
+    /// `matches!`s, not worth a cross-module export for.
+    pub fn select(self, rolls: &[RollInfo]) -> Vec<String> {
+        rolls
+            .iter()
+            .filter(|r| matches!(r.state, RollState::Active | RollState::Blocked))
+            .filter(|r| matches!(r.location, BranchLocation::Local | BranchLocation::Both))
+            .filter(|r| match self {
+                UpdateSet::All => true,
+                UpdateSet::Active => r.state == RollState::Active,
+                UpdateSet::Blocked => r.state == RollState::Blocked,
+            })
+            .map(|r| r.branch.clone())
+            .collect()
+    }
+}
+
 /// The ref to read a branch's file content at: its own tip when there is a
 /// local copy, `origin/<branch>` when the branch only exists on the remote.
 ///

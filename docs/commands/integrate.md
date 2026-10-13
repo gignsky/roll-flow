@@ -59,7 +59,8 @@ This is also what [`graduate`](graduate.md#when-the-merge-conflicts) recommends
 when its merge conflicts with a roll already on rolling: integrating that roll
 reproduces the conflict on your branch, where you resolve and commit it, and
 records the dependency the conflict revealed. `rf graduate --yes` does it for
-you.
+you. [`rf verify`](verify.md) finds the same conflict ahead of time, without
+merging anything, and prints the same `rf integrate <roll>` lines.
 
 ## Consequences
 
