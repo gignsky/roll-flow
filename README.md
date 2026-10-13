@@ -44,7 +44,7 @@ rf init [--rolling-branch <name>] [--stable-branch <name>] [--roll-prefix <prefi
 rf create <slug> [--date MMDD] [--dry-run] [--no-dev-version]  (alias: rf start)
 rf integrate <branch>
 rf hotfix [<slug>] [--date MMDD] [--land] [--dry-run]
-rf verify [--dry-run] [--bump <patch|minor|major>] [--yes]
+rf verify [--dry-run] [--bump <patch|minor|major>] [--yes] [--all] [--state <set>]
 rf graduate [--dry-run] [--force --reason <text>] [--no-tag] [--yes]
 rf promote [--roll <branch>]... [--dry-run] [--force --reason <text>] [--bump <patch|minor|major>] [--no-tag] [--final] [--yes]
 rf status [--no-tui] [--no-deps] [--json]
@@ -139,6 +139,14 @@ piece off.
 See [CONTRIBUTING.md](CONTRIBUTING.md) for how this repo uses roll-flow on
 itself, and [CLAUDE.md](CLAUDE.md) for the internal domain model.
 
+## Nix modules
+
+The flake defines `homeManagerModules.roll-flow` and `nixosModules.roll-flow`
+(their exports are currently commented out in `flake.nix`).
+The Home Manager one writes the machine-wide `~/.config/roll-flow/config.toml`
+that every repo's `.roll-flow.toml` is laid over — see
+[docs/nix-modules.md](docs/nix-modules.md) and [docs/config.md](docs/config.md).
+
 ## Testing
 
 ```bash
@@ -156,10 +164,10 @@ cargo test
   which pull, push and fetch the selected branch, plus `PP`, which pushes every
   branch that can be fast-forwarded
 - no daemon; `rf` only ever runs when invoked. The `status`/`list` TUI drives the
-  workflow (`i` integrate, `I` integrate rolling, `v` verify, `G` graduate, `m`
-  promote, `u` update, `x` prune, `t` tidy, `d` delete, `b` bump the version) and
-  syncs the selected branch (`p` pull, `P` push, `PP` push every branch that
-  needs it, `f` fetch, `gg` lazygit). The status bar carries only the basics;
-  `?` opens a fuzzy-searchable list of every key, and enter runs the one under
-  the cursor. A force *push* is available there behind a confirmation; every
-  other forced operation stays CLI-only by design
+  workflow (`i` integrate, `I` integrate rolling, `v` verify, `V` verify many,
+  `G` graduate, `m` promote, `u` update, `x` prune, `t` tidy, `d` delete, `b`
+  bump the version) and syncs the selected branch (`p` pull, `P` push, `PP` push
+  every branch that needs it, `f` fetch, `gg` lazygit). The status bar carries
+  only the basics; `?` opens a fuzzy-searchable list of every key, and enter
+  runs the one under the cursor. A force *push* is available there behind a
+  confirmation; every other forced operation stays CLI-only by design

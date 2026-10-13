@@ -12,11 +12,14 @@
 //! lazygit's rather than one of our own — `[G]raduate` and `[m] promote` moved
 //! aside to make room for it.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::time::{Duration, Instant};
 
 use anyhow::{anyhow, bail, Result};
-use crossterm::event::{self, Event, KeyCode, KeyEventKind};
+use crossterm::event::{
+    self, Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers, MouseButton, MouseEvent,
+    MouseEventKind,
+};
 use ratatui::{
     layout::{Alignment, Constraint, Layout, Rect},
     style::{Color, Modifier, Style},
@@ -26,11 +29,12 @@ use ratatui::{
 };
 
 use super::output::{self, Followup, JobDone, JobProgress};
+use super::queue::{self, Pending, Queue};
 use crate::core::{
-    branches::{self, BranchLocation, RollInfo, RollState},
+    branches::{self, BranchLocation, HotfixInfo, HotfixState, RollInfo, RollState, VerifySet},
     config::Config,
     git::{self, TrackState},
-    ops,
+    history, ops, proc,
     sync::{self, PullPlan, PushOutcome, SyncTarget},
     version::{self, BumpLevel, Semver, VersionCheck, VersionStatus},
 };
@@ -55,6 +59,10 @@ pub(crate) enum Action {
     /// Delete the local copy of every graduated or promoted roll branch,
     /// leaving `origin` untouched.
     Tidy,
+    /// Land the *checked-out* hotfix into stable, then reintegrate stable into
+    /// rolling. Reads HEAD like `[v]` and `[b]` do: `ops::hotfix_land` merges
+    /// from the branch that is checked out, so the cursor cannot pick another.
+    LandHotfix,
 }
 
 impl Action {
@@ -68,6 +76,7 @@ impl Action {
             Action::Update => "update",
             Action::Prune => "prune",
             Action::Tidy => "tidy",
+            Action::LandHotfix => "hotfix --land",
         };
         match target {
             Some(t) => format!("rf {verb} {t}"),
@@ -121,6 +130,37 @@ pub(crate) fn bump_key(code: KeyCode) -> BumpOutcome {
         KeyCode::Char('n') | KeyCode::Char('N') | KeyCode::Esc => BumpOutcome::Cancel,
         _ => BumpOutcome::Ignore,
     }
+}
+
+/// What a keypress in the `[V]` picker resolves to.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub(crate) enum VerifyManyOutcome {
+    Ignore,
+    Cancel,
+    Set(VerifySet),
+}
+
+/// Decide a keystroke in the verify-many picker: digits pick a set in the
+/// order [`VerifySet::ALL`] lists them, `n`/`esc` cancel. Digits for the same
+/// reason the bump modal uses them — six choices share too many initials.
+pub(crate) fn verify_many_key(code: KeyCode) -> VerifyManyOutcome {
+    match code {
+        KeyCode::Char(c @ '1'..='9') => {
+            let index = (c as usize) - ('1' as usize);
+            match VerifySet::ALL.get(index) {
+                Some(set) => VerifyManyOutcome::Set(*set),
+                None => VerifyManyOutcome::Ignore,
+            }
+        }
+        KeyCode::Char('n') | KeyCode::Char('N') | KeyCode::Esc => VerifyManyOutcome::Cancel,
+        _ => VerifyManyOutcome::Ignore,
+    }
+}
+
+/// How many rolls each set would verify, in menu order. Computed once when the
+/// modal opens so the counts it shows are the counts the pass will use.
+pub(crate) fn verify_set_counts(rolls: &[RollInfo]) -> [(VerifySet, usize); 6] {
+    VerifySet::ALL.map(|set| (set, set.select(rolls).len()))
 }
 
 /// The three levels and what each would produce, in the order the modal lists
@@ -219,12 +259,21 @@ enum Mode {
     Detail {
         roll: RollInfo,
         ahead_behind: Option<(u32, u32)>,
+        /// Which linked roll `[enter]` opens: an index into
+        /// [`detail_targets`] — the chain rows, then the dependents.
+        cursor: usize,
+        /// The rolls drilled through to get here, innermost last, so
+        /// `[backspace]` retraces the path rather than closing. Each carries
+        /// the divergence it was opened with, so going back redraws exactly
+        /// what was there.
+        trail: Vec<(RollInfo, Option<(u32, u32)>)>,
     },
-    /// Slug-input modal for creating a new roll (issue #79). Holds the
-    /// in-progress text buffer; on Enter it runs `ops::create` through the same
-    /// suspend/resume path as the other actions.
+    /// Slug-input modal for creating a new roll (issue #79) or a hotfix. Holds
+    /// the in-progress text buffer; on Enter it runs `ops::create` or
+    /// `ops::hotfix_create` through the same job path as the other actions.
     CreateInput {
         slug: String,
+        kind: CreateKind,
     },
     /// Destructive per-row branch deletion. Deliberately not a `Confirm`: the
     /// prompt shape depends on where the branch exists, and the decision
@@ -236,6 +285,12 @@ enum Mode {
     /// opened, so the previews it shows and the bump it applies agree.
     Bump {
         current: Semver,
+    },
+    /// `[V]`: pick which set of rolls to verify in one pass. Holds the counts
+    /// read when the modal opened, so the numbers it shows and the set it
+    /// runs agree.
+    VerifyMany {
+        counts: [(VerifySet, usize); 6],
     },
     /// A graduation or promotion conflicted and was unwound. Offers the ways
     /// forward; the diagnosis is in the panel underneath.
@@ -270,7 +325,46 @@ enum Mode {
     ForcePush {
         branch: String,
         remote: String,
+        /// Opened because a push was rejected, which also held the queue: a
+        /// `y` then runs the forced push ahead of the queue and releases it.
+        rejected: bool,
     },
+    /// `:`: the lazygit-style command prompt.
+    Command {
+        /// What the user actually typed. Filters the history list, and
+        /// nothing else — `Up`/`Down` never touch it, only character edits do
+        /// (resetting `cursor` to 0, same as `Help`'s `query`). Keeping this
+        /// apart from `input` is what lets Up/Down cycle through more than one
+        /// suggestion: filtering against `input` instead would, after the
+        /// first pick, filter history against a full command string rather
+        /// than what was actually typed, collapsing the candidate list.
+        query: String,
+        /// What `enter` runs. Starts equal to `query` and is overwritten by
+        /// `Up`/`Down` picking a suggestion (reverse-search-style); any
+        /// further character edit resets it back to `query`.
+        input: String,
+        /// Indexes the fuzzy-filtered (by `query`) history list below the
+        /// prompt.
+        cursor: usize,
+    },
+}
+
+/// What the slug-input modal creates. One modal for both, because the input
+/// is identical — a slug — and only the op it feeds and the words on the box
+/// differ.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub(crate) enum CreateKind {
+    Roll,
+    Hotfix,
+}
+
+impl CreateKind {
+    fn noun(self) -> &'static str {
+        match self {
+            CreateKind::Roll => "roll",
+            CreateKind::Hotfix => "hotfix",
+        }
+    }
 }
 
 /// Which copies of a roll branch a `[d]elete` targets.
@@ -380,15 +474,24 @@ pub(crate) struct BaseBranch {
 pub(crate) enum RowKind {
     Base(usize),
     Roll(usize),
+    /// A `hotfix/N-…` row, listed below the rolls.
+    Hotfix(usize),
 }
 
-/// Map a flat table index onto the base-then-roll row layout. `None` when the
-/// index is past the last row.
-pub(crate) fn row_at(index: usize, base_count: usize, roll_count: usize) -> Option<RowKind> {
+/// Map a flat table index onto the base-then-roll-then-hotfix row layout.
+/// `None` when the index is past the last row.
+pub(crate) fn row_at(
+    index: usize,
+    base_count: usize,
+    roll_count: usize,
+    hotfix_count: usize,
+) -> Option<RowKind> {
     if index < base_count {
         Some(RowKind::Base(index))
     } else if index - base_count < roll_count {
         Some(RowKind::Roll(index - base_count))
+    } else if index - base_count - roll_count < hotfix_count {
+        Some(RowKind::Hotfix(index - base_count - roll_count))
     } else {
         None
     }
@@ -430,8 +533,12 @@ pub(crate) fn base_branches(
 /// Initial table selection: the row for the current branch when it is on
 /// screen (a base branch or one of the rolls), else the first row. `None` only
 /// when there is nothing to select at all.
-pub(crate) fn initial_selection(bases: &[BaseBranch], rolls: &[RollInfo]) -> Option<usize> {
-    if bases.is_empty() && rolls.is_empty() {
+pub(crate) fn initial_selection(
+    bases: &[BaseBranch],
+    rolls: &[RollInfo],
+    hotfixes: &[HotfixInfo],
+) -> Option<usize> {
+    if bases.is_empty() && rolls.is_empty() && hotfixes.is_empty() {
         return None;
     }
     if let Some(i) = bases.iter().position(|b| b.is_current) {
@@ -439,6 +546,9 @@ pub(crate) fn initial_selection(bases: &[BaseBranch], rolls: &[RollInfo]) -> Opt
     }
     if let Some(i) = rolls.iter().position(|r| r.is_current) {
         return Some(bases.len() + i);
+    }
+    if let Some(i) = hotfixes.iter().position(|h| h.is_current) {
+        return Some(bases.len() + rolls.len() + i);
     }
     Some(0)
 }
@@ -455,6 +565,12 @@ pub(crate) fn initial_selection(bases: &[BaseBranch], rolls: &[RollInfo]) -> Opt
 /// commits is just as stale as a `Diverged` one that graduated and then moved.
 /// A roll can therefore be both blocked on a dependency *and* behind its
 /// latest commits at the same time.
+///
+/// `carried` marks the one exception to `is_blocker`: a fellow member of a
+/// dependency cycle that the roll on the other end carries (see
+/// [`branches::DepCycle`]). The carrier contains its tip, so graduating the
+/// carrier lands it — it is ungraduated, but it gates nothing. Always false
+/// when `is_blocker` is true.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct DepRow {
     pub number: u32,
@@ -462,6 +578,16 @@ pub(crate) struct DepRow {
     pub state: RollState,
     pub is_blocker: bool,
     pub needs_reintegration: bool,
+    pub carried: bool,
+}
+
+/// True when `carrier` is the carrier of a dependency cycle `member` is also
+/// in — the one relation under which an ungraduated dependency does not block.
+fn carries(carrier: &RollInfo, member: u32) -> bool {
+    carrier
+        .cycle
+        .as_ref()
+        .is_some_and(|c| c.carrier() == Some(carrier.number) && c.contains(member))
 }
 
 /// Owns everything needed to render and to *reload* after an action.
@@ -472,6 +598,10 @@ struct StatusApp {
     /// so `is_current` tracks the branch actually checked out.
     bases: Vec<BaseBranch>,
     rolls: Vec<RollInfo>,
+    /// `hotfix/*` rows shown below the rolls; recomputed on reload like the
+    /// rolls are. Kept apart from `rolls` because they carry no dependencies
+    /// and number independently — see `branches::HotfixInfo`.
+    hotfixes: Vec<HotfixInfo>,
     show_deps: bool,
     /// Upstream tracking state per local branch, refreshed on reload. Sourced in
     /// one `for-each-ref` rather than an `ahead_behind` call per row.
@@ -489,17 +619,41 @@ struct StatusApp {
     /// Transient one-line feedback (e.g. why an action was rejected), cleared on
     /// the next browsing keypress.
     message: Option<String>,
-    /// The command currently running, if any. Mutating keys are refused while
-    /// this is set; navigation is not.
+    /// The command currently running, if any. A mutating key pressed while
+    /// this is set queues behind it rather than racing it.
     job: Option<output::Job>,
+    /// The running command's panel title, for naming it when it fails.
+    job_title: String,
+    /// Whether the running command can change the checked-out branch.
+    job_moves_head: bool,
+    /// Commands waiting for the running one to finish. See [`queue`].
+    queue: Queue,
+    /// True after a `q` that would have dropped queued commands, waiting for a
+    /// second `q` to confirm. Any other key disarms it.
+    quit_armed: bool,
+    /// A modal a finished job asked for while another was open. Jobs now finish
+    /// under open modals — `[c]` can be typing a slug mid-push — and replacing
+    /// the modal would throw away what the user was in the middle of, so it
+    /// opens once they are back to browsing.
+    deferred_mode: Option<Mode>,
     /// The output log. Outlives its job so a result stays readable until `esc`.
     panel: Option<output::Panel>,
+    /// Whether the panel fills most of the frame instead of its usual
+    /// bottom-right corner. Not folded into `Mode`: like `panel` itself, this
+    /// is orthogonal state that must not steal input routing from `Browsing`.
+    panel_maximized: bool,
+    /// The panel's rect as of the last render, for hit-testing a mouse click
+    /// against. `None` whenever no panel is shown.
+    panel_rect: Option<Rect>,
     /// True after a bare `g`, waiting to see whether the next key makes it `gg`.
     /// `g` has no action of its own, so this needs no timeout.
     pending_g: bool,
     /// When a bare `P` was pressed, waiting to see whether it becomes `PP`.
     /// Unlike `pending_g` this *is* timed — see [`PUSH_CHORD_WINDOW`].
     pending_push: Option<Instant>,
+    /// Commands run through `:`, most-recent-first. Loaded once at startup
+    /// from [`history::load`] and saved back after every run.
+    command_history: Vec<String>,
 }
 
 /// Entry point. Takes ownership of the data so the app can rebuild it after an
@@ -520,13 +674,31 @@ pub fn run(
 
 // ── Pure decision logic (unit-tested) ───────────────────────────────────────
 
-/// A roll can graduate only while it is active, or needs re-graduation
-/// (diverged, or reverted on rolling). Graduated / promoted / blocked rolls
-/// cannot.
+/// Whether `(x, y)` falls inside `rect`.
+fn point_in_rect(x: u16, y: u16, rect: Rect) -> bool {
+    x >= rect.x && x < rect.x + rect.width && y >= rect.y && y < rect.y + rect.height
+}
+
+/// Whether a left-click at `(x, y)` against the panel's last-drawn `rect`
+/// should leave it maximized.
+///
+/// No `maximized` input needed: "click on it to maximize, click off of it to
+/// restore" is symmetric in both directions — a click inside the small panel
+/// should maximize it, a click inside the already-maximized one should leave
+/// it maximized, and a click outside either should not. All three collapse to
+/// the same rule: maximized afterward iff the click landed inside whatever
+/// rect was last drawn.
+pub(crate) fn click_maximizes(x: u16, y: u16, rect: Rect) -> bool {
+    point_in_rect(x, y, rect)
+}
+
+/// A roll can graduate while it is active, blocked (its ungraduated
+/// dependencies graduate first, as a chain), or needs re-graduation (diverged,
+/// or reverted on rolling). Graduated / promoted rolls cannot.
 pub(crate) fn can_graduate(state: &RollState) -> bool {
     matches!(
         state,
-        RollState::Active | RollState::Diverged | RollState::Reverted
+        RollState::Active | RollState::Diverged | RollState::Reverted | RollState::Blocked
     )
 }
 
@@ -712,6 +884,28 @@ fn is_tidy_candidate(roll: &RollInfo) -> bool {
         && matches!(roll.location, BranchLocation::Local | BranchLocation::Both)
 }
 
+/// Landed hotfixes prune would consider: landing is a hotfix's promotion, so
+/// `ops::prune_plan` winds them up alongside promoted rolls.
+pub(crate) fn prunable_hotfix_count(hotfixes: &[HotfixInfo]) -> usize {
+    hotfixes
+        .iter()
+        .filter(|h| h.state == HotfixState::Landed)
+        .count()
+}
+
+/// Hotfixes `[t]` would consider. `ops::tidy_plan` maps a landed hotfix to
+/// `Promoted` and an open one to `Active`, and [`TIDY_STATES`] — tidy's
+/// default — selects only the former; as with rolls, only a local copy counts.
+pub(crate) fn tidyable_hotfix_count(hotfixes: &[HotfixInfo]) -> usize {
+    hotfixes
+        .iter()
+        .filter(|h| {
+            h.state == HotfixState::Landed
+                && matches!(h.location, BranchLocation::Local | BranchLocation::Both)
+        })
+        .count()
+}
+
 // ── Keymap ──────────────────────────────────────────────────────────────────
 
 /// One entry in the keymap.
@@ -859,6 +1053,13 @@ pub(crate) const BINDINGS: &[Binding] = &[
         replay: &[KeyCode::Char('v')],
     },
     Binding {
+        keys: "V",
+        label: "verify all rolls, or a set of them",
+        group: "roll",
+        hint: None,
+        replay: &[KeyCode::Char('V')],
+    },
+    Binding {
         keys: "G",
         label: "graduate the selected roll into rolling",
         group: "roll",
@@ -887,8 +1088,22 @@ pub(crate) const BINDINGS: &[Binding] = &[
         replay: &[KeyCode::Char('b')],
     },
     Binding {
+        keys: "h",
+        label: "create a hotfix off stable",
+        group: "hotfix",
+        hint: None,
+        replay: &[KeyCode::Char('h')],
+    },
+    Binding {
+        keys: "H",
+        label: "land the checked-out hotfix into stable and rolling",
+        group: "hotfix",
+        hint: None,
+        replay: &[KeyCode::Char('H')],
+    },
+    Binding {
         keys: "d",
-        label: "delete the selected branch",
+        label: "delete the selected roll or hotfix branch",
         group: "branches",
         hint: None,
         replay: &[KeyCode::Char('d')],
@@ -909,7 +1124,7 @@ pub(crate) const BINDINGS: &[Binding] = &[
     },
     Binding {
         keys: "esc",
-        label: "close the output panel",
+        label: "restore, then close, the output panel",
         group: "output",
         hint: None,
         replay: &[KeyCode::Esc],
@@ -934,6 +1149,43 @@ pub(crate) const BINDINGS: &[Binding] = &[
         group: "output",
         hint: None,
         replay: &[KeyCode::End],
+    },
+    Binding {
+        keys: "z",
+        label: "maximize or restore the output panel",
+        group: "output",
+        hint: None,
+        // Also reachable by clicking the panel (to maximize) or clicking
+        // outside it while maximized (to restore) — not something `?` can
+        // replay, so there is nothing to add here for that.
+        replay: &[KeyCode::Char('z')],
+    },
+    Binding {
+        keys: ":",
+        label: "run a shell command",
+        group: "output",
+        // Not a `hint`: the status bar is capped at five curated basics (see
+        // `the_status_bar_carries_only_the_basics_and_points_at_the_rest`),
+        // and `?` already makes every other binding, this one included,
+        // discoverable by name.
+        hint: None,
+        replay: &[KeyCode::Char(':')],
+    },
+    Binding {
+        keys: "s",
+        // "resume" and "continue" are both what someone types looking for this
+        // after a conflict, and the search is a subsequence match.
+        label: "resume (continue) the queued commands a failure held",
+        group: "queue",
+        hint: None,
+        replay: &[KeyCode::Char('s')],
+    },
+    Binding {
+        keys: "S",
+        label: "drop every queued command",
+        group: "queue",
+        hint: None,
+        replay: &[KeyCode::Char('S')],
     },
 ];
 
@@ -1011,6 +1263,19 @@ pub(crate) fn filter_bindings(query: &str) -> Vec<usize> {
     scored.into_iter().map(|(i, _)| i).collect()
 }
 
+/// The commands in `history` matching `query`, best first, as indices into
+/// `history`. Exactly [`filter_bindings`]'s shape against a different list —
+/// one fuzzy matcher, reused rather than written twice.
+pub(crate) fn filter_history(history: &[String], query: &str) -> Vec<usize> {
+    let mut scored: Vec<(usize, i32)> = history
+        .iter()
+        .enumerate()
+        .filter_map(|(i, cmd)| fuzzy_score(cmd, query).map(|score| (i, score)))
+        .collect();
+    scored.sort_by_key(|&(_, score)| std::cmp::Reverse(score));
+    scored.into_iter().map(|(i, _)| i).collect()
+}
+
 /// What a keypress in the `?` list does.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum HelpOutcome {
@@ -1067,6 +1332,100 @@ pub(crate) fn handle_help_key(
     }
 }
 
+/// What a keypress in the `:` command prompt does.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum CommandOutcome {
+    /// Input or cursor changed (or the key meant nothing); keep the prompt open.
+    Continue,
+    Close,
+    /// Run the current input in the panel.
+    Run,
+    /// Run the current input in the real shell instead (`alt+enter`, or
+    /// `shift+enter` where the terminal reports it distinguishably).
+    RunInShell,
+}
+
+/// Apply one keystroke to the `:` prompt, mutating `input` and `cursor` in
+/// place. `alt` carries whether the modifier was held on `Enter` — the pure
+/// function takes it as a plain bool rather than a `KeyEvent` so the whole
+/// interaction is testable without constructing one.
+///
+/// Up/Down are reverse-search-style, unlike the `?` list's cursor: there is no
+/// separate "list" to look at here, so moving the highlight also copies that
+/// entry straight into `input`, the way a shell's history search does. Typing
+/// resets the highlight to the top match, same as `?`.
+pub(crate) fn handle_command_key(
+    query: &mut String,
+    input: &mut String,
+    cursor: &mut usize,
+    history: &[String],
+    code: KeyCode,
+    alt: bool,
+) -> CommandOutcome {
+    match code {
+        KeyCode::Esc => CommandOutcome::Close,
+        KeyCode::Enter if alt => CommandOutcome::RunInShell,
+        KeyCode::Enter => {
+            if input.trim().is_empty() {
+                CommandOutcome::Continue
+            } else {
+                CommandOutcome::Run
+            }
+        }
+        KeyCode::Down => {
+            let matches = filter_history(history, query);
+            if !matches.is_empty() {
+                // `input == query` means nothing has been picked yet (every
+                // character edit resets them to match), so the first press
+                // lands on the top suggestion rather than skipping straight to
+                // the second.
+                *cursor = if *input == *query {
+                    0
+                } else {
+                    (*cursor + 1).min(matches.len() - 1)
+                };
+                *input = history[matches[*cursor]].clone();
+            }
+            CommandOutcome::Continue
+        }
+        KeyCode::Up => {
+            let matches = filter_history(history, query);
+            if !matches.is_empty() {
+                *cursor = if *input == *query {
+                    0
+                } else {
+                    cursor.saturating_sub(1)
+                };
+                *input = history[matches[*cursor]].clone();
+            }
+            CommandOutcome::Continue
+        }
+        KeyCode::Backspace => {
+            query.pop();
+            *input = query.clone();
+            *cursor = 0;
+            CommandOutcome::Continue
+        }
+        KeyCode::Char(c) if !c.is_control() => {
+            query.push(c);
+            *input = query.clone();
+            *cursor = 0;
+            CommandOutcome::Continue
+        }
+        _ => CommandOutcome::Continue,
+    }
+}
+
+/// Build a `<shell> -c <input>` command. The user's own shell (`$SHELL`,
+/// falling back to `sh` only when it's unset) rather than a hardcoded `sh`:
+/// the whole point of "the shell that launched rf" is that it may not be a
+/// POSIX shell at all — this project's own developer runs Nushell.
+fn shell_command(shell: &str, input: &str) -> std::process::Command {
+    let mut cmd = std::process::Command::new(shell);
+    cmd.arg("-c").arg(input);
+    cmd
+}
+
 /// The route `[v]` would check, as `(source, target)`, or `None` when the
 /// checked-out branch is not on one.
 ///
@@ -1119,24 +1478,160 @@ fn push_version_check(lines: &mut Vec<String>, check: &VersionCheck, source: &st
 /// question answered by `selected.stale_deps`: has the dependency's branch
 /// moved since `selected` integrated it, whatever its state — so a dep can be
 /// both a blocker *and* stale at once (still active, and already moved again).
-/// Unknown dep numbers (not present in `all`) are skipped. The empty result
-/// means "no dependencies / not blocked".
+/// The one exception to "ungraduated blocks" is a fellow dependency-cycle
+/// member `selected` carries: it is `carried`, not a blocker, because
+/// graduating `selected` lands it. Unknown dep numbers (not present in `all`)
+/// are skipped. The empty result means "no dependencies / not blocked".
 pub(crate) fn dep_rows(selected: &RollInfo, all: &[RollInfo]) -> Vec<DepRow> {
     selected
         .deps
         .iter()
         .filter_map(|num| all.iter().find(|r| r.number == *num))
-        .map(|dep| DepRow {
-            number: dep.number,
-            branch: dep.branch.clone(),
-            state: dep.state.clone(),
-            is_blocker: matches!(
-                dep.state,
-                RollState::Active | RollState::Blocked | RollState::Reverted
-            ),
-            needs_reintegration: selected.stale_deps.contains(&dep.number),
+        .map(|dep| {
+            let carried = carries(selected, dep.number);
+            DepRow {
+                number: dep.number,
+                branch: dep.branch.clone(),
+                state: dep.state.clone(),
+                is_blocker: !carried
+                    && matches!(
+                        dep.state,
+                        RollState::Active | RollState::Blocked | RollState::Reverted
+                    ),
+                needs_reintegration: selected.stale_deps.contains(&dep.number),
+                carried,
+            }
         })
         .collect()
+}
+
+/// One link in the dependency chain the detail view draws.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct ChainRow {
+    /// 0 for a direct dependency, 1 for a dependency of that one, and so on.
+    pub depth: usize,
+    pub number: u32,
+    pub branch: String,
+    pub state: RollState,
+    /// Not yet graduated/promoted — holds its parent back.
+    pub is_blocker: bool,
+    /// The parent integrated this roll, and its branch has moved since —
+    /// [`DepRow::needs_reintegration`], read from the parent's `stale_deps`.
+    pub needs_reintegration: bool,
+    /// [`DepRow::carried`], read the same way: the roll's parent at this link
+    /// is the cycle's carrier, so this link gates nothing despite being
+    /// ungraduated. Always false when `is_blocker` is true.
+    pub carried: bool,
+    /// Already listed higher up the chain (a diamond). Its own dependencies
+    /// are not repeated under it.
+    pub repeated: bool,
+}
+
+/// The whole dependency chain below `selected`, depth-first, as the detail
+/// view shows it: roll 12 depends on 9, which depends on 8, which depends on 7.
+///
+/// [`dep_rows`] is the first level of this. The traversal keeps a set of rolls
+/// already listed, and a roll reached a second time — a diamond, or a cycle if
+/// the history is strange enough — is listed once more as `repeated` and not
+/// descended into, so the output is finite and every roll's own deps appear
+/// exactly once. Both markers on a link are the *parent's* judgement of it —
+/// `needs_reintegration` reads the parent's `RollInfo::stale_deps`, since that
+/// is who integrated it. Unknown numbers are skipped, as in [`dep_rows`].
+pub(crate) fn dep_chain(selected: &RollInfo, all: &[RollInfo]) -> Vec<ChainRow> {
+    fn walk(
+        parent: &RollInfo,
+        all: &[RollInfo],
+        depth: usize,
+        seen: &mut HashSet<u32>,
+        rows: &mut Vec<ChainRow>,
+    ) {
+        // Each level is exactly `dep_rows` of its parent, so there is one
+        // definition of a direct dependency row and the chain only adds depth.
+        for row in dep_rows(parent, all) {
+            let repeated = !seen.insert(row.number);
+            rows.push(ChainRow {
+                depth,
+                number: row.number,
+                branch: row.branch,
+                state: row.state,
+                is_blocker: row.is_blocker,
+                needs_reintegration: row.needs_reintegration,
+                carried: row.carried,
+                repeated,
+            });
+            if !repeated {
+                if let Some(dep) = all.iter().find(|r| r.number == row.number) {
+                    walk(dep, all, depth + 1, seen, rows);
+                }
+            }
+        }
+    }
+    let mut seen = HashSet::from([selected.number]);
+    let mut rows = Vec::new();
+    walk(selected, all, 0, &mut seen, &mut rows);
+    rows
+}
+
+/// The rolls `[enter]` can open from a detail pane, in the order the pane
+/// lists them: every chain row (repeated ones included — opening a diamond's
+/// second mention is as valid as its first), then the dependents. The cursor
+/// in [`Mode::Detail`] is an index into this.
+pub(crate) fn detail_targets(roll: &RollInfo, all: &[RollInfo]) -> Vec<u32> {
+    dep_chain(roll, all)
+        .iter()
+        .map(|r| r.number)
+        .chain(dependent_rows(roll, all).iter().map(|r| r.number))
+        .collect()
+}
+
+/// What a keypress in a detail pane does.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum DetailOutcome {
+    Continue,
+    /// Leave the overlay entirely, however deep the trail.
+    Close,
+    /// Return to the pane this one was opened from.
+    Back,
+    /// Open the linked roll at this index of [`detail_targets`].
+    Open(usize),
+}
+
+/// Apply one keystroke to a detail pane.
+///
+/// The pane is a place to *dig*, not just read: `j`/`k` walk the linked rolls,
+/// `enter` (or `l`/`→`) opens the one under the cursor as its own pane, and
+/// `backspace` (or `h`/`←`) comes back up one level — falling through to
+/// closing when there is nowhere further up, so the key never dead-ends.
+/// `esc`/`q` always close outright, whatever the depth. Pure, so the whole
+/// navigation is testable without a terminal.
+pub(crate) fn detail_key(
+    code: KeyCode,
+    cursor: &mut usize,
+    targets: usize,
+    has_trail: bool,
+) -> DetailOutcome {
+    match code {
+        KeyCode::Esc | KeyCode::Char('q') => DetailOutcome::Close,
+        KeyCode::Backspace | KeyCode::Char('h') | KeyCode::Left => {
+            if has_trail {
+                DetailOutcome::Back
+            } else {
+                DetailOutcome::Close
+            }
+        }
+        KeyCode::Down | KeyCode::Char('j') => {
+            *cursor = (*cursor + 1).min(targets.saturating_sub(1));
+            DetailOutcome::Continue
+        }
+        KeyCode::Up | KeyCode::Char('k') => {
+            *cursor = cursor.saturating_sub(1);
+            DetailOutcome::Continue
+        }
+        KeyCode::Enter | KeyCode::Char('l') | KeyCode::Right if targets > 0 => {
+            DetailOutcome::Open((*cursor).min(targets - 1))
+        }
+        _ => DetailOutcome::Continue,
+    }
 }
 
 /// Build the *reverse*-dependency rows to show in the detail view for `target`:
@@ -1158,8 +1653,9 @@ pub(crate) fn dep_rows(selected: &RollInfo, all: &[RollInfo]) -> Vec<DepRow> {
 /// dependent last integrated it, not on what `target` is doing now. The detail
 /// view does not render a per-row marker for dependents, so both flags are
 /// purely informational here, but they keep the fields meaningful and
-/// testable. A roll is never its own dependent, even if a self-referential
-/// entry somehow appears.
+/// testable. A dependent that carries `target` (a dependency-cycle carrier) is
+/// `carried` rather than gated, mirroring [`dep_rows`]. A roll is never its own
+/// dependent, even if a self-referential entry somehow appears.
 pub(crate) fn dependent_rows(target: &RollInfo, all: &[RollInfo]) -> Vec<DepRow> {
     let target_gates = matches!(
         target.state,
@@ -1170,14 +1666,29 @@ pub(crate) fn dependent_rows(target: &RollInfo, all: &[RollInfo]) -> Vec<DepRow>
         .iter()
         .filter(|num| **num != target.number)
         .filter_map(|num| all.iter().find(|r| r.number == *num))
-        .map(|dependent| DepRow {
-            number: dependent.number,
-            branch: dependent.branch.clone(),
-            state: dependent.state.clone(),
-            is_blocker: target_gates,
-            needs_reintegration: dependent.stale_deps.contains(&target.number),
+        .map(|dependent| {
+            let carried = carries(dependent, target.number);
+            DepRow {
+                number: dependent.number,
+                branch: dependent.branch.clone(),
+                state: dependent.state.clone(),
+                is_blocker: target_gates && !carried,
+                needs_reintegration: dependent.stale_deps.contains(&target.number),
+                carried,
+            }
         })
         .collect()
+}
+
+/// The detail view's dependency-cycle note: [`branches::DepCycle::advice`] —
+/// the same sentence the plain tables print and `--json` carries — broken at
+/// its dash so it fits a popup rather than stretching it across the screen.
+pub(crate) fn cycle_lines(cycle: &branches::DepCycle, all: &[RollInfo]) -> Vec<String> {
+    let advice = cycle.advice(all);
+    match advice.split_once(" — ") {
+        Some((what, todo)) => vec![what.to_string(), format!("  {todo}")],
+        None => vec![advice],
+    }
 }
 
 /// Render the ahead/behind divergence of a both-location roll versus its
@@ -1200,6 +1711,64 @@ fn state_color(state: &RollState) -> Color {
         RollState::Demoted => Color::Cyan,
         RollState::Blocked => Color::Magenta,
     }
+}
+
+/// Hotfix rows in their own colour, distinct from every roll state, so a
+/// glance separates the two tiers even when their labels are both a tick.
+fn hotfix_color(state: HotfixState) -> Color {
+    match state {
+        HotfixState::Open => Color::LightRed,
+        HotfixState::Landed => Color::DarkGray,
+    }
+}
+
+/// The two-lane glyph pair (`main_lane`, `rolling_lane`) for a roll's graph
+/// column cell, read left-to-right in the same order the pinned base rows are
+/// listed (stable, then rolling).
+///
+/// Deliberately two *fixed* lanes rather than a dynamic multi-lane layout: a
+/// dependency between two rolls already has a home (the `deps`/`dependants`
+/// columns and their `⚠` stale markers), and the `branch` column has no width
+/// to spare for a packer that would need unbounded space in pathological
+/// cases. This column re-renders facts `RollState` already carries — it adds
+/// no new ones — as the lane position a glance reads as "how settled is
+/// this": further right (rolling) is further from landing, `●` in the main
+/// lane means it is on stable. See docs/internals/algorithms.md.
+pub(crate) fn graph_glyphs(state: &RollState) -> (char, char) {
+    match state {
+        RollState::Active => ('│', '○'),
+        RollState::Blocked => ('│', '◌'),
+        RollState::Diverged => ('│', '◐'),
+        RollState::Reverted => ('│', '↺'),
+        RollState::Graduated => ('│', '●'),
+        RollState::Promoted => ('●', '●'),
+        RollState::Demoted => ('◐', '●'),
+    }
+}
+
+/// Same lane pair for a hotfix row: a hotfix lands directly into both stable
+/// and rolling in one step (`[H]`), so it has no `Graduated`-only state of its
+/// own — it is either still open (not yet on either lane) or landed (on both).
+pub(crate) fn hotfix_graph_glyphs(state: HotfixState) -> (char, char) {
+    match state {
+        HotfixState::Open => ('│', '○'),
+        HotfixState::Landed => ('●', '●'),
+    }
+}
+
+/// The graph column's own two rows: stable sits on the main lane with nothing
+/// yet in rolling's; rolling sits on its own lane, with the main lane passing
+/// through underneath it since a later promotion still has to reach stable.
+pub(crate) fn base_graph_glyphs(role: BaseRole) -> (char, char) {
+    match role {
+        BaseRole::Stable => ('●', ' '),
+        BaseRole::Rolling => ('│', '●'),
+    }
+}
+
+/// Render a lane pair as the graph column's cell text.
+fn graph_cell(glyphs: (char, char)) -> String {
+    format!("{}{}", glyphs.0, glyphs.1)
 }
 
 /// What `[p]` should promote, given the current selection.
@@ -1350,6 +1919,29 @@ pub(crate) fn integrate_target_for(
     Ok(sel.branch.clone())
 }
 
+/// [`validate_action`], plus the hotfix rows: prune and tidy are repo-wide and
+/// also reach landed hotfixes, so either is worth offering when only hotfixes
+/// qualify. Every other action is about rolls and is decided by
+/// `validate_action` alone.
+pub(crate) fn validate_with_hotfixes(
+    action: Action,
+    selected: Option<&RollInfo>,
+    rolls: &[RollInfo],
+    hotfixes: &[HotfixInfo],
+    current_branch: &str,
+    roll_prefix: &str,
+) -> Result<(), String> {
+    let hotfixes_qualify = match action {
+        Action::Prune => prunable_hotfix_count(hotfixes) > 0,
+        Action::Tidy => tidyable_hotfix_count(hotfixes) > 0,
+        _ => false,
+    };
+    if hotfixes_qualify {
+        return Ok(());
+    }
+    validate_action(action, selected, rolls, current_branch, roll_prefix)
+}
+
 /// Validate an action against the current selection/list. `Ok(())` means the
 /// confirm modal may open; `Err(msg)` is a brief reason to surface instead.
 pub(crate) fn validate_action(
@@ -1362,15 +1954,20 @@ pub(crate) fn validate_action(
     match action {
         Action::Graduate => {
             let sel = selected.ok_or_else(|| "no roll selected".to_string())?;
-            if can_graduate(&sel.state) {
-                Ok(())
-            } else {
-                Err(format!(
-                    "{} is {} — only active, diverged, or reverted rolls can graduate",
+            if !can_graduate(&sel.state) {
+                return Err(format!(
+                    "{} is {} — only active, blocked, diverged, or reverted rolls can graduate",
                     sel.branch,
                     sel.state.label()
-                ))
+                ));
             }
+            // A blocked roll graduates after its dependencies; the planner's
+            // refusals (a cycle, a dependency with no local copy) are the
+            // reasons worth showing, so they are surfaced here rather than
+            // discovered mid-run.
+            ops::dependency_chain(rolls, &sel.branch, ops::ChainKind::Graduate)
+                .map(|_| ())
+                .map_err(|e| e.to_string())
         }
         Action::Integrate => {
             integrate_target_for(current_branch, roll_prefix, selected).map(|_| ())
@@ -1381,7 +1978,7 @@ pub(crate) fn validate_action(
             if can_prune(rolls) {
                 Ok(())
             } else {
-                Err("nothing to prune — no promoted roll branches".to_string())
+                Err("nothing to prune — no promoted roll branches or landed hotfixes".to_string())
             }
         }
         Action::Tidy => {
@@ -1389,6 +1986,15 @@ pub(crate) fn validate_action(
                 Ok(())
             } else {
                 Err("nothing to tidy — no local graduated or promoted roll branches".to_string())
+            }
+        }
+        Action::LandHotfix => {
+            if current_branch.starts_with(branches::HOTFIX_PREFIX) {
+                Ok(())
+            } else {
+                Err(format!(
+                    "'{current_branch}' is not a hotfix — [space] onto one to land it"
+                ))
             }
         }
     }
@@ -1428,12 +2034,15 @@ pub(crate) fn is_submittable_slug(buffer: &str) -> bool {
 /// checked-out branch's local copy is never deletable, so a both-location
 /// current roll degrades to a remote-only y/N and a local-only current roll is
 /// refused. `Neither` is refused too — the row is stale, there is nothing there.
-pub(crate) fn delete_prompt(roll: &RollInfo) -> Result<DeletePrompt, String> {
-    match (&roll.location, roll.is_current) {
-        (BranchLocation::Neither, _) => Err(format!("{} no longer exists", roll.branch)),
+pub(crate) fn delete_prompt(
+    branch: &str,
+    location: &BranchLocation,
+    is_current: bool,
+) -> Result<DeletePrompt, String> {
+    match (location, is_current) {
+        (BranchLocation::Neither, _) => Err(format!("{branch} no longer exists")),
         (BranchLocation::Local, true) => Err(format!(
-            "{} is checked out — switch away before deleting it",
-            roll.branch
+            "{branch} is checked out — switch away before deleting it"
         )),
         (BranchLocation::Local, false) => Ok(DeletePrompt::Single(DeleteScope::Local)),
         (BranchLocation::Remote, _) => Ok(DeletePrompt::Single(DeleteScope::Remote)),
@@ -1526,16 +2135,21 @@ impl StatusApp {
         let bases = base_branches(&config, &current_branch, |refspec| {
             git::ref_exists(&config.repo_root, refspec)
         });
+        // Loaded here rather than passed in: the CLI's plain table loads its
+        // own, and a load failure degrades to "no hotfix rows" instead of
+        // refusing to open the view.
+        let hotfixes = branches::list_hotfixes(&config).unwrap_or_default();
         let mut table = TableState::default();
-        table.select(initial_selection(&bases, &rolls));
+        table.select(initial_selection(&bases, &rolls, &hotfixes));
         let tracking = load_tracking(&config);
-        let versions = load_versions(&config, &bases, &rolls);
+        let versions = load_versions(&config, &bases, &rolls, &hotfixes);
         let version = version::read_version(&config.repo_root).unwrap_or(None);
         Self {
             config,
             current_branch,
             bases,
             rolls,
+            hotfixes,
             show_deps,
             tracking,
             versions,
@@ -1544,9 +2158,17 @@ impl StatusApp {
             mode: Mode::Browsing,
             message: None,
             job: None,
+            job_title: String::new(),
+            job_moves_head: false,
+            queue: Queue::default(),
+            quit_armed: false,
+            deferred_mode: None,
             panel: None,
+            panel_maximized: false,
+            panel_rect: None,
             pending_g: false,
             pending_push: None,
+            command_history: history::load(),
         }
     }
 
@@ -1556,10 +2178,21 @@ impl StatusApp {
             // Before reading input, so a job that finished during the poll is
             // reflected in this frame rather than the next one.
             self.poll_job()?;
+            self.open_deferred_mode();
             self.resolve_lapsed_push();
 
             if event::poll(Duration::from_millis(50))? {
-                if let Event::Key(key) = event::read()? {
+                let event = event::read()?;
+                if let Event::Mouse(mouse) = event {
+                    // Clicks only drive the panel, and only while nothing else
+                    // is already claiming input — a modal's own keys take
+                    // precedence, same as every mutating key already does.
+                    if matches!(self.mode, Mode::Browsing) {
+                        self.handle_mouse(mouse);
+                    }
+                    continue;
+                }
+                if let Event::Key(key) = event {
                     if key.kind != KeyEventKind::Press {
                         continue;
                     }
@@ -1573,6 +2206,8 @@ impl StatusApp {
                         self.handle_force_push(key.code);
                     } else if matches!(self.mode, Mode::Bump { .. }) {
                         self.handle_bump(key.code);
+                    } else if matches!(self.mode, Mode::VerifyMany { .. }) {
+                        self.handle_verify_many(key.code);
                     } else if matches!(self.mode, Mode::Detail { .. }) {
                         self.handle_detail(key.code);
                     } else if matches!(self.mode, Mode::CreateInput { .. }) {
@@ -1585,6 +2220,11 @@ impl StatusApp {
                         if self.handle_help(terminal, key.code)? {
                             break;
                         }
+                    } else if matches!(self.mode, Mode::Command { .. }) {
+                        // Takes the whole `KeyEvent`, not just the code: telling
+                        // `alt+enter` apart from a plain `enter` needs the
+                        // modifiers, which every other mode's dispatch discards.
+                        self.handle_command(terminal, key)?;
                     } else if self.handle_browsing(terminal, key.code)? {
                         break;
                     }
@@ -1606,13 +2246,30 @@ impl StatusApp {
         if let Some(panel) = self.panel.as_mut() {
             panel.tick();
         }
-        let JobProgress::Finished(next) = progress else {
+        let JobProgress::Finished { ok, next } = progress else {
             return Ok(());
         };
         self.job = None;
         // Reload regardless of outcome: a failed op may still have changed the
         // repo, and a stale table is worse than a redundant refresh.
         self.reload()?;
+        self.finish_job(ok, next);
+        Ok(())
+    }
+
+    /// Act on a finished job's outcome — hold the queue on a failure, apply
+    /// its follow-up — and start whatever is next. Split from
+    /// [`Self::poll_job`] so the sequencing is testable without a repo to
+    /// reload from.
+    fn finish_job(&mut self, ok: bool, next: Option<Followup>) {
+        if !ok && !self.queue.is_empty() {
+            let reason = format!("'{}' failed", self.job_title);
+            self.message = Some(format!(
+                "{reason} — {} queued kept; resolve it, then [s] resume or [S] drop",
+                self.queue.len()
+            ));
+            self.queue.hold(reason);
+        }
         match next {
             Some(Followup::SelectBranch(branch)) => {
                 if let Some(idx) = self.rolls.iter().position(|r| r.branch == branch) {
@@ -1620,7 +2277,15 @@ impl StatusApp {
                 }
             }
             Some(Followup::OfferForcePush { branch, remote }) => {
-                self.mode = Mode::ForcePush { branch, remote };
+                // The commands behind a push were queued expecting it to land,
+                // so they wait on the answer: `y` runs the forced push ahead of
+                // them and carries on, `n` leaves them held.
+                self.queue.hold(format!("push of '{branch}' was rejected"));
+                self.open_mode(Mode::ForcePush {
+                    branch,
+                    remote,
+                    rejected: true,
+                });
             }
             Some(Followup::OfferConflictResolution {
                 source,
@@ -1637,36 +2302,212 @@ impl StatusApp {
             }
             None => {}
         }
-        Ok(())
+        self.advance_queue();
     }
 
-    /// Start a background job, replacing any previous panel.
+    /// Open `mode` now if nothing else is open, otherwise once the view is back
+    /// to browsing — see [`StatusApp::deferred_mode`].
+    fn open_mode(&mut self, mode: Mode) {
+        if matches!(self.mode, Mode::Browsing) {
+            self.mode = mode;
+        } else {
+            self.deferred_mode = Some(mode);
+        }
+    }
+
+    /// Open a deferred modal once the one in its way has closed. Called once
+    /// per loop iteration.
+    fn open_deferred_mode(&mut self) {
+        if matches!(self.mode, Mode::Browsing) {
+            if let Some(mode) = self.deferred_mode.take() {
+                self.mode = mode;
+            }
+        }
+    }
+
+    /// Run a command as a background job, or queue it behind the running one.
     ///
-    /// Replacing rather than appending keeps one panel to one operation, so its
-    /// border colour means something: a green panel is *this* command's success,
-    /// not the last one's.
+    /// A fresh command replaces any previous panel, which keeps one panel to
+    /// one plan so its border colour means something: a green panel is *this*
+    /// command's success, not the last one's. A queued command instead
+    /// continues the panel it follows — see [`output::Panel::chain`].
     fn start_job(
         &mut self,
         title: impl Into<String>,
         body: impl FnOnce() -> Result<JobDone> + Send + 'static,
     ) {
-        self.panel = Some(output::Panel::new(title));
-        self.job = Some(output::Job::spawn(body));
+        self.submit(Pending::new(title, false, Box::new(body)), false);
     }
 
-    /// Refuse a mutating key while a job is in flight, so two commands cannot
-    /// race on the same repo. Returns true when the caller should stop.
+    /// Toggle the panel between its usual corner and filling most of the
+    /// frame. A no-op with no panel up.
+    fn toggle_maximize(&mut self) {
+        if self.panel.is_some() {
+            self.panel_maximized = !self.panel_maximized;
+        }
+    }
+
+    /// [`Self::start_job`] for a command that can change the checked-out
+    /// branch. Keys that read HEAD are refused while one is pending — see
+    /// [`Self::head_will_move`].
+    fn start_head_job(
+        &mut self,
+        title: impl Into<String>,
+        body: impl FnOnce() -> Result<JobDone> + Send + 'static,
+    ) {
+        self.submit(Pending::new(title, true, Box::new(body)), false);
+    }
+
+    /// Start `pending` now if nothing is running or waiting, otherwise queue
+    /// it. `front` puts it ahead of everything waiting and releases a hold —
+    /// for the one command that answers what held the queue.
+    fn submit(&mut self, pending: Pending, front: bool) {
+        if self.job.is_none() && self.queue.is_empty() {
+            self.panel = Some(output::Panel::new(pending.title.clone()));
+            self.panel_maximized = false;
+            self.run(pending);
+            return;
+        }
+        if front {
+            self.queue.push_front(pending);
+            self.queue.resume();
+        } else {
+            let title = pending.title.clone();
+            self.queue.push(pending);
+            self.message = Some(match self.queue.held() {
+                Some(_) => format!("queued '{title}' behind the held commands — [s] resumes them"),
+                None => format!("queued '{title}' — it runs when the commands ahead finish"),
+            });
+        }
+        self.advance_queue();
+    }
+
+    /// Start the next queued command, if nothing is running and the queue is
+    /// not held. Continues the current panel rather than replacing it.
+    fn advance_queue(&mut self) {
+        if self.job.is_some() {
+            return;
+        }
+        let Some(pending) = self.queue.next() else {
+            return;
+        };
+        match self.panel.as_mut() {
+            Some(panel) => panel.chain(pending.title.clone()),
+            None => {
+                self.panel = Some(output::Panel::new(pending.title.clone()));
+                self.panel_maximized = false;
+            }
+        }
+        self.run(pending);
+    }
+
+    fn run(&mut self, pending: Pending) {
+        self.job_title = pending.title;
+        self.job_moves_head = pending.moves_head;
+        self.job = Some(output::Job::spawn(pending.body));
+    }
+
+    /// `[s]` — release a held queue and carry on with the next command.
+    fn resume_queue(&mut self) {
+        if self.queue.resume() {
+            self.message = None;
+            self.advance_queue();
+        } else if self.queue.is_empty() {
+            self.message = Some("nothing is queued".to_string());
+        } else {
+            self.message = Some("the queue is not held — it runs on its own".to_string());
+        }
+    }
+
+    /// `[S]` — drop every queued command. The running one, if any, finishes:
+    /// it is already a subprocess, and killing git mid-operation is how a repo
+    /// ends up half-merged.
+    fn drop_queue(&mut self) {
+        self.message = Some(match self.queue.clear() {
+            0 => "nothing is queued".to_string(),
+            1 => "dropped 1 queued command".to_string(),
+            n => format!("dropped {n} queued commands"),
+        });
+    }
+
+    /// The command that will change the checked-out branch before anything
+    /// queued now gets to run, if one is running or waiting.
+    fn head_will_move(&self) -> Option<&str> {
+        if self.job.is_some() && self.job_moves_head {
+            return Some(&self.job_title);
+        }
+        self.queue.first_head_mover()
+    }
+
+    /// Refuse a key that reads the checked-out branch *now* while a pending
+    /// command will change it. Such a key would capture one branch and, by the
+    /// time its turn came, act on another — `[i]` would merge into a roll the
+    /// user never confirmed. Returns true when the caller should stop.
+    fn waits_on_head(&mut self, key: &str) -> bool {
+        let Some(title) = self.head_will_move() else {
+            return false;
+        };
+        self.message = Some(format!(
+            "{key} acts on the checked-out branch, which '{title}' is about to change — press it again once that has run"
+        ));
+        true
+    }
+
+    /// Refuse `gg` while a job is running: lazygit takes the terminal and the
+    /// repo, and a git command racing it is exactly what the queue avoids. A
+    /// *held* queue is fine — that is when lazygit is most needed. Returns
+    /// true when the caller should stop.
     fn busy(&mut self) -> bool {
         if self.job.is_some() {
-            self.message = Some("a git command is already running".to_string());
+            self.message = Some(format!(
+                "'{}' is still running — gg once it finishes",
+                self.job_title
+            ));
             return true;
         }
+        false
+    }
+
+    /// Whether a quit key should actually quit. With commands queued, the
+    /// first press only warns, since quitting drops them.
+    fn confirm_quit(&mut self, armed: bool) -> bool {
+        if self.queue.is_empty() || armed {
+            return true;
+        }
+        self.quit_armed = true;
+        let n = self.queue.len();
+        self.message = Some(format!(
+            "{n} queued command{} will be dropped — press it again to quit",
+            if n == 1 { "" } else { "s" }
+        ));
         false
     }
 
     /// Handle a keypress while browsing. Returns `Ok(true)` to quit.
     fn handle_browsing(&mut self, terminal: &mut super::Tui, code: KeyCode) -> Result<bool> {
         self.message = None;
+        let quit_armed = std::mem::take(&mut self.quit_armed);
+
+        // Maximized, the table sits hidden behind the panel: `j`/`k` and the
+        // page keys scroll it instead of moving a selection nobody can see,
+        // and everything else beyond `z`/`esc`/`q` is swallowed rather than
+        // falling through to a table-nav binding that would act blind.
+        if self.panel_maximized {
+            match code {
+                KeyCode::Char('z') => self.toggle_maximize(),
+                // Restores first; a second `esc` (now un-maximized) closes
+                // the panel via the ordinary arm below.
+                KeyCode::Esc => self.panel_maximized = false,
+                KeyCode::Char('j') | KeyCode::Down => self.scroll_panel(PanelScroll::Down),
+                KeyCode::Char('k') | KeyCode::Up => self.scroll_panel(PanelScroll::Up),
+                KeyCode::PageUp => self.scroll_panel(PanelScroll::Up),
+                KeyCode::PageDown => self.scroll_panel(PanelScroll::Down),
+                KeyCode::End => self.scroll_panel(PanelScroll::End),
+                KeyCode::Char('q') => return Ok(true),
+                _ => {}
+            }
+            return Ok(false);
+        }
 
         // `gg` opens lazygit. `g` alone does nothing, so a pending `g` needs no
         // timeout: any other key clears it and is then handled normally.
@@ -1696,14 +2537,14 @@ impl StatusApp {
         }
 
         match code {
-            KeyCode::Char('q') => return Ok(true),
+            KeyCode::Char('q') => return Ok(self.confirm_quit(quit_armed)),
             // `esc` dismisses the output panel when one is up, and only quits
             // when there is nothing left to dismiss.
             KeyCode::Esc => {
                 if self.panel.is_some() && self.job.is_none() {
                     self.panel = None;
                 } else if self.panel.is_none() {
-                    return Ok(true);
+                    return Ok(self.confirm_quit(quit_armed));
                 }
             }
             KeyCode::Down | KeyCode::Char('j') => self.select_next(),
@@ -1712,38 +2553,54 @@ impl StatusApp {
             KeyCode::PageUp => self.scroll_panel(PanelScroll::Up),
             KeyCode::PageDown => self.scroll_panel(PanelScroll::Down),
             KeyCode::End => self.scroll_panel(PanelScroll::End),
+            KeyCode::Char('z') => self.toggle_maximize(),
+            KeyCode::Char(':') => {
+                if self.busy() {
+                    return Ok(false);
+                }
+                self.mode = Mode::Command {
+                    query: String::new(),
+                    input: String::new(),
+                    cursor: 0,
+                };
+            }
             KeyCode::Char('r') => {
                 self.reload()?;
                 self.message = Some("refreshed".to_string());
             }
             KeyCode::Char('c') => {
-                if self.busy() {
-                    return Ok(false);
-                }
                 self.mode = Mode::CreateInput {
                     slug: String::new(),
+                    kind: CreateKind::Roll,
                 }
             }
-            KeyCode::Char(' ') => {
-                if self.busy() {
-                    return Ok(false);
-                }
-                match self.selected_row() {
-                    Some(RowKind::Roll(i)) => {
-                        let roll = self.rolls[i].clone();
-                        self.execute_switch(roll.branch, roll.location);
-                    }
-                    Some(RowKind::Base(i)) => {
-                        let base = self.bases[i].clone();
-                        self.execute_switch(base.branch, base.location);
-                    }
-                    None => self.message = Some("no branch selected".to_string()),
+            KeyCode::Char('h') => {
+                self.mode = Mode::CreateInput {
+                    slug: String::new(),
+                    kind: CreateKind::Hotfix,
                 }
             }
+            KeyCode::Char('H') => self.request_land_hotfix(),
+            KeyCode::Char(' ') => match self.selected_row() {
+                Some(RowKind::Roll(i)) => {
+                    let roll = self.rolls[i].clone();
+                    self.execute_switch(roll.branch, roll.location);
+                }
+                Some(RowKind::Base(i)) => {
+                    let base = self.bases[i].clone();
+                    self.execute_switch(base.branch, base.location);
+                }
+                Some(RowKind::Hotfix(i)) => {
+                    let hotfix = self.hotfixes[i].clone();
+                    self.execute_switch(hotfix.branch, hotfix.location);
+                }
+                None => self.message = Some("no branch selected".to_string()),
+            },
             KeyCode::Char('p') => self.start_pull(),
             KeyCode::Char('P') => self.arm_push(),
             KeyCode::Char('f') => self.start_fetch(),
             KeyCode::Char('v') => self.start_verify(),
+            KeyCode::Char('V') => self.request_verify_many(),
             KeyCode::Char('G') => self.request(Action::Graduate),
             KeyCode::Char('i') => self.request_integrate(),
             KeyCode::Char('I') => self.request_integrate_rolling(),
@@ -1753,8 +2610,10 @@ impl StatusApp {
             KeyCode::Char('x') => self.request(Action::Prune),
             KeyCode::Char('t') => self.request(Action::Tidy),
             KeyCode::Char('d') => self.request_delete()?,
-            // No busy guard: the list changes nothing, and every binding it can
-            // run carries its own.
+            KeyCode::Char('s') => self.resume_queue(),
+            KeyCode::Char('S') => self.drop_queue(),
+            // No guard: the list changes nothing, and every binding it can run
+            // carries its own.
             KeyCode::Char('?') => {
                 self.mode = Mode::Help {
                     query: String::new(),
@@ -1765,6 +2624,13 @@ impl StatusApp {
                 if let Some(RowKind::Base(i)) = self.selected_row() {
                     // Base branches have no roll detail to drill into.
                     self.message = Some(format!("'{}' is a base branch", self.bases[i].branch));
+                } else if let Some(RowKind::Hotfix(i)) = self.selected_row() {
+                    // Nor do hotfixes: no dependencies, nothing to break out.
+                    self.message = Some(format!(
+                        "'{}' is a hotfix branch — {}",
+                        self.hotfixes[i].branch,
+                        self.hotfixes[i].state.label()
+                    ));
                 } else if let Some(roll) = self.selected_roll() {
                     let roll = roll.clone();
                     // Capture the branch's divergence from origin for the overlay
@@ -1774,7 +2640,12 @@ impl StatusApp {
                     } else {
                         None
                     };
-                    self.mode = Mode::Detail { roll, ahead_behind };
+                    self.mode = Mode::Detail {
+                        roll,
+                        ahead_behind,
+                        cursor: 0,
+                        trail: Vec::new(),
+                    };
                 }
             }
             _ => {}
@@ -1782,11 +2653,51 @@ impl StatusApp {
         Ok(false)
     }
 
-    /// Handle a keypress while the read-only detail overlay is open. Only close
-    /// keys apply; everything else is ignored so action keys can't fire here.
+    /// Handle a keypress while the read-only detail overlay is open: walk,
+    /// open and retrace linked rolls (see [`detail_key`]). Action keys are
+    /// ignored, so nothing can fire from here.
     fn handle_detail(&mut self, code: KeyCode) {
-        if matches!(code, KeyCode::Char('q') | KeyCode::Esc) {
-            self.mode = Mode::Browsing;
+        let Mode::Detail {
+            roll,
+            ahead_behind,
+            cursor,
+            trail,
+        } = &mut self.mode
+        else {
+            return;
+        };
+        let targets = detail_targets(roll, &self.rolls);
+        match detail_key(code, cursor, targets.len(), !trail.is_empty()) {
+            DetailOutcome::Continue => {}
+            DetailOutcome::Close => self.mode = Mode::Browsing,
+            DetailOutcome::Back => {
+                if let Some((previous, divergence)) = trail.pop() {
+                    *roll = previous;
+                    *ahead_behind = divergence;
+                    *cursor = 0;
+                }
+            }
+            DetailOutcome::Open(index) => {
+                // Drill into the linked roll: the one under the cursor becomes
+                // the pane, and the current one joins the trail so backspace
+                // can return to it. Divergence is read the way `[enter]` from
+                // the table reads it, at open time, for a both-location roll.
+                let Some(next) = targets
+                    .get(index)
+                    .and_then(|n| self.rolls.iter().find(|r| r.number == *n))
+                    .cloned()
+                else {
+                    return;
+                };
+                let divergence = if matches!(next.location, BranchLocation::Both) {
+                    git::ahead_behind(&self.config.repo_root, &next.branch).ok()
+                } else {
+                    None
+                };
+                trail.push((std::mem::replace(roll, next), *ahead_behind));
+                *ahead_behind = divergence;
+                *cursor = 0;
+            }
         }
     }
 
@@ -1794,7 +2705,7 @@ impl StatusApp {
     /// cancel back to browsing, or submit. Submitting an empty buffer surfaces a
     /// message instead of invoking `ops::create`.
     fn handle_create_input(&mut self, code: KeyCode) {
-        let outcome = if let Mode::CreateInput { slug } = &mut self.mode {
+        let outcome = if let Mode::CreateInput { slug, .. } = &mut self.mode {
             handle_create_key(slug, code)
         } else {
             return;
@@ -1803,12 +2714,12 @@ impl StatusApp {
             InputOutcome::Continue => {}
             InputOutcome::Cancel => self.mode = Mode::Browsing,
             InputOutcome::Submit => {
-                let slug = match std::mem::replace(&mut self.mode, Mode::Browsing) {
-                    Mode::CreateInput { slug } => slug,
-                    _ => String::new(),
+                let (slug, kind) = match std::mem::replace(&mut self.mode, Mode::Browsing) {
+                    Mode::CreateInput { slug, kind } => (slug, kind),
+                    _ => (String::new(), CreateKind::Roll),
                 };
                 if is_submittable_slug(&slug) {
-                    self.execute_create(slug);
+                    self.execute_create(slug, kind);
                 } else {
                     self.message = Some("slug cannot be empty".to_string());
                 }
@@ -1874,15 +2785,133 @@ impl StatusApp {
         }
     }
 
+    /// Dispatch one keystroke to the `:` prompt. Unlike every other mode's
+    /// handler this takes the whole `KeyEvent` rather than just its `code` —
+    /// `alt+enter` has to be told apart from a plain `enter`, which needs the
+    /// modifiers.
+    fn handle_command(&mut self, terminal: &mut super::Tui, key: KeyEvent) -> Result<()> {
+        // Cloned rather than borrowed: `handle_command_key` needs it alongside
+        // a mutable borrow of `self.mode` for `input`/`cursor`, and the history
+        // list is short enough that cloning it once per keystroke is cheaper
+        // than fighting the borrow checker over two fields of `self`.
+        let history = self.command_history.clone();
+        let alt = key
+            .modifiers
+            .intersects(KeyModifiers::ALT | KeyModifiers::SHIFT);
+        let outcome = {
+            let Mode::Command {
+                query,
+                input,
+                cursor,
+            } = &mut self.mode
+            else {
+                return Ok(());
+            };
+            handle_command_key(query, input, cursor, &history, key.code, alt)
+        };
+        match outcome {
+            CommandOutcome::Continue => Ok(()),
+            CommandOutcome::Close => {
+                self.mode = Mode::Browsing;
+                Ok(())
+            }
+            CommandOutcome::Run => {
+                let input = self.take_command_input();
+                self.execute_command(input);
+                Ok(())
+            }
+            CommandOutcome::RunInShell => {
+                let input = self.take_command_input();
+                self.run_command_in_shell(terminal, input)
+            }
+        }
+    }
+
+    /// Close the `:` prompt and hand back the text it held, or an empty string
+    /// if the mode has already moved on (defensive; the two callers only ever
+    /// reach this from inside `Mode::Command`).
+    fn take_command_input(&mut self) -> String {
+        match std::mem::replace(&mut self.mode, Mode::Browsing) {
+            Mode::Command { input, .. } => input,
+            other => {
+                self.mode = other;
+                String::new()
+            }
+        }
+    }
+
+    /// `enter` in the `:` prompt: run `input` as a background job, the same
+    /// path every other mutating action uses — its output streams into the
+    /// floating panel while the table stays navigable.
+    fn execute_command(&mut self, input: String) {
+        history::record(&mut self.command_history, &input);
+        // Best-effort: a command the user just ran is worth more than a
+        // history write that failed because, say, `$HOME` is unset.
+        let _ = history::save(&self.command_history);
+        let shell = std::env::var("SHELL").unwrap_or_else(|_| "sh".to_string());
+        let title = input.clone();
+        self.start_job(title, move || {
+            let status = proc::run(&mut shell_command(&shell, &input))?;
+            Ok(JobDone::lines(if status.success() {
+                Vec::new()
+            } else {
+                vec![format!("exited with {status}")]
+            }))
+        });
+    }
+
+    /// `alt+enter` (or `shift+enter`, where the terminal reports it
+    /// distinguishably) in the `:` prompt: suspend the terminal and run
+    /// `input` with inherited stdio, the same shape [`Self::launch_lazygit`]
+    /// uses — a shell command may be interactive (an editor, a pager, a
+    /// prompt of its own) in a way a piped job never could be.
+    fn run_command_in_shell(&mut self, terminal: &mut super::Tui, input: String) -> Result<()> {
+        if self.busy() {
+            return Ok(());
+        }
+        history::record(&mut self.command_history, &input);
+        let _ = history::save(&self.command_history);
+        let shell = std::env::var("SHELL").unwrap_or_else(|_| "sh".to_string());
+
+        super::suspend(terminal)?;
+        let spawned = shell_command(&shell, &input).status();
+        if spawned.is_ok() {
+            // Unlike lazygit's own full-screen takeover, a one-shot shell
+            // command returns the instant it exits — without this pause,
+            // `resume`'s `terminal.clear()` would wipe output nobody had a
+            // chance to read.
+            println!("\npress enter to return to rf...");
+            let mut discard = String::new();
+            let _ = std::io::stdin().read_line(&mut discard);
+        }
+        super::resume(terminal)?;
+
+        match spawned {
+            Ok(status) if status.success() => self.message = None,
+            Ok(status) => self.message = Some(format!("'{input}' exited with {status}")),
+            Err(err) => {
+                let mut panel = output::Panel::new(input.clone());
+                panel.fail(vec![format!("could not run '{input}': {err}")]);
+                self.panel = Some(panel);
+            }
+        }
+        self.reload()
+    }
+
     /// Total number of table rows: the pinned base branches plus the rolls.
     fn row_count(&self) -> usize {
-        self.bases.len() + self.rolls.len()
+        self.bases.len() + self.rolls.len() + self.hotfixes.len()
     }
 
     /// Which row the cursor is on, or `None` when the table is empty.
     fn selected_row(&self) -> Option<RowKind> {
         let index = self.table.selected()?;
-        row_at(index, self.bases.len(), self.rolls.len())
+        row_at(
+            index,
+            self.bases.len(),
+            self.rolls.len(),
+            self.hotfixes.len(),
+        )
     }
 
     /// The selected roll, or `None` when the cursor is on a base-branch row —
@@ -1890,17 +2919,18 @@ impl StatusApp {
     fn selected_roll(&self) -> Option<&RollInfo> {
         match self.selected_row()? {
             RowKind::Roll(i) => self.rolls.get(i),
-            RowKind::Base(_) => None,
+            RowKind::Base(_) | RowKind::Hotfix(_) => None,
         }
     }
 
     /// Validate an action and either open the confirm modal or set a message.
     fn request(&mut self, action: Action) {
         let selected = self.selected_roll();
-        let validation = validate_action(
+        let validation = validate_with_hotfixes(
             action,
             selected,
             &self.rolls,
+            &self.hotfixes,
             &self.current_branch,
             &self.config.roll_prefix,
         );
@@ -1916,7 +2946,7 @@ impl StatusApp {
             _ => None,
         };
         let carried = match (action, &target) {
-            (Action::Promote, Some(roll)) => carried_by_promoting(&self.config, roll),
+            (Action::Promote, Some(roll)) => carried_by_promoting(&self.config, &self.rolls, roll),
             _ => Vec::new(),
         };
         match validation {
@@ -1941,13 +2971,20 @@ impl StatusApp {
     /// `rolling` are selectable, but merging them into a roll is a different
     /// operation with its own key.
     fn request_integrate(&mut self) {
-        if self.busy() {
+        if self.waits_on_head("[i]") {
             return;
         }
         if let Some(RowKind::Base(i)) = self.selected_row() {
             self.message = Some(format!(
                 "'{}' is a base branch — [u]pdate brings stable into your rolls",
                 self.bases[i].branch
+            ));
+            return;
+        }
+        if let Some(RowKind::Hotfix(i)) = self.selected_row() {
+            self.message = Some(format!(
+                "'{}' is a hotfix — it lands on stable, not into a roll",
+                self.hotfixes[i].branch
             ));
             return;
         }
@@ -1972,7 +3009,7 @@ impl StatusApp {
     /// Needs no selection, unlike `[i]`: the source is always rolling, which
     /// isn't a roll row to point the cursor at.
     fn request_integrate_rolling(&mut self) {
-        if self.busy() {
+        if self.waits_on_head("[I]") {
             return;
         }
         match integrate_rolling_target_for(
@@ -1996,13 +3033,74 @@ impl StatusApp {
     /// Always the current branch, never the row under the cursor: a bump is a
     /// commit, and it has to land where the merge that needs it will be made from.
     fn request_bump(&mut self) {
-        if self.busy() {
+        if self.waits_on_head("[b]") {
             return;
         }
         match bump_gate(self.version) {
             Ok(current) => self.mode = Mode::Bump { current },
             Err(msg) => self.message = Some(msg),
         }
+    }
+
+    /// `[V]` — open the verify-many picker, or say why it cannot run.
+    ///
+    /// The clean-tree check happens here as well as inside `ops::verify_many`,
+    /// so the refusal is a status-bar message before the modal opens rather
+    /// than a failed job after the user has already chosen a set.
+    fn request_verify_many(&mut self) {
+        if self.busy() {
+            return;
+        }
+        if let Err(err) = ops::ensure_clean_state(&self.config) {
+            self.message = Some(format!("{err} — verifying many rolls switches branches"));
+            return;
+        }
+        self.mode = Mode::VerifyMany {
+            counts: verify_set_counts(&self.rolls),
+        };
+    }
+
+    /// Handle a keypress while the verify-many picker is open.
+    fn handle_verify_many(&mut self, code: KeyCode) {
+        match verify_many_key(code) {
+            VerifyManyOutcome::Ignore => {}
+            VerifyManyOutcome::Cancel => self.mode = Mode::Browsing,
+            VerifyManyOutcome::Set(set) => {
+                self.mode = Mode::Browsing;
+                self.execute_verify_many(set);
+            }
+        }
+    }
+
+    /// Verify every roll in `set`, as one job. Sequential and in one panel: a
+    /// pass that switches branches under the table must not race another job,
+    /// and the roll-by-roll log reads best as a single scroll.
+    fn execute_verify_many(&mut self, set: VerifySet) {
+        let selected = set.select(&self.rolls);
+        if selected.is_empty() {
+            self.message = Some(format!("no rolls to verify ({})", set.label()));
+            return;
+        }
+        let config = self.config.clone();
+        let n = selected.len();
+        self.start_job(
+            format!("rf verify --all ({}, {n})", set.label()),
+            move || {
+                let results = ops::verify_many(&config, &selected)?;
+                let (lines, failed) = render_verify_many(&results);
+                if failed.is_empty() {
+                    Ok(JobDone::lines(lines))
+                } else {
+                    // Folded into the error so a failed panel still carries the
+                    // per-roll report rather than only the names.
+                    Err(anyhow!(
+                        "{}\nverification failed for: {}",
+                        lines.join("\n"),
+                        failed.join(", ")
+                    ))
+                }
+            },
+        );
     }
 
     /// Handle a keypress while the bump picker is open.
@@ -2034,13 +3132,26 @@ impl StatusApp {
     }
 
     fn request_delete(&mut self) -> Result<()> {
-        let Some(roll) = self.selected_roll() else {
-            self.message = Some("no roll selected".to_string());
-            return Ok(());
+        // Rolls and hotfixes alike: `delete_branch_plan` takes any branch that
+        // is not stable or rolling, and the safety rules downstream are the
+        // same. Only a base row is refused, and `selected_roll` already treats
+        // it as no selection.
+        let (branch, location, is_current) = match self.selected_row() {
+            Some(RowKind::Roll(i)) => {
+                let r = &self.rolls[i];
+                (r.branch.clone(), r.location.clone(), r.is_current)
+            }
+            Some(RowKind::Hotfix(i)) => {
+                let h = &self.hotfixes[i];
+                (h.branch.clone(), h.location.clone(), h.is_current)
+            }
+            _ => {
+                self.message = Some("no roll or hotfix selected".to_string());
+                return Ok(());
+            }
         };
-        let roll = roll.clone();
 
-        let prompt = match delete_prompt(&roll) {
+        let prompt = match delete_prompt(&branch, &location, is_current) {
             Ok(prompt) => prompt,
             Err(msg) => {
                 self.message = Some(msg);
@@ -2048,17 +3159,15 @@ impl StatusApp {
             }
         };
 
-        let (local_unmerged, remote_unmerged) =
-            ops::unmerged_commit_counts(&self.config, &roll.branch);
+        let (local_unmerged, remote_unmerged) = ops::unmerged_commit_counts(&self.config, &branch);
 
         self.mode = Mode::Delete {
             preview: DeletePreview {
-                branch: roll.branch,
+                branch,
                 prompt,
                 local_unmerged,
                 remote_unmerged,
-                local_is_checked_out: roll.is_current
-                    && matches!(roll.location, BranchLocation::Both),
+                local_is_checked_out: is_current && matches!(location, BranchLocation::Both),
             },
         };
         Ok(())
@@ -2144,15 +3253,43 @@ impl StatusApp {
     /// Create a roll from `slug`, selecting it once the reload turns it up. An
     /// `ops::create` error (e.g. an invalid slug) lands in the panel like any
     /// other failure and never aborts the TUI.
-    fn execute_create(&mut self, slug: String) {
+    fn execute_create(&mut self, slug: String, kind: CreateKind) {
         let config = self.config.clone();
-        self.start_job("rf create", move || {
-            let outcome = ops::create(&config, &slug, None, false)?;
+        let title = match kind {
+            CreateKind::Roll => "rf create",
+            CreateKind::Hotfix => "rf hotfix",
+        };
+        self.start_head_job(title, move || {
+            let outcome = match kind {
+                CreateKind::Roll => ops::create(&config, &slug, None, false)?,
+                CreateKind::Hotfix => ops::hotfix_create(&config, &slug, None, false)?,
+            };
             Ok(JobDone::with_next(
                 vec![format!("Created {}", outcome.branch)],
                 Followup::SelectBranch(outcome.branch),
             ))
         });
+    }
+
+    /// `[H]` — land the checked-out hotfix. The cursor is consulted only to
+    /// explain a refusal: a hotfix row that is not checked out gets told how to
+    /// become so, since `ops::hotfix_land` can only merge from HEAD.
+    fn request_land_hotfix(&mut self) {
+        if let Some(RowKind::Hotfix(i)) = self.selected_row() {
+            let hotfix = &self.hotfixes[i];
+            if !hotfix.is_current {
+                self.message = Some(format!(
+                    "[space] onto '{}' first — landing merges from the checked-out branch",
+                    hotfix.branch
+                ));
+                return;
+            }
+            if hotfix.state == HotfixState::Landed {
+                self.message = Some(format!("'{}' is already landed", hotfix.branch));
+                return;
+            }
+        }
+        self.request(Action::LandHotfix);
     }
 
     /// Switch the working tree to `branch` (issue #99). Git natively carries
@@ -2161,8 +3298,11 @@ impl StatusApp {
     /// Serves both roll rows and the pinned base-branch rows.
     fn execute_switch(&mut self, branch: String, location: BranchLocation) {
         let config = self.config.clone();
-        let current = self.current_branch.clone();
-        self.start_job(format!("git switch {branch}"), move || {
+        self.start_head_job(format!("git switch {branch}"), move || {
+            // Read HEAD when the switch runs, not when it was queued: a switch
+            // queued behind another one would otherwise compare against a
+            // branch that is no longer checked out.
+            let current = git::current_branch(&config.repo_root)?;
             Ok(JobDone::lines(run_switch(
                 &config, &current, &branch, &location,
             )?))
@@ -2187,6 +3327,10 @@ impl StatusApp {
         let (branch, location) = match self.selected_row()? {
             RowKind::Roll(i) => (self.rolls[i].branch.clone(), self.rolls[i].location.clone()),
             RowKind::Base(i) => (self.bases[i].branch.clone(), self.bases[i].location.clone()),
+            RowKind::Hotfix(i) => (
+                self.hotfixes[i].branch.clone(),
+                self.hotfixes[i].location.clone(),
+            ),
         };
         Some(SyncTarget::resolve(
             &branch,
@@ -2199,7 +3343,7 @@ impl StatusApp {
     /// `[p]` — pull the selected branch. What that means depends on whether it is
     /// checked out; see [`sync::pull_plan`].
     fn start_pull(&mut self) {
-        if self.busy() {
+        if self.waits_on_head("[p]") {
             return;
         }
         let Some(target) = self.sync_target() else {
@@ -2228,7 +3372,7 @@ impl StatusApp {
     /// goes straight to the confirmation, which is what lazygit does: there is no
     /// point spending a round-trip to be told what the tracking ref already says.
     fn start_push(&mut self) {
-        if self.busy() {
+        if self.waits_on_head("[P]") {
             return;
         }
         let Some(target) = self.sync_target() else {
@@ -2249,21 +3393,22 @@ impl StatusApp {
             self.mode = Mode::ForcePush {
                 branch: target.branch.clone(),
                 remote: target.remote.clone(),
+                rejected: false,
             };
             return;
         }
-        self.push_job(target, false);
+        self.push_job(target, false, false);
     }
 
     /// `[P]` — arm the push chord. The push itself does not start until the
     /// chord resolves, in [`Self::handle_browsing`] or
     /// [`Self::resolve_lapsed_push`].
     ///
-    /// The busy check happens here rather than only at the far end so that a `P`
-    /// during a running job is refused the instant it is pressed, as every other
-    /// mutating key is, instead of after the window.
+    /// The HEAD check happens here as well as at the far end so that a `P`
+    /// that cannot run is refused the instant it is pressed, instead of after
+    /// the window.
     fn arm_push(&mut self) {
-        if self.busy() {
+        if self.waits_on_head("[P]") {
             return;
         }
         self.pending_push = Some(Instant::now());
@@ -2289,7 +3434,7 @@ impl StatusApp {
     /// Nothing is pushed here. The plan is resolved from the tracking data the
     /// view already loaded, so the modal states exactly what the job will do.
     fn start_push_all(&mut self) {
-        if self.busy() {
+        if self.waits_on_head("PP") {
             return;
         }
         let rows: Vec<(String, BranchLocation)> = self
@@ -2300,6 +3445,13 @@ impl StatusApp {
                 self.rolls
                     .iter()
                     .map(|r| (r.branch.clone(), r.location.clone())),
+            )
+            // Hotfix rows are rows too: `[P]` pushes one unchanged, so `PP`
+            // covers them under the same ahead-or-unpublished rule.
+            .chain(
+                self.hotfixes
+                    .iter()
+                    .map(|h| (h.branch.clone(), h.location.clone())),
             )
             .collect();
         let plan = plan_push_all(&rows, &self.current_branch, &self.tracking);
@@ -2371,40 +3523,40 @@ impl StatusApp {
     /// Run one push attempt. On a non-fast-forward refusal the job finishes
     /// *successfully* carrying a [`Followup::OfferForcePush`] — the refusal is an
     /// expected answer to be acted on, not an error to report and stop at.
-    fn push_job(&mut self, target: SyncTarget, force: bool) {
+    ///
+    /// `answers_hold` marks the forced retry of a push whose rejection held the
+    /// queue: it jumps ahead of the commands that were waiting on that push and
+    /// releases them.
+    fn push_job(&mut self, target: SyncTarget, force: bool, answers_hold: bool) {
         let repo = self.config.repo_root.clone();
         let title = if force {
             format!("git push --force-with-lease {}", target.branch)
         } else {
             format!("git push {}", target.branch)
         };
-        self.start_job(title, move || {
-            match sync::run_push(&repo, &target, force).map_err(sync_error)? {
-                PushOutcome::Pushed => Ok(JobDone::lines(vec![format!(
-                    "Pushed '{}' to {}",
+        let body = move || match sync::run_push(&repo, &target, force).map_err(sync_error)? {
+            PushOutcome::Pushed => Ok(JobDone::lines(vec![format!(
+                "Pushed '{}' to {}",
+                target.branch, target.remote
+            )])),
+            PushOutcome::Rejected { .. } => Ok(JobDone::with_next(
+                vec![format!(
+                    "'{}' was rejected by {}",
                     target.branch, target.remote
-                )])),
-                PushOutcome::Rejected { .. } => Ok(JobDone::with_next(
-                    vec![format!(
-                        "'{}' was rejected by {}",
-                        target.branch, target.remote
-                    )],
-                    Followup::OfferForcePush {
-                        branch: target.branch.clone(),
-                        remote: target.remote.clone(),
-                    },
-                )),
-            }
-        });
+                )],
+                Followup::OfferForcePush {
+                    branch: target.branch.clone(),
+                    remote: target.remote.clone(),
+                },
+            )),
+        };
+        self.submit(Pending::new(title, false, Box::new(body)), answers_hold);
     }
 
     /// `[f]` — refresh every remote-tracking ref and drop the ones whose upstream
     /// is gone, so the sync column and every containment check that follows are
     /// judged against current data.
     fn start_fetch(&mut self) {
-        if self.busy() {
-            return;
-        }
         let repo = self.config.repo_root.clone();
         self.start_job("git fetch --prune", move || {
             sync::run_fetch(&repo, "origin").map_err(sync_error)?;
@@ -2422,7 +3574,7 @@ impl StatusApp {
     /// repo with `cargo test` gates that is the difference between a title the
     /// user can trust and several silent minutes.
     fn start_verify(&mut self) {
-        if self.busy() {
+        if self.waits_on_head("[v]") {
             return;
         }
         let Some((source, target)) = verify_route_for(&self.config, &self.current_branch) else {
@@ -2477,6 +3629,22 @@ impl StatusApp {
         self.reload()
     }
 
+    /// Route a mouse event to the output panel. A no-op with no panel up —
+    /// there is nothing else on this view a click or scroll drives.
+    fn handle_mouse(&mut self, mouse: MouseEvent) {
+        let Some(rect) = self.panel_rect else {
+            return;
+        };
+        match mouse.kind {
+            MouseEventKind::Down(MouseButton::Left) => {
+                self.panel_maximized = click_maximizes(mouse.column, mouse.row, rect);
+            }
+            MouseEventKind::ScrollUp => self.scroll_panel(PanelScroll::Up),
+            MouseEventKind::ScrollDown => self.scroll_panel(PanelScroll::Down),
+            _ => {}
+        }
+    }
+
     /// Move the output panel's scrollback, if one is up.
     fn scroll_panel(&mut self, how: PanelScroll) {
         let Some(panel) = self.panel.as_mut() else {
@@ -2495,8 +3663,9 @@ impl StatusApp {
             ForcePushOutcome::Ignore => {}
             ForcePushOutcome::Cancel => self.mode = Mode::Browsing,
             ForcePushOutcome::Force => {
-                let Mode::ForcePush { branch, .. } =
-                    std::mem::replace(&mut self.mode, Mode::Browsing)
+                let Mode::ForcePush {
+                    branch, rejected, ..
+                } = std::mem::replace(&mut self.mode, Mode::Browsing)
                 else {
                     return;
                 };
@@ -2510,7 +3679,7 @@ impl StatusApp {
                     location,
                     self.tracking.get(&branch),
                 );
-                self.push_job(target, true);
+                self.push_job(target, true, rejected);
             }
         }
     }
@@ -2620,8 +3789,9 @@ impl StatusApp {
             git::ref_exists(&self.config.repo_root, refspec)
         });
         self.rolls = branches::list_rolls(&self.config)?;
+        self.hotfixes = branches::list_hotfixes(&self.config).unwrap_or_default();
         self.tracking = load_tracking(&self.config);
-        self.versions = load_versions(&self.config, &self.bases, &self.rolls);
+        self.versions = load_versions(&self.config, &self.bases, &self.rolls, &self.hotfixes);
         // Read from the worktree, so a bump — or a branch switch that changes it —
         // shows in the header straight away.
         self.version = version::read_version(&self.config.repo_root).unwrap_or(None);
@@ -2651,10 +3821,17 @@ impl StatusApp {
         self.render_status_bar(f, chunks[2]);
 
         // Over the table, never over the hints: the panel is passed the table's
-        // area so the keymap stays readable while a job runs.
-        if let Some(panel) = &self.panel {
-            output::render(f, chunks[1], panel);
-        }
+        // area so the keymap stays readable while a job runs. Maximized, it
+        // still only grows into this area, never over the header/status bar.
+        self.panel_rect = self.panel.as_ref().map(|panel| {
+            output::render(
+                f,
+                chunks[1],
+                panel,
+                self.panel_maximized,
+                panel_footer(&self.queue),
+            )
+        });
 
         match &self.mode {
             Mode::Confirm {
@@ -2671,17 +3848,27 @@ impl StatusApp {
                         target: target.as_deref(),
                         carried,
                         rolls: &self.rolls,
+                        hotfixes: &self.hotfixes,
                         current_branch: &self.current_branch,
                     },
                 );
             }
-            Mode::Detail { roll, ahead_behind } => {
-                render_detail(f, area, roll, *ahead_behind, &self.rolls)
+            Mode::Detail {
+                roll,
+                ahead_behind,
+                cursor,
+                trail,
+            } => {
+                let path: Vec<u32> = trail.iter().map(|(r, _)| r.number).collect();
+                render_detail(f, area, roll, *ahead_behind, &self.rolls, *cursor, &path)
             }
-            Mode::CreateInput { slug } => render_create_input(f, area, &self.config, slug),
+            Mode::CreateInput { slug, kind } => {
+                render_create_input(f, area, &self.config, slug, *kind)
+            }
             Mode::Delete { preview } => render_delete_modal(f, area, &self.config, preview),
             Mode::Bump { current } => render_bump_modal(f, area, *current, &self.current_branch),
-            Mode::ForcePush { branch, remote } => {
+            Mode::VerifyMany { counts } => render_verify_many_modal(f, area, counts),
+            Mode::ForcePush { branch, remote, .. } => {
                 render_force_push_modal(f, area, branch, remote, self.tracking.get(branch))
             }
             Mode::Conflict {
@@ -2692,6 +3879,11 @@ impl StatusApp {
             } => render_conflict_modal(f, area, source, target, culprits, *can_integrate),
             Mode::PushAll { plan } => render_push_all_modal(f, area, plan),
             Mode::Help { query, cursor } => render_help(f, area, query, *cursor),
+            Mode::Command {
+                query,
+                input,
+                cursor,
+            } => render_command(f, area, query, input, *cursor, &self.command_history),
             Mode::Browsing => {}
         }
     }
@@ -2711,19 +3903,34 @@ impl StatusApp {
                 Style::default().fg(Color::Green),
             ),
         ];
+        let repo_name = self
+            .config
+            .repo_root
+            .file_name()
+            .map(|n| n.to_string_lossy().into_owned())
+            .unwrap_or_else(|| self.config.repo_root.display().to_string());
         // The corner names the binary that is running, not the checked-out
         // branch's manifest. The two used to be conflated, and the corner would
         // change on every `[space]` — in a repo that *is* roll-flow it read as
         // the roll's dev version, in any other repo as whatever that repo ships.
         // Neither is what "which rf is this" asks. The per-branch versions have
         // their own column; the bump modal shows the manifest it will raise.
-        let block = Block::bordered().title(" roll-flow ").title_top(
-            Line::from(Span::styled(
-                format!(" rf v{} ", env!("CARGO_PKG_VERSION")),
-                Style::default().fg(Color::Magenta),
-            ))
-            .right_aligned(),
-        );
+        let block = Block::bordered()
+            .title(
+                Line::from(Span::styled(
+                    format!(" {repo_name} @ {} ", current_hostname()),
+                    Style::default().fg(Color::Yellow),
+                ))
+                .left_aligned(),
+            )
+            .title(Line::from(" roll-flow ").centered())
+            .title_top(
+                Line::from(Span::styled(
+                    format!(" rf v{} ", env!("CARGO_PKG_VERSION")),
+                    Style::default().fg(Color::Magenta),
+                ))
+                .right_aligned(),
+            );
         f.render_widget(Paragraph::new(Line::from(spans)).block(block), area);
     }
 
@@ -2732,6 +3939,9 @@ impl StatusApp {
             // The current-branch chevron, narrow and always present so the
             // columns after it do not shift as HEAD moves.
             Constraint::Length(1),
+            // The graph column: two lane glyphs (main, rolling) plus a cell of
+            // breathing room. TUI-only — see graph_glyphs' doc comment.
+            Constraint::Length(3),
             Constraint::Length(4),
             Constraint::Fill(1),
             Constraint::Length(3),
@@ -2765,6 +3975,7 @@ impl StatusApp {
 
         let bold = Style::default().add_modifier(Modifier::BOLD);
         let mut header_cells = vec![
+            Cell::from(""),
             Cell::from(""),
             Cell::from("#").style(bold),
             Cell::from("branch").style(bold),
@@ -2807,6 +4018,7 @@ impl StatusApp {
                             .fg(Color::Green)
                             .add_modifier(Modifier::BOLD),
                     ),
+                    Cell::from(graph_cell(base_graph_glyphs(base.role))),
                     Cell::from(""),
                     Cell::from(base.branch.clone()).style(base_style.fg(base.role.color())),
                     Cell::from(base.location.symbol()).style(base_style),
@@ -2840,6 +4052,7 @@ impl StatusApp {
                         .fg(Color::Green)
                         .add_modifier(Modifier::BOLD),
                 ),
+                Cell::from(graph_cell(graph_glyphs(&roll.state))),
                 Cell::from(roll.number.to_string()).style(base_style),
                 Cell::from(roll.branch.clone()).style(base_style),
                 Cell::from(roll.location.symbol()).style(base_style),
@@ -2852,10 +4065,49 @@ impl StatusApp {
                 );
             }
             if show_deps {
-                cells.push(Cell::from(branches::format_roll_numbers(&roll.deps)));
+                cells.push(Cell::from(branches::format_deps(roll)));
                 cells.push(Cell::from(branches::format_roll_numbers(&roll.dependents)));
             }
             Row::new(cells)
+        }));
+        // Hotfixes last, numbered `h<N>` so their independent numbering is never
+        // read as a roll's. Same columns, so the sync keys work unchanged.
+        let first_hotfix = rows.len();
+        rows.extend(self.hotfixes.iter().enumerate().map(|(i, hotfix)| {
+            let base_style = if hotfix.is_current {
+                Style::default().add_modifier(Modifier::BOLD)
+            } else {
+                Style::default()
+            };
+            let (sync_text, sync_color) = sync_cell(track_of(tracking, &hotfix.branch));
+            let color = hotfix_color(hotfix.state);
+            let mut cells = vec![
+                Cell::from(current_marker(hotfix.is_current)).style(
+                    Style::default()
+                        .fg(Color::Green)
+                        .add_modifier(Modifier::BOLD),
+                ),
+                Cell::from(graph_cell(hotfix_graph_glyphs(hotfix.state))),
+                Cell::from(format!("h{}", hotfix.number)).style(base_style.fg(color)),
+                Cell::from(hotfix.branch.clone()).style(base_style.fg(color)),
+                Cell::from(hotfix.location.symbol()).style(base_style),
+                Cell::from(sync_text).style(Style::default().fg(sync_color)),
+                Cell::from(hotfix.state.label()).style(Style::default().fg(color)),
+            ];
+            if show_versions {
+                cells.push(
+                    Cell::from(version_cell(versions.get(&hotfix.branch).copied()))
+                        .style(base_style),
+                );
+            }
+            if show_deps {
+                cells.push(Cell::from(""));
+                cells.push(Cell::from(""));
+            }
+            // The first hotfix row keeps a blank line above it, which the rule
+            // below is drawn into: the tiers number independently, so they
+            // should not read as one list.
+            Row::new(cells).top_margin(u16::from(i == 0))
         }));
 
         let table = Table::new(rows, col_constraints)
@@ -2865,15 +4117,51 @@ impl StatusApp {
             .highlight_symbol("▶ ");
 
         f.render_stateful_widget(table, area, &mut self.table);
+
+        // Drawn over that margin rather than as a row of its own, so it is never
+        // selectable and every index `row_at` maps stays as it was. The table
+        // has scrolled by `offset` rows (all one line tall above the hotfixes);
+        // when the first hotfix is the top visible row there is nothing above
+        // it to separate from, and the margin is not drawn over.
+        if !self.hotfixes.is_empty() && first_hotfix > self.table.offset() {
+            // Top border and header, then one line per visible row above.
+            let y = area.y + 2 + (first_hotfix - self.table.offset()) as u16;
+            if y + 1 < area.bottom() {
+                let rule = Rect {
+                    x: area.x + 1,
+                    y,
+                    width: area.width.saturating_sub(2),
+                    height: 1,
+                };
+                f.render_widget(
+                    Paragraph::new("┄".repeat(rule.width as usize))
+                        .style(Style::default().fg(Color::DarkGray)),
+                    rule,
+                );
+            }
+        }
     }
 
     fn render_status_bar(&self, f: &mut Frame, area: Rect) {
-        let msg_line = match &self.message {
-            Some(m) => Line::from(Span::styled(
+        // A transient message wins; otherwise a non-empty queue keeps the line,
+        // so a held queue stays in view after its panel is dismissed.
+        let msg_line = match (&self.message, queue::summary(&self.queue)) {
+            (Some(m), _) => Line::from(Span::styled(
                 format!(" {m}"),
                 Style::default().fg(Color::Yellow),
             )),
-            None => Line::from(""),
+            (None, Some(summary)) => {
+                let color = if self.queue.held().is_some() {
+                    Color::Red
+                } else {
+                    Color::Cyan
+                };
+                Line::from(Span::styled(
+                    format!(" {summary}"),
+                    Style::default().fg(color),
+                ))
+            }
+            (None, None) => Line::from(""),
         };
         // One line, built from the keymap rather than written out. Four hand-kept
         // lines listing twenty bindings crowded the bottom of the screen and had
@@ -2884,6 +4172,18 @@ impl StatusApp {
             Paragraph::new(vec![msg_line, Line::from(basic_hints())]),
             area,
         );
+    }
+}
+
+/// The output panel's bottom hint while commands are queued, `None` to keep its
+/// default. A held queue names the keys that act on it, since the panel showing
+/// the failure is where the user is looking.
+fn panel_footer(queue: &Queue) -> Option<String> {
+    let n = queue.len();
+    match (n, queue.held()) {
+        (0, _) => None,
+        (_, Some(_)) => Some(format!("{n} held · [s] resume · [S] drop · [esc] close")),
+        (_, None) => Some(format!("+{n} queued")),
     }
 }
 
@@ -3047,18 +4347,28 @@ fn run_op(config: &Config, action: Action, target: Option<&str>) -> Result<Vec<S
         Action::Graduate => {
             let roll = target.ok_or_else(|| anyhow!("no roll selected"))?;
             ops::ensure_clean_state(config)?;
-            let o = ops::graduate(config, roll, false, &force, true)?;
-            push_gate_notices(&mut lines, &o.gate_notices);
-            if o.restored {
-                lines.push(format!(
-                    "Restored '{}' on '{}' (reverted the revert)",
-                    o.roll, o.rolling
-                ));
-            } else {
-                lines.push(format!("Graduated '{}' into '{}'", o.roll, o.rolling));
-            }
-            if let Some(line) = o.tag.describe() {
-                lines.push(line);
+            // The modal listed the chain, so this is the confirmation. Each
+            // step is the ordinary graduation with its own gate run; a failure
+            // partway names what landed and what did not.
+            let rolls = branches::list_rolls(config)?;
+            let chain = ops::dependency_chain(&rolls, roll, ops::ChainKind::Graduate)?;
+            let outcomes = ops::graduate_chain(config, &chain, false, &force, true, ops::graduate)?;
+            for (step, o) in chain.iter().zip(&outcomes) {
+                push_gate_notices(&mut lines, &o.gate_notices);
+                if o.restored {
+                    lines.push(format!(
+                        "Restored '{}' on '{}' (reverted the revert)",
+                        o.roll, o.rolling
+                    ));
+                } else {
+                    lines.push(format!("Graduated '{}' into '{}'", o.roll, o.rolling));
+                }
+                if !step.carries.is_empty() {
+                    lines.push(step.carried_line(&rolls, false));
+                }
+                if let Some(line) = o.tag.describe() {
+                    lines.push(line);
+                }
             }
         }
         Action::Integrate => {
@@ -3074,7 +4384,13 @@ fn run_op(config: &Config, action: Action, target: Option<&str>) -> Result<Vec<S
         Action::Promote => {
             ops::ensure_clean_state(config)?;
             let promote_target = match target {
-                Some(roll) => ops::PromoteTarget::Rolls(vec![roll.to_string()]),
+                // Graduated-but-unpromoted dependencies first, each its own
+                // step — the same expansion `rf promote --roll` performs.
+                Some(roll) => {
+                    let rolls = branches::list_rolls(config)?;
+                    let chain = ops::dependency_chain(&rolls, roll, ops::ChainKind::Promote)?;
+                    ops::PromoteTarget::Rolls(chain.into_iter().map(|s| s.branch).collect())
+                }
                 None => ops::PromoteTarget::Rolling,
             };
             // Tagging is on; the version gate hard-fails here rather than
@@ -3135,7 +4451,7 @@ fn run_op(config: &Config, action: Action, target: Option<&str>) -> Result<Vec<S
             // needs `rf prune --force` from the CLI, deliberately.
             let plan = ops::prune_plan(config, &ops::PruneScope::both())?;
             if plan.is_empty() {
-                lines.push("no promoted roll branches to prune".to_string());
+                lines.push("no promoted roll branches or landed hotfixes to prune".to_string());
                 push_prune_skips(&mut lines, &plan.skipped);
             } else {
                 let results = ops::prune_apply(config, &plan)?;
@@ -3150,12 +4466,22 @@ fn run_op(config: &Config, action: Action, target: Option<&str>) -> Result<Vec<S
             // three places allowed to delete a ref on origin.
             let plan = ops::tidy_plan(config, &ops::PruneScope::tidy(false), &TIDY_STATES)?;
             if plan.is_empty() {
-                lines.push("no local roll branches to tidy".to_string());
+                lines.push("no local roll branches or hotfixes to tidy".to_string());
                 push_prune_skips(&mut lines, &plan.skipped);
             } else {
                 let results = ops::prune_apply(config, &plan)?;
                 lines.extend(render_prune_outcome(&plan, &results));
             }
+        }
+        Action::LandHotfix => {
+            // The same op `rf hotfix --land` runs, gates and all; never dry,
+            // never forced — a hotfix that fails its gates is fixed on the
+            // branch, not pushed past them from a keypress.
+            ops::ensure_clean_state(config)?;
+            let o = ops::hotfix_land(config, false)?;
+            push_gate_notices(&mut lines, &o.gate_notices);
+            lines.push(format!("Landed '{}' into '{}'", o.current, o.stable));
+            lines.push(format!("Reintegrated '{}' into '{}'", o.stable, o.rolling));
         }
     }
     Ok(lines)
@@ -3204,20 +4530,22 @@ fn load_versions(
     config: &Config,
     bases: &[BaseBranch],
     rolls: &[RollInfo],
+    hotfixes: &[HotfixInfo],
 ) -> HashMap<String, Semver> {
-    let rows = bases
+    let rows: Vec<(&String, &BranchLocation)> = bases
         .iter()
         .map(|b| (&b.branch, &b.location))
-        .chain(rolls.iter().map(|r| (&r.branch, &r.location)));
+        .chain(rolls.iter().map(|r| (&r.branch, &r.location)))
+        .chain(hotfixes.iter().map(|h| (&h.branch, &h.location)))
+        .collect();
     let refs: Vec<String> = rows
+        .iter()
         .map(|(branch, location)| branches::content_ref(branch, location))
         .collect();
 
     let by_ref = version::versions_at(&config.repo_root, &refs);
-    bases
-        .iter()
-        .map(|b| &b.branch)
-        .chain(rolls.iter().map(|r| &r.branch))
+    rows.iter()
+        .map(|(branch, _)| *branch)
         .zip(refs.iter())
         .filter_map(|(branch, refspec)| Some((branch.clone(), *by_ref.get(refspec)?)))
         .collect()
@@ -3249,6 +4577,94 @@ fn track_of(tracking: &HashMap<String, git::LocalBranch>, branch: &str) -> Optio
 /// Render the version-bump picker.
 ///
 /// Every level shows the version it would produce, not just its name: "minor" is
+/// Render a verify-many pass as printable lines, plus the branches that failed.
+///
+/// Mirrors `run_verify`'s vocabulary roll by roll, then a summary line, so a
+/// six-roll pass reads like six `[v]` results stacked — and never offers a
+/// bump, which is a commit on one branch where this pass walks many.
+fn render_verify_many(results: &[ops::VerifyManyResult]) -> (Vec<String>, Vec<String>) {
+    let mut lines = Vec::new();
+    let mut failed = Vec::new();
+    let mut passed = 0;
+    let mut skipped = 0;
+    for result in results {
+        lines.push(format!("── {} ──", result.branch));
+        if let Some(dev) = result.marked {
+            lines.push(format!("version marked {dev}"));
+        }
+        if let Some(o) = &result.outcome {
+            if o.diverged_note {
+                lines.push(format!(
+                    "note: '{}' has commits not in '{}'; graduation/promotion will create a --no-ff merge",
+                    o.target, o.source
+                ));
+            }
+            push_version_check(&mut lines, &o.version, &o.source, &o.target);
+            push_gate_notices(&mut lines, &o.gate_notices);
+            push_gate_notices(&mut lines, &o.host_notices);
+            push_host_results(&mut lines, &o.host_results);
+        }
+        match &result.verdict {
+            ops::VerifyVerdict::Passed => {
+                passed += 1;
+                lines.push("PASSED".to_string());
+            }
+            ops::VerifyVerdict::Failed(why) => {
+                failed.push(result.branch.clone());
+                lines.push(format!("FAILED: {why}"));
+            }
+            ops::VerifyVerdict::Skipped(why) => {
+                skipped += 1;
+                lines.push(format!("skipped: {why}"));
+            }
+        }
+    }
+    lines.push(format!(
+        "{passed} passed, {} failed, {skipped} skipped",
+        failed.len()
+    ));
+    (lines, failed)
+}
+
+/// Render the `[V]` picker: each set with how many rolls it would cover.
+fn render_verify_many_modal(f: &mut Frame, area: Rect, counts: &[(VerifySet, usize); 6]) {
+    let mut lines = vec![
+        Line::from(Span::styled(
+            "Verify which rolls? (switches to each, then back)",
+            Style::default().add_modifier(Modifier::BOLD),
+        )),
+        Line::from(""),
+    ];
+    for (i, (set, n)) in counts.iter().enumerate() {
+        lines.push(Line::from(vec![
+            Span::styled(format!("[{}] ", i + 1), Style::default().fg(Color::Yellow)),
+            Span::raw(format!("{:<24}", set.label())),
+            Span::styled(
+                format!("{n} roll{}", if *n == 1 { "" } else { "s" }),
+                Style::default().fg(Color::DarkGray),
+            ),
+        ]));
+    }
+    lines.push(Line::from(""));
+    lines.push(Line::from(Span::styled(
+        "[n] cancel",
+        Style::default().fg(Color::Yellow),
+    )));
+
+    let width = lines
+        .iter()
+        .map(|l| l.width())
+        .max()
+        .unwrap_or(32)
+        .clamp(28, 70) as u16;
+    let modal = centered_rect(area, width + 4, lines.len() as u16 + 2);
+    f.render_widget(Clear, modal);
+    f.render_widget(
+        Paragraph::new(lines).block(Block::bordered().title(" verify all ")),
+        modal,
+    );
+}
+
 /// abstract, `0.2.0 → 0.3.0` is not, and seeing all three at once is what makes
 /// picking the right one obvious.
 fn render_bump_modal(f: &mut Frame, area: Rect, current: Semver, branch: &str) {
@@ -3497,6 +4913,24 @@ fn plural(n: u32) -> &'static str {
     }
 }
 
+/// The machine's own name, for the header corner — not a configured `hosts`
+/// entry, which names a *verification target* and may not be the host `rf` is
+/// currently running on. `/proc/sys/kernel/hostname` exists on every target
+/// this binary ships for (NixOS and WSL2 are both real Linux kernels);
+/// `HOSTNAME` is tried first since it's cheaper and some shells export it.
+fn current_hostname() -> String {
+    std::env::var("HOSTNAME")
+        .ok()
+        .filter(|h| !h.trim().is_empty())
+        .or_else(|| {
+            std::fs::read_to_string("/proc/sys/kernel/hostname")
+                .ok()
+                .map(|h| h.trim().to_string())
+                .filter(|h| !h.is_empty())
+        })
+        .unwrap_or_else(|| "unknown-host".to_string())
+}
+
 /// Everything the confirm modal reads, gathered so the renderer takes one
 /// parameter per *thing* rather than one per field.
 struct ConfirmModal<'a> {
@@ -3506,6 +4940,8 @@ struct ConfirmModal<'a> {
     /// See [`Mode::Confirm`]'s field of the same name.
     carried: &'a [String],
     rolls: &'a [RollInfo],
+    /// Counted alongside `rolls` by `[x]` and `[t]`, which reach landed hotfixes.
+    hotfixes: &'a [HotfixInfo],
     current_branch: &'a str,
 }
 
@@ -3514,20 +4950,59 @@ struct ConfirmModal<'a> {
 /// `carried` is non-empty only for `[m]` on a roll row, and the modal then grows
 /// to list those rolls: the merge lands them on stable too, and the confirmation
 /// is the last place the user can see that before it happens.
+/// What a prune or tidy confirmation is about to delete: `n` roll branches
+/// described by `rolls`, and `hotfixes` landed hotfixes. The hotfix half only
+/// appears when there is one, so a roll-only prompt reads exactly as before.
+fn deletion_count(n: usize, rolls: &str, hotfixes: usize) -> String {
+    let plural = |n: usize, one: &str, many: &str| {
+        if n == 1 {
+            one.to_string()
+        } else {
+            many.to_string()
+        }
+    };
+    let roll_part = format!("{n} {rolls} {}", plural(n, "branch", "branches"));
+    match (n, hotfixes) {
+        (_, 0) => roll_part,
+        (0, h) => format!("{h} landed {}", plural(h, "hotfix", "hotfixes")),
+        (_, h) => format!(
+            "{roll_part} and {h} landed {}",
+            plural(h, "hotfix", "hotfixes")
+        ),
+    }
+}
+
 fn render_modal(f: &mut Frame, area: Rect, config: &Config, modal: &ConfirmModal) {
     let ConfirmModal {
         action,
         target,
         carried,
         rolls,
+        hotfixes,
         current_branch,
     } = *modal;
+    // Lines under the prompt: the ordered steps when an action lands more than
+    // the one roll the cursor is on. Empty for everything else, so the modal
+    // keeps its two-line shape for the ordinary case.
+    let mut detail: Vec<String> = Vec::new();
     let prompt = match action {
-        Action::Graduate => format!(
-            "Graduate {} into {}?",
-            target.unwrap_or("(selected roll)"),
-            config.rolling_branch
-        ),
+        Action::Graduate => {
+            match target.and_then(|t| chain_lines(rolls, t, ops::ChainKind::Graduate)) {
+                Some(lines) => {
+                    let n = lines.len();
+                    detail = lines;
+                    format!(
+                        "Graduate {n} rolls into {}, in this order?",
+                        config.rolling_branch
+                    )
+                }
+                None => format!(
+                    "Graduate {} into {}?",
+                    target.unwrap_or("(selected roll)"),
+                    config.rolling_branch
+                ),
+            }
+        }
         Action::Integrate => format!(
             "Integrate {} into {}?",
             target.unwrap_or("(selected roll)"),
@@ -3537,7 +5012,17 @@ fn render_modal(f: &mut Frame, area: Rect, config: &Config, modal: &ConfirmModal
         // `None` for a whole-branch promotion — the prompt must say which,
         // because the two differ enormously in what they land on stable.
         Action::Promote => match target {
-            Some(roll) => format!("Promote {} into {}?", roll, config.stable_branch),
+            Some(roll) => match chain_lines(rolls, roll, ops::ChainKind::Promote) {
+                Some(lines) => {
+                    let n = lines.len();
+                    detail = lines;
+                    format!(
+                        "Promote {n} rolls into {}, in this order?",
+                        config.stable_branch
+                    )
+                }
+                None => format!("Promote {} into {}?", roll, config.stable_branch),
+            },
             None => format!(
                 "Promote all of {} into {}?",
                 config.rolling_branch, config.stable_branch
@@ -3553,26 +5038,35 @@ fn render_modal(f: &mut Frame, area: Rect, config: &Config, modal: &ConfirmModal
             ),
         },
         Action::Prune => {
-            let n = prunable_count(rolls);
-            format!(
-                "Delete {n} promoted roll branch{} (local + origin)?",
-                if n == 1 { "" } else { "es" }
-            )
+            let what = deletion_count(
+                prunable_count(rolls),
+                "promoted roll",
+                prunable_hotfix_count(hotfixes),
+            );
+            format!("Delete {what} (local + origin)?")
         }
         // Says "local only" where prune says "local + origin": the two keys sit
         // next to each other and differ in exactly that, so the prompt is where
         // the difference has to be visible.
         Action::Tidy => {
-            let n = tidyable_count(rolls);
-            format!(
-                "Delete {n} local graduated/promoted roll branch{} (local only)?",
-                if n == 1 { "" } else { "es" }
-            )
+            let what = deletion_count(
+                tidyable_count(rolls),
+                "local graduated/promoted roll",
+                tidyable_hotfix_count(hotfixes),
+            );
+            format!("Delete {what} (local only)?")
         }
+        // Both merges named, because the second is the one people forget:
+        // landing writes to stable *and* to rolling.
+        Action::LandHotfix => format!(
+            "Land {} into {}, then reintegrate into {}?",
+            current_branch, config.stable_branch, config.rolling_branch
+        ),
     };
     let hint = "[y] confirm    [n] cancel";
 
     let mut lines = vec![Line::from(prompt)];
+    lines.extend(detail.into_iter().map(Line::from));
     if !carried.is_empty() {
         let yellow = Style::default().fg(Color::Yellow);
         lines.push(Line::from(Span::styled(
@@ -3595,14 +5089,40 @@ fn render_modal(f: &mut Frame, area: Rect, config: &Config, modal: &ConfirmModal
     f.render_widget(body, modal);
 }
 
-/// The rolls that `[m]` on `roll` would land on stable besides `roll` itself.
+/// The numbered steps of a chain that lands more than `target` alone, or `None`
+/// when it is just the one roll (or cannot be planned — validation has already
+/// said why, and the modal is not the place to repeat it).
+fn chain_lines(rolls: &[RollInfo], target: &str, kind: ops::ChainKind) -> Option<Vec<String>> {
+    let chain = ops::dependency_chain(rolls, target, kind).ok()?;
+    // A lone step is still worth listing when it is not `target` (a carried
+    // cycle member graduates by way of its carrier) or carries other rolls:
+    // either way more lands than the row under the cursor.
+    if ops::chain_is_lone(&chain, target) && chain.iter().all(|s| s.carries.is_empty()) {
+        return None;
+    }
+    Some(
+        chain
+            .iter()
+            .enumerate()
+            .map(|(i, step)| format!("{}. {}", i + 1, step.describe()))
+            .collect(),
+    )
+}
+
+/// The rolls that `[m]` on `roll` would land on stable besides `roll` itself
+/// and the graduated-but-unpromoted dependencies its chain already names (those
+/// are listed as steps of their own, see [`chain_lines`]).
 ///
 /// Best-effort: a planning failure yields an empty list rather than an error.
 /// The keypress opens a confirmation, and `ops::promote` reports the real
 /// problem a moment later if there is one — refusing to draw the modal because
 /// the disclosure could not be computed would be the worse trade.
-fn carried_by_promoting(config: &Config, roll: &str) -> Vec<String> {
-    ops::preview_roll_promotion(config, &[roll.to_string()])
+fn carried_by_promoting(config: &Config, rolls: &[RollInfo], roll: &str) -> Vec<String> {
+    // The same expansion `run_op` promotes, so the disclosure matches the merge.
+    let named: Vec<String> = ops::dependency_chain(rolls, roll, ops::ChainKind::Promote)
+        .map(|chain| chain.into_iter().map(|s| s.branch).collect())
+        .unwrap_or_else(|_| vec![roll.to_string()]);
+    ops::preview_roll_promotion(config, &named)
         .map(|preview| {
             preview
                 .steps
@@ -3891,10 +5411,83 @@ fn column_width<'a>(values: impl Iterator<Item = &'a str>) -> usize {
     values.map(|v| v.chars().count()).max().unwrap_or(0)
 }
 
+/// Render the `:` command prompt: the input line on top, the fuzzy-matched
+/// history below it. Exactly [`render_help`]'s shape against a plain list of
+/// strings instead of [`BINDINGS`].
+fn render_command(
+    f: &mut Frame,
+    area: Rect,
+    query: &str,
+    input: &str,
+    cursor: usize,
+    history: &[String],
+) {
+    // The list is filtered by `query` (what was typed), not `input` (what
+    // will run) — after an Up/Down pick they differ, and filtering by the
+    // picked command instead would collapse the candidate list to just itself.
+    let matches = filter_history(history, query);
+    let dim = Style::default().fg(Color::DarkGray);
+
+    let visible = (area.height.saturating_sub(8) as usize).max(1);
+    let rows = matches.len().min(visible);
+    let first = cursor.saturating_sub(rows.saturating_sub(1));
+
+    let mut lines = vec![
+        Line::from(vec![
+            Span::styled(": ", Style::default().fg(Color::Cyan)),
+            Span::raw(input.to_string()),
+            Span::styled("_", Style::default().fg(Color::Cyan)),
+        ]),
+        Line::from(""),
+    ];
+
+    if matches.is_empty() {
+        lines.push(Line::from(Span::styled("no history yet", dim)));
+    }
+    for (row, &index) in matches.iter().enumerate().skip(first).take(rows) {
+        let selected = row == cursor;
+        let style = if selected {
+            Style::default().add_modifier(Modifier::REVERSED)
+        } else {
+            Style::default()
+        };
+        lines.push(Line::from(vec![
+            Span::raw(if selected { "▶ " } else { "  " }),
+            Span::styled(history[index].clone(), style),
+        ]));
+    }
+    if matches.len() > rows {
+        lines.push(Line::from(Span::styled(
+            format!("… {} more, keep typing", matches.len() - rows),
+            dim,
+        )));
+    }
+
+    lines.push(Line::from(""));
+    lines.push(Line::from(Span::styled(
+        "[↑/↓] history   [enter] run here   [alt+enter] run in shell   [esc] cancel",
+        dim,
+    )));
+
+    let width = lines.iter().map(|l| l.width()).max().unwrap_or(40) as u16 + 4;
+    let height = lines.len() as u16 + 2;
+    let modal = centered_rect(area, width.max(60), height);
+
+    f.render_widget(Clear, modal);
+    f.render_widget(
+        Paragraph::new(lines).block(Block::bordered().title(" : ")),
+        modal,
+    );
+}
+
 /// Render the centered slug-input popup for creating a new roll. Shows the
 /// prompt, the current buffer with a trailing caret, and the key hints.
-fn render_create_input(f: &mut Frame, area: Rect, config: &Config, buffer: &str) {
-    let prompt = format!("New roll slug (branched from {}):", config.stable_branch);
+fn render_create_input(f: &mut Frame, area: Rect, config: &Config, buffer: &str, kind: CreateKind) {
+    let prompt = format!(
+        "New {} slug (branched from {}):",
+        kind.noun(),
+        config.stable_branch
+    );
     let input_line = format!("{buffer}_");
     let hint = "[enter] create    [esc] cancel";
 
@@ -3915,7 +5508,7 @@ fn render_create_input(f: &mut Frame, area: Rect, config: &Config, buffer: &str)
         Line::from(Span::styled(hint, Style::default().fg(Color::DarkGray))),
     ])
     .alignment(Alignment::Center)
-    .block(Block::bordered().title(" create roll "));
+    .block(Block::bordered().title(format!(" create {} ", kind.noun())));
     f.render_widget(body, modal);
 }
 
@@ -3927,11 +5520,30 @@ fn render_detail(
     roll: &RollInfo,
     ahead_behind: Option<(u32, u32)>,
     all: &[RollInfo],
+    cursor: usize,
+    trail: &[u32],
 ) {
-    let rows = dep_rows(roll, all);
+    let chain = dep_chain(roll, all);
     let dependents = dependent_rows(roll, all);
+    // The cursor marker: chain rows first, then dependents, matching
+    // `detail_targets` exactly so what is highlighted is what enter opens.
+    let cursor_mark = |index: usize| if index == cursor { "▶ " } else { "  " };
 
-    let mut lines = vec![
+    let mut lines = Vec::new();
+    // Where this pane was reached from, so a deep dig still reads as a path
+    // rather than as a pane that appeared from nowhere.
+    if !trail.is_empty() {
+        let mut crumbs = String::new();
+        for n in trail {
+            crumbs.push_str(&format!("#{n} → "));
+        }
+        crumbs.push_str(&format!("#{}", roll.number));
+        lines.push(Line::from(Span::styled(
+            crumbs,
+            Style::default().fg(Color::DarkGray),
+        )));
+    }
+    lines.extend([
         Line::from(vec![
             Span::styled("roll #", Style::default().add_modifier(Modifier::BOLD)),
             Span::styled(
@@ -3950,7 +5562,7 @@ fn render_detail(
             Span::raw("    location: "),
             Span::raw(roll.location.label()),
         ]),
-    ];
+    ]);
 
     // Local-vs-origin divergence, only for both-location rolls (issue #99).
     if let Some(text) = format_ahead_behind(ahead_behind) {
@@ -3962,33 +5574,66 @@ fn render_detail(
 
     lines.push(Line::from(""));
 
-    if rows.is_empty() {
+    // A cycle explains what the dependency rows alone cannot: why two rolls
+    // are each waiting on the other, and which one to graduate to end it.
+    if let Some(cycle) = &roll.cycle {
+        lines.extend(
+            cycle_lines(cycle, all)
+                .into_iter()
+                .map(|text| Line::from(Span::styled(text, Style::default().fg(Color::Cyan)))),
+        );
+        lines.push(Line::from(""));
+    }
+
+    if chain.is_empty() {
         lines.push(Line::from(Span::styled(
             "no dependencies / not blocked",
             Style::default().fg(Color::Green),
         )));
     } else {
-        let blockers = rows.iter().filter(|r| r.is_blocker).count();
-        let stale = rows.iter().filter(|r| r.needs_reintegration).count();
+        // Blockers anywhere in the chain, each counted once: a dependency's
+        // own ungraduated dependency holds this roll back just as surely.
+        // Stale links are counted per link, since each is a separate
+        // integration — the same roll reached twice may be stale in one
+        // parent and current in the other.
+        let blockers = chain.iter().filter(|r| r.is_blocker && !r.repeated).count();
+        let stale = chain.iter().filter(|r| r.needs_reintegration).count();
         let header = match (blockers, stale) {
-            (0, 0) => "dependencies (all graduated):".to_string(),
-            (0, s) => format!("dependencies ({s} stale — reintegrate):"),
-            (b, 0) => format!("dependencies ({b} blocking):"),
-            (b, s) => format!("dependencies ({b} blocking, {s} stale):"),
+            (0, 0) => "dependency chain (all graduated):".to_string(),
+            (0, s) => format!("dependency chain ({s} stale — reintegrate):"),
+            (b, 0) => format!("dependency chain ({b} blocking):"),
+            (b, s) => format!("dependency chain ({b} blocking, {s} stale):"),
         };
         lines.push(Line::from(Span::styled(
             header,
             Style::default().add_modifier(Modifier::BOLD),
         )));
-        for r in &rows {
-            let (marker, marker_style) = match (r.is_blocker, r.needs_reintegration) {
-                (true, true) => ("⛔ blocker, ⚠ stale", Style::default().fg(Color::Red)),
-                (true, false) => ("⛔ blocker", Style::default().fg(Color::Red)),
-                (false, true) => ("⚠ reintegrate", Style::default().fg(Color::Yellow)),
-                (false, false) => ("✓ ok", Style::default().fg(Color::Green)),
-            };
+        for (i, r) in chain.iter().enumerate() {
+            let indent = "  ".repeat(r.depth);
+            let elbow = if r.depth > 0 { "└ " } else { "" };
+            // `repeated` (shown higher in the chain already) takes priority
+            // over everything else, same as a plain blocker/stale link would.
+            // `carried` is checked next, ahead of blocker/stale: a cycle's
+            // carrier contains this row's tip, so it gates nothing despite
+            // being ungraduated — see [`ChainRow::carried`].
+            let (marker, marker_style) =
+                match (r.repeated, r.carried, r.is_blocker, r.needs_reintegration) {
+                    (true, _, _, true) => {
+                        ("↑ shown above, ⚠ stale", Style::default().fg(Color::Yellow))
+                    }
+                    (true, _, _, false) => ("↑ shown above", Style::default().fg(Color::DarkGray)),
+                    (false, true, _, _) => ("↻ carried", Style::default().fg(Color::Cyan)),
+                    (false, false, true, true) => {
+                        ("⛔ blocker, ⚠ stale", Style::default().fg(Color::Red))
+                    }
+                    (false, false, true, false) => ("⛔ blocker", Style::default().fg(Color::Red)),
+                    (false, false, false, true) => {
+                        ("⚠ reintegrate", Style::default().fg(Color::Yellow))
+                    }
+                    (false, false, false, false) => ("✓ ok", Style::default().fg(Color::Green)),
+                };
             lines.push(Line::from(vec![
-                Span::raw(format!("  #{}  ", r.number)),
+                Span::raw(format!("{}{indent}{elbow}#{}  ", cursor_mark(i), r.number)),
                 Span::styled(r.branch.clone(), Style::default().fg(Color::Cyan)),
                 Span::raw("  ["),
                 Span::styled(r.state.label(), Style::default().fg(state_color(&r.state))),
@@ -4011,9 +5656,9 @@ fn render_detail(
             format!("dependents ({}):", dependents.len()),
             Style::default().add_modifier(Modifier::BOLD),
         )));
-        for r in &dependents {
+        for (i, r) in dependents.iter().enumerate() {
             lines.push(Line::from(vec![
-                Span::raw(format!("  #{}  ", r.number)),
+                Span::raw(format!("{}#{}  ", cursor_mark(chain.len() + i), r.number)),
                 Span::styled(r.branch.clone(), Style::default().fg(Color::Cyan)),
                 Span::raw("  ["),
                 Span::styled(r.state.label(), Style::default().fg(state_color(&r.state))),
@@ -4023,8 +5668,14 @@ fn render_detail(
     }
 
     lines.push(Line::from(""));
+    let hint = match (chain.is_empty() && dependents.is_empty(), trail.is_empty()) {
+        (true, true) => "[q/esc] close",
+        (true, false) => "[backspace] back   [esc] close",
+        (false, true) => "[j/k] move   [enter] open   [esc] close",
+        (false, false) => "[j/k] move   [enter] open   [backspace] back   [esc] close",
+    };
     lines.push(Line::from(Span::styled(
-        "[q/esc] back",
+        hint,
         Style::default().fg(Color::DarkGray),
     )));
 
@@ -4129,6 +5780,7 @@ mod tests {
             dependents: Vec::new(),
             stale_deps: Vec::new(),
             graduation_commit: None,
+            cycle: None,
         }
     }
 
@@ -4189,6 +5841,192 @@ mod tests {
         git(&["add", "work.txt"]);
         git(&["commit", "-q", "-m", "roll work"]);
         dir
+    }
+
+    #[test]
+    fn a_click_inside_the_small_panel_maximizes_it() {
+        let rect = Rect {
+            x: 50,
+            y: 20,
+            width: 30,
+            height: 10,
+        };
+        assert!(click_maximizes(55, 22, rect));
+        assert!(click_maximizes(50, 20, rect), "top-left corner is inside");
+        assert!(
+            click_maximizes(79, 29, rect),
+            "bottom-right-most cell is inside"
+        );
+    }
+
+    #[test]
+    fn a_click_outside_the_panel_rect_does_not_maximize() {
+        let rect = Rect {
+            x: 50,
+            y: 20,
+            width: 30,
+            height: 10,
+        };
+        assert!(!click_maximizes(0, 0, rect));
+        assert!(!click_maximizes(80, 20, rect), "one past the right edge");
+        assert!(!click_maximizes(50, 30, rect), "one past the bottom edge");
+    }
+
+    #[test]
+    fn a_click_outside_the_maximized_rect_restores_it() {
+        // Same rule, different rect: `render` passes the *expanded* rect once
+        // maximized, so a click outside that larger area is what restores it
+        // — `click_maximizes` does not need to know it was ever maximized.
+        let expanded = Rect {
+            x: 2,
+            y: 2,
+            width: 96,
+            height: 36,
+        };
+        assert!(click_maximizes(50, 20, expanded));
+        assert!(!click_maximizes(0, 0, expanded));
+    }
+
+    #[test]
+    fn clicking_the_panel_maximizes_it_and_clicking_off_restores_it() {
+        let cfg = config("main", "develop");
+        let mut app = StatusApp {
+            config: cfg,
+            current_branch: "main".to_string(),
+            bases: Vec::new(),
+            rolls: Vec::new(),
+            hotfixes: Vec::new(),
+            show_deps: false,
+            tracking: HashMap::new(),
+            versions: HashMap::new(),
+            version: None,
+            table: TableState::default(),
+            mode: Mode::Browsing,
+            message: None,
+            job: None,
+            job_title: String::new(),
+            job_moves_head: false,
+            queue: Queue::default(),
+            quit_armed: false,
+            deferred_mode: None,
+            panel: Some(output::Panel::new("test")),
+            panel_maximized: false,
+            panel_rect: Some(Rect {
+                x: 50,
+                y: 20,
+                width: 30,
+                height: 10,
+            }),
+            pending_g: false,
+            pending_push: None,
+            command_history: Vec::new(),
+        };
+
+        app.handle_mouse(MouseEvent {
+            kind: MouseEventKind::Down(MouseButton::Left),
+            column: 55,
+            row: 22,
+            modifiers: crossterm::event::KeyModifiers::NONE,
+        });
+        assert!(
+            app.panel_maximized,
+            "click inside the panel should maximize it"
+        );
+
+        // The rect `handle_mouse` tests against is whatever was last drawn —
+        // standing in for `render` having drawn the expanded rect once
+        // maximized.
+        app.panel_rect = Some(Rect {
+            x: 2,
+            y: 2,
+            width: 96,
+            height: 36,
+        });
+        app.handle_mouse(MouseEvent {
+            kind: MouseEventKind::Down(MouseButton::Left),
+            column: 0,
+            row: 0,
+            modifiers: crossterm::event::KeyModifiers::NONE,
+        });
+        assert!(!app.panel_maximized, "click outside should restore it");
+    }
+
+    #[test]
+    fn mouse_clicks_are_a_no_op_with_no_panel_up() {
+        let cfg = config("main", "develop");
+        let mut app = StatusApp {
+            config: cfg,
+            current_branch: "main".to_string(),
+            bases: Vec::new(),
+            rolls: Vec::new(),
+            hotfixes: Vec::new(),
+            show_deps: false,
+            tracking: HashMap::new(),
+            versions: HashMap::new(),
+            version: None,
+            table: TableState::default(),
+            mode: Mode::Browsing,
+            message: None,
+            job: None,
+            job_title: String::new(),
+            job_moves_head: false,
+            queue: Queue::default(),
+            quit_armed: false,
+            deferred_mode: None,
+            panel: None,
+            panel_maximized: false,
+            panel_rect: None,
+            pending_g: false,
+            pending_push: None,
+            command_history: Vec::new(),
+        };
+
+        app.handle_mouse(MouseEvent {
+            kind: MouseEventKind::Down(MouseButton::Left),
+            column: 5,
+            row: 5,
+            modifiers: crossterm::event::KeyModifiers::NONE,
+        });
+        assert!(!app.panel_maximized);
+    }
+
+    #[test]
+    fn toggle_maximize_is_a_no_op_with_no_panel() {
+        let cfg = config("main", "develop");
+        let mut app = StatusApp {
+            config: cfg,
+            current_branch: "main".to_string(),
+            bases: Vec::new(),
+            rolls: Vec::new(),
+            hotfixes: Vec::new(),
+            show_deps: false,
+            tracking: HashMap::new(),
+            versions: HashMap::new(),
+            version: None,
+            table: TableState::default(),
+            mode: Mode::Browsing,
+            message: None,
+            job: None,
+            job_title: String::new(),
+            job_moves_head: false,
+            queue: Queue::default(),
+            quit_armed: false,
+            deferred_mode: None,
+            panel: None,
+            panel_maximized: false,
+            panel_rect: None,
+            pending_g: false,
+            pending_push: None,
+            command_history: Vec::new(),
+        };
+        app.toggle_maximize();
+        assert!(!app.panel_maximized, "nothing to maximize");
+
+        app.panel = Some(output::Panel::new("test"));
+        app.toggle_maximize();
+        assert!(app.panel_maximized);
+        app.toggle_maximize();
+        assert!(!app.panel_maximized);
     }
 
     #[test]
@@ -4265,16 +6103,16 @@ mod tests {
 
     #[test]
     fn row_at_maps_indices_over_bases_then_rolls() {
-        assert_eq!(row_at(0, 2, 3), Some(RowKind::Base(0)));
-        assert_eq!(row_at(1, 2, 3), Some(RowKind::Base(1)));
-        assert_eq!(row_at(2, 2, 3), Some(RowKind::Roll(0)));
-        assert_eq!(row_at(4, 2, 3), Some(RowKind::Roll(2)));
+        assert_eq!(row_at(0, 2, 3, 0), Some(RowKind::Base(0)));
+        assert_eq!(row_at(1, 2, 3, 0), Some(RowKind::Base(1)));
+        assert_eq!(row_at(2, 2, 3, 0), Some(RowKind::Roll(0)));
+        assert_eq!(row_at(4, 2, 3, 0), Some(RowKind::Roll(2)));
         // Past the last row.
-        assert_eq!(row_at(5, 2, 3), None);
+        assert_eq!(row_at(5, 2, 3, 0), None);
         // No bases → rolls start at 0; no rolls → only bases.
-        assert_eq!(row_at(0, 0, 1), Some(RowKind::Roll(0)));
-        assert_eq!(row_at(1, 1, 0), None);
-        assert_eq!(row_at(0, 0, 0), None);
+        assert_eq!(row_at(0, 0, 1, 0), Some(RowKind::Roll(0)));
+        assert_eq!(row_at(1, 1, 0, 0), None);
+        assert_eq!(row_at(0, 0, 0, 0), None);
     }
 
     #[test]
@@ -4284,22 +6122,22 @@ mod tests {
         let mut rolls = vec![roll_n(1, RollState::Active), roll_n(2, RollState::Active)];
 
         // Current branch is the rolling base → its own row.
-        assert_eq!(initial_selection(&bases, &rolls), Some(1));
+        assert_eq!(initial_selection(&bases, &rolls, &[]), Some(1));
 
         // Current branch is a roll → offset past the bases.
         let off_bases = base_branches(&cfg, "roll/2-0101-x", |_| true);
         rolls[1].is_current = true;
-        assert_eq!(initial_selection(&off_bases, &rolls), Some(3));
+        assert_eq!(initial_selection(&off_bases, &rolls, &[]), Some(3));
 
         // Nothing current → first row.
         rolls[1].is_current = false;
-        assert_eq!(initial_selection(&off_bases, &rolls), Some(0));
+        assert_eq!(initial_selection(&off_bases, &rolls, &[]), Some(0));
 
         // Rolls but no bases still selects the first roll.
-        assert_eq!(initial_selection(&[], &rolls), Some(0));
+        assert_eq!(initial_selection(&[], &rolls, &[]), Some(0));
 
         // Nothing at all → no selection.
-        assert_eq!(initial_selection(&[], &[]), None);
+        assert_eq!(initial_selection(&[], &[], &[]), None);
     }
 
     fn roll_n(number: u32, state: RollState) -> RollInfo {
@@ -4313,6 +6151,7 @@ mod tests {
             dependents: Vec::new(),
             stale_deps: Vec::new(),
             graduation_commit: None,
+            cycle: None,
         }
     }
 
@@ -4322,7 +6161,56 @@ mod tests {
         assert!(can_graduate(&RollState::Diverged));
         assert!(!can_graduate(&RollState::Graduated));
         assert!(!can_graduate(&RollState::Promoted));
-        assert!(!can_graduate(&RollState::Blocked));
+        // Blocked is allowed: the chain graduates what it waits on first.
+        assert!(can_graduate(&RollState::Blocked));
+    }
+
+    #[test]
+    fn landed_hotfixes_make_prune_and_tidy_worth_offering() {
+        let hotfix = |number: u32, state: HotfixState, location: BranchLocation| HotfixInfo {
+            branch: format!("hotfix/{number}-0720-x"),
+            number,
+            state,
+            location,
+            is_current: false,
+        };
+        let hotfixes = vec![
+            hotfix(1, HotfixState::Landed, BranchLocation::Both),
+            hotfix(2, HotfixState::Landed, BranchLocation::Remote),
+            hotfix(3, HotfixState::Open, BranchLocation::Local),
+        ];
+        // Prune takes both copies of every landed hotfix; tidy only local
+        // copies, and an open hotfix is no more tidy's default than an active
+        // roll is.
+        assert_eq!(prunable_hotfix_count(&hotfixes), 2);
+        assert_eq!(tidyable_hotfix_count(&hotfixes), 1);
+
+        // No roll qualifies, yet the hotfixes alone make both keys valid.
+        let rolls = vec![roll_n(1, RollState::Active)];
+        for action in [Action::Prune, Action::Tidy] {
+            assert!(validate_action(action, None, &rolls, "main", "roll/").is_err());
+            assert!(
+                validate_with_hotfixes(action, None, &rolls, &hotfixes, "main", "roll/").is_ok(),
+                "{action:?}"
+            );
+            assert!(
+                validate_with_hotfixes(action, None, &rolls, &[], "main", "roll/").is_err(),
+                "{action:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn deletion_prompts_count_hotfixes_only_when_there_are_some() {
+        assert_eq!(
+            deletion_count(2, "promoted roll", 0),
+            "2 promoted roll branches"
+        );
+        assert_eq!(
+            deletion_count(1, "promoted roll", 2),
+            "1 promoted roll branch and 2 landed hotfixes"
+        );
+        assert_eq!(deletion_count(0, "promoted roll", 1), "1 landed hotfix");
     }
 
     #[test]
@@ -4644,6 +6532,239 @@ mod tests {
             handle_help_key(&mut empty, &mut at, KeyCode::Enter),
             HelpOutcome::Close
         );
+    }
+
+    #[test]
+    fn filter_history_ranks_the_best_match_first_and_respects_order_on_ties() {
+        let history = vec![
+            "git status".to_string(),
+            "git push".to_string(),
+            "ls -la".to_string(),
+        ];
+        let matches = filter_history(&history, "git");
+        assert_eq!(matches, vec![0, 1]);
+        // An empty query is everything, in history order (most-recent-first,
+        // since that is the order the caller stores it in).
+        assert_eq!(filter_history(&history, ""), vec![0, 1, 2]);
+        assert!(filter_history(&history, "zzzz").is_empty());
+    }
+
+    #[test]
+    fn typing_in_the_command_prompt_fills_the_buffer() {
+        let mut query = String::new();
+        let mut input = String::new();
+        let mut cursor = 0;
+        let history: Vec<String> = Vec::new();
+        for c in "git st".chars() {
+            assert_eq!(
+                handle_command_key(
+                    &mut query,
+                    &mut input,
+                    &mut cursor,
+                    &history,
+                    KeyCode::Char(c),
+                    false
+                ),
+                CommandOutcome::Continue
+            );
+        }
+        assert_eq!(query, "git st");
+        // Nothing has been picked from history, so `input` (what `enter` would
+        // run) tracks the typed text exactly.
+        assert_eq!(input, "git st");
+    }
+
+    #[test]
+    fn enter_on_a_blank_prompt_does_nothing() {
+        let mut query = String::new();
+        let mut input = String::new();
+        let mut cursor = 0;
+        let history: Vec<String> = Vec::new();
+        assert_eq!(
+            handle_command_key(
+                &mut query,
+                &mut input,
+                &mut cursor,
+                &history,
+                KeyCode::Enter,
+                false
+            ),
+            CommandOutcome::Continue
+        );
+    }
+
+    #[test]
+    fn enter_on_a_typed_command_runs_it() {
+        let mut query = "echo hi".to_string();
+        let mut input = "echo hi".to_string();
+        let mut cursor = 0;
+        let history: Vec<String> = Vec::new();
+        assert_eq!(
+            handle_command_key(
+                &mut query,
+                &mut input,
+                &mut cursor,
+                &history,
+                KeyCode::Enter,
+                false
+            ),
+            CommandOutcome::Run
+        );
+    }
+
+    #[test]
+    fn alt_enter_runs_in_the_shell_instead() {
+        let mut query = "vim".to_string();
+        let mut input = "vim".to_string();
+        let mut cursor = 0;
+        let history: Vec<String> = Vec::new();
+        assert_eq!(
+            handle_command_key(
+                &mut query,
+                &mut input,
+                &mut cursor,
+                &history,
+                KeyCode::Enter,
+                true
+            ),
+            CommandOutcome::RunInShell
+        );
+    }
+
+    #[test]
+    fn esc_closes_the_prompt() {
+        let mut query = "anything".to_string();
+        let mut input = "anything".to_string();
+        let mut cursor = 0;
+        let history: Vec<String> = Vec::new();
+        assert_eq!(
+            handle_command_key(
+                &mut query,
+                &mut input,
+                &mut cursor,
+                &history,
+                KeyCode::Esc,
+                false
+            ),
+            CommandOutcome::Close
+        );
+    }
+
+    #[test]
+    fn up_and_down_fill_the_input_from_the_highlighted_history_entry() {
+        let history = vec!["git push".to_string(), "git status".to_string()];
+        let mut query = "git".to_string();
+        let mut input = "git".to_string();
+        let mut cursor = 0;
+
+        // The first press lands on the top suggestion.
+        handle_command_key(
+            &mut query,
+            &mut input,
+            &mut cursor,
+            &history,
+            KeyCode::Down,
+            false,
+        );
+        assert_eq!(cursor, 0);
+        assert_eq!(input, "git push");
+        // The query itself — what's filtered against — is untouched by the pick.
+        assert_eq!(query, "git");
+
+        handle_command_key(
+            &mut query,
+            &mut input,
+            &mut cursor,
+            &history,
+            KeyCode::Down,
+            false,
+        );
+        assert_eq!(cursor, 1);
+        assert_eq!(input, "git status");
+
+        handle_command_key(
+            &mut query,
+            &mut input,
+            &mut cursor,
+            &history,
+            KeyCode::Up,
+            false,
+        );
+        assert_eq!(cursor, 0);
+        assert_eq!(input, "git push");
+
+        // Cannot walk off either end.
+        handle_command_key(
+            &mut query,
+            &mut input,
+            &mut cursor,
+            &history,
+            KeyCode::Up,
+            false,
+        );
+        assert_eq!(cursor, 0);
+        assert_eq!(input, "git push");
+    }
+
+    #[test]
+    fn cycling_through_more_than_two_history_entries_does_not_collapse_the_list() {
+        // The bug this guards against: filtering by `input` (the just-picked
+        // command) instead of `query` (what was actually typed) would shrink
+        // the candidate list to one entry after the first pick, so a second
+        // `Down` could never reach a third match.
+        let history = vec![
+            "git push".to_string(),
+            "git status".to_string(),
+            "git log".to_string(),
+        ];
+        let mut query = "git".to_string();
+        let mut input = "git".to_string();
+        let mut cursor = 0;
+
+        for expected in ["git push", "git status", "git log"] {
+            handle_command_key(
+                &mut query,
+                &mut input,
+                &mut cursor,
+                &history,
+                KeyCode::Down,
+                false,
+            );
+            assert_eq!(input, expected);
+        }
+        assert_eq!(query, "git", "query must stay exactly what was typed");
+    }
+
+    #[test]
+    fn typing_after_a_history_pick_resets_the_highlight_and_the_input() {
+        let history = vec!["git push".to_string(), "git status".to_string()];
+        let mut query = "git".to_string();
+        let mut input = "git".to_string();
+        let mut cursor = 0;
+        handle_command_key(
+            &mut query,
+            &mut input,
+            &mut cursor,
+            &history,
+            KeyCode::Down,
+            false,
+        );
+        assert_eq!(cursor, 0);
+        assert_eq!(input, "git push");
+
+        handle_command_key(
+            &mut query,
+            &mut input,
+            &mut cursor,
+            &history,
+            KeyCode::Char('x'),
+            false,
+        );
+        assert_eq!(cursor, 0);
+        assert_eq!(query, "gitx");
+        // Typing overrides whatever was picked — it no longer reflects the
+        // history entry that was highlighted a moment ago.
+        assert_eq!(input, "gitx");
     }
 
     #[test]
@@ -5160,6 +7281,219 @@ mod tests {
         assert_eq!(rows[0].number, 1);
     }
 
+    /// `12 → 9 → 8 → 7`: the chain the user asked to see, built the way
+    /// `list_rolls` would record it (each roll's `deps` are its direct
+    /// integrations only).
+    fn linear_chain() -> Vec<RollInfo> {
+        let mut r7 = roll_n(7, RollState::Graduated);
+        let mut r8 = roll_n(8, RollState::Graduated);
+        let mut r9 = roll_n(9, RollState::Active);
+        let mut r12 = roll_n(12, RollState::Blocked);
+        r8.deps = vec![7];
+        r9.deps = vec![8];
+        r12.deps = vec![9];
+        r7.dependents = vec![8];
+        r8.dependents = vec![9];
+        r9.dependents = vec![12];
+        vec![r7, r8, r9, r12]
+    }
+
+    #[test]
+    fn dep_chain_follows_every_link_to_the_bottom() {
+        let all = linear_chain();
+        let rows = dep_chain(&all[3], &all);
+        let shape: Vec<(usize, u32, bool)> = rows
+            .iter()
+            .map(|r| (r.depth, r.number, r.is_blocker))
+            .collect();
+        // Depth grows one per link; only 9 is still ungraduated.
+        assert_eq!(shape, vec![(0, 9, true), (1, 8, false), (2, 7, false)]);
+        assert!(rows.iter().all(|r| !r.repeated));
+        // The first level is exactly `dep_rows`, by construction.
+        let direct: Vec<u32> = dep_rows(&all[3], &all).iter().map(|r| r.number).collect();
+        assert_eq!(direct, vec![9]);
+    }
+
+    #[test]
+    fn dep_chain_lists_a_diamond_once_and_never_loops() {
+        // 4 depends on 2 and 3; both depend on 1 (a diamond). 1 also claims to
+        // depend on 4 (a cycle, which real history cannot produce but a scan
+        // of hand-written merges might).
+        let mut r1 = roll_n(1, RollState::Active);
+        let mut r2 = roll_n(2, RollState::Active);
+        let mut r3 = roll_n(3, RollState::Active);
+        let mut r4 = roll_n(4, RollState::Blocked);
+        r1.deps = vec![4];
+        r2.deps = vec![1];
+        r3.deps = vec![1];
+        r4.deps = vec![2, 3];
+        let all = vec![r1, r2, r3, r4];
+
+        let rows = dep_chain(&all[3], &all);
+        let shape: Vec<(usize, u32, bool)> = rows
+            .iter()
+            .map(|r| (r.depth, r.number, r.repeated))
+            .collect();
+        assert_eq!(
+            shape,
+            vec![
+                (0, 2, false),
+                (1, 1, false),
+                // 1's dep on 4 is the roll we started from: repeated, not
+                // descended — so the walk terminates.
+                (2, 4, true),
+                (0, 3, false),
+                // Second arm of the diamond: 1 is shown again but marked.
+                (1, 1, true),
+            ]
+        );
+        // Blockers are counted once, however many arms reach them.
+        assert_eq!(
+            rows.iter().filter(|r| r.is_blocker && !r.repeated).count(),
+            3
+        );
+    }
+
+    #[test]
+    fn dep_chain_marks_the_link_the_parent_finds_stale() {
+        let mut all = linear_chain();
+        // 9 integrated 8 and 8 has since moved; 12's own view of 9 is fine.
+        all[2].stale_deps = vec![8];
+        let rows = dep_chain(&all[3], &all);
+        let flags: Vec<(u32, bool)> = rows
+            .iter()
+            .map(|r| (r.number, r.needs_reintegration))
+            .collect();
+        assert_eq!(flags, vec![(9, false), (8, true), (7, false)]);
+    }
+
+    /// 12 → 9 → 8 → 7, with 3 depending on 12: the shape this feature exists for.
+    fn drill_fixture() -> Vec<RollInfo> {
+        let mut rolls = vec![
+            roll_n(7, RollState::Graduated),
+            roll_n(8, RollState::Active),
+            roll_n(9, RollState::Blocked),
+            roll_n(12, RollState::Blocked),
+            roll_n(3, RollState::Blocked),
+        ];
+        rolls[0].dependents = vec![8];
+        rolls[1].deps = vec![7];
+        rolls[1].dependents = vec![9];
+        rolls[2].deps = vec![8];
+        rolls[2].dependents = vec![12];
+        rolls[3].deps = vec![9];
+        rolls[3].dependents = vec![3];
+        rolls[4].deps = vec![12];
+        rolls
+    }
+
+    #[test]
+    fn the_detail_targets_are_the_chain_then_the_dependents_in_pane_order() {
+        let all = drill_fixture();
+        let twelve = all.iter().find(|r| r.number == 12).unwrap();
+        // What the cursor walks is exactly what the pane lists, in order — so
+        // the highlighted row and the opened row can never disagree.
+        assert_eq!(detail_targets(twelve, &all), vec![9, 8, 7, 3]);
+        let seven = all.iter().find(|r| r.number == 7).unwrap();
+        assert_eq!(detail_targets(seven, &all), vec![8]);
+    }
+
+    #[test]
+    fn detail_keys_walk_open_and_retrace() {
+        let mut cursor = 0;
+        // Movement clamps to the list.
+        assert_eq!(
+            detail_key(KeyCode::Char('j'), &mut cursor, 3, false),
+            DetailOutcome::Continue
+        );
+        assert_eq!(
+            detail_key(KeyCode::Down, &mut cursor, 3, false),
+            DetailOutcome::Continue
+        );
+        assert_eq!(
+            detail_key(KeyCode::Char('j'), &mut cursor, 3, false),
+            DetailOutcome::Continue
+        );
+        assert_eq!(cursor, 2, "walked past the end");
+        assert_eq!(
+            detail_key(KeyCode::Char('k'), &mut cursor, 3, false),
+            DetailOutcome::Continue
+        );
+        assert_eq!(cursor, 1);
+
+        // Enter opens the row under the cursor; with nothing to open it does nothing.
+        assert_eq!(
+            detail_key(KeyCode::Enter, &mut cursor, 3, false),
+            DetailOutcome::Open(1)
+        );
+        assert_eq!(
+            detail_key(KeyCode::Char('l'), &mut cursor, 3, false),
+            DetailOutcome::Open(1)
+        );
+        assert_eq!(
+            detail_key(KeyCode::Enter, &mut cursor, 0, false),
+            DetailOutcome::Continue
+        );
+
+        // Backspace retraces when there is a trail and closes when there is not,
+        // so the key never dead-ends. Esc always closes outright.
+        assert_eq!(
+            detail_key(KeyCode::Backspace, &mut cursor, 3, true),
+            DetailOutcome::Back
+        );
+        assert_eq!(
+            detail_key(KeyCode::Char('h'), &mut cursor, 3, true),
+            DetailOutcome::Back
+        );
+        assert_eq!(
+            detail_key(KeyCode::Backspace, &mut cursor, 3, false),
+            DetailOutcome::Close
+        );
+        assert_eq!(
+            detail_key(KeyCode::Esc, &mut cursor, 3, true),
+            DetailOutcome::Close
+        );
+        assert_eq!(
+            detail_key(KeyCode::Char('q'), &mut cursor, 3, true),
+            DetailOutcome::Close
+        );
+    }
+
+    #[test]
+    fn a_drilled_pane_shows_where_it_came_from_and_marks_the_cursor() {
+        let all = drill_fixture();
+        let nine = all.iter().find(|r| r.number == 9).unwrap();
+        let out = draw(|f, area| render_detail(f, area, nine, None, &all, 1, &[12]));
+        assert!(out.contains("#12 → #9"), "no breadcrumb:\n{out}");
+        // Cursor on the second target (#7), not the first.
+        assert!(out.contains("▶ "), "{out}");
+        let marked = out.lines().find(|l| l.contains("▶ ")).unwrap();
+        assert!(marked.contains("#7"), "cursor on the wrong row: {marked}");
+        assert!(out.contains("[backspace] back"), "{out}");
+
+        // A top-level pane has no breadcrumb and no back hint.
+        let top = draw(|f, area| render_detail(f, area, nine, None, &all, 0, &[]));
+        assert!(!top.contains("→ #9"), "{top}");
+        assert!(!top.contains("[backspace]"), "{top}");
+        assert!(top.contains("[enter] open"), "{top}");
+    }
+
+    #[test]
+    fn the_detail_view_draws_the_chain_with_its_markers() {
+        let mut all = linear_chain();
+        all[3].stale_deps = vec![9];
+        let out = draw(|f, area| render_detail(f, area, &all[3], None, &all, 0, &[]));
+        assert!(
+            out.contains("dependency chain (1 blocking, 1 stale)"),
+            "{out}"
+        );
+        assert!(out.contains("#9"), "{out}");
+        // The blocker and the staleness are both on the one link.
+        assert!(out.contains("blocker, ⚠ stale"), "{out}");
+        assert!(out.contains("└ #8"), "{out}");
+        assert!(out.contains("└ #7"), "{out}");
+    }
+
     // ── delete ──────────────────────────────────────────────────────────
 
     /// A preview with the given per-copy unmerged counts, for the force-confirm
@@ -5178,9 +7512,13 @@ mod tests {
         }
     }
 
+    fn delete_prompt_of(roll: &RollInfo) -> Result<DeletePrompt, String> {
+        delete_prompt(&roll.branch, &roll.location, roll.is_current)
+    }
+
     #[test]
     fn delete_prompt_shape_follows_location() {
-        let single = |loc| delete_prompt(&roll(RollState::Active, loc));
+        let single = |loc| delete_prompt_of(&roll(RollState::Active, loc));
         assert_eq!(
             single(BranchLocation::Local),
             Ok(DeletePrompt::Single(DeleteScope::Local))
@@ -5207,7 +7545,7 @@ mod tests {
             RollState::Blocked,
         ] {
             assert_eq!(
-                delete_prompt(&roll(state.clone(), BranchLocation::Local)),
+                delete_prompt_of(&roll(state.clone(), BranchLocation::Local)),
                 Ok(DeletePrompt::Single(DeleteScope::Local)),
                 "{state:?} should still be deletable"
             );
@@ -5218,14 +7556,14 @@ mod tests {
     fn delete_prompt_never_offers_the_checked_out_local_copy() {
         let mut local = roll(RollState::Active, BranchLocation::Local);
         local.is_current = true;
-        let err = delete_prompt(&local).expect_err("checked-out local-only roll");
+        let err = delete_prompt_of(&local).expect_err("checked-out local-only roll");
         assert!(err.contains("checked out"), "should explain itself: {err}");
 
         // The origin copy of a checked-out roll is still fair game.
         let mut both = roll(RollState::Active, BranchLocation::Both);
         both.is_current = true;
         assert_eq!(
-            delete_prompt(&both),
+            delete_prompt_of(&both),
             Ok(DeletePrompt::Single(DeleteScope::Remote)),
             "a checked-out both-location roll degrades to origin-only"
         );
@@ -5359,6 +7697,130 @@ mod tests {
         assert!(both.local && both.remote && both.fetch);
         assert!(both.force, "force passes through to the plan");
         assert!(!prune_scope_for(DeleteScope::Both, false).force);
+    }
+
+    // ── graph column ────────────────────────────────────────────────────
+
+    #[test]
+    fn graph_glyphs_place_an_open_marker_on_the_rolling_lane_while_active() {
+        assert_eq!(graph_glyphs(&RollState::Active), ('│', '○'));
+        assert_eq!(graph_glyphs(&RollState::Blocked), ('│', '◌'));
+    }
+
+    #[test]
+    fn graph_glyphs_fill_the_rolling_lane_once_graduated() {
+        assert_eq!(graph_glyphs(&RollState::Graduated), ('│', '●'));
+    }
+
+    #[test]
+    fn graph_glyphs_mark_divergence_and_reversion_on_the_rolling_lane() {
+        assert_eq!(graph_glyphs(&RollState::Diverged), ('│', '◐'));
+        assert_eq!(graph_glyphs(&RollState::Reverted), ('│', '↺'));
+    }
+
+    #[test]
+    fn graph_glyphs_fill_both_lanes_once_promoted() {
+        assert_eq!(graph_glyphs(&RollState::Promoted), ('●', '●'));
+    }
+
+    #[test]
+    fn graph_glyphs_mark_a_demoted_main_lane_without_losing_the_rolling_fill() {
+        // Demoted means stable's copy was reverted; the roll's content is
+        // still on rolling, so only the main lane changes from `Promoted`.
+        assert_eq!(graph_glyphs(&RollState::Demoted), ('◐', '●'));
+    }
+
+    #[test]
+    fn hotfix_graph_glyphs_distinguish_open_from_landed() {
+        assert_eq!(hotfix_graph_glyphs(HotfixState::Open), ('│', '○'));
+        assert_eq!(hotfix_graph_glyphs(HotfixState::Landed), ('●', '●'));
+    }
+
+    #[test]
+    fn base_graph_glyphs_put_stable_on_main_and_rolling_behind_a_passthrough() {
+        assert_eq!(base_graph_glyphs(BaseRole::Stable), ('●', ' '));
+        assert_eq!(base_graph_glyphs(BaseRole::Rolling), ('│', '●'));
+    }
+
+    #[test]
+    fn the_graph_column_sits_left_of_the_roll_number_for_every_row_kind() {
+        let bases = vec![
+            BaseBranch {
+                role: BaseRole::Stable,
+                branch: "main".to_string(),
+                location: BranchLocation::Local,
+                is_current: false,
+            },
+            BaseBranch {
+                role: BaseRole::Rolling,
+                branch: "rolling".to_string(),
+                location: BranchLocation::Local,
+                is_current: false,
+            },
+        ];
+        let mut app = StatusApp {
+            config: config("main", "rolling"),
+            current_branch: "main".to_string(),
+            bases,
+            rolls: vec![roll_n(1, RollState::Active), roll_n(2, RollState::Promoted)],
+            hotfixes: Vec::new(),
+            show_deps: false,
+            tracking: HashMap::new(),
+            versions: HashMap::new(),
+            version: None,
+            table: TableState::default(),
+            mode: Mode::Browsing,
+            message: None,
+            job: None,
+            job_title: String::new(),
+            job_moves_head: false,
+            queue: Queue::default(),
+            quit_armed: false,
+            deferred_mode: None,
+            panel: None,
+            panel_maximized: false,
+            panel_rect: None,
+            pending_g: false,
+            pending_push: None,
+            command_history: Vec::new(),
+        };
+        let out = draw(|f, area| app.render_table(f, area));
+
+        let stable = out
+            .lines()
+            .find(|l| l.contains("main"))
+            .expect("stable row");
+        assert!(
+            stable.contains("● "),
+            "stable row missing its glyph: {stable}"
+        );
+
+        let rolling = out
+            .lines()
+            .find(|l| l.contains("rolling") && !l.contains("roll/"))
+            .expect("rolling row");
+        assert!(
+            rolling.contains("│●"),
+            "rolling row missing its glyph: {rolling}"
+        );
+
+        let active = out
+            .lines()
+            .find(|l| l.contains("roll/1-0101-x"))
+            .expect("active roll row");
+        assert!(
+            active.contains("│○"),
+            "active roll missing its glyph: {active}"
+        );
+
+        let promoted = out
+            .lines()
+            .find(|l| l.contains("roll/2-0101-x"))
+            .expect("promoted roll row");
+        assert!(
+            promoted.contains("●●"),
+            "promoted roll missing its glyph: {promoted}"
+        );
     }
 
     // ── rendering ───────────────────────────────────────────────────────
@@ -5525,6 +7987,85 @@ mod tests {
     }
 
     #[test]
+    fn the_hotfix_keys_are_in_the_keymap_and_found_by_the_search() {
+        let hits: Vec<&str> = filter_bindings("hotfix")
+            .into_iter()
+            .map(|i| BINDINGS[i].keys)
+            .collect();
+        assert!(hits.contains(&"h"), "{hits:?}");
+        assert!(hits.contains(&"H"), "{hits:?}");
+        // Neither belongs on the slim bar.
+        for b in BINDINGS.iter().filter(|b| b.keys == "h" || b.keys == "H") {
+            assert!(b.hint.is_none(), "{} on the status bar", b.keys);
+        }
+    }
+
+    #[test]
+    fn landing_a_hotfix_needs_one_checked_out() {
+        let rolls = vec![roll_n(1, RollState::Active)];
+        assert!(validate_action(
+            Action::LandHotfix,
+            None,
+            &rolls,
+            "hotfix/1-0720-urgent",
+            "roll/"
+        )
+        .is_ok());
+        let err = validate_action(Action::LandHotfix, None, &rolls, "main", "roll/")
+            .expect_err("main is not a hotfix");
+        assert!(err.contains("[space]"), "{err}");
+    }
+
+    #[test]
+    fn the_land_modal_names_both_merges() {
+        let cfg = config("main", "develop");
+        let out = draw(|f, area| {
+            render_modal(
+                f,
+                area,
+                &cfg,
+                &ConfirmModal {
+                    action: Action::LandHotfix,
+                    target: None,
+                    carried: &[],
+                    rolls: &[],
+                    hotfixes: &[],
+                    current_branch: "hotfix/1-0720-urgent",
+                },
+            )
+        });
+        assert!(
+            out.contains("Land hotfix/1-0720-urgent into main, then reintegrate into develop?"),
+            "{out}"
+        );
+    }
+
+    #[test]
+    fn the_create_modal_says_which_tier_it_creates() {
+        let cfg = config("main", "develop");
+        let roll = draw(|f, area| render_create_input(f, area, &cfg, "", CreateKind::Roll));
+        assert!(roll.contains("New roll slug"), "{roll}");
+        assert!(roll.contains(" create roll "), "{roll}");
+        let hot = draw(|f, area| render_create_input(f, area, &cfg, "urg", CreateKind::Hotfix));
+        assert!(
+            hot.contains("New hotfix slug (branched from main)"),
+            "{hot}"
+        );
+        assert!(hot.contains("urg_"), "{hot}");
+    }
+
+    #[test]
+    fn a_hotfix_row_gets_the_same_delete_shapes_as_a_roll() {
+        assert_eq!(
+            delete_prompt("hotfix/1-0720-x", &BranchLocation::Both, false),
+            Ok(DeletePrompt::Choice)
+        );
+        let err = delete_prompt("hotfix/1-0720-x", &BranchLocation::Local, true)
+            .expect_err("checked out");
+        assert!(err.contains("checked out"), "{err}");
+    }
+
+    #[test]
     fn every_binding_is_declared_once_and_can_be_run() {
         // The table is the only place keys are declared, so this is where a
         // doubled-up or unlabelled binding has to be caught.
@@ -5585,6 +8126,7 @@ mod tests {
             current_branch: "roll/1-0101-ahead".to_string(),
             bases: Vec::new(),
             rolls,
+            hotfixes: Vec::new(),
             show_deps: false,
             tracking,
             versions: HashMap::new(),
@@ -5593,9 +8135,17 @@ mod tests {
             mode: Mode::Browsing,
             message: None,
             job: None,
+            job_title: String::new(),
+            job_moves_head: false,
+            queue: Queue::default(),
+            quit_armed: false,
+            deferred_mode: None,
             panel: None,
+            panel_maximized: false,
+            panel_rect: None,
             pending_g: false,
             pending_push: None,
+            command_history: Vec::new(),
         };
 
         let out = draw(|f, area| app.render_table(f, area));
@@ -5633,6 +8183,7 @@ mod tests {
             current_branch: "main".to_string(),
             bases: Vec::new(),
             rolls,
+            hotfixes: Vec::new(),
             show_deps: false,
             tracking: HashMap::new(),
             versions,
@@ -5641,9 +8192,17 @@ mod tests {
             mode: Mode::Browsing,
             message: None,
             job: None,
+            job_title: String::new(),
+            job_moves_head: false,
+            queue: Queue::default(),
+            quit_armed: false,
+            deferred_mode: None,
             panel: None,
+            panel_maximized: false,
+            panel_rect: None,
             pending_g: false,
             pending_push: None,
+            command_history: Vec::new(),
         };
         let out = draw(|f, area| app.render_table(f, area));
 
@@ -5663,6 +8222,7 @@ mod tests {
             current_branch: "main".to_string(),
             bases: Vec::new(),
             rolls: vec![roll_n(1, RollState::Active)],
+            hotfixes: Vec::new(),
             show_deps: false,
             tracking: HashMap::new(),
             versions: HashMap::new(),
@@ -5671,9 +8231,17 @@ mod tests {
             mode: Mode::Browsing,
             message: None,
             job: None,
+            job_title: String::new(),
+            job_moves_head: false,
+            queue: Queue::default(),
+            quit_armed: false,
+            deferred_mode: None,
             panel: None,
+            panel_maximized: false,
+            panel_rect: None,
             pending_g: false,
             pending_push: None,
+            command_history: Vec::new(),
         };
         let out = draw(|f, area| app.render_table(f, area));
         assert!(!out.contains("version"), "column shown anyway:\n{out}");
@@ -5705,6 +8273,7 @@ mod tests {
             current_branch: "main".to_string(),
             bases: Vec::new(),
             rolls: vec![roll_n(1, RollState::Active)],
+            hotfixes: Vec::new(),
             show_deps: false,
             tracking: HashMap::new(),
             versions: HashMap::new(),
@@ -5713,9 +8282,17 @@ mod tests {
             mode: Mode::Browsing,
             message: None,
             job: None,
+            job_title: String::new(),
+            job_moves_head: false,
+            queue: Queue::default(),
+            quit_armed: false,
+            deferred_mode: None,
             panel: None,
+            panel_maximized: false,
+            panel_rect: None,
             pending_g: false,
             pending_push: None,
+            command_history: Vec::new(),
         };
         let out = draw(|f, area| app.render_table(f, area));
         let row = out
@@ -5804,6 +8381,116 @@ mod tests {
             let key = KeyCode::Char(char::from_digit(i as u32 + 1, 10).unwrap());
             assert_eq!(bump_key(key), BumpOutcome::Level(level), "row {}", i + 1);
         }
+    }
+
+    #[test]
+    fn the_verify_many_picker_maps_digits_to_sets_in_menu_order() {
+        for (i, set) in VerifySet::ALL.iter().enumerate() {
+            let key = KeyCode::Char(char::from_digit(i as u32 + 1, 10).unwrap());
+            assert_eq!(
+                verify_many_key(key),
+                VerifyManyOutcome::Set(*set),
+                "{key:?}"
+            );
+        }
+        // A digit past the menu is ignored rather than wrapping or panicking.
+        assert_eq!(
+            verify_many_key(KeyCode::Char('9')),
+            VerifyManyOutcome::Ignore
+        );
+        for key in [KeyCode::Char('n'), KeyCode::Char('N'), KeyCode::Esc] {
+            assert_eq!(verify_many_key(key), VerifyManyOutcome::Cancel, "{key:?}");
+        }
+        // Enter is deliberately unbound: this pass switches branches, so a
+        // stray Enter must not start it.
+        for key in [KeyCode::Enter, KeyCode::Char(' '), KeyCode::Char('V')] {
+            assert_eq!(verify_many_key(key), VerifyManyOutcome::Ignore, "{key:?}");
+        }
+    }
+
+    #[test]
+    fn verify_sets_select_by_state_and_never_include_promoted_rolls() {
+        let rolls = vec![
+            roll_n(1, RollState::Active),
+            roll_n(2, RollState::Blocked),
+            roll_n(3, RollState::Graduated),
+            roll_n(4, RollState::Diverged),
+            roll_n(5, RollState::Promoted),
+            RollInfo {
+                location: BranchLocation::Remote,
+                ..roll_n(6, RollState::Active)
+            },
+        ];
+        let names = |set: VerifySet| -> Vec<u32> {
+            set.select(&rolls)
+                .iter()
+                .map(|b| branches::parse_roll_number(b, "roll/").unwrap())
+                .collect()
+        };
+        // Promoted has nowhere left to go, so it is in no set — not even All.
+        assert_eq!(names(VerifySet::All), vec![1, 2, 3, 4, 6]);
+        assert_eq!(names(VerifySet::Active), vec![1, 6]);
+        assert_eq!(names(VerifySet::Blocked), vec![2]);
+        assert_eq!(names(VerifySet::Graduated), vec![3]);
+        assert_eq!(names(VerifySet::Diverged), vec![4]);
+        // Local is a location filter: the remote-only roll drops out.
+        assert_eq!(names(VerifySet::Local), vec![1, 2, 3, 4]);
+
+        let counts = verify_set_counts(&rolls);
+        assert_eq!(counts[0], (VerifySet::All, 5));
+        assert_eq!(counts[5], (VerifySet::Local, 4));
+    }
+
+    #[test]
+    fn the_verify_many_modal_shows_each_set_with_its_count() {
+        let rolls = vec![
+            roll_n(1, RollState::Active),
+            roll_n(2, RollState::Graduated),
+        ];
+        let counts = verify_set_counts(&rolls);
+        let out = draw(|f, area| render_verify_many_modal(f, area, &counts));
+        assert!(out.contains("[1] all rolls"), "{out}");
+        assert!(out.contains("2 rolls"), "{out}");
+        assert!(out.contains("[2] active"), "{out}");
+        assert!(out.contains("1 roll "), "{out}");
+        assert!(out.contains("[n] cancel"), "{out}");
+    }
+
+    #[test]
+    fn a_verify_many_report_summarises_and_names_the_failures() {
+        let results = vec![
+            ops::VerifyManyResult {
+                branch: "roll/1-x".to_string(),
+                outcome: None,
+                marked: Some(crate::core::version::Semver::parse("0.0.1-roll1").unwrap()),
+                verdict: ops::VerifyVerdict::Passed,
+            },
+            ops::VerifyManyResult {
+                branch: "roll/2-y".to_string(),
+                outcome: None,
+                marked: None,
+                verdict: ops::VerifyVerdict::Failed("gate exited 1".to_string()),
+            },
+            ops::VerifyManyResult {
+                branch: "roll/3-z".to_string(),
+                outcome: None,
+                marked: None,
+                verdict: ops::VerifyVerdict::Skipped("no local copy".to_string()),
+            },
+        ];
+        let (lines, failed) = render_verify_many(&results);
+        assert_eq!(failed, vec!["roll/2-y"]);
+        assert!(
+            lines.contains(&"version marked 0.0.1-roll1".to_string()),
+            "{lines:?}"
+        );
+        assert!(lines.contains(&"── roll/2-y ──".to_string()), "{lines:?}");
+        assert!(
+            lines.contains(&"FAILED: gate exited 1".to_string()),
+            "{lines:?}"
+        );
+        assert!(lines.contains(&"skipped: no local copy".to_string()));
+        assert_eq!(lines.last().unwrap(), "1 passed, 1 failed, 1 skipped");
     }
 
     #[test]
@@ -6205,6 +8892,52 @@ mod tests {
     }
 
     #[test]
+    fn the_graduate_modal_lists_the_chain_when_there_is_one() {
+        // A blocked roll's confirm has to say what else is about to land: the
+        // modal is the confirmation, and it would otherwise read as one merge.
+        let cfg = config("main", "rolling");
+        let mut dep = roll_n(8, RollState::Active);
+        dep.branch = "roll/8-0101-dep".to_string();
+        let mut target = roll_n(9, RollState::Blocked);
+        target.branch = "roll/9-0102-target".to_string();
+        target.deps = vec![8];
+        let rolls = vec![dep, target];
+
+        let out = draw(|f, area| {
+            render_modal(
+                f,
+                area,
+                &cfg,
+                &ConfirmModal {
+                    action: Action::Graduate,
+                    target: Some("roll/9-0102-target"),
+                    carried: &[],
+                    rolls: &rolls,
+                    hotfixes: &[],
+                    current_branch: "roll/9-0102-target",
+                },
+            )
+        });
+        assert!(
+            out.contains("Graduate 2 rolls into rolling, in this order?"),
+            "{out}"
+        );
+        assert!(
+            out.contains("1. roll/8-0101-dep  (dependency of 9, active)"),
+            "{out}"
+        );
+        // The blocked glyph is double-width and pads the buffer text, so the
+        // target row is matched in two halves.
+        assert!(out.contains("2. roll/9-0102-target"), "{out}");
+        assert!(out.contains("blocked)"), "{out}");
+
+        // And a blocked roll passes validation — the chain is the answer.
+        assert!(
+            validate_action(Action::Graduate, Some(&rolls[1]), &rolls, "main", "roll/").is_ok()
+        );
+    }
+
+    #[test]
     fn the_integrate_modal_names_both_the_source_and_the_destination() {
         // The direction is the whole point and the easiest thing to get backwards,
         // so the prompt has to spell it out.
@@ -6219,6 +8952,7 @@ mod tests {
                     target: Some("roll/1-0101-alpha"),
                     carried: &[],
                     rolls: &[],
+                    hotfixes: &[],
                     current_branch: "roll/2-0102-beta",
                 },
             )
@@ -6249,6 +8983,7 @@ mod tests {
                     target: Some("roll/8-0918-help-menu"),
                     carried: &carried,
                     rolls: &[],
+                    hotfixes: &[],
                     current_branch: "rolling",
                 },
             )
@@ -6283,6 +9018,7 @@ mod tests {
                     target: None,
                     carried: &[],
                     rolls: &rolls,
+                    hotfixes: &[],
                     current_branch: "main",
                 },
             )
@@ -6302,6 +9038,7 @@ mod tests {
                     target: None,
                     carried: &[],
                     rolls: &rolls,
+                    hotfixes: &[],
                     current_branch: "main",
                 },
             )
@@ -6310,6 +9047,286 @@ mod tests {
             prune.contains("Delete 1 promoted roll branch (local + origin)?"),
             "{prune}"
         );
+    }
+
+    // ── Job queue ───────────────────────────────────────────────────────────
+
+    /// An idle view over a repo that is never touched: these tests drive the
+    /// queue directly and never reload.
+    fn idle_app() -> StatusApp {
+        StatusApp {
+            config: test_config(),
+            current_branch: "roll/1-0101-x".to_string(),
+            bases: Vec::new(),
+            rolls: Vec::new(),
+            hotfixes: Vec::new(),
+            show_deps: false,
+            tracking: HashMap::new(),
+            versions: HashMap::new(),
+            version: None,
+            table: TableState::default(),
+            mode: Mode::Browsing,
+            message: None,
+            job: None,
+            job_title: String::new(),
+            job_moves_head: false,
+            queue: Queue::default(),
+            quit_armed: false,
+            deferred_mode: None,
+            panel: None,
+            panel_maximized: false,
+            panel_rect: None,
+            pending_g: false,
+            pending_push: None,
+            command_history: Vec::new(),
+        }
+    }
+
+    /// Wait for the running job and hand its outcome to the view, exactly as
+    /// `poll_job` does minus the reload.
+    fn settle(app: &mut StatusApp) {
+        loop {
+            let (Some(job), Some(panel)) = (app.job.as_mut(), app.panel.as_mut()) else {
+                panic!("settle called with nothing running");
+            };
+            if let JobProgress::Finished { ok, next } = job.drain(panel) {
+                app.job = None;
+                app.finish_job(ok, next);
+                return;
+            }
+            std::thread::yield_now();
+        }
+    }
+
+    fn says(lines: &'static str) -> impl FnOnce() -> Result<JobDone> + Send + 'static {
+        move || Ok(JobDone::lines(vec![lines.to_string()]))
+    }
+
+    #[test]
+    fn a_command_pressed_mid_job_queues_and_runs_after_it() {
+        let mut app = idle_app();
+        let (release, gate) = std::sync::mpsc::channel::<()>();
+        app.start_job("first", move || {
+            gate.recv().ok();
+            Ok(JobDone::lines(vec!["first done".to_string()]))
+        });
+        app.start_job("second", says("second done"));
+
+        assert_eq!(app.job_title, "first", "the second must not start early");
+        assert_eq!(app.queue.len(), 1);
+        assert!(
+            app.message.as_deref().unwrap().contains("queued 'second'"),
+            "{:?}",
+            app.message
+        );
+
+        release.send(()).unwrap();
+        settle(&mut app);
+        assert_eq!(app.job_title, "second", "it starts as the first finishes");
+        assert!(app.queue.is_empty());
+        settle(&mut app);
+        assert!(app.job.is_none());
+
+        let panel = app.panel.as_ref().unwrap();
+        assert_eq!(panel.title, "second");
+        assert_eq!(panel.status(), output::Status::Ok);
+    }
+
+    #[test]
+    fn a_failure_holds_the_queue_until_resumed() {
+        let mut app = idle_app();
+        let (release, gate) = std::sync::mpsc::channel::<()>();
+        app.start_job("rf integrate", move || {
+            gate.recv().ok();
+            anyhow::bail!("merge conflict")
+        });
+        app.start_job("rf create", says("created"));
+        release.send(()).unwrap();
+        settle(&mut app);
+
+        assert!(app.job.is_none(), "nothing may run behind a failure");
+        assert_eq!(app.queue.len(), 1, "the queue is kept, not discarded");
+        assert_eq!(app.queue.held(), Some("'rf integrate' failed"));
+        assert!(app.message.as_deref().unwrap().contains("[s] resume"));
+        assert_eq!(
+            panel_footer(&app.queue).as_deref(),
+            Some("1 held · [s] resume · [S] drop · [esc] close")
+        );
+
+        // A command pressed while held waits with the rest instead of jumping
+        // ahead of a conflict the user has not resolved yet.
+        app.start_job("git fetch --prune", says("fetched"));
+        assert!(app.job.is_none());
+        assert_eq!(app.queue.len(), 2);
+
+        app.resume_queue();
+        assert_eq!(app.job_title, "rf create");
+        settle(&mut app);
+        assert_eq!(app.job_title, "git fetch --prune");
+        settle(&mut app);
+        assert!(app.queue.is_empty());
+    }
+
+    #[test]
+    fn dropping_the_queue_discards_it_and_lets_the_next_command_run() {
+        let mut app = idle_app();
+        app.start_job("bad", || anyhow::bail!("nope"));
+        app.start_job("a", says("a"));
+        app.start_job("b", says("b"));
+        settle(&mut app);
+        assert_eq!(app.queue.len(), 2);
+
+        app.drop_queue();
+        assert!(app.queue.is_empty());
+        assert_eq!(app.queue.held(), None);
+        assert_eq!(app.message.as_deref(), Some("dropped 2 queued commands"));
+
+        app.start_job("fresh", says("ok"));
+        assert_eq!(app.job_title, "fresh", "no stale hold may linger");
+        settle(&mut app);
+    }
+
+    #[test]
+    fn a_failure_with_nothing_queued_holds_nothing() {
+        let mut app = idle_app();
+        app.start_job("bad", || anyhow::bail!("nope"));
+        settle(&mut app);
+        assert_eq!(app.queue.held(), None);
+        assert_eq!(app.message, None);
+        app.start_job("next", says("ok"));
+        assert_eq!(app.job_title, "next");
+        settle(&mut app);
+    }
+
+    #[test]
+    fn keys_that_read_head_wait_for_a_pending_switch() {
+        let mut app = idle_app();
+        let (release, gate) = std::sync::mpsc::channel::<()>();
+        app.start_job("git fetch --prune", move || {
+            gate.recv().ok();
+            Ok(JobDone::default())
+        });
+        assert!(!app.waits_on_head("[i]"), "a fetch leaves HEAD alone");
+
+        app.start_head_job("git switch main", says("switched"));
+        assert!(app.waits_on_head("[i]"));
+        let msg = app.message.clone().unwrap();
+        assert!(
+            msg.contains("[i]") && msg.contains("git switch main"),
+            "{msg}"
+        );
+
+        // And `[i]` itself is refused rather than opening its modal.
+        app.request_integrate();
+        assert!(matches!(app.mode, Mode::Browsing));
+
+        release.send(()).unwrap();
+        settle(&mut app);
+        assert_eq!(app.job_title, "git switch main");
+        assert!(app.waits_on_head("[v]"), "still pending while it runs");
+        settle(&mut app);
+        assert!(!app.waits_on_head("[v]"));
+    }
+
+    #[test]
+    fn quitting_with_commands_queued_asks_first() {
+        let mut app = idle_app();
+        assert!(app.confirm_quit(false), "nothing queued: quit at once");
+
+        app.start_job("bad", || anyhow::bail!("nope"));
+        app.start_job("held", says("x"));
+        settle(&mut app);
+        assert!(!app.confirm_quit(false));
+        assert!(app.quit_armed);
+        assert!(app.message.as_deref().unwrap().contains("will be dropped"));
+        assert!(app.confirm_quit(true));
+    }
+
+    #[test]
+    fn a_rejected_push_holds_the_queue_and_a_force_runs_ahead_of_it() {
+        let mut app = idle_app();
+        let (release, gate) = std::sync::mpsc::channel::<()>();
+        app.start_job("git push roll/1", move || {
+            gate.recv().ok();
+            Ok(JobDone::with_next(
+                vec!["rejected".to_string()],
+                Followup::OfferForcePush {
+                    branch: "roll/1".to_string(),
+                    remote: "origin".to_string(),
+                },
+            ))
+        });
+        app.start_job("rf create", says("created"));
+        release.send(()).unwrap();
+        settle(&mut app);
+
+        assert!(matches!(app.mode, Mode::ForcePush { rejected: true, .. }));
+        assert!(app.job.is_none(), "the queue waits on the answer");
+        assert!(app.queue.held().unwrap().contains("rejected"));
+
+        // What `y` submits: the forced retry, flagged as answering the hold.
+        app.submit(
+            Pending::new(
+                "git push --force-with-lease roll/1",
+                false,
+                Box::new(says("forced")),
+            ),
+            true,
+        );
+        assert_eq!(app.job_title, "git push --force-with-lease roll/1");
+        assert_eq!(app.queue.held(), None);
+        settle(&mut app);
+        assert_eq!(app.job_title, "rf create");
+        settle(&mut app);
+    }
+
+    #[test]
+    fn a_force_prompt_waits_for_an_open_modal_to_close() {
+        let mut app = idle_app();
+        app.start_job("git push roll/1", || {
+            Ok(JobDone::with_next(
+                vec!["rejected".to_string()],
+                Followup::OfferForcePush {
+                    branch: "roll/1".to_string(),
+                    remote: "origin".to_string(),
+                },
+            ))
+        });
+        app.mode = Mode::CreateInput {
+            slug: "half-typ".to_string(),
+            kind: CreateKind::Roll,
+        };
+        settle(&mut app);
+        app.open_deferred_mode();
+        assert!(
+            matches!(&app.mode, Mode::CreateInput { slug, .. } if slug == "half-typ"),
+            "the slug being typed must survive"
+        );
+
+        app.mode = Mode::Browsing;
+        app.open_deferred_mode();
+        assert!(matches!(app.mode, Mode::ForcePush { .. }));
+    }
+
+    #[test]
+    fn the_status_bar_keeps_a_held_queue_in_view() {
+        use ratatui::{backend::TestBackend, Terminal};
+
+        let mut app = idle_app();
+        app.start_job("bad", || anyhow::bail!("nope"));
+        app.start_job("rf create", says("x"));
+        settle(&mut app);
+        // The panel dismissed and the transient message gone, as after `esc`.
+        app.panel = None;
+        app.message = None;
+
+        let mut terminal = Terminal::new(TestBackend::new(160, 2)).unwrap();
+        terminal
+            .draw(|f| app.render_status_bar(f, f.area()))
+            .unwrap();
+        let out = format!("{:?}", terminal.backend().buffer());
+        assert!(out.contains("held"), "{out}");
+        assert!(out.contains("rf create"), "{out}");
     }
 
     #[test]
@@ -6336,18 +9353,40 @@ mod tests {
     /// `state` column and no roll number, and the cursor starts on the checked
     /// out base branch.
     #[test]
-    fn base_rows_render_above_the_rolls() {
-        use ratatui::{backend::TestBackend, Terminal};
+    fn row_at_maps_hotfixes_after_the_rolls() {
+        assert_eq!(row_at(5, 2, 3, 2), Some(RowKind::Hotfix(0)));
+        assert_eq!(row_at(6, 2, 3, 2), Some(RowKind::Hotfix(1)));
+        assert_eq!(row_at(7, 2, 3, 2), None);
+        // No rolls at all: hotfixes follow the bases directly.
+        assert_eq!(row_at(2, 2, 0, 1), Some(RowKind::Hotfix(0)));
+    }
 
-        let cfg = config("main", "develop");
-        let bases = base_branches(&cfg, "develop", |_| true);
+    #[test]
+    fn a_hotfix_row_renders_below_the_rolls_with_its_own_number() {
+        let hotfixes = vec![
+            HotfixInfo {
+                branch: "hotfix/1-0720-urgent".to_string(),
+                number: 1,
+                state: HotfixState::Open,
+                location: BranchLocation::Local,
+                is_current: false,
+            },
+            HotfixInfo {
+                branch: "hotfix/2-0721-landed-one".to_string(),
+                number: 2,
+                state: HotfixState::Landed,
+                location: BranchLocation::Both,
+                is_current: false,
+            },
+        ];
         let mut table = TableState::default();
-        table.select(initial_selection(&bases, &[]));
+        table.select(initial_selection(&[], &[], &hotfixes));
         let mut app = StatusApp {
-            config: cfg,
-            current_branch: "develop".to_string(),
-            bases,
+            config: test_config(),
+            current_branch: "main".to_string(),
+            bases: Vec::new(),
             rolls: vec![roll_n(1, RollState::Active)],
+            hotfixes,
             show_deps: false,
             tracking: HashMap::new(),
             versions: HashMap::new(),
@@ -6356,9 +9395,89 @@ mod tests {
             mode: Mode::Browsing,
             message: None,
             job: None,
+            job_title: String::new(),
+            job_moves_head: false,
+            queue: Queue::default(),
+            quit_armed: false,
+            deferred_mode: None,
             panel: None,
+            panel_maximized: false,
+            panel_rect: None,
             pending_g: false,
             pending_push: None,
+            command_history: Vec::new(),
+        };
+        let out = draw(|f, area| app.render_table(f, area));
+        let lines: Vec<&str> = out.lines().collect();
+        let roll_line = lines
+            .iter()
+            .position(|l| l.contains("roll/1-0101-x"))
+            .unwrap();
+        let hotfix_line = lines
+            .iter()
+            .position(|l| l.contains("hotfix/1-0720-urgent"))
+            .unwrap();
+        assert!(hotfix_line > roll_line, "hotfix above the roll:\n{out}");
+        // A thin rule sits between the two tiers, in a line of its own — not a
+        // row, so selection indices are unaffected.
+        assert_eq!(hotfix_line, roll_line + 2, "no gap for the rule:\n{out}");
+        assert!(
+            lines[roll_line + 1].contains("┄┄┄"),
+            "no separator between rolls and hotfixes:\n{out}"
+        );
+        // ...and none without hotfixes to separate.
+        let hotfixes = std::mem::take(&mut app.hotfixes);
+        let bare = draw(|f, area| app.render_table(f, area));
+        assert!(!bare.contains('┄'), "separator with no hotfixes:\n{bare}");
+        app.hotfixes = hotfixes;
+        // `h1`, not a bare `1`: hotfix numbering is independent of rolls, and
+        // this row sits under a roll that is also number 1.
+        assert!(lines[hotfix_line].contains("h1"), "{}", lines[hotfix_line]);
+        assert!(
+            lines[hotfix_line].contains("hotfix"),
+            "{}",
+            lines[hotfix_line]
+        );
+        assert!(out.contains("✓ landed"), "{out}");
+        // The current-branch hunt reaches hotfix rows too.
+        let mut current = app.hotfixes.clone();
+        current[1].is_current = true;
+        assert_eq!(initial_selection(&[], &app.rolls, &current), Some(2));
+    }
+
+    #[test]
+    fn base_rows_render_above_the_rolls() {
+        use ratatui::{backend::TestBackend, Terminal};
+
+        let cfg = config("main", "develop");
+        let bases = base_branches(&cfg, "develop", |_| true);
+        let mut table = TableState::default();
+        table.select(initial_selection(&bases, &[], &[]));
+        let mut app = StatusApp {
+            config: cfg,
+            current_branch: "develop".to_string(),
+            bases,
+            rolls: vec![roll_n(1, RollState::Active)],
+            hotfixes: Vec::new(),
+            show_deps: false,
+            tracking: HashMap::new(),
+            versions: HashMap::new(),
+            version: None,
+            table,
+            mode: Mode::Browsing,
+            message: None,
+            job: None,
+            job_title: String::new(),
+            job_moves_head: false,
+            queue: Queue::default(),
+            quit_armed: false,
+            deferred_mode: None,
+            panel: None,
+            panel_maximized: false,
+            panel_rect: None,
+            pending_g: false,
+            pending_push: None,
+            command_history: Vec::new(),
         };
 
         // Tall enough for the header, three table rows and the five-line status
@@ -6382,5 +9501,99 @@ mod tests {
         // Cursor sits on the current branch (the rolling base), not the roll.
         assert!(line(6).contains('▶'), "{}", line(6));
         assert!(!line(5).contains('▶') && !line(7).contains('▶'));
+    }
+
+    /// Rolls 14 and 15 integrated each other; `lacks` empty makes 15 the
+    /// carrier, non-empty leaves the cycle without one.
+    fn cycle_14_15(lacks: &[u32]) -> Vec<RollInfo> {
+        let cycle = branches::DepCycle {
+            members: vec![14, 15],
+            suggested: 15,
+            lacks: lacks.to_vec(),
+        };
+        let mut r14 = roll_n(14, RollState::Blocked);
+        r14.deps = vec![15];
+        r14.dependents = vec![15];
+        r14.cycle = Some(cycle.clone());
+        let mut r15 = roll_n(15, RollState::Active);
+        r15.deps = vec![14];
+        r15.dependents = vec![14];
+        r15.cycle = Some(cycle);
+        vec![r14, r15]
+    }
+
+    #[test]
+    fn a_carrier_shows_its_cycle_member_as_carried_not_blocking() {
+        let all = cycle_14_15(&[]);
+        // 15 carries 14: ungraduated, but it gates nothing.
+        let rows = dep_rows(&all[1], &all);
+        assert_eq!(rows.len(), 1);
+        assert!(rows[0].carried && !rows[0].is_blocker, "{rows:?}");
+        // 14 really is waiting on 15, which is what lands it.
+        let rows = dep_rows(&all[0], &all);
+        assert!(rows[0].is_blocker && !rows[0].carried, "{rows:?}");
+        // And from the other side: 15, as 14's dependent, is not gated by it.
+        let rows = dependent_rows(&all[0], &all);
+        assert!(rows[0].carried && !rows[0].is_blocker, "{rows:?}");
+    }
+
+    #[test]
+    fn the_detail_cycle_note_says_which_roll_to_graduate() {
+        let all = cycle_14_15(&[]);
+        let lines = cycle_lines(all[0].cycle.as_ref().unwrap(), &all);
+        assert_eq!(lines.len(), 2, "{lines:?}");
+        assert!(lines[0].contains("14 ⇄ 15"), "{lines:?}");
+        assert!(lines[1].contains("graduate roll/15-0101-x"), "{lines:?}");
+    }
+
+    #[test]
+    fn graduating_a_carried_member_lists_the_carrier_in_the_confirm() {
+        // A one-step chain, but not of the row under the cursor — so the
+        // modal must say what will actually merge.
+        let all = cycle_14_15(&[]);
+        let lines = chain_lines(&all, "roll/14-0101-x", ops::ChainKind::Graduate)
+            .expect("the plan is listed");
+        assert_eq!(lines.len(), 1);
+        assert!(lines[0].contains("roll/15-0101-x"), "{lines:?}");
+        assert!(lines[0].contains("carries 14"), "{lines:?}");
+        assert!(validate_action(Action::Graduate, Some(&all[0]), &all, "main", "roll/").is_ok());
+    }
+
+    #[test]
+    fn graduating_a_cycle_with_no_carrier_is_refused_with_the_remedy() {
+        let all = cycle_14_15(&[14]);
+        for sel in &all {
+            let err =
+                validate_action(Action::Graduate, Some(sel), &all, "main", "roll/").unwrap_err();
+            assert!(err.contains("`rf integrate roll/14-0101-x`"), "{err}");
+        }
+    }
+
+    #[test]
+    fn dep_chain_carries_the_carried_marker_onto_its_rows() {
+        // Regression test: `dep_chain` builds each `ChainRow` from `dep_rows`,
+        // and used to drop `carried` doing it — a merge-conflict casualty
+        // (ChainRow predates the cycle feature) that left a carried member
+        // reading as a plain blocker several levels down. `dep_rows` itself
+        // was already covered by `a_carrier_shows_its_cycle_member_as_carried_
+        // not_blocking`; this is the same fact, through `dep_chain` instead.
+        let all = cycle_14_15(&[]);
+        let chain = dep_chain(&all[1], &all); // 15, the carrier
+                                              // 14 at depth 0, then 15 again at depth 1 (14's own dep is 15 —
+                                              // the cycle), marked `repeated` since 15 is the pane's own root.
+        let direct = chain.iter().find(|r| r.number == 14).expect("14 in chain");
+        assert!(
+            direct.carried && !direct.is_blocker,
+            "carried dropped in dep_chain: {direct:?}"
+        );
+    }
+
+    #[test]
+    fn the_detail_pane_marks_a_carried_dependency_rather_than_a_blocker() {
+        let all = cycle_14_15(&[]);
+        // Selecting 15 (the carrier): its one dependency, 14, is carried.
+        let out = draw(|f, area| render_detail(f, area, &all[1], None, &all, 0, &[]));
+        assert!(out.contains("↻ carried"), "{out}");
+        assert!(!out.contains("⛔ blocker"), "{out}");
     }
 }

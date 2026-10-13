@@ -17,12 +17,12 @@ use std::process::Command;
 use anyhow::{anyhow, bail, Context, Result};
 
 use crate::core::version::{BumpLevel, Marker, Semver, VersionCheck, VersionStatus};
-use crate::core::{branches, config::Config, git, proc, version};
+use crate::core::{branches, config::Config, git, merge_driver, proc, version};
 
 /// Prefix for the hotfix tier. Parallel to `roll_prefix`, but fixed rather than
 /// configurable — hotfixes are a rarely-used sanctioned exception with their own
 /// independent numbering.
-pub(crate) const HOTFIX_PREFIX: &str = "hotfix/";
+pub(crate) use crate::core::branches::HOTFIX_PREFIX;
 
 // ── Clean-state / working-tree guards ───────────────────────────────────────
 
@@ -42,9 +42,11 @@ pub(crate) fn workflow_clean(config: &Config) -> Result<bool> {
     }
     let status = git::capture_git(&config.repo_root, &["status", "--porcelain"])?;
     let config_rel = repo_relative_path(config, &Config::config_path(&config.repo_root));
-    // `.gitattributes` is the other file `rf init` writes without committing
-    // (`ensure_version_merge_driver`) — untracked if `rf init` just created
-    // it, modified if it already existed and gained the merge-driver line.
+    // `.gitattributes` is the file older versions of `rf init` wrote without
+    // committing — untracked if it created it, modified if it already existed
+    // and gained the merge-driver line. `ensure_version_merge_driver` now
+    // writes the clone's own `info/attributes` instead, which is never in the
+    // tree; this keeps clones set up the old way from reading as dirty.
     let attrs_rel = repo_relative_path(config, &config.repo_root.join(".gitattributes"));
     let all_allowed = status.lines().all(|line| {
         let trimmed = line.trim();
@@ -206,6 +208,8 @@ fn run_merge(
     git::run_git(repo, &["checkout", target])
         .with_context(|| format!("failed to check out '{target}'"))?;
 
+    wire_driver_quietly(repo);
+
     let mut merge_args = vec!["merge", "--no-ff", "--no-edit", "-m", subject];
     if let Some(body) = body {
         merge_args.push("-m");
@@ -214,9 +218,21 @@ fn run_merge(
     merge_args.push(source);
 
     if let Err(merge_err) = git::run_git(repo, &merge_args) {
-        return Err(conflict_or_error(
-            repo, source, target, &original, merge_err,
-        ));
+        // A stop on nothing but the version line is not a conflict this
+        // workflow has; finish it the way the driver would have. Anything else
+        // is a real conflict, diagnosed before the unwind erases it.
+        if !settle_version_only_conflicts(repo) {
+            return Err(conflict_or_error(
+                repo, source, target, &original, merge_err,
+            ));
+        }
+        if let Err(commit_err) = commit_settled_merge(repo) {
+            unwind_merge(repo, &original);
+            return Err(commit_err.context(format!(
+                "the merge of '{source}' into '{target}' was aborted and you are back on \
+                 '{original}'"
+            )));
+        }
     }
 
     git::run_git(repo, &["checkout", &original]).with_context(|| {
@@ -253,15 +269,21 @@ fn merge_gated<T>(
     git::run_git(repo, &["checkout", target])
         .with_context(|| format!("failed to check out '{target}'"))?;
 
+    wire_driver_quietly(repo);
+
     // `--no-ff --no-commit` leaves MERGE_HEAD set and the result staged, which
-    // is precisely the state the gates need to see.
+    // is precisely the state the gates need to see — and a version-only stop
+    // settled here leaves exactly that state too, so the gates (and
+    // graduation's own `reconcile_staged_version`) cannot tell the two apart.
     if let Err(merge_err) = git::run_git(
         repo,
         &["merge", "--no-ff", "--no-commit", "--no-edit", source],
     ) {
-        return Err(conflict_or_error(
-            repo, source, target, &original, merge_err,
-        ));
+        if !settle_version_only_conflicts(repo) {
+            return Err(conflict_or_error(
+                repo, source, target, &original, merge_err,
+            ));
+        }
     }
 
     let outcome = match run_step() {
@@ -1011,7 +1033,17 @@ pub(crate) fn integrate(config: &Config, branch: &str) -> Result<IntegrateOutcom
     if !git::ref_exists(repo, branch) {
         bail!("branch not found: {}", branch);
     }
-    git::run_git(repo, &["merge", "--no-ff", branch])?;
+    wire_driver_quietly(repo);
+    // On a real conflict the merge is left in progress, exactly as git left
+    // it, for the user to resolve right here — unlike graduation there is no
+    // other branch to return to. Only a stop on nothing but the version line
+    // is finished on their behalf.
+    if let Err(err) = git::run_git(repo, &["merge", "--no-ff", branch]) {
+        if !settle_version_only_conflicts(repo) {
+            return Err(err.into());
+        }
+        commit_settled_merge(repo)?;
+    }
     Ok(IntegrateOutcome {
         branch: branch.to_string(),
         current,
@@ -1033,20 +1065,6 @@ fn next_hotfix_number(config: &Config) -> Result<u32> {
         .max()
         .unwrap_or(0);
     Ok(max + 1)
-}
-
-/// Short reference form used in hotfix merge subjects: the branch
-/// `hotfix/N-MMDD-slug` renders as `hotfix/N-slug` (date dropped).
-fn hotfix_short_name(branch: &str) -> Option<String> {
-    let rest = branch.strip_prefix(HOTFIX_PREFIX)?;
-    let mut parts = rest.splitn(3, '-');
-    let number = parts.next()?;
-    let _mmdd = parts.next()?;
-    let slug = parts.next()?;
-    if number.is_empty() || slug.is_empty() {
-        return None;
-    }
-    Some(format!("{HOTFIX_PREFIX}{number}-{slug}"))
 }
 
 /// Create a hotfix branch off the stable branch: `hotfix/N-MMDD-slug`.
@@ -1116,7 +1134,7 @@ pub(crate) fn hotfix_land(config: &Config, dry_run: bool) -> Result<HotfixLandOu
             current
         );
     }
-    let short = hotfix_short_name(&current)
+    let short = branches::hotfix_short_name(&current)
         .ok_or_else(|| anyhow!("could not parse hotfix branch name '{current}'"))?;
     let stable = config.stable_branch.clone();
     let rolling = config.rolling_branch.clone();
@@ -1441,58 +1459,171 @@ fn check_dev_marker_ownership(config: &Config, branch: &str) -> Result<()> {
     }
 }
 
-/// The name `rf init` registers the version merge driver under, in both
-/// `.gitattributes` and local git config.
+/// The name the version merge driver is registered under, in both the
+/// clone's attributes and its git config.
 const VERSION_MERGE_DRIVER: &str = "rf-version";
 
-/// Ensure this clone routes `Cargo.toml` through [`crate::core::merge_driver`]
-/// on merge, so a roll's dev marker never shows up as a real conflict. Called
-/// from `rf init`, which is the command every documented workflow already
-/// runs on a fresh clone — and has to be, since the git config half of this
-/// is local to the clone. `.gitattributes` can declare that `Cargo.toml` uses
-/// a driver *named* `rf-version`, and that line is committed and shared; but
-/// what that name actually runs is never stored in the repo (a well-known git
-/// limitation), so every clone needs its own `git config merge.rf-version.driver`
-/// or the attribute silently falls back to git's default merge, conflicts and
-/// all.
+/// What git runs for [`VERSION_MERGE_DRIVER`]. `%P` tells the driver which of
+/// the two attributed files it is resolving. A bare `rf`, looked up on `PATH`
+/// by git mid-merge, rather than this binary's own path: on Nix that path is a
+/// store path an upgrade or a garbage collection would leave dangling, while
+/// `rf` is whatever the user runs `rf` as. When the lookup fails anyway, the
+/// merge stops and [`settle_version_only_conflicts`] finishes it in-process.
+const VERSION_MERGE_DRIVER_CMD: &str = "rf __merge-driver-version %O %A %B %P";
+
+/// Ensure this clone routes `Cargo.toml` and `Cargo.lock` through
+/// [`crate::core::merge_driver`] on merge, so a roll's dev marker never shows
+/// up as a real conflict. `rf init` calls this to report what it wired; every
+/// `rf` merge calls it too, quietly (see [`wire_driver_quietly`]), because the
+/// whole thing is local to the clone and a fresh clone that never ran
+/// `rf init` — the case that actually happened — would otherwise merge with
+/// git's default driver, conflicts and all.
+///
+/// Both halves live in the clone, never the tree. What a driver name runs is
+/// git config, which is never stored in a repo (a well-known git limitation),
+/// so the attribute naming it is clone-local too: `info/attributes` (via
+/// `git rev-parse --git-path`, so a linked worktree resolves to the shared
+/// one). A committed `.gitattributes` would only apply on branches that carry
+/// it — `main` here never did — and writing one lazily from a merge would
+/// leave an uncommitted file on whatever branch happened to be checked out.
+/// A `.gitattributes` line an older `rf init` left behind names the same
+/// driver and keeps working.
 ///
 /// A no-op on a repo with no `Cargo.toml` at all, matching every other
 /// version-related feature here. Returns whether anything was written, so the
 /// caller can report it.
 pub(crate) fn ensure_version_merge_driver(config: &Config) -> Result<bool> {
-    let repo = &config.repo_root;
+    wire_version_merge_driver(&config.repo_root)
+}
+
+fn wire_version_merge_driver(repo: &Path) -> Result<bool> {
     if !repo.join(version::VERSION_FILE).exists() {
         return Ok(false);
     }
 
     let mut changed = false;
 
-    let attrs_path = repo.join(".gitattributes");
+    let attrs_rel = git::capture_git(repo, &["rev-parse", "--git-path", "info/attributes"])
+        .context("failed to locate the clone's info/attributes")?;
+    let attrs_path = repo.join(attrs_rel);
     let existing = std::fs::read_to_string(&attrs_path).unwrap_or_default();
-    let line = format!("{} merge={VERSION_MERGE_DRIVER}", version::VERSION_FILE);
-    if !existing.lines().any(|l| l.trim() == line) {
-        let mut next = existing;
-        if !next.is_empty() && !next.ends_with('\n') {
+    let mut next = existing.clone();
+    for file in merge_driver::VersionFile::ALL {
+        let line = format!("{} merge={VERSION_MERGE_DRIVER}", file.file_name());
+        if !next.lines().any(|l| l.trim() == line) {
+            if !next.is_empty() && !next.ends_with('\n') {
+                next.push('\n');
+            }
+            next.push_str(&line);
             next.push('\n');
         }
-        next.push_str(&line);
-        next.push('\n');
+    }
+    if next != existing {
+        if let Some(dir) = attrs_path.parent() {
+            std::fs::create_dir_all(dir)
+                .with_context(|| format!("failed to create {}", dir.display()))?;
+        }
         std::fs::write(&attrs_path, next)
             .with_context(|| format!("failed to write {}", attrs_path.display()))?;
         changed = true;
     }
 
     let driver_key = format!("merge.{VERSION_MERGE_DRIVER}.driver");
-    let driver_cmd = "rf __merge-driver-version %O %A %B";
     let current =
         git::capture_git(repo, &["config", "--local", "--get", &driver_key]).unwrap_or_default();
-    if current != driver_cmd {
-        git::run_git(repo, &["config", "--local", &driver_key, driver_cmd])
-            .context("failed to configure the version merge driver")?;
+    if current != VERSION_MERGE_DRIVER_CMD {
+        git::run_git(
+            repo,
+            &["config", "--local", &driver_key, VERSION_MERGE_DRIVER_CMD],
+        )
+        .context("failed to configure the version merge driver")?;
         changed = true;
     }
 
     Ok(changed)
+}
+
+/// [`wire_version_merge_driver`] ahead of an `rf` merge, with its outcome
+/// dropped on purpose. Wiring is an optimisation here, not a precondition: a
+/// clone where it fails (a read-only config, say) still gets every
+/// version-only conflict settled by [`settle_version_only_conflicts`], so
+/// failing the merge over it would be strictly worse. And `core` never prints,
+/// so there is nowhere to say "wired it" mid-merge — `rf init` is the place
+/// that reports it.
+fn wire_driver_quietly(repo: &Path) {
+    let _ = wire_version_merge_driver(repo);
+}
+
+/// Finish a merge that stopped only on the crate's own version, by the same
+/// rule the merge driver applies ([`merge_driver::merge_texts`]). Returns
+/// `true` when it did — every conflict resolved and staged, the merge still in
+/// progress for the caller to commit (or gate) — and `false`, having touched
+/// nothing, in every other case.
+///
+/// This is what makes a version-only conflict impossible rather than merely
+/// unlikely: git can stop on one without the driver ever having run — the
+/// clone was never wired, or `rf` is not on the `PATH` git sees (a `cargo run`
+/// build, a stale install). The resolution is computed from the index's own
+/// conflict stages, so it does not care which.
+///
+/// All or nothing, deliberately. If any unmerged path is not a version file, or
+/// a version file still conflicts once its version line agrees (a dependency
+/// that moved on both sides, say), the merge is left exactly as git left it —
+/// finishing the parts this understands would make the real conflict look
+/// smaller than it is.
+fn settle_version_only_conflicts(repo: &Path) -> bool {
+    if !git::ref_exists(repo, "MERGE_HEAD") {
+        return false;
+    }
+    let Ok(unmerged) = git::capture_git(repo, &["diff", "--name-only", "--diff-filter=U"]) else {
+        return false;
+    };
+    let paths: Vec<&str> = unmerged.lines().filter(|l| !l.is_empty()).collect();
+    if paths.is_empty() {
+        return false;
+    }
+
+    let stage = |n: u8, path: &str| {
+        git::show_file_at_ref(repo, &format!(":{n}"), path)
+            .ok()
+            .flatten()
+    };
+    let mut resolved = Vec::with_capacity(paths.len());
+    for path in &paths {
+        let Some(file) = merge_driver::VersionFile::for_path(Path::new(path)) else {
+            return false;
+        };
+        // Stage 1 is missing when both sides added the file; stages 2/3 when
+        // one side deleted it — a real conflict this has no rule for.
+        let (Some(ours), Some(theirs)) = (stage(2, path), stage(3, path)) else {
+            return false;
+        };
+        let base = stage(1, path).unwrap_or_default();
+        let package = merge_driver::package_name(repo, Path::new(path));
+        match merge_driver::merge_texts(file, package.as_deref(), &base, &ours, &theirs) {
+            Ok(Some(merged)) => resolved.push((*path, merged)),
+            _ => return false,
+        }
+    }
+
+    for (path, merged) in &resolved {
+        if std::fs::write(repo.join(path), merged).is_err() {
+            return false;
+        }
+    }
+    let mut add = vec!["add", "--"];
+    add.extend(resolved.iter().map(|(p, _)| *p));
+    git::run_git(repo, &add).is_ok()
+}
+
+/// Commit a merge that [`settle_version_only_conflicts`] finished, with the
+/// message git prepared for it. `--cleanup=strip` because that message now
+/// carries git's `# Conflicts:` list, which `--no-edit` alone would keep in
+/// the commit.
+fn commit_settled_merge(repo: &Path) -> Result<()> {
+    git::run_git(repo, &["commit", "--no-edit", "--cleanup=strip"])
+        .context("failed to commit the merge after resolving its version-only conflicts")?;
+    Ok(())
 }
 
 /// Best-effort `Cargo.lock` refresh after a version rewrite.
@@ -1503,10 +1634,14 @@ pub(crate) fn ensure_version_merge_driver(config: &Config) -> Result<bool> {
 /// `cargo update --workspace --locked` gate is the real enforcement. Keeping it
 /// non-fatal also lets the integration tests run offline against fixture
 /// manifests that are not real crates.
+///
+/// The crate's own entry is rewritten directly first
+/// ([`sync_lockfile_own_entry`]), so it is right even when cargo cannot run.
 fn refresh_lockfile(repo: &Path) {
     if !repo.join("Cargo.lock").exists() {
         return;
     }
+    sync_lockfile_own_entry(repo);
     let offline = Command::new("cargo")
         .args(["update", "--workspace", "--offline"])
         .current_dir(repo)
@@ -1518,6 +1653,38 @@ fn refresh_lockfile(repo: &Path) {
         .args(["update", "--workspace"])
         .current_dir(repo)
         .status();
+}
+
+/// Make `Cargo.lock`'s own `[[package]]` entry carry `Cargo.toml`'s version,
+/// touching nothing else in the file.
+///
+/// The one part of a lockfile refresh that must never be left to chance: the
+/// two lines change in lockstep on every marker, bump and finalize, and the
+/// merge driver resolves them *as a pair*. A lockfile left one marker behind
+/// (cargo offline, or absent) is a merge conflict waiting on the next
+/// marker-vs-marker merge, and a `--locked` gate failure on the next run.
+/// Best-effort like the rest of [`refresh_lockfile`]: no readable name or
+/// version, or no unambiguous own entry, and the file is left alone.
+fn sync_lockfile_own_entry(repo: &Path) {
+    let lock_path = repo.join(version::LOCK_FILE);
+    let (Ok(manifest), Ok(lock)) = (
+        std::fs::read_to_string(repo.join(version::VERSION_FILE)),
+        std::fs::read_to_string(&lock_path),
+    ) else {
+        return;
+    };
+    let (Some(name), Some(current)) = (
+        version::parse_package_name(&manifest),
+        version::parse_version(&manifest),
+    ) else {
+        return;
+    };
+    if version::parse_lock_package_version(&lock, &name) == Some(current) {
+        return;
+    }
+    if let Some(rewritten) = version::replace_lock_package_version(&lock, &name, current) {
+        let _ = std::fs::write(&lock_path, rewritten);
+    }
 }
 
 /// Create the release tag for a completed promotion.
@@ -1703,6 +1870,201 @@ pub(crate) fn verify(config: &Config, dry_run: bool) -> Result<VerifyOutcome> {
     })
 }
 
+/// Why a roll in a verify-many pass did not produce a plain pass.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum VerifyVerdict {
+    Passed,
+    /// The gates, hosts or version gate refused it. Carries the reason.
+    Failed(String),
+    /// Nothing was checked: no local copy, or nothing to merge. Carries why.
+    Skipped(String),
+}
+
+/// One roll's result from [`verify_many`].
+pub(crate) struct VerifyManyResult {
+    pub branch: String,
+    /// `None` when the roll was skipped before `verify` could run.
+    pub outcome: Option<VerifyOutcome>,
+    /// The dev marker this pass committed onto the roll, when it was missing.
+    pub marked: Option<Semver>,
+    pub verdict: VerifyVerdict,
+}
+
+impl VerifyManyResult {
+    fn skipped(branch: &str, why: impl Into<String>) -> Self {
+        VerifyManyResult {
+            branch: branch.to_string(),
+            outcome: None,
+            marked: None,
+            verdict: VerifyVerdict::Skipped(why.into()),
+        }
+    }
+
+    fn failed(branch: &str, marked: Option<Semver>, why: impl Into<String>) -> Self {
+        VerifyManyResult {
+            branch: branch.to_string(),
+            outcome: None,
+            marked,
+            verdict: VerifyVerdict::Failed(why.into()),
+        }
+    }
+}
+
+/// Why the checked-out roll's version numbers are behind stable's, if they are.
+///
+/// Numbers only — the marker is ignored on both sides. A roll's `-roll<N>`
+/// always sorts below the same release, so comparing whole versions would call
+/// every freshly-updated roll "behind"; what matters is a roll still on
+/// `0.2.3-roll13` after stable released `0.2.7`, which has missed a release and
+/// would carry a stale version into rolling. `rf update` is the remedy: the
+/// merge driver keeps the roll's marker and takes stable's higher numbers.
+///
+/// `None` when there is nothing to compare: the gate is off, there is no
+/// `Cargo.toml` on either side, or stable cannot be resolved.
+fn version_behind_stable(config: &Config) -> Result<Option<String>> {
+    if !config.version_gate {
+        return Ok(None);
+    }
+    let repo = &config.repo_root;
+    let Some(head) = version::read_version(repo)? else {
+        return Ok(None);
+    };
+    let Some(stable_ref) = git::resolve_branch(repo, &config.stable_branch) else {
+        return Ok(None);
+    };
+    let Some(stable) = git::show_file_at_ref(repo, &stable_ref, version::VERSION_FILE)?
+        .as_deref()
+        .and_then(version::parse_version)
+    else {
+        return Ok(None);
+    };
+    if head.release() >= stable.release() {
+        return Ok(None);
+    }
+    Ok(Some(format!(
+        "version {head} is behind '{}' ({stable}); run `rf update` (or [u] in the TUI) \
+         to bring it up to date",
+        config.stable_branch
+    )))
+}
+
+/// The verdict `verify`'s outcome amounts to, so the CLI's `rf verify`, the
+/// TUI's `[v]` and [`verify_many`] all draw the line in the same place.
+pub(crate) fn verify_verdict(outcome: &VerifyOutcome) -> VerifyVerdict {
+    if !outcome.failed_hosts.is_empty() {
+        return VerifyVerdict::Failed(format!(
+            "host verification failed: {}",
+            outcome.failed_hosts.join(", ")
+        ));
+    }
+    if !outcome.version.is_satisfied() {
+        return VerifyVerdict::Failed(
+            version_gate_error(&outcome.version, &outcome.source, &outcome.target).to_string(),
+        );
+    }
+    VerifyVerdict::Passed
+}
+
+/// Verify several rolls in one pass, returning a result per branch in the
+/// order given.
+///
+/// `verify` judges the checked-out branch and runs the gates in the working
+/// tree, so this has to check each roll out in turn — which is the whole
+/// design problem. The rules that make it safe:
+///
+/// - A dirty tree is refused up front, before the first switch, rather than
+///   discovered halfway through with HEAD somewhere else.
+/// - The starting branch is recorded first and restored **unconditionally** at
+///   the end: after a failed gate, after a `verify` error, after a roll that
+///   would not even check out. A pass that leaves HEAD on roll 3 because roll 3
+///   failed has turned a report into a surprise.
+/// - A roll with no local copy is skipped with a reason, never fetched: nothing
+///   here writes to or reads from the remote, and a switch that would create a
+///   branch from `origin/` is a side effect the user did not ask for.
+/// - "Nothing to merge" is a skip, not a failure: the roll has nothing to be
+///   judged on, which is not the same as failing judgement.
+/// - Each roll's version gets what a single `rf verify` gives it: a missing
+///   `-roll<N>` marker is committed first (before the `--locked` gates, for the
+///   same lockfile reason), and then a roll whose numbers are behind stable's
+///   fails without running its gates — a version problem should cost
+///   milliseconds, not a gate run. The marker is the one commit this pass
+///   makes; it never bumps.
+///
+/// Every gate's output still streams through `core::proc`'s sink as it runs,
+/// so the caller sees each roll's gates as they happen; this returns only the
+/// structured summary.
+pub(crate) fn verify_many(config: &Config, branches: &[String]) -> Result<Vec<VerifyManyResult>> {
+    ensure_clean_state(config)?;
+    let repo = &config.repo_root;
+    let start = git::current_branch(repo)?;
+
+    let mut results = Vec::with_capacity(branches.len());
+    for branch in branches {
+        if !git::ref_exists(repo, branch) {
+            results.push(VerifyManyResult::skipped(
+                branch,
+                "no local copy — pull it first",
+            ));
+            continue;
+        }
+        if let Err(err) = git::run_git(repo, &["switch", "--quiet", branch]) {
+            results.push(VerifyManyResult::skipped(
+                branch,
+                format!("could not switch to it: {err}"),
+            ));
+            continue;
+        }
+        let marked = match apply_dev_version_for_branch(config, branch) {
+            Ok(marked) => marked,
+            Err(err) => {
+                results.push(VerifyManyResult::failed(
+                    branch,
+                    None,
+                    format!("could not apply its dev marker: {err}"),
+                ));
+                continue;
+            }
+        };
+        match version_behind_stable(config) {
+            Ok(None) => {}
+            Ok(Some(why)) => {
+                results.push(VerifyManyResult::failed(branch, marked, why));
+                continue;
+            }
+            Err(err) => {
+                results.push(VerifyManyResult::failed(
+                    branch,
+                    marked,
+                    format!("could not compare its version with stable: {err}"),
+                ));
+                continue;
+            }
+        }
+        results.push(match verify(config, false) {
+            Ok(outcome) => {
+                let verdict = verify_verdict(&outcome);
+                VerifyManyResult {
+                    branch: branch.clone(),
+                    outcome: Some(outcome),
+                    marked,
+                    verdict,
+                }
+            }
+            Err(err) if err.to_string().starts_with("nothing to merge") => VerifyManyResult {
+                marked,
+                ..VerifyManyResult::skipped(branch, err.to_string())
+            },
+            Err(err) => VerifyManyResult::failed(branch, marked, err.to_string()),
+        });
+    }
+
+    // Unconditional, and the one error this function refuses to swallow: a
+    // report that cannot say where it left HEAD is worse than no report.
+    git::run_git(repo, &["switch", "--quiet", &start])
+        .with_context(|| format!("verified, but could not switch back to '{start}'"))?;
+    Ok(results)
+}
+
 // ── graduate ────────────────────────────────────────────────────────────────
 
 /// Outcome of graduating a roll into the rolling branch.
@@ -1803,8 +2165,8 @@ pub(crate) fn graduate(
         .with_context(|| format!("failed to check out '{roll}' to graduate it"))?;
 
     // Read both sides' version *before* the merge starts: the version merge
-    // driver (`core::merge_driver`, wired up by `rf init` via
-    // `ensure_version_merge_driver`) only ever runs when git needs to
+    // driver (`core::merge_driver`, wired up by `merge_gated` itself via
+    // `wire_driver_quietly`) only ever runs when git needs to
     // content-merge the line — i.e. when *both* sides changed it, which is
     // precisely when it would otherwise conflict. The common graduate case is
     // the opposite: rolling's own version is untouched and only the roll
@@ -1975,6 +2337,378 @@ fn run_revert(repo: &Path, commit: &str, target: &str) -> Result<()> {
     Ok(())
 }
 
+// ── dependency chains ───────────────────────────────────────────────────────
+
+/// Which lifecycle step a chain is being planned for.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ChainKind {
+    /// Graduate the target into rolling, after any dependency that has not.
+    Graduate,
+    /// Promote the target to stable, after any dependency that has graduated
+    /// but not yet promoted.
+    Promote,
+}
+
+/// Why a roll is in a chain: the one asked for, or something it needs first.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum ChainReason {
+    Requested,
+    /// A dependency of roll `of` that has to land first.
+    Dependency {
+        of: u32,
+    },
+}
+
+/// One roll in a dependency chain, in the order it must be merged.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct ChainStep {
+    pub branch: String,
+    pub number: u32,
+    pub state: branches::RollState,
+    pub reason: ChainReason,
+    /// Fellow members of a dependency cycle this step's roll is the carrier
+    /// of: they have no step of their own, because this one's merge lands
+    /// their tips too (see [`branches::DepCycle`]). Empty for any roll not
+    /// carrying a cycle.
+    pub carries: Vec<u32>,
+}
+
+impl ChainStep {
+    /// One line for a plan listing: `roll/8-x  (dependency of 9, ⛔ blocked)`,
+    /// with `, carries 14` appended when the step lands a cycle's other members.
+    pub fn describe(&self) -> String {
+        let carries = if self.carries.is_empty() {
+            String::new()
+        } else {
+            format!(", carries {}", branches::format_roll_numbers(&self.carries))
+        };
+        match &self.reason {
+            ChainReason::Requested => {
+                format!("{}  ({}{carries})", self.branch, self.state.label())
+            }
+            ChainReason::Dependency { of } => format!(
+                "{}  (dependency of {}, {}{carries})",
+                self.branch,
+                of,
+                self.state.label()
+            ),
+        }
+    }
+
+    /// The line reporting, after this step's graduation, which rolls it
+    /// carried — by branch name, since that is what the user will look for.
+    /// Shared by the CLI and the TUI's output panel.
+    pub fn carried_line(&self, rolls: &[branches::RollInfo], dry_run: bool) -> String {
+        let names: Vec<String> = self
+            .carries
+            .iter()
+            .map(|n| {
+                rolls
+                    .iter()
+                    .find(|r| r.number == *n)
+                    .map(|r| r.branch.clone())
+                    .unwrap_or_else(|| format!("roll {n}"))
+            })
+            .collect();
+        format!(
+            "  {} {} with it (dependency cycle)",
+            if dry_run { "would carry" } else { "carried" },
+            names.join(", ")
+        )
+    }
+}
+
+/// True when graduating `target` is exactly one merge of `target` itself — no
+/// dependency first, and no other branch merged in its place. That is the case
+/// that has always run without a confirmation; anything else merges a branch
+/// the user is not standing on, and is shown and confirmed first. A carrier
+/// graduating its own cycle is still lone: its merge is its own branch, and
+/// the rolls it carries are already inside it.
+pub(crate) fn chain_is_lone(chain: &[ChainStep], target: &str) -> bool {
+    matches!(chain, [only] if only.branch == target)
+}
+
+/// Plan the ordered merges needed to graduate or promote `target`, dependencies
+/// first.
+///
+/// Walks `RollInfo::deps` transitively and emits a post-order: every roll
+/// appears after everything it integrated, and the target comes last. Which
+/// dependencies count depends on `kind` — for graduation, any that has not yet
+/// graduated (`active`, `blocked`, `diverged`, `reverted`); for promotion, any
+/// that has graduated but not been promoted. A dependency already past that point is
+/// history, not a step, and is not walked further: what *it* integrated is
+/// already on the branch being merged into.
+///
+/// Dependency cycles — two rolls that integrated each other, as 14 and 15 did —
+/// have no post-order, so for graduation a cycle `branches::list_rolls` recorded
+/// on `RollInfo::cycle` is planned as **one node**: every member's dependencies
+/// outside the cycle first, then a single step for the cycle's carrier, which
+/// lands the others because it contains their tips (`ChainStep::carries`). The
+/// carried members get no step of their own; after the carrier's merge they
+/// read as graduated through its integrate merges. Asking for a carried member
+/// plans the carrier's step in its place — that is the only way it can land.
+/// A cycle with no carrier is refused with [`branches::DepCycle::advice`],
+/// which names the `rf integrate` that makes one.
+///
+/// For promotion a cycle orders nothing: members that graduated together share
+/// a graduation merge, and per-roll promotion is ordered by rolling's history
+/// (`plan_roll_steps`), not by this list. An edge back into the current path is
+/// therefore skipped rather than refused, so the walk still terminates.
+///
+/// Pure over the roll list, so ordering, cycle detection and the refusals below
+/// are unit-tested without a repository. Refusals, all naming the roll:
+/// - a dependency number nothing in the list carries;
+/// - a dependency cycle with no carrier (see above), or — for graduation — a
+///   back edge `RollInfo::cycle` does not account for, which only an
+///   inconsistent roll list can produce;
+/// - for graduation, a dependency with no local copy — `ops::graduate` merges
+///   a local branch, and "branch not found" halfway through a chain is a worse
+///   place to learn that than before it starts;
+/// - for promotion, a dependency that has not graduated (or whose graduation
+///   was reverted), since there is nothing on rolling to advance stable to, and
+///   one that was demoted, since re-promotion is not automated.
+pub(crate) fn dependency_chain(
+    rolls: &[branches::RollInfo],
+    target: &str,
+    kind: ChainKind,
+) -> Result<Vec<ChainStep>> {
+    let root = rolls
+        .iter()
+        .find(|r| r.branch == target)
+        .ok_or_else(|| anyhow!("no such roll: '{target}'"))?;
+
+    let mut order: Vec<ChainStep> = Vec::new();
+    let mut done: HashSet<u32> = HashSet::new();
+    let mut visiting: Vec<u32> = Vec::new();
+    chain_visit(
+        root,
+        ChainReason::Requested,
+        rolls,
+        kind,
+        &mut order,
+        &mut done,
+        &mut visiting,
+    )?;
+    Ok(order)
+}
+
+/// Depth-first post-order over one roll's dependencies. `visiting` is the
+/// current path, for cycle detection; `done` is everything already emitted.
+///
+/// For graduation, a roll in a recorded dependency cycle is visited as its
+/// whole cycle (see [`dependency_chain`]): `group` is every member, the
+/// dependencies walked are all of theirs that lie outside it, and the one step
+/// emitted is the carrier's.
+fn chain_visit(
+    roll: &branches::RollInfo,
+    reason: ChainReason,
+    rolls: &[branches::RollInfo],
+    kind: ChainKind,
+    order: &mut Vec<ChainStep>,
+    done: &mut HashSet<u32>,
+    visiting: &mut Vec<u32>,
+) -> Result<()> {
+    if done.contains(&roll.number) {
+        return Ok(());
+    }
+    if visiting.contains(&roll.number) {
+        let cycle: Vec<String> = visiting
+            .iter()
+            .chain(std::iter::once(&roll.number))
+            .map(|n| n.to_string())
+            .collect();
+        bail!(
+            "dependency cycle among rolls {} — a roll cannot be merged before itself",
+            cycle.join(" -> ")
+        );
+    }
+
+    // The unit this visit plans: the roll alone, or — graduating a roll in a
+    // dependency cycle — the whole cycle, landed by its carrier.
+    let (group, emitted): (Vec<&branches::RollInfo>, &branches::RollInfo) =
+        match (kind, roll.cycle.as_ref()) {
+            (ChainKind::Graduate, Some(cycle)) => {
+                let Some(carrier) = cycle.carrier() else {
+                    bail!("{}", cycle.advice(rolls));
+                };
+                let members: Vec<&branches::RollInfo> =
+                    rolls.iter().filter(|r| cycle.contains(r.number)).collect();
+                let Some(carrier_roll) = members.iter().copied().find(|r| r.number == carrier)
+                else {
+                    bail!(
+                        "'{}' is in a dependency cycle whose carrier, roll {carrier}, is not \
+                         among the known roll branches",
+                        roll.branch
+                    );
+                };
+                (members, carrier_roll)
+            }
+            _ => (vec![roll], roll),
+        };
+    visiting.extend(group.iter().map(|r| r.number));
+
+    for member in &group {
+        for dep in &member.deps {
+            if group.iter().any(|g| g.number == *dep) {
+                continue;
+            }
+            // Promotion follows graduation order, so a cycle among graduated
+            // rolls orders nothing: skip the edge back rather than refuse it.
+            if kind == ChainKind::Promote && visiting.contains(dep) {
+                continue;
+            }
+            chain_visit_dep(member, *dep, rolls, kind, order, done, visiting)?;
+        }
+    }
+
+    visiting.retain(|n| !group.iter().any(|g| g.number == *n));
+    done.extend(group.iter().map(|r| r.number));
+    let reason = if emitted.number == roll.number {
+        reason
+    } else {
+        match reason {
+            // Asked for a carried member: the carrier lands it, on its behalf.
+            ChainReason::Requested => ChainReason::Dependency { of: roll.number },
+            other => other,
+        }
+    };
+    order.push(ChainStep {
+        branch: emitted.branch.clone(),
+        number: emitted.number,
+        state: emitted.state.clone(),
+        reason,
+        carries: group
+            .iter()
+            .map(|r| r.number)
+            .filter(|n| *n != emitted.number)
+            .collect(),
+    });
+    Ok(())
+}
+
+/// One dependency edge of [`chain_visit`]: whether `dep` is a step for this
+/// `kind`, the refusals that apply to it, and the recursion into it.
+fn chain_visit_dep(
+    roll: &branches::RollInfo,
+    dep: u32,
+    rolls: &[branches::RollInfo],
+    kind: ChainKind,
+    order: &mut Vec<ChainStep>,
+    done: &mut HashSet<u32>,
+    visiting: &mut Vec<u32>,
+) -> Result<()> {
+    use branches::{BranchLocation, RollState};
+
+    let Some(dep_roll) = rolls.iter().find(|r| r.number == dep) else {
+        bail!(
+            "'{}' depends on roll {dep}, which is not among the known roll branches",
+            roll.branch
+        );
+    };
+    match kind {
+        ChainKind::Graduate => {
+            if !matches!(
+                dep_roll.state,
+                RollState::Active | RollState::Blocked | RollState::Diverged | RollState::Reverted
+            ) {
+                return Ok(());
+            }
+            if !matches!(
+                dep_roll.location,
+                BranchLocation::Local | BranchLocation::Both
+            ) {
+                bail!(
+                    "'{}' depends on '{}', which exists only on origin — fetch it \
+                         (or press [space] on it in the TUI) before graduating",
+                    roll.branch,
+                    dep_roll.branch
+                );
+            }
+        }
+        ChainKind::Promote => match dep_roll.state {
+            RollState::Promoted => return Ok(()),
+            RollState::Graduated | RollState::Diverged => {}
+            RollState::Active | RollState::Blocked => bail!(
+                "'{}' depends on '{}', which has not graduated — graduate it first",
+                roll.branch,
+                dep_roll.branch
+            ),
+            // Its graduation was reverted on rolling, so its content is
+            // not really there to advance stable to.
+            RollState::Reverted => bail!(
+                "'{}' depends on '{}', whose graduation was reverted on rolling — \
+                     re-graduate it first",
+                roll.branch,
+                dep_roll.branch
+            ),
+            // Re-promotion is detect-only (see algorithms.md), and a
+            // per-roll step cannot undo a revert on stable by re-merging.
+            RollState::Demoted => bail!(
+                "'{}' depends on '{}', whose promotion was reverted on stable — \
+                     restore it by hand (revert the revert) first",
+                roll.branch,
+                dep_roll.branch
+            ),
+        },
+    }
+    chain_visit(
+        dep_roll,
+        ChainReason::Dependency { of: roll.number },
+        rolls,
+        kind,
+        order,
+        done,
+        visiting,
+    )
+}
+
+/// Graduate every step of a chain in order, stopping at the first failure.
+///
+/// Each step is the ordinary [`graduate`] — its own gate run, its own `--no-ff`
+/// merge, the same abort-and-restore on conflict — so a chain is exactly what
+/// running `rf graduate` on each roll by hand would have been. On failure the
+/// error names which rolls did graduate, which one failed, and which were not
+/// attempted, because by then the earlier merges are committed and the user
+/// needs to know where the graph stands rather than re-derive it.
+///
+/// `run_step` performs one step — ordinarily [`graduate`] itself, passed
+/// straight through by the TUI, which gets a conflicting step's diagnosis for
+/// free (`run_op`'s caller downcasts a context-wrapped [`MergeConflict`] the
+/// same as any single-roll one, since `anyhow::Error::context` does not
+/// disturb a `downcast::<T>()` of the error it wraps). The CLI instead passes
+/// a closure around [`graduate`] that offers the interactive "ways forward" on
+/// a conflict (`main.rs`'s `with_conflict_handling`) — threading it through a
+/// parameter, rather than hard-coding the call here, is what lets that
+/// interactive layer stay out of `core`, which prints nothing of its own.
+pub(crate) fn graduate_chain(
+    config: &Config,
+    steps: &[ChainStep],
+    dry_run: bool,
+    force: &ForceOpts,
+    tag: bool,
+    mut run_step: impl FnMut(&Config, &str, bool, &ForceOpts, bool) -> Result<GraduateOutcome>,
+) -> Result<Vec<GraduateOutcome>> {
+    let mut outcomes = Vec::new();
+    for (i, step) in steps.iter().enumerate() {
+        match run_step(config, &step.branch, dry_run, force, tag) {
+            Ok(outcome) => outcomes.push(outcome),
+            Err(err) => {
+                let done: Vec<&str> = steps[..i].iter().map(|s| s.branch.as_str()).collect();
+                let left: Vec<&str> = steps[i + 1..].iter().map(|s| s.branch.as_str()).collect();
+                let mut note = format!("graduating '{}' failed", step.branch);
+                if !done.is_empty() {
+                    note.push_str(&format!("; already graduated: {}", done.join(", ")));
+                }
+                if !left.is_empty() {
+                    note.push_str(&format!("; not attempted: {}", left.join(", ")));
+                }
+                return Err(err.context(note));
+            }
+        }
+    }
+    Ok(outcomes)
+}
+
 // ── promote ─────────────────────────────────────────────────────────────────
 
 /// What a `rf promote` invocation should carry to stable.
@@ -2088,16 +2822,28 @@ pub(crate) fn promote(
     let per_roll = matches!(target, PromoteTarget::Rolls(_));
 
     let mut steps = Vec::new();
-    for step in plan.steps {
-        steps.push(run_promote_step(
-            config,
-            &stable_ref,
-            step,
-            dry_run,
-            force,
-            tag,
-            if per_roll { bump } else { None },
-        )?);
+    let total = plan.steps.len();
+    for (i, step) in plan.steps.into_iter().enumerate() {
+        let name = step.roll.clone().unwrap_or_else(|| rolling.clone());
+        let step_bump = if per_roll { bump } else { None };
+        match run_promote_step(config, &stable_ref, step, dry_run, force, tag, step_bump) {
+            Ok(done) => steps.push(done),
+            // Earlier steps are committed by now, so the error has to say where
+            // stable stands rather than leave the user to work it out.
+            Err(err) if total > 1 => {
+                let done: Vec<&str> = steps
+                    .iter()
+                    .map(|s| s.roll.as_deref().unwrap_or(rolling))
+                    .collect();
+                let mut note = format!("promoting '{name}' failed (step {} of {total})", i + 1);
+                if !done.is_empty() {
+                    note.push_str(&format!("; already promoted: {}", done.join(", ")));
+                }
+                note.push_str("; later steps were not attempted");
+                return Err(err.context(note));
+            }
+            Err(err) => return Err(err),
+        }
     }
 
     let mut reintegrated = false;
@@ -2242,7 +2988,23 @@ fn plan_roll_steps(config: &Config, rolls: &[String], stable_ref: &str) -> Resul
     }
 
     planned.sort_by_key(|(pos, _)| *pos);
-    let mut steps: Vec<PlannedStep> = planned.into_iter().map(|(_, step)| step).collect();
+    // Rolls that graduated in one merge — a dependency cycle's carrier and the
+    // members it carried — share a graduation commit. Merging it once lands
+    // them all; a second step would merge an already-merged commit.
+    let mut steps: Vec<PlannedStep> = Vec::new();
+    for (_, step) in planned {
+        if let Some(earlier) = steps.iter().find(|s| s.source == step.source) {
+            skipped.push(SkippedRoll {
+                roll: step.roll.clone().unwrap_or_default(),
+                reason: format!(
+                    "lands with '{}' (same graduation merge)",
+                    earlier.roll.as_deref().unwrap_or_default()
+                ),
+            });
+            continue;
+        }
+        steps.push(step);
+    }
     fill_carried_rolls(repo, &known, &order, &mut steps, stable_ref);
     Ok(PromotePlan { steps, skipped })
 }
@@ -2823,6 +3585,9 @@ impl PruneScope {
 pub(crate) struct PruneCandidate {
     pub branch: String,
     pub number: u32,
+    /// A `hotfix/N-…` branch rather than a roll. Hotfixes number independently,
+    /// so `number` alone would pass `hotfix/1` off as roll 1.
+    pub hotfix: bool,
     pub delete_local: bool,
     pub delete_remote: bool,
 }
@@ -3143,6 +3908,7 @@ fn plan_branch_deletion(
     (delete_local || delete_remote).then(|| PruneCandidate {
         branch: branch.to_string(),
         number,
+        hotfix: branch.starts_with(HOTFIX_PREFIX),
         delete_local,
         delete_remote,
     })
@@ -3156,10 +3922,16 @@ fn plan_branch_deletion(
 /// take commits after its graduation merge). Every copy is additionally checked
 /// for containment in stable, and anything that fails is skipped with a reason
 /// unless `--force` is given.
+///
+/// Landed hotfixes are wound up alongside promoted rolls: landing is a
+/// hotfix's promotion, and the same containment check guards both.
 pub(crate) fn prune_plan(config: &Config, scope: &PruneScope) -> Result<PrunePlan> {
-    plan_rolls(config, scope, |state| {
-        *state == branches::RollState::Promoted
-    })
+    plan_rolls(
+        config,
+        scope,
+        |state| *state == branches::RollState::Promoted,
+        |state| *state == branches::HotfixState::Landed,
+    )
 }
 
 /// Decide what `rf tidy` would delete locally, without deleting anything.
@@ -3173,16 +3945,36 @@ pub(crate) fn prune_plan(config: &Config, scope: &PruneScope) -> Result<PrunePla
 /// It takes a [`PruneScope`] like everything else here rather than a bespoke
 /// one: there is deliberately a single deletion path, and tidy is a set of
 /// arguments to it, not a second implementation.
+///
+/// Hotfixes have no states of their own to select, so each follows the roll
+/// state it corresponds to: a landed hotfix is tidied when `Promoted` is
+/// selected (it reached stable), an open one when `Active` is (it reached
+/// nothing yet, so only a fully pushed copy counts as recoverable).
 pub(crate) fn tidy_plan(
     config: &Config,
     scope: &PruneScope,
     states: &[branches::RollState],
 ) -> Result<PrunePlan> {
-    plan_rolls(config, scope, |state| states.contains(state))
+    plan_rolls(
+        config,
+        scope,
+        |state| states.contains(state),
+        |state| states.contains(&hotfix_tidy_state(*state)),
+    )
 }
 
-/// The shared body of [`prune_plan`] and [`tidy_plan`]: walk every roll the
-/// `accept` predicate keeps and plan each one's deletion against `scope`.
+/// The roll state a hotfix counts as when `rf tidy --state` selects branches.
+fn hotfix_tidy_state(state: branches::HotfixState) -> branches::RollState {
+    match state {
+        branches::HotfixState::Landed => branches::RollState::Promoted,
+        branches::HotfixState::Open => branches::RollState::Active,
+    }
+}
+
+/// The shared body of [`prune_plan`] and [`tidy_plan`]: walk every roll
+/// `accept` keeps and every hotfix `accept_hotfix` keeps, and plan each
+/// one's deletion against `scope` — through the same [`plan_branch_deletion`],
+/// so a hotfix gets exactly the safety rules a roll does.
 ///
 /// The [`DeletionContext`] is built once, so the pruning fetch and the worktree
 /// scan are each paid for a single time no matter how many rolls match.
@@ -3190,6 +3982,7 @@ fn plan_rolls(
     config: &Config,
     scope: &PruneScope,
     accept: impl Fn(&branches::RollState) -> bool,
+    accept_hotfix: impl Fn(&branches::HotfixState) -> bool,
 ) -> Result<PrunePlan> {
     let ctx = DeletionContext::build(config, scope)?;
 
@@ -3203,6 +3996,21 @@ fn plan_rolls(
         if let Some(candidate) =
             plan_branch_deletion(config, &roll.branch, roll.number, scope, &ctx, &mut skipped)
         {
+            candidates.push(candidate);
+        }
+    }
+    for hotfix in branches::list_hotfixes(config)? {
+        if !accept_hotfix(&hotfix.state) {
+            continue;
+        }
+        if let Some(candidate) = plan_branch_deletion(
+            config,
+            &hotfix.branch,
+            hotfix.number,
+            scope,
+            &ctx,
+            &mut skipped,
+        ) {
             candidates.push(candidate);
         }
     }
@@ -3774,5 +4582,260 @@ mod tests {
         // Restored to whatever was checked out before the call.
         assert_eq!(git::current_branch(&cfg.repo_root).unwrap(), "rolling");
         assert!(dir.path().join("roll-only.txt").exists());
+    }
+    mod chains {
+        use super::super::{dependency_chain, ChainKind, ChainReason};
+        use crate::core::branches::{BranchLocation, DepCycle, RollInfo, RollState};
+
+        fn roll(n: u32, state: RollState, deps: &[u32]) -> RollInfo {
+            RollInfo {
+                branch: format!("roll/{n}-0101-r{n}"),
+                number: n,
+                state,
+                location: BranchLocation::Local,
+                is_current: false,
+                deps: deps.to_vec(),
+                dependents: Vec::new(),
+                stale_deps: Vec::new(),
+                graduation_commit: None,
+                cycle: None,
+            }
+        }
+
+        /// Mark `members` as one cycle on every roll in it, the way
+        /// `branches::list_rolls` would, with `suggested` lacking `lacks`.
+        fn in_cycle(rolls: &mut [RollInfo], members: &[u32], suggested: u32, lacks: &[u32]) {
+            let cycle = DepCycle {
+                members: members.to_vec(),
+                suggested,
+                lacks: lacks.to_vec(),
+            };
+            for r in rolls.iter_mut().filter(|r| members.contains(&r.number)) {
+                r.cycle = Some(cycle.clone());
+            }
+        }
+
+        fn numbers(rolls: &[RollInfo], target: &str, kind: ChainKind) -> Vec<u32> {
+            dependency_chain(rolls, target, kind)
+                .expect("chain plans")
+                .into_iter()
+                .map(|s| s.number)
+                .collect()
+        }
+
+        #[test]
+        fn dependencies_come_first_transitively_and_the_target_last() {
+            // 9 integrated 8, which integrated 7: asking for 9 lands 7, 8, 9.
+            let rolls = vec![
+                roll(7, RollState::Active, &[]),
+                roll(8, RollState::Blocked, &[7]),
+                roll(9, RollState::Blocked, &[8]),
+            ];
+            assert_eq!(
+                numbers(&rolls, "roll/9-0101-r9", ChainKind::Graduate),
+                vec![7, 8, 9]
+            );
+            let chain = dependency_chain(&rolls, "roll/9-0101-r9", ChainKind::Graduate).unwrap();
+            assert_eq!(chain[0].reason, ChainReason::Dependency { of: 8 });
+            assert_eq!(chain[1].reason, ChainReason::Dependency { of: 9 });
+            assert_eq!(chain[2].reason, ChainReason::Requested);
+        }
+
+        #[test]
+        fn a_dependency_that_already_graduated_is_history_not_a_step() {
+            // 8 graduated; what *it* integrated (7, still active) is already on
+            // rolling by way of 8's merge, so neither is a step.
+            let rolls = vec![
+                roll(7, RollState::Active, &[]),
+                roll(8, RollState::Graduated, &[7]),
+                roll(9, RollState::Active, &[8]),
+            ];
+            assert_eq!(
+                numbers(&rolls, "roll/9-0101-r9", ChainKind::Graduate),
+                vec![9]
+            );
+            // A diverged dependency re-graduates.
+            let rolls = vec![
+                roll(8, RollState::Diverged, &[]),
+                roll(9, RollState::Active, &[8]),
+            ];
+            assert_eq!(
+                numbers(&rolls, "roll/9-0101-r9", ChainKind::Graduate),
+                vec![8, 9]
+            );
+            // So does a reverted one: its content is no longer on rolling.
+            let rolls = vec![
+                roll(8, RollState::Reverted, &[]),
+                roll(9, RollState::Active, &[8]),
+            ];
+            assert_eq!(
+                numbers(&rolls, "roll/9-0101-r9", ChainKind::Graduate),
+                vec![8, 9]
+            );
+        }
+
+        #[test]
+        fn a_shared_dependency_is_emitted_once() {
+            let rolls = vec![
+                roll(5, RollState::Active, &[]),
+                roll(6, RollState::Blocked, &[5]),
+                roll(7, RollState::Blocked, &[5]),
+                roll(8, RollState::Blocked, &[6, 7]),
+            ];
+            assert_eq!(
+                numbers(&rolls, "roll/8-0101-r8", ChainKind::Graduate),
+                vec![5, 6, 7, 8]
+            );
+        }
+
+        #[test]
+        fn a_cycle_is_refused_by_name() {
+            let rolls = vec![
+                roll(1, RollState::Blocked, &[2]),
+                roll(2, RollState::Blocked, &[1]),
+            ];
+            let err = dependency_chain(&rolls, "roll/1-0101-r1", ChainKind::Graduate)
+                .unwrap_err()
+                .to_string();
+            assert!(err.contains("cycle"), "{err}");
+            assert!(err.contains("1 -> 2 -> 1"), "{err}");
+        }
+
+        #[test]
+        fn a_cycle_graduates_as_one_step_its_carrier_carrying_the_rest() {
+            // 14 and 15 integrated each other; 15 contains 14.
+            let mut rolls = vec![
+                roll(14, RollState::Blocked, &[15]),
+                roll(15, RollState::Active, &[14]),
+            ];
+            in_cycle(&mut rolls, &[14, 15], 15, &[]);
+
+            // Asked for the carrier: one step, its own, carrying 14.
+            let chain = dependency_chain(&rolls, "roll/15-0101-r15", ChainKind::Graduate).unwrap();
+            assert_eq!(chain.len(), 1);
+            assert_eq!(chain[0].number, 15);
+            assert_eq!(chain[0].reason, ChainReason::Requested);
+            assert_eq!(chain[0].carries, vec![14]);
+
+            // Asked for the carried member: the same single step — 14 cannot
+            // land any other way — now as a dependency of what was asked for.
+            let chain = dependency_chain(&rolls, "roll/14-0101-r14", ChainKind::Graduate).unwrap();
+            assert_eq!(chain.len(), 1);
+            assert_eq!(chain[0].number, 15);
+            assert_eq!(chain[0].reason, ChainReason::Dependency { of: 14 });
+            assert!(chain[0].describe().contains("carries 14"));
+        }
+
+        #[test]
+        fn a_cycles_outside_dependencies_come_first_whichever_member_needs_them() {
+            // The real shape: both integrated 8; only 14 integrated 7. The
+            // carrier lands 14, so 14's own dependency has to precede it too.
+            let mut rolls = vec![
+                roll(7, RollState::Active, &[]),
+                roll(8, RollState::Active, &[]),
+                roll(14, RollState::Blocked, &[7, 8, 15]),
+                roll(15, RollState::Blocked, &[8, 14]),
+            ];
+            in_cycle(&mut rolls, &[14, 15], 15, &[]);
+            assert_eq!(
+                numbers(&rolls, "roll/15-0101-r15", ChainKind::Graduate),
+                vec![7, 8, 15]
+            );
+            // And a roll depending on the cycle from outside comes after it.
+            rolls.push(roll(16, RollState::Blocked, &[14]));
+            assert_eq!(
+                numbers(&rolls, "roll/16-0101-r16", ChainKind::Graduate),
+                vec![7, 8, 15, 16]
+            );
+        }
+
+        #[test]
+        fn a_cycle_with_no_carrier_is_refused_with_the_integrate_that_makes_one() {
+            let mut rolls = vec![
+                roll(14, RollState::Blocked, &[15]),
+                roll(15, RollState::Blocked, &[14]),
+            ];
+            in_cycle(&mut rolls, &[14, 15], 15, &[14]);
+            for target in ["roll/14-0101-r14", "roll/15-0101-r15"] {
+                let err = dependency_chain(&rolls, target, ChainKind::Graduate)
+                    .unwrap_err()
+                    .to_string();
+                assert!(
+                    err.contains("on roll/15-0101-r15 run `rf integrate roll/14-0101-r14`"),
+                    "{err}"
+                );
+            }
+        }
+
+        #[test]
+        fn a_promotion_chain_through_a_graduated_cycle_terminates() {
+            // Both graduated in one merge (15 carried 14); promotion follows
+            // graduation order, so the cycle orders nothing and must not be
+            // refused — let alone walked forever.
+            let rolls = vec![
+                roll(14, RollState::Graduated, &[15]),
+                roll(15, RollState::Graduated, &[14]),
+            ];
+            let mut got = numbers(&rolls, "roll/15-0101-r15", ChainKind::Promote);
+            got.sort_unstable();
+            assert_eq!(got, vec![14, 15]);
+            let mut got = numbers(&rolls, "roll/14-0101-r14", ChainKind::Promote);
+            got.sort_unstable();
+            assert_eq!(got, vec![14, 15]);
+        }
+
+        #[test]
+        fn an_unknown_dependency_and_a_remote_only_one_are_refused_before_anything_runs() {
+            let rolls = vec![roll(9, RollState::Blocked, &[4])];
+            let err = dependency_chain(&rolls, "roll/9-0101-r9", ChainKind::Graduate)
+                .unwrap_err()
+                .to_string();
+            assert!(err.contains("roll 4"), "{err}");
+
+            let mut remote = roll(8, RollState::Active, &[]);
+            remote.location = BranchLocation::Remote;
+            let rolls = vec![remote, roll(9, RollState::Blocked, &[8])];
+            let err = dependency_chain(&rolls, "roll/9-0101-r9", ChainKind::Graduate)
+                .unwrap_err()
+                .to_string();
+            assert!(err.contains("only on origin"), "{err}");
+            assert!(err.contains("roll/8-0101-r8"), "{err}");
+
+            assert!(dependency_chain(&rolls, "roll/nope", ChainKind::Graduate).is_err());
+        }
+
+        #[test]
+        fn a_promotion_chain_takes_graduated_dependencies_and_refuses_ungraduated_ones() {
+            let rolls = vec![
+                roll(6, RollState::Promoted, &[]),
+                roll(7, RollState::Graduated, &[6]),
+                roll(8, RollState::Graduated, &[7]),
+            ];
+            // 6 is already on stable — no step; 7 must precede 8.
+            assert_eq!(
+                numbers(&rolls, "roll/8-0101-r8", ChainKind::Promote),
+                vec![7, 8]
+            );
+
+            let rolls = vec![
+                roll(7, RollState::Active, &[]),
+                roll(8, RollState::Graduated, &[7]),
+            ];
+            let err = dependency_chain(&rolls, "roll/8-0101-r8", ChainKind::Promote)
+                .unwrap_err()
+                .to_string();
+            assert!(err.contains("has not graduated"), "{err}");
+
+            for (state, needle) in [
+                (RollState::Reverted, "reverted on rolling"),
+                (RollState::Demoted, "reverted on stable"),
+            ] {
+                let rolls = vec![roll(7, state, &[]), roll(8, RollState::Graduated, &[7])];
+                let err = dependency_chain(&rolls, "roll/8-0101-r8", ChainKind::Promote)
+                    .unwrap_err()
+                    .to_string();
+                assert!(err.contains(needle), "{err}");
+            }
+        }
     }
 }

@@ -29,6 +29,10 @@ use crate::error::RfError;
 /// The file the crate version is read from and written to.
 pub const VERSION_FILE: &str = "Cargo.toml";
 
+/// The lockfile that repeats the crate's own version in its `[[package]]`
+/// entry, and so changes in lockstep with every [`VERSION_FILE`] rewrite.
+pub const LOCK_FILE: &str = "Cargo.lock";
+
 // ── Semver ──────────────────────────────────────────────────────────────────
 
 /// The pre-release marker a `Semver` carries: a roll branch's own `-roll<N>`,
@@ -416,14 +420,102 @@ pub fn replace_package_version(text: &str, new: Semver) -> Option<String> {
     Some(out)
 }
 
+/// Extract `package.name` from `Cargo.toml` text — what the lockfile's own
+/// `[[package]]` entry is keyed by.
+pub fn parse_package_name(cargo_toml: &str) -> Option<String> {
+    let doc: toml::Value = toml::from_str(cargo_toml).ok()?;
+    Some(doc.get("package")?.get("name")?.as_str()?.to_string())
+}
+
+/// The crate's own version as `Cargo.lock` records it, under the
+/// `[[package]]` entry named `name`. `None` when there is no such entry, or
+/// when it cannot be told apart from another (see [`lock_own_version_line`]).
+pub fn parse_lock_package_version(cargo_lock: &str, name: &str) -> Option<Semver> {
+    let lines: Vec<&str> = cargo_lock.lines().collect();
+    let line = lines[lock_own_version_line(&lines, name)?];
+    Semver::parse(line.split('"').nth(1)?)
+}
+
+/// Rewrite the crate's own `version` in `Cargo.lock` text, leaving every
+/// other byte — the lockfile's own top-level `version = 4`, every dependency
+/// entry — exactly as it was. Line-based for the same reason as
+/// [`replace_package_version`], and `None` under the same conditions as
+/// [`parse_lock_package_version`].
+///
+/// This is the one lockfile change `cargo update --workspace` makes after a
+/// version rewrite, done without cargo: no network, no toolchain, and no
+/// chance of moving a dependency as a side effect.
+pub fn replace_lock_package_version(cargo_lock: &str, name: &str, new: Semver) -> Option<String> {
+    let lines: Vec<&str> = cargo_lock.lines().collect();
+    let at = lock_own_version_line(&lines, name)?;
+    let mut out = String::with_capacity(cargo_lock.len());
+    for (i, line) in lines.iter().enumerate() {
+        if i == at {
+            let indent = &line[..line.len() - line.trim_start().len()];
+            out.push_str(indent);
+            out.push_str(&format!("version = \"{new}\""));
+        } else {
+            out.push_str(line);
+        }
+        out.push('\n');
+    }
+    if !cargo_lock.ends_with('\n') {
+        out.pop();
+    }
+    Some(out)
+}
+
+/// Index of the `version = ...` line in the crate's own `[[package]]` entry.
+///
+/// "Own" is the entry named `name` with no `source` key: cargo records a
+/// `source` for everything fetched from a registry or git, and none for a
+/// workspace member, so a registry crate that happens to share the name is
+/// never mistaken for this one. More than one match counts as no match —
+/// guessing which entry to rewrite is how a real dependency would get
+/// silently moved.
+fn lock_own_version_line(lines: &[&str], name: &str) -> Option<usize> {
+    let wanted = format!("name = \"{name}\"");
+    let mut found = None;
+    let mut i = 0;
+    while i < lines.len() {
+        if lines[i].trim() != "[[package]]" {
+            i += 1;
+            continue;
+        }
+        let (mut named, mut sourced, mut version) = (false, false, None);
+        i += 1;
+        while i < lines.len() && !lines[i].trim_start().starts_with('[') {
+            let trimmed = lines[i].trim();
+            if trimmed == wanted {
+                named = true;
+            } else if is_key(trimmed, "source") {
+                sourced = true;
+            } else if version.is_none() && is_version_key(trimmed) {
+                version = Some(i);
+            }
+            i += 1;
+        }
+        if named && !sourced {
+            if found.is_some() {
+                return None;
+            }
+            found = Some(version?);
+        }
+    }
+    found
+}
+
 /// True for a `version = ...` assignment (allowing whitespace around `=`), the
 /// same shape the workflows' `^version[[:space:]]*=` grep matches.
 fn is_version_key(trimmed: &str) -> bool {
-    let rest = match trimmed.strip_prefix("version") {
-        Some(rest) => rest,
-        None => return false,
-    };
-    rest.trim_start().starts_with('=')
+    is_key(trimmed, "version")
+}
+
+/// True for a `<key> = ...` assignment, allowing whitespace around `=`.
+fn is_key(trimmed: &str, key: &str) -> bool {
+    trimmed
+        .strip_prefix(key)
+        .is_some_and(|rest| rest.trim_start().starts_with('='))
 }
 
 #[cfg(test)]
@@ -608,5 +700,48 @@ version = "1.0.228"
     #[test]
     fn not_applicable_is_satisfied() {
         assert!(VersionCheck::not_applicable().is_satisfied());
+    }
+
+    const LOCK: &str = "# generated\nversion = 4\n\n\
+        [[package]]\nname = \"roll-flow\"\nversion = \"0.2.7-roll35\"\n\
+        dependencies = [\n \"serde\",\n]\n\n\
+        [[package]]\nname = \"serde\"\nversion = \"1.0.228\"\n\
+        source = \"registry+https://github.com/rust-lang/crates.io-index\"\n";
+
+    #[test]
+    fn the_lockfile_s_own_entry_is_read_and_rewritten_alone() {
+        assert_eq!(
+            parse_lock_package_version(LOCK, "roll-flow"),
+            Semver::parse("0.2.7-roll35")
+        );
+        let next = Semver::parse("0.2.8-roll35").unwrap();
+        let out = replace_lock_package_version(LOCK, "roll-flow", next).unwrap();
+        assert_eq!(out, LOCK.replace("0.2.7-roll35", "0.2.8-roll35"));
+        // The lockfile format's own `version = 4` and the dependency are left
+        // exactly as they were.
+        assert!(out.contains("version = 4\n"));
+        assert!(out.contains("version = \"1.0.228\""));
+    }
+
+    #[test]
+    fn a_registry_entry_is_never_the_crate_s_own() {
+        // Named like a dependency that carries a `source`: not ours.
+        assert_eq!(parse_lock_package_version(LOCK, "serde"), None);
+        let v = Semver::parse("9.9.9").unwrap();
+        assert_eq!(replace_lock_package_version(LOCK, "serde", v), None);
+        assert_eq!(parse_lock_package_version(LOCK, "absent"), None);
+    }
+
+    #[test]
+    fn an_ambiguous_own_entry_is_left_alone() {
+        let twice = format!("{LOCK}\n[[package]]\nname = \"roll-flow\"\nversion = \"0.1.0\"\n");
+        assert_eq!(parse_lock_package_version(&twice, "roll-flow"), None);
+    }
+
+    #[test]
+    fn the_package_name_is_read_from_the_manifest() {
+        let toml = "[package]\nname = \"roll-flow\"\nversion = \"0.2.7\"\n";
+        assert_eq!(parse_package_name(toml).as_deref(), Some("roll-flow"));
+        assert_eq!(parse_package_name("[workspace]\n"), None);
     }
 }
