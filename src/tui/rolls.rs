@@ -9064,6 +9064,7 @@ mod tests {
             panel_rect: None,
             pending_g: false,
             pending_push: None,
+            pending_pull: None,
             command_history: Vec::new(),
         };
 
