@@ -166,7 +166,9 @@ rows: it merges the roll under the cursor into the roll wearing the chevron — 
 [`integrate`](integrate.md#from-the-tui). The `sync` column reports each branch against
 its upstream: `✓` in sync, `↑2` ahead, `↓1` behind, `↑2↓1` diverged, `gone` once
 the upstream is deleted, and `—` when there is nothing to compare (no upstream,
-or no local copy).
+or no local copy). A `⚡` appended to any of those means that branch's worktree
+has uncommitted changes — only possible for a branch checked out somewhere,
+local or in a linked `git worktree`.
 
 ## Running commands
 
