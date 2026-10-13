@@ -31,8 +31,11 @@ use ratatui::{
 use super::output::{self, Followup, JobDone, JobProgress};
 use super::queue::{self, Pending, Queue};
 use crate::core::{
-    branches::{self, BranchLocation, HotfixInfo, HotfixState, RollInfo, RollState, VerifySet},
-    config::Config,
+    branches::{
+        self, BranchLocation, HotfixInfo, HotfixState, PullSet, RollInfo, RollState, UpdateSet,
+        VerifySet,
+    },
+    config::{Config, PullMode},
     git::{self, TrackState},
     history, ops, proc,
     sync::{self, PullPlan, PushOutcome, SyncTarget},
@@ -161,6 +164,66 @@ pub(crate) fn verify_many_key(code: KeyCode) -> VerifyManyOutcome {
 /// modal opens so the counts it shows are the counts the pass will use.
 pub(crate) fn verify_set_counts(rolls: &[RollInfo]) -> [(VerifySet, usize); 6] {
     VerifySet::ALL.map(|set| (set, set.select(rolls).len()))
+}
+
+/// What a keypress in the `pp` picker resolves to. Mirrors
+/// [`VerifyManyOutcome`] exactly.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub(crate) enum PullManyOutcome {
+    Ignore,
+    Cancel,
+    Set(PullSet),
+}
+
+/// Decide a keystroke in the pull-many picker. Mirrors [`verify_many_key`].
+pub(crate) fn pull_many_key(code: KeyCode) -> PullManyOutcome {
+    match code {
+        KeyCode::Char(c @ '1'..='9') => {
+            let index = (c as usize) - ('1' as usize);
+            match PullSet::ALL.get(index) {
+                Some(set) => PullManyOutcome::Set(*set),
+                None => PullManyOutcome::Ignore,
+            }
+        }
+        KeyCode::Char('n') | KeyCode::Char('N') | KeyCode::Esc => PullManyOutcome::Cancel,
+        _ => PullManyOutcome::Ignore,
+    }
+}
+
+/// How many rolls each set would pull, in menu order. Mirrors
+/// [`verify_set_counts`].
+pub(crate) fn pull_set_counts(rolls: &[RollInfo]) -> [(PullSet, usize); 6] {
+    PullSet::ALL.map(|set| (set, set.select(rolls).len()))
+}
+
+/// What a keypress in the `[U]` picker resolves to. Mirrors
+/// [`VerifyManyOutcome`], over [`UpdateSet`]'s three choices instead of six.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub(crate) enum UpdateManyOutcome {
+    Ignore,
+    Cancel,
+    Set(UpdateSet),
+}
+
+/// Decide a keystroke in the update-many picker. Mirrors [`verify_many_key`].
+pub(crate) fn update_many_key(code: KeyCode) -> UpdateManyOutcome {
+    match code {
+        KeyCode::Char(c @ '1'..='9') => {
+            let index = (c as usize) - ('1' as usize);
+            match UpdateSet::ALL.get(index) {
+                Some(set) => UpdateManyOutcome::Set(*set),
+                None => UpdateManyOutcome::Ignore,
+            }
+        }
+        KeyCode::Char('n') | KeyCode::Char('N') | KeyCode::Esc => UpdateManyOutcome::Cancel,
+        _ => UpdateManyOutcome::Ignore,
+    }
+}
+
+/// How many rolls each set would update, in menu order. Mirrors
+/// [`verify_set_counts`].
+pub(crate) fn update_set_counts(rolls: &[RollInfo]) -> [(UpdateSet, usize); 3] {
+    UpdateSet::ALL.map(|set| (set, set.select(rolls).len()))
 }
 
 /// The three levels and what each would produce, in the order the modal lists
@@ -317,6 +380,24 @@ enum Mode {
     /// runs agree.
     VerifyMany {
         counts: [(VerifySet, usize); 6],
+    },
+    /// `pp`: pick which set of rolls to pull in one pass. Same shape as
+    /// `VerifyMany`, and for the same reason: the picker states the scope
+    /// (and its count) up front, so running it needs no second confirmation —
+    /// pulling can only fast-forward or fetch, never force, so there is
+    /// nothing a `y`/`N` would be protecting against that the count doesn't
+    /// already say.
+    PullMany {
+        counts: [(PullSet, usize); 6],
+    },
+    /// `[U]`: pick which set of rolls to update (merge stable into) in one
+    /// pass. Narrower than `VerifyMany`/`PullMany` — see [`UpdateSet`] — but
+    /// the same one-step shape: the count in the picker is the confirmation,
+    /// the same way `[b]`'s bump picker needs no second one once a level is
+    /// chosen, because a merge this explicitly scoped is not the
+    /// auto-computed, not-named-upfront sweep that `PushAll` is.
+    UpdateMany {
+        counts: [(UpdateSet, usize); 3],
     },
     /// A graduation or promotion conflicted and was unwound. Offers the ways
     /// forward; the diagnosis is in the panel underneath.
@@ -680,6 +761,9 @@ struct StatusApp {
     /// When a bare `P` was pressed, waiting to see whether it becomes `PP`.
     /// Unlike `pending_g` this *is* timed — see [`PUSH_CHORD_WINDOW`].
     pending_push: Option<Instant>,
+    /// When a bare `p` was pressed, waiting to see whether it becomes `pp`.
+    /// Same shape as `pending_push`, timed by [`PULL_CHORD_WINDOW`].
+    pending_pull: Option<Instant>,
     /// Commands run through `:`, most-recent-first. Loaded once at startup
     /// from [`history::load`] and saved back after every run.
     command_history: Vec<String>,
@@ -797,6 +881,30 @@ pub(crate) fn push_chord_key(code: KeyCode) -> PushChord {
     }
 }
 
+/// Same timeout as [`PUSH_CHORD_WINDOW`], for the same reason: `pp` needs a
+/// lone `p` to still fire by itself when nothing follows it.
+pub(crate) const PULL_CHORD_WINDOW: Duration = Duration::from_millis(400);
+
+/// What the key following a bare `p` makes of it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum PullChord {
+    /// A second `p`: open the pull-many picker.
+    All,
+    /// Anything else: the single-branch pull the first `p` already meant.
+    Single,
+}
+
+/// Decide a pending `p` from the key that followed it. Mirrors
+/// [`push_chord_key`]: only a second `p` completes the chord, everything else
+/// — including `Esc` — falls back to the single pull the first `p` already
+/// committed to.
+pub(crate) fn pull_chord_key(code: KeyCode) -> PullChord {
+    match code {
+        KeyCode::Char('p') => PullChord::All,
+        _ => PullChord::Single,
+    }
+}
+
 /// One branch `PP` will push.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct PushItem {
@@ -882,6 +990,83 @@ pub(crate) fn plan_push_all(
                 skip("upstream deleted — [P] on the row to re-create it".to_string())
             }
         }
+    }
+    plan
+}
+
+/// Which of the three [`PullPlan`] shapes `pp` resolved a branch to, so the
+/// job report can say the same thing `[p]`'s own title would have.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum PullKind {
+    Pull,
+    FastForward,
+    FetchRemote,
+}
+
+/// One branch `pp` will pull.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct PullItem {
+    pub branch: String,
+    pub kind: PullKind,
+    pub args: Vec<String>,
+}
+
+/// A branch `pp` leaves untouched, and why — the same shape as [`PushSkip`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct PullSkip {
+    pub branch: String,
+    pub reason: String,
+}
+
+/// What `pp` would do over the rolls a [`PullSet`] picked: the branches it
+/// pulls, and the ones it declines to, with why.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub(crate) struct PullManyPlan {
+    pub items: Vec<PullItem>,
+    pub skipped: Vec<PullSkip>,
+}
+
+/// Plan a pull over every row in `rows`, in order.
+///
+/// Unlike [`plan_push_all`], this has no "needs a force" category to skip —
+/// pulling can only fast-forward or fetch, never lose work — so the only way
+/// a branch is left out is [`PullPlan::Refused`] (no upstream, or one that's
+/// gone) or already being in sync, which is not worth a line any more than
+/// `plan_push_all` mentions an in-sync branch.
+pub(crate) fn plan_pull_many(
+    rows: &[(String, BranchLocation)],
+    current_branch: &str,
+    tracking: &HashMap<String, git::LocalBranch>,
+    mode: PullMode,
+) -> PullManyPlan {
+    let mut plan = PullManyPlan::default();
+    for (branch, location) in rows {
+        let target = SyncTarget::resolve(
+            branch,
+            current_branch,
+            location.clone(),
+            tracking.get(branch),
+        );
+        if matches!(target.track, Some(TrackState::InSync)) {
+            continue;
+        }
+        let (kind, args) = match sync::pull_plan(&target, mode) {
+            PullPlan::Pull { args } => (PullKind::Pull, args),
+            PullPlan::FastForward { args } => (PullKind::FastForward, args),
+            PullPlan::FetchRemote { args } => (PullKind::FetchRemote, args),
+            PullPlan::Refused { reason } => {
+                plan.skipped.push(PullSkip {
+                    branch: branch.clone(),
+                    reason,
+                });
+                continue;
+            }
+        };
+        plan.items.push(PullItem {
+            branch: branch.clone(),
+            kind,
+            args,
+        });
     }
     plan
 }
@@ -1047,6 +1232,15 @@ pub(crate) const BINDINGS: &[Binding] = &[
         replay: &[KeyCode::Char('P'), KeyCode::Char('P')],
     },
     Binding {
+        keys: "pp",
+        // "all" earns its place here too, for the same reason `PP`'s does.
+        label: "pull all rolls, or a set of them",
+        group: "sync",
+        hint: None,
+        // Mirrors `PP`'s replay exactly, over `PULL_CHORD_WINDOW` instead.
+        replay: &[KeyCode::Char('p'), KeyCode::Char('p')],
+    },
+    Binding {
         keys: "f",
         label: "fetch and prune remote-tracking refs",
         group: "sync",
@@ -1108,6 +1302,13 @@ pub(crate) const BINDINGS: &[Binding] = &[
         group: "roll",
         hint: None,
         replay: &[KeyCode::Char('u')],
+    },
+    Binding {
+        keys: "U",
+        label: "update all rolls, or a set of them",
+        group: "roll",
+        hint: None,
+        replay: &[KeyCode::Char('U')],
     },
     Binding {
         keys: "b",
@@ -2203,6 +2404,7 @@ impl StatusApp {
             panel_rect: None,
             pending_g: false,
             pending_push: None,
+            pending_pull: None,
             command_history: history::load(),
         }
     }
@@ -2215,6 +2417,7 @@ impl StatusApp {
             self.poll_job()?;
             self.open_deferred_mode();
             self.resolve_lapsed_push();
+            self.resolve_lapsed_pull();
 
             if event::poll(Duration::from_millis(50))? {
                 let event = event::read()?;
@@ -2243,6 +2446,10 @@ impl StatusApp {
                         self.handle_bump(key.code);
                     } else if matches!(self.mode, Mode::VerifyMany { .. }) {
                         self.handle_verify_many(key.code);
+                    } else if matches!(self.mode, Mode::PullMany { .. }) {
+                        self.handle_pull_many(key.code);
+                    } else if matches!(self.mode, Mode::UpdateMany { .. }) {
+                        self.handle_update_many(key.code);
                     } else if matches!(self.mode, Mode::Detail { .. }) {
                         self.handle_detail(key.code);
                     } else if matches!(self.mode, Mode::CreateInput { .. }) {
@@ -2571,6 +2778,17 @@ impl StatusApp {
             return Ok(false);
         }
 
+        // `pp` opens the pull-many picker. Same shape as the `PP` block
+        // above, for the same reason: the key that resolves the chord is
+        // consumed rather than also acted on.
+        if self.pending_pull.take().is_some() {
+            match pull_chord_key(code) {
+                PullChord::All => self.request_pull_many(),
+                PullChord::Single => self.start_pull(),
+            }
+            return Ok(false);
+        }
+
         match code {
             KeyCode::Char('q') => return Ok(self.confirm_quit(quit_armed)),
             // `esc` dismisses the output panel when one is up, and only quits
@@ -2631,7 +2849,7 @@ impl StatusApp {
                 }
                 None => self.message = Some("no branch selected".to_string()),
             },
-            KeyCode::Char('p') => self.start_pull(),
+            KeyCode::Char('p') => self.arm_pull(),
             KeyCode::Char('P') => self.arm_push(),
             KeyCode::Char('f') => self.start_fetch(),
             KeyCode::Char('v') => self.start_verify(),
@@ -2642,6 +2860,7 @@ impl StatusApp {
             KeyCode::Char('b') => self.request_bump(),
             KeyCode::Char('m') => self.request(Action::Promote),
             KeyCode::Char('u') => self.request(Action::Update),
+            KeyCode::Char('U') => self.request_update_many(),
             KeyCode::Char('x') => self.request(Action::Prune),
             KeyCode::Char('t') => self.request(Action::Tidy),
             KeyCode::Char('d') => self.request_delete()?,
@@ -3191,6 +3410,162 @@ impl StatusApp {
         );
     }
 
+    /// `pp` — open the pull-many picker, or say why it cannot run.
+    ///
+    /// Unlike [`Self::request_verify_many`] this needs no clean-tree gate up
+    /// front: most of what it does (fast-forwarding a branch that is not
+    /// checked out, fetching a remote-only one) never touches the working
+    /// tree at all, and the one shape that does — a real `git pull` on the
+    /// checked-out branch — already refuses on its own if the tree is dirty,
+    /// which the job then reports like any other per-branch failure.
+    fn request_pull_many(&mut self) {
+        if self.busy() {
+            return;
+        }
+        self.mode = Mode::PullMany {
+            counts: pull_set_counts(&self.rolls),
+        };
+    }
+
+    /// Handle a keypress while the pull-many picker is open.
+    fn handle_pull_many(&mut self, code: KeyCode) {
+        match pull_many_key(code) {
+            PullManyOutcome::Ignore => {}
+            PullManyOutcome::Cancel => self.mode = Mode::Browsing,
+            PullManyOutcome::Set(set) => {
+                self.mode = Mode::Browsing;
+                self.execute_pull_many(set);
+            }
+        }
+    }
+
+    /// Plan and run a pull over every roll in `set`, as one job — the pull
+    /// counterpart of [`Self::execute_verify_many`]. One job rather than one
+    /// per branch, for the same reason `PP`'s push sweep is one job: they
+    /// share a panel and a reload, and a half-finished sweep reads best as a
+    /// single scroll.
+    fn execute_pull_many(&mut self, set: PullSet) {
+        let selected = set.select(&self.rolls);
+        if selected.is_empty() {
+            self.message = Some(format!("no rolls to pull ({})", set.label()));
+            return;
+        }
+        let rows: Vec<(String, BranchLocation)> = selected
+            .iter()
+            .filter_map(|branch| {
+                self.rolls
+                    .iter()
+                    .find(|r| &r.branch == branch)
+                    .map(|r| (r.branch.clone(), r.location.clone()))
+            })
+            .collect();
+        let plan = plan_pull_many(
+            &rows,
+            &self.current_branch,
+            &self.tracking,
+            self.config.pull_mode,
+        );
+        if plan.items.is_empty() {
+            self.message = Some(match plan.skipped.len() {
+                0 => format!("nothing to pull ({}) — already up to date", set.label()),
+                n => format!(
+                    "nothing to pull ({}) without a fix — {n} branch{} need{} attention",
+                    set.label(),
+                    if n == 1 { "" } else { "es" },
+                    if n == 1 { "s" } else { "" }
+                ),
+            });
+            return;
+        }
+        self.pull_all_job(plan, set.label());
+    }
+
+    /// Pull every branch in the plan, in table order, reporting each one.
+    /// Mirrors [`Self::push_all_job`]; a branch that fails does not stop the
+    /// sweep, since the remaining branches are independent refs.
+    fn pull_all_job(&mut self, plan: PullManyPlan, set_label: &'static str) {
+        let repo = self.config.repo_root.clone();
+        let title = format!("rf pull --all ({set_label}, {})", plan.items.len());
+        self.start_job(title, move || {
+            let mut lines = Vec::new();
+            let mut failed = 0;
+            for item in &plan.items {
+                match sync::run_pull(&repo, &item.args) {
+                    Ok(()) => lines.push(match item.kind {
+                        PullKind::Pull => format!("Pulled '{}'", item.branch),
+                        PullKind::FastForward => format!("Fast-forwarded '{}'", item.branch),
+                        PullKind::FetchRemote => {
+                            format!("Fetched '{}' (no local copy)", item.branch)
+                        }
+                    }),
+                    Err(err) => {
+                        failed += 1;
+                        lines.push(format!("'{}' failed: {}", item.branch, sync_error(err)));
+                    }
+                }
+            }
+            pull_skips(&mut lines, &plan.skipped);
+            if failed > 0 {
+                lines.push(format!(
+                    "{failed} of {} branches were not pulled",
+                    plan.items.len()
+                ));
+            }
+            Ok(JobDone::lines(lines))
+        });
+    }
+
+    /// `[U]` — open the update-many picker, or say why it cannot run.
+    ///
+    /// Needs the same clean-tree gate [`Self::request_verify_many`] does:
+    /// `ops::update` checks out each target roll to merge stable into it, so
+    /// a dirty tree has to be refused before the modal opens rather than
+    /// mid-sweep.
+    fn request_update_many(&mut self) {
+        if self.busy() {
+            return;
+        }
+        if let Err(err) = ops::ensure_clean_state(&self.config) {
+            self.message = Some(format!("{err} — updating many rolls switches branches"));
+            return;
+        }
+        self.mode = Mode::UpdateMany {
+            counts: update_set_counts(&self.rolls),
+        };
+    }
+
+    /// Handle a keypress while the update-many picker is open.
+    fn handle_update_many(&mut self, code: KeyCode) {
+        match update_many_key(code) {
+            UpdateManyOutcome::Ignore => {}
+            UpdateManyOutcome::Cancel => self.mode = Mode::Browsing,
+            UpdateManyOutcome::Set(set) => {
+                self.mode = Mode::Browsing;
+                self.execute_update_many(set);
+            }
+        }
+    }
+
+    /// Merge stable into every roll in `set`, as one job — the update
+    /// counterpart of [`Self::execute_verify_many`]. Reuses `ops::update`
+    /// through [`ops::UpdateTarget::Rolls`] exactly as a named `--roll` list
+    /// would, so `[u]`, `[U]` and `rf update --state` can never disagree
+    /// about what a merge-stable-into-this-roll pass does.
+    fn execute_update_many(&mut self, set: UpdateSet) {
+        let selected = set.select(&self.rolls);
+        if selected.is_empty() {
+            self.message = Some(format!("no rolls to update ({})", set.label()));
+            return;
+        }
+        let config = self.config.clone();
+        let n = selected.len();
+        let label = set.label();
+        self.start_job(format!("rf update --state {label} ({n})"), move || {
+            let outcome = ops::update(&config, &ops::UpdateTarget::Rolls(selected), false)?;
+            Ok(JobDone::lines(render_update_outcome(outcome)))
+        });
+    }
+
     /// Handle a keypress while the bump picker is open.
     fn handle_bump(&mut self, code: KeyCode) {
         match bump_key(code) {
@@ -3517,6 +3892,30 @@ impl StatusApp {
             self.pending_push = None;
             self.message = None;
             self.start_push();
+        }
+    }
+
+    /// `[p]` — arm the pull chord. Mirrors [`Self::arm_push`]: the pull
+    /// itself does not start until the chord resolves, in
+    /// [`Self::handle_browsing`] or [`Self::resolve_lapsed_pull`].
+    fn arm_pull(&mut self) {
+        if self.busy() {
+            return;
+        }
+        self.pending_pull = Some(Instant::now());
+        self.message = Some("p again to pull a chosen set of rolls".to_string());
+    }
+
+    /// Fire a pending `p` that nothing followed. Mirrors
+    /// [`Self::resolve_lapsed_push`].
+    fn resolve_lapsed_pull(&mut self) {
+        let lapsed = self
+            .pending_pull
+            .is_some_and(|armed| armed.elapsed() >= PULL_CHORD_WINDOW);
+        if lapsed {
+            self.pending_pull = None;
+            self.message = None;
+            self.start_pull();
         }
     }
 
@@ -3971,6 +4370,8 @@ impl StatusApp {
             Mode::Delete { preview } => render_delete_modal(f, area, &self.config, preview),
             Mode::Bump { current } => render_bump_modal(f, area, *current, &self.current_branch),
             Mode::VerifyMany { counts } => render_verify_many_modal(f, area, counts),
+            Mode::PullMany { counts } => render_pull_many_modal(f, area, counts),
+            Mode::UpdateMany { counts } => render_update_many_modal(f, area, counts),
             Mode::ForcePush { branch, remote, .. } => {
                 render_force_push_modal(f, area, branch, remote, self.tracking.get(branch))
             }
@@ -4605,30 +5006,8 @@ fn run_op(
                 Some(roll) => ops::UpdateTarget::Rolls(vec![roll.to_string()]),
                 None => ops::UpdateTarget::AllActive,
             };
-            match ops::update(config, &update_target, false)? {
-                ops::UpdateOutcome::NoActiveRolls => {
-                    lines.push("no active local rolls to update".to_string());
-                }
-                ops::UpdateOutcome::Ran { stable, items } => {
-                    for item in items {
-                        match item {
-                            ops::UpdateItem::AlreadyUpToDate { roll } => {
-                                lines.push(format!(
-                                    "'{roll}' is already up to date with '{stable}'"
-                                ));
-                            }
-                            ops::UpdateItem::WouldMerge { roll, behind } => {
-                                lines.push(format!(
-                                    "would merge '{stable}' into '{roll}' ({behind} ahead)"
-                                ));
-                            }
-                            ops::UpdateItem::Updated { roll } => {
-                                lines.push(format!("updated '{roll}' with '{stable}'"));
-                            }
-                        }
-                    }
-                }
-            }
+            let outcome = ops::update(config, &update_target, false)?;
+            lines.extend(render_update_outcome(outcome));
         }
         Action::Prune => {
             // The modal was the confirmation, so plan and apply run back to
@@ -4905,6 +5284,85 @@ fn render_verify_many_modal(f: &mut Frame, area: Rect, counts: &[(VerifySet, usi
     f.render_widget(Clear, modal);
     f.render_widget(
         Paragraph::new(lines).block(Block::bordered().title(" verify all ")),
+        modal,
+    );
+}
+
+/// Mirrors [`render_verify_many_modal`] exactly, over [`PullSet`].
+fn render_pull_many_modal(f: &mut Frame, area: Rect, counts: &[(PullSet, usize); 6]) {
+    let mut lines = vec![
+        Line::from(Span::styled(
+            "Pull which rolls?",
+            Style::default().add_modifier(Modifier::BOLD),
+        )),
+        Line::from(""),
+    ];
+    for (i, (set, n)) in counts.iter().enumerate() {
+        lines.push(Line::from(vec![
+            Span::styled(format!("[{}] ", i + 1), Style::default().fg(Color::Yellow)),
+            Span::raw(format!("{:<24}", set.label())),
+            Span::styled(
+                format!("{n} roll{}", if *n == 1 { "" } else { "s" }),
+                Style::default().fg(Color::DarkGray),
+            ),
+        ]));
+    }
+    lines.push(Line::from(""));
+    lines.push(Line::from(Span::styled(
+        "[n] cancel",
+        Style::default().fg(Color::Yellow),
+    )));
+
+    let width = lines
+        .iter()
+        .map(|l| l.width())
+        .max()
+        .unwrap_or(32)
+        .clamp(28, 70) as u16;
+    let modal = centered_rect(area, width + 4, lines.len() as u16 + 2);
+    f.render_widget(Clear, modal);
+    f.render_widget(
+        Paragraph::new(lines).block(Block::bordered().title(" pull all ")),
+        modal,
+    );
+}
+
+/// Mirrors [`render_verify_many_modal`] exactly, over [`UpdateSet`]'s three
+/// choices instead of six.
+fn render_update_many_modal(f: &mut Frame, area: Rect, counts: &[(UpdateSet, usize); 3]) {
+    let mut lines = vec![
+        Line::from(Span::styled(
+            "Update which rolls? (merges stable into each)",
+            Style::default().add_modifier(Modifier::BOLD),
+        )),
+        Line::from(""),
+    ];
+    for (i, (set, n)) in counts.iter().enumerate() {
+        lines.push(Line::from(vec![
+            Span::styled(format!("[{}] ", i + 1), Style::default().fg(Color::Yellow)),
+            Span::raw(format!("{:<24}", set.label())),
+            Span::styled(
+                format!("{n} roll{}", if *n == 1 { "" } else { "s" }),
+                Style::default().fg(Color::DarkGray),
+            ),
+        ]));
+    }
+    lines.push(Line::from(""));
+    lines.push(Line::from(Span::styled(
+        "[n] cancel",
+        Style::default().fg(Color::Yellow),
+    )));
+
+    let width = lines
+        .iter()
+        .map(|l| l.width())
+        .max()
+        .unwrap_or(32)
+        .clamp(28, 70) as u16;
+    let modal = centered_rect(area, width + 4, lines.len() as u16 + 2);
+    f.render_widget(Clear, modal);
+    f.render_widget(
+        Paragraph::new(lines).block(Block::bordered().title(" update all ")),
         modal,
     );
 }
@@ -5602,6 +6060,14 @@ fn push_push_skips(lines: &mut Vec<String>, skipped: &[PushSkip]) {
     }
 }
 
+/// Append the skipped branches to a `pp` job's output. Mirrors
+/// [`push_push_skips`].
+fn pull_skips(lines: &mut Vec<String>, skipped: &[PullSkip]) {
+    for skip in skipped {
+        lines.push(format!("skipped '{}': {}", skip.branch, skip.reason));
+    }
+}
+
 /// Human wording for which copies a scope covers, used in the force-confirm
 /// line and nowhere else.
 fn scope_label(scope: DeleteScope) -> &'static str {
@@ -6007,6 +6473,37 @@ fn centered_rect(area: Rect, width: u16, height: u16) -> Rect {
 ///
 /// Shared by `[x] prune` and `[d]elete` so there is one result vocabulary for
 /// branch deletion in the TUI, matching `main.rs`'s `render_prune_results`.
+/// Render an `ops::update` outcome as readable lines. Shared by `run_op`'s
+/// `Action::Update` (the single-roll/`[u]`-with-nothing-selected path) and
+/// [`StatusApp::execute_update_many`] (the `[U]` picker), so the two can
+/// never describe the same merge differently.
+fn render_update_outcome(outcome: ops::UpdateOutcome) -> Vec<String> {
+    let mut lines = Vec::new();
+    match outcome {
+        ops::UpdateOutcome::NoActiveRolls => {
+            lines.push("no active local rolls to update".to_string());
+        }
+        ops::UpdateOutcome::Ran { stable, items } => {
+            for item in items {
+                match item {
+                    ops::UpdateItem::AlreadyUpToDate { roll } => {
+                        lines.push(format!("'{roll}' is already up to date with '{stable}'"));
+                    }
+                    ops::UpdateItem::WouldMerge { roll, behind } => {
+                        lines.push(format!(
+                            "would merge '{stable}' into '{roll}' ({behind} ahead)"
+                        ));
+                    }
+                    ops::UpdateItem::Updated { roll } => {
+                        lines.push(format!("updated '{roll}' with '{stable}'"));
+                    }
+                }
+            }
+        }
+    }
+    lines
+}
+
 fn render_prune_outcome(plan: &ops::PrunePlan, results: &[ops::PruneResult]) -> Vec<String> {
     let mut lines = Vec::new();
     for result in results {
@@ -6224,6 +6721,7 @@ mod tests {
             }),
             pending_g: false,
             pending_push: None,
+            pending_pull: None,
             command_history: Vec::new(),
         };
 
@@ -6284,6 +6782,7 @@ mod tests {
             panel_rect: None,
             pending_g: false,
             pending_push: None,
+            pending_pull: None,
             command_history: Vec::new(),
         };
 
@@ -6324,6 +6823,7 @@ mod tests {
             panel_rect: None,
             pending_g: false,
             pending_push: None,
+            pending_pull: None,
             command_history: Vec::new(),
         };
         app.toggle_maximize();
@@ -8110,6 +8610,7 @@ mod tests {
             panel_rect: None,
             pending_g: false,
             pending_push: None,
+            pending_pull: None,
             command_history: Vec::new(),
         };
         let out = draw(|f, area| app.render_table(f, area));
@@ -8315,6 +8816,33 @@ mod tests {
     }
 
     #[test]
+    fn the_search_finds_pull_all_and_update_all_and_offers_to_run_them() {
+        let hits = filter_bindings("pull all");
+        let top = &BINDINGS[hits[0]];
+        assert_eq!(top.keys, "pp", "got {} instead", top.keys);
+        assert_eq!(
+            top.replay,
+            &[KeyCode::Char('p'), KeyCode::Char('p')],
+            "pp must replay as a chord"
+        );
+        assert!(top.hint.is_none());
+
+        // `u`'s own label also mentions "all" (in passing, for the
+        // no-selection case), so unlike "pull all" this query does not rank
+        // `U` first — it only has to be *findable*, the same bar
+        // `the_hotfix_keys_are_in_the_keymap_and_found_by_the_search` below
+        // holds `h`/`H` to.
+        let hits: Vec<&str> = filter_bindings("update all")
+            .into_iter()
+            .map(|i| BINDINGS[i].keys)
+            .collect();
+        assert!(hits.contains(&"U"), "{hits:?}");
+        let u = BINDINGS.iter().find(|b| b.keys == "U").unwrap();
+        assert_eq!(u.replay, &[KeyCode::Char('U')]);
+        assert!(u.hint.is_none());
+    }
+
+    #[test]
     fn the_hotfix_keys_are_in_the_keymap_and_found_by_the_search() {
         let hits: Vec<&str> = filter_bindings("hotfix")
             .into_iter()
@@ -8476,6 +9004,7 @@ mod tests {
             panel_rect: None,
             pending_g: false,
             pending_push: None,
+            pending_pull: None,
             command_history: Vec::new(),
         };
 
@@ -8586,6 +9115,7 @@ mod tests {
             panel_rect: None,
             pending_g: false,
             pending_push: None,
+            pending_pull: None,
             command_history: Vec::new(),
         };
         let out = draw(|f, area| app.render_table(f, area));
@@ -8626,6 +9156,7 @@ mod tests {
             panel_rect: None,
             pending_g: false,
             pending_push: None,
+            pending_pull: None,
             command_history: Vec::new(),
         };
         let out = draw(|f, area| app.render_table(f, area));
@@ -8678,6 +9209,7 @@ mod tests {
             panel_rect: None,
             pending_g: false,
             pending_push: None,
+            pending_pull: None,
             command_history: Vec::new(),
         };
         let out = draw(|f, area| app.render_table(f, area));
@@ -8856,6 +9388,72 @@ mod tests {
     }
 
     #[test]
+    fn pull_sets_select_the_same_way_verify_sets_do() {
+        // `PullSet` mirrors `VerifySet` category-for-category, so this is the
+        // same fixture and the same assertions.
+        let rolls = vec![
+            roll_n(1, RollState::Active),
+            roll_n(2, RollState::Blocked),
+            roll_n(3, RollState::Graduated),
+            roll_n(4, RollState::Diverged),
+            roll_n(5, RollState::Promoted),
+            RollInfo {
+                location: BranchLocation::Remote,
+                ..roll_n(6, RollState::Active)
+            },
+        ];
+        let names = |set: PullSet| -> Vec<u32> {
+            set.select(&rolls)
+                .iter()
+                .map(|b| branches::parse_roll_number(b, "roll/").unwrap())
+                .collect()
+        };
+        assert_eq!(names(PullSet::All), vec![1, 2, 3, 4, 6]);
+        assert_eq!(names(PullSet::Active), vec![1, 6]);
+        assert_eq!(names(PullSet::Blocked), vec![2]);
+        assert_eq!(names(PullSet::Graduated), vec![3]);
+        assert_eq!(names(PullSet::Diverged), vec![4]);
+        assert_eq!(names(PullSet::Local), vec![1, 2, 3, 4]);
+
+        let counts = pull_set_counts(&rolls);
+        assert_eq!(counts[0], (PullSet::All, 5));
+        assert_eq!(counts[5], (PullSet::Local, 4));
+    }
+
+    #[test]
+    fn update_sets_only_ever_cover_active_or_blocked_local_rolls() {
+        // Narrower than `VerifySet`/`PullSet` on purpose: `rf update` has
+        // nothing to do with a graduated, diverged or remote-only roll, so
+        // there is no `UpdateSet` variant for them at all (see `UpdateSet`'s
+        // doc comment) — this just pins `All`/`Active`/`Blocked` down.
+        let rolls = vec![
+            roll_n(1, RollState::Active),
+            roll_n(2, RollState::Blocked),
+            roll_n(3, RollState::Graduated),
+            RollInfo {
+                location: BranchLocation::Remote,
+                ..roll_n(4, RollState::Active)
+            },
+        ];
+        let names = |set: UpdateSet| -> Vec<u32> {
+            set.select(&rolls)
+                .iter()
+                .map(|b| branches::parse_roll_number(b, "roll/").unwrap())
+                .collect()
+        };
+        // Roll 3 (graduated) and roll 4 (remote-only) are never eligible,
+        // even under `All`.
+        assert_eq!(names(UpdateSet::All), vec![1, 2]);
+        assert_eq!(names(UpdateSet::Active), vec![1]);
+        assert_eq!(names(UpdateSet::Blocked), vec![2]);
+
+        let counts = update_set_counts(&rolls);
+        assert_eq!(counts[0], (UpdateSet::All, 2));
+        assert_eq!(counts[1], (UpdateSet::Active, 1));
+        assert_eq!(counts[2], (UpdateSet::Blocked, 1));
+    }
+
+    #[test]
     fn the_verify_many_modal_shows_each_set_with_its_count() {
         let rolls = vec![
             roll_n(1, RollState::Active),
@@ -8868,6 +9466,142 @@ mod tests {
         assert!(out.contains("[2] active"), "{out}");
         assert!(out.contains("1 roll "), "{out}");
         assert!(out.contains("[n] cancel"), "{out}");
+    }
+
+    #[test]
+    fn the_pull_many_picker_maps_digits_to_sets_in_menu_order() {
+        for (i, set) in PullSet::ALL.iter().enumerate() {
+            let key = KeyCode::Char(char::from_digit(i as u32 + 1, 10).unwrap());
+            assert_eq!(pull_many_key(key), PullManyOutcome::Set(*set), "{key:?}");
+        }
+        assert_eq!(pull_many_key(KeyCode::Char('9')), PullManyOutcome::Ignore);
+        for key in [KeyCode::Char('n'), KeyCode::Char('N'), KeyCode::Esc] {
+            assert_eq!(pull_many_key(key), PullManyOutcome::Cancel, "{key:?}");
+        }
+    }
+
+    #[test]
+    fn the_pull_many_modal_shows_each_set_with_its_count() {
+        let rolls = vec![
+            roll_n(1, RollState::Active),
+            roll_n(2, RollState::Graduated),
+        ];
+        let counts = pull_set_counts(&rolls);
+        let out = draw(|f, area| render_pull_many_modal(f, area, &counts));
+        assert!(out.contains("[1] all rolls"), "{out}");
+        assert!(out.contains("2 rolls"), "{out}");
+        assert!(out.contains("[2] active"), "{out}");
+        assert!(out.contains("1 roll "), "{out}");
+        assert!(out.contains("[n] cancel"), "{out}");
+    }
+
+    #[test]
+    fn the_update_many_picker_maps_digits_to_sets_in_menu_order() {
+        for (i, set) in UpdateSet::ALL.iter().enumerate() {
+            let key = KeyCode::Char(char::from_digit(i as u32 + 1, 10).unwrap());
+            assert_eq!(
+                update_many_key(key),
+                UpdateManyOutcome::Set(*set),
+                "{key:?}"
+            );
+        }
+        // Only three choices here, unlike the six-set pickers.
+        assert_eq!(
+            update_many_key(KeyCode::Char('4')),
+            UpdateManyOutcome::Ignore
+        );
+        for key in [KeyCode::Char('n'), KeyCode::Char('N'), KeyCode::Esc] {
+            assert_eq!(update_many_key(key), UpdateManyOutcome::Cancel, "{key:?}");
+        }
+    }
+
+    #[test]
+    fn the_update_many_modal_shows_each_set_with_its_count() {
+        let rolls = vec![roll_n(1, RollState::Active), roll_n(2, RollState::Blocked)];
+        let counts = update_set_counts(&rolls);
+        let out = draw(|f, area| render_update_many_modal(f, area, &counts));
+        assert!(out.contains("[1] all active local rolls"), "{out}");
+        assert!(out.contains("2 rolls"), "{out}");
+        assert!(out.contains("[2] active"), "{out}");
+        assert!(out.contains("1 roll "), "{out}");
+        assert!(out.contains("[3] blocked"), "{out}");
+        assert!(out.contains("[n] cancel"), "{out}");
+    }
+
+    #[test]
+    fn only_a_second_p_widens_a_pull_and_nothing_cancels_one() {
+        assert_eq!(pull_chord_key(KeyCode::Char('p')), PullChord::All);
+        // Uppercase `P` is push, not pull — it must not complete the chord.
+        // `Esc` resolves to the single pull rather than cancelling: the first
+        // `p` was already a decision to pull the selected branch.
+        for key in [
+            KeyCode::Char('P'),
+            KeyCode::Esc,
+            KeyCode::Char('q'),
+            KeyCode::Enter,
+            KeyCode::Down,
+        ] {
+            assert_eq!(pull_chord_key(key), PullChord::Single, "{key:?}");
+        }
+    }
+
+    #[test]
+    fn pull_all_takes_only_the_branches_a_plain_pull_would_carry() {
+        let mut tracking = HashMap::new();
+        tracking.insert("main".to_string(), tracked("main", ""));
+        tracking.insert("rolling".to_string(), tracked("rolling", "behind 2"));
+        tracking.insert("roll/1-x".to_string(), untracked("roll/1-x"));
+        let rows = push_all_rows(&["main", "rolling", "roll/1-x"]);
+
+        let plan = plan_pull_many(&rows, "rolling", &tracking, PullMode::default());
+
+        // In-sync is not mentioned at all, mirroring `plan_push_all`. "behind"
+        // on the checked-out branch is a real `git pull`; the untracked roll
+        // has no upstream at all, so it is refused rather than queued.
+        let pulled: Vec<_> = plan
+            .items
+            .iter()
+            .map(|i| (i.branch.as_str(), i.kind))
+            .collect();
+        assert_eq!(pulled, vec![("rolling", PullKind::Pull)]);
+        assert_eq!(plan.skipped.len(), 1);
+        assert_eq!(plan.skipped[0].branch, "roll/1-x");
+    }
+
+    #[test]
+    fn pull_all_does_not_resurrect_a_deleted_upstream() {
+        let mut tracking = HashMap::new();
+        tracking.insert("roll/1-x".to_string(), tracked("roll/1-x", "gone"));
+        let plan = plan_pull_many(
+            &push_all_rows(&["roll/1-x"]),
+            "main",
+            &tracking,
+            PullMode::default(),
+        );
+
+        assert!(plan.items.is_empty());
+        assert_eq!(plan.skipped.len(), 1);
+        assert!(
+            plan.skipped[0].reason.starts_with("upstream"),
+            "{:?}",
+            plan.skipped[0]
+        );
+    }
+
+    #[test]
+    fn pull_all_fast_forwards_a_branch_that_is_not_checked_out() {
+        let mut tracking = HashMap::new();
+        tracking.insert("roll/1-x".to_string(), tracked("roll/1-x", "behind 1"));
+        let plan = plan_pull_many(
+            &push_all_rows(&["roll/1-x"]),
+            "rolling",
+            &tracking,
+            PullMode::default(),
+        );
+
+        assert_eq!(plan.items.len(), 1);
+        assert_eq!(plan.items[0].kind, PullKind::FastForward);
+        assert!(plan.skipped.is_empty(), "{:?}", plan.skipped);
     }
 
     #[test]
@@ -9573,6 +10307,7 @@ mod tests {
             panel_rect: None,
             pending_g: false,
             pending_push: None,
+            pending_pull: None,
             command_history: Vec::new(),
         }
     }
@@ -9901,6 +10636,7 @@ mod tests {
             panel_rect: None,
             pending_g: false,
             pending_push: None,
+            pending_pull: None,
             command_history: Vec::new(),
         };
         let out = draw(|f, area| app.render_table(f, area));
@@ -9974,6 +10710,7 @@ mod tests {
             panel_rect: None,
             pending_g: false,
             pending_push: None,
+            pending_pull: None,
             command_history: Vec::new(),
         };
 
