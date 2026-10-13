@@ -304,7 +304,12 @@ routine, so the rules are identical, and the one that matters is that the pass
 on, whatever any roll's gates said. A dirty tree is refused in the status bar
 before the picker even opens. One job, one panel: each roll's report under its
 own header, then `N passed, M failed, K skipped`, and the panel marks failed if
-any did — see [`verify`](verify.md#verifying-many-at-once).
+any did — see [`verify`](verify.md#verifying-many-at-once). A roll whose merge
+was predicted to conflict fails there with the same attributed report `[v]`
+gives, under that roll's own header rather than flattened to the summary line
+— but `[i]`/`[I]` act on whatever is checked out, and the pass restores that
+to the branch it started from, not the conflicting roll, so the fix there
+says to `[space]` onto it first.
 
 ## Hotfixes
 

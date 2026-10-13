@@ -638,10 +638,19 @@ fn cmd_verify_all(set: branches::VerifySet) -> Result<()> {
                     outcome.target, outcome.source
                 );
             }
+            if let Some(why) = &outcome.conflict_check_skipped {
+                println!(
+                    "note: could not pre-check '{}' -> '{}' for merge conflicts ({why}); the merge itself will still stop on one",
+                    outcome.source, outcome.target
+                );
+            }
             render_version_check(&outcome.version, &outcome.source, &outcome.target);
             render_gate_notices(&outcome.gate_notices);
             render_gate_notices(&outcome.host_notices);
             render_host_results(&outcome.host_results);
+        }
+        if let Some(report) = &result.conflict {
+            print_predicted_conflict(&config, report);
         }
         match &result.verdict {
             ops::VerifyVerdict::Passed => {

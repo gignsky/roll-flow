@@ -1888,6 +1888,12 @@ pub(crate) struct VerifyManyResult {
     /// The dev marker this pass committed onto the roll, when it was missing.
     pub marked: Option<Semver>,
     pub verdict: VerifyVerdict,
+    /// Set when the verdict is [`VerifyVerdict::Failed`] because the merge
+    /// `verify` tried was predicted to conflict. Carried separately from
+    /// `verdict`'s one-line reason so a renderer can print the same attributed
+    /// report and `rf integrate`/`[i]` fix a lone `rf verify` gives — the batch
+    /// and the single check must describe one conflict identically.
+    pub conflict: Option<ConflictReport>,
 }
 
 impl VerifyManyResult {
@@ -1897,6 +1903,7 @@ impl VerifyManyResult {
             outcome: None,
             marked: None,
             verdict: VerifyVerdict::Skipped(why.into()),
+            conflict: None,
         }
     }
 
@@ -1906,6 +1913,7 @@ impl VerifyManyResult {
             outcome: None,
             marked,
             verdict: VerifyVerdict::Failed(why.into()),
+            conflict: None,
         }
     }
 }
@@ -2048,13 +2056,27 @@ pub(crate) fn verify_many(config: &Config, branches: &[String]) -> Result<Vec<Ve
                     outcome: Some(outcome),
                     marked,
                     verdict,
+                    conflict: None,
                 }
             }
-            Err(err) if err.to_string().starts_with("nothing to merge") => VerifyManyResult {
-                marked,
-                ..VerifyManyResult::skipped(branch, err.to_string())
+            // Carried whole, not flattened to `err.to_string()`: a renderer
+            // needs the same attributed report and `rf integrate`/`[i]` fix a
+            // lone `rf verify` gives, so the batch and the single check never
+            // disagree about what a conflict looks like.
+            Err(err) => match err.downcast::<PredictedConflict>() {
+                Ok(conflict) => VerifyManyResult {
+                    branch: branch.clone(),
+                    outcome: None,
+                    marked,
+                    verdict: VerifyVerdict::Failed(conflict.to_string()),
+                    conflict: Some(conflict.report),
+                },
+                Err(err) if err.to_string().starts_with("nothing to merge") => VerifyManyResult {
+                    marked,
+                    ..VerifyManyResult::skipped(branch, err.to_string())
+                },
+                Err(err) => VerifyManyResult::failed(branch, marked, err.to_string()),
             },
-            Err(err) => VerifyManyResult::failed(branch, marked, err.to_string()),
         });
     }
 

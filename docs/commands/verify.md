@@ -28,7 +28,12 @@ cannot drift:
 - a roll with no local copy is skipped with a reason, never fetched. `--state
   local` leaves those out entirely.
 
-A roll whose route has nothing to merge counts as skipped, not failed.
+A roll whose route has nothing to merge counts as skipped, not failed. A roll
+whose merge was predicted to conflict counts as failed, and the report carries
+the same attributed detail — conflicted paths, culprit rolls, the
+`rf integrate`/`[i]` fix — a lone `rf verify` prints for it (see
+[merge conflicts](../internals/algorithms.md#predicting-it-in-rf-verify)), not
+just a one-line summary.
 
 Each roll's version is checked the way a single `rf verify` checks it, and then
 some:
