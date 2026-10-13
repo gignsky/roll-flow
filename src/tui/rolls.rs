@@ -209,10 +209,13 @@ fn sync_error(err: sync::SyncFailure) -> anyhow::Error {
 ///
 /// `track` is `None` when the branch has no local copy, which is not the same as
 /// having no upstream — a remote-only roll has nothing to compare, so it shows a
-/// dash rather than claiming to be in sync. Pure, so the whole table is testable
+/// dash rather than claiming to be in sync. `dirty` is a separate fact — this
+/// branch's worktree has uncommitted changes — and is appended as its own glyph
+/// rather than folded into one of the match arms above, since it is orthogonal to
+/// how the branch sits against its upstream. Pure, so the whole table is testable
 /// without a terminal.
-pub(crate) fn sync_cell(track: Option<TrackState>) -> (String, Color) {
-    match track {
+pub(crate) fn sync_cell(track: Option<TrackState>, dirty: bool) -> (String, Color) {
+    let (mut text, mut color) = match track {
         None | Some(TrackState::NoUpstream) => ("—".to_string(), Color::DarkGray),
         Some(TrackState::Gone) => ("gone".to_string(), Color::Red),
         Some(TrackState::InSync) => ("✓".to_string(), Color::Green),
@@ -221,7 +224,16 @@ pub(crate) fn sync_cell(track: Option<TrackState>) -> (String, Color) {
         Some(TrackState::Diverged { ahead, behind }) => {
             (format!("↑{ahead}↓{behind}"), Color::Yellow)
         }
+    };
+    if dirty {
+        text.push_str(" ⚡");
+        // Uncommitted changes always need attention and must not hide behind a
+        // green ✓ — but a `gone` upstream is the worse problem, so it keeps red.
+        if color != Color::Red {
+            color = Color::Yellow;
+        }
     }
+    (text, color)
 }
 
 /// The marker shown against the checked-out branch.
@@ -620,6 +632,9 @@ struct StatusApp {
     /// Upstream tracking state per local branch, refreshed on reload. Sourced in
     /// one `for-each-ref` rather than an `ahead_behind` call per row.
     tracking: HashMap<String, git::LocalBranch>,
+    /// Branches whose worktree has uncommitted changes, refreshed on reload.
+    /// Drawn as a ⚡ in the `sync` column. See [`load_dirty`].
+    dirty: HashSet<String>,
     /// The `[package]` version at each visible branch's tip, refreshed on
     /// reload. Sourced in one `cat-file --batch` rather than a `git show` per
     /// row, the same reason `tracking` is one `for-each-ref`.
@@ -2160,6 +2175,7 @@ impl StatusApp {
         let mut table = TableState::default();
         table.select(initial_selection(&bases, &rolls, &hotfixes));
         let tracking = load_tracking(&config);
+        let dirty = load_dirty(&tracking);
         let versions = load_versions(&config, &bases, &rolls, &hotfixes);
         let version = version::read_version(&config.repo_root).unwrap_or(None);
         Self {
@@ -2170,6 +2186,7 @@ impl StatusApp {
             hotfixes,
             show_deps,
             tracking,
+            dirty,
             versions,
             version,
             table,
@@ -3872,6 +3889,7 @@ impl StatusApp {
         self.rolls = branches::list_rolls(&self.config)?;
         self.hotfixes = branches::list_hotfixes(&self.config).unwrap_or_default();
         self.tracking = load_tracking(&self.config);
+        self.dirty = load_dirty(&self.tracking);
         self.versions = load_versions(&self.config, &self.bases, &self.rolls, &self.hotfixes);
         // Read from the worktree, so a bump — or a branch switch that changes it —
         // shows in the header straight away.
@@ -4084,6 +4102,7 @@ impl StatusApp {
 
         let show_deps = self.show_deps;
         let tracking = &self.tracking;
+        let dirty = &self.dirty;
         let versions = &self.versions;
         // Base branches are pinned above the rolls: no number and no state, the
         // `state` column carrying their role instead.
@@ -4096,7 +4115,10 @@ impl StatusApp {
                 } else {
                     Style::default()
                 };
-                let (sync_text, sync_color) = sync_cell(track_of(tracking, &base.branch));
+                let (sync_text, sync_color) = sync_cell(
+                    track_of(tracking, &base.branch),
+                    dirty.contains(&base.branch),
+                );
                 let mut cells = vec![
                     Cell::from(current_marker(base.is_current)).style(
                         Style::default()
@@ -4130,7 +4152,10 @@ impl StatusApp {
             } else {
                 Style::default()
             };
-            let (sync_text, sync_color) = sync_cell(track_of(tracking, &roll.branch));
+            let (sync_text, sync_color) = sync_cell(
+                track_of(tracking, &roll.branch),
+                dirty.contains(&roll.branch),
+            );
             let mut cells = vec![
                 Cell::from(current_marker(roll.is_current)).style(
                     Style::default()
@@ -4164,7 +4189,10 @@ impl StatusApp {
             } else {
                 Style::default()
             };
-            let (sync_text, sync_color) = sync_cell(track_of(tracking, &hotfix.branch));
+            let (sync_text, sync_color) = sync_cell(
+                track_of(tracking, &hotfix.branch),
+                dirty.contains(&hotfix.branch),
+            );
             let color = hotfix_color(hotfix.state);
             let mut cells = vec![
                 Cell::from(current_marker(hotfix.is_current)).style(
@@ -4672,6 +4700,39 @@ fn load_tracking(config: &Config) -> HashMap<String, git::LocalBranch> {
     git::local_branch_details(&config.repo_root)
         .map(|branches| branches.into_iter().map(|b| (b.name.clone(), b)).collect())
         .unwrap_or_default()
+}
+
+/// Branches whose worktree currently has uncommitted changes.
+///
+/// `tracking` already carries each branch's worktree path for free — the same
+/// `for-each-ref` that answers the sync column answers this too, so no second
+/// git call is needed to find out *which* branches are checked out anywhere.
+/// Grouped by path first so a path shared by nothing (the ordinary case: one
+/// worktree, one branch) costs exactly one `git status`, same as a path shared
+/// by several branches would (which cannot happen for distinct worktrees, but
+/// keeps this correct if a caller ever hands in stale duplicate paths). A
+/// branch with no worktree (not checked out anywhere) is never dirty — there is
+/// no working tree for it to be dirty in. A worktree whose status can't be read
+/// degrades to "clean" rather than failing the reload, the same degrade
+/// `load_tracking` itself uses for a failed git call.
+fn load_dirty(tracking: &HashMap<String, git::LocalBranch>) -> HashSet<String> {
+    let mut branches_by_path: HashMap<&str, Vec<&str>> = HashMap::new();
+    for branch in tracking.values() {
+        if !branch.worktree.is_empty() {
+            branches_by_path
+                .entry(branch.worktree.as_str())
+                .or_default()
+                .push(branch.name.as_str());
+        }
+    }
+    let mut dirty = HashSet::new();
+    for (path, names) in branches_by_path {
+        let clean = git::working_tree_clean(std::path::Path::new(path)).unwrap_or(true);
+        if !clean {
+            dirty.extend(names.into_iter().map(String::from));
+        }
+    }
+    dirty
 }
 
 /// Read the crate version at every branch on screen, keyed by branch name.
@@ -6141,6 +6202,7 @@ mod tests {
             hotfixes: Vec::new(),
             show_deps: false,
             tracking: HashMap::new(),
+            dirty: HashSet::new(),
             versions: HashMap::new(),
             version: None,
             table: TableState::default(),
@@ -6205,6 +6267,7 @@ mod tests {
             hotfixes: Vec::new(),
             show_deps: false,
             tracking: HashMap::new(),
+            dirty: HashSet::new(),
             versions: HashMap::new(),
             version: None,
             table: TableState::default(),
@@ -6244,6 +6307,7 @@ mod tests {
             hotfixes: Vec::new(),
             show_deps: false,
             tracking: HashMap::new(),
+            dirty: HashSet::new(),
             versions: HashMap::new(),
             version: None,
             table: TableState::default(),
@@ -6295,6 +6359,26 @@ mod tests {
         assert!(
             cargo_toml.contains("0.0.1-roll1"),
             "marker not written: {cargo_toml}"
+        );
+    }
+
+    #[test]
+    fn load_dirty_flags_the_checked_out_branch_only_once_it_has_uncommitted_changes() {
+        let dir = sandbox_repo();
+        let mut cfg = config("main", "rolling");
+        cfg.repo_root = dir.path().to_path_buf();
+
+        let tracking = load_tracking(&cfg);
+        assert!(
+            load_dirty(&tracking).is_empty(),
+            "a freshly committed repo must not read as dirty"
+        );
+
+        std::fs::write(dir.path().join("work.txt"), "edited\n").expect("edit work.txt");
+        let dirty = load_dirty(&tracking);
+        assert!(
+            dirty.contains("roll/1-0101-late"),
+            "the checked-out branch must be flagged once its worktree is edited: {dirty:?}"
         );
     }
 
@@ -8009,6 +8093,7 @@ mod tests {
             hotfixes: Vec::new(),
             show_deps: false,
             tracking: HashMap::new(),
+            dirty: HashSet::new(),
             versions: HashMap::new(),
             version: None,
             table: TableState::default(),
@@ -8374,6 +8459,7 @@ mod tests {
             hotfixes: Vec::new(),
             show_deps: false,
             tracking,
+            dirty: HashSet::new(),
             versions: HashMap::new(),
             version: None,
             table: TableState::default(),
@@ -8415,6 +8501,58 @@ mod tests {
     }
 
     #[test]
+    fn the_sync_column_shows_a_bolt_only_on_the_row_with_uncommitted_changes() {
+        let cfg = config("main", "rolling");
+        let mut rolls = vec![roll_n(1, RollState::Active), roll_n(2, RollState::Active)];
+        rolls[0].branch = "roll/1-0101-dirty".to_string();
+        rolls[1].branch = "roll/2-0102-clean".to_string();
+
+        let mut dirty = HashSet::new();
+        dirty.insert("roll/1-0101-dirty".to_string());
+
+        let mut app = StatusApp {
+            config: cfg,
+            current_branch: "roll/1-0101-dirty".to_string(),
+            bases: Vec::new(),
+            rolls,
+            hotfixes: Vec::new(),
+            show_deps: false,
+            tracking: HashMap::new(),
+            dirty,
+            versions: HashMap::new(),
+            version: None,
+            table: TableState::default(),
+            mode: Mode::Browsing,
+            message: None,
+            job: None,
+            job_title: String::new(),
+            job_moves_head: false,
+            queue: Queue::default(),
+            quit_armed: false,
+            deferred_mode: None,
+            panel: None,
+            panel_maximized: false,
+            panel_rect: None,
+            pending_g: false,
+            pending_push: None,
+            command_history: Vec::new(),
+        };
+
+        let out = draw(|f, area| app.render_table(f, area));
+        let dirty_row = out
+            .lines()
+            .find(|l| l.contains("roll/1-0101-dirty"))
+            .expect("dirty roll row");
+        let clean_row = out
+            .lines()
+            .find(|l| l.contains("roll/2-0102-clean"))
+            .expect("clean roll row");
+
+        assert!(dirty_row.contains('⚡'), "{dirty_row}");
+        assert!(!clean_row.contains('⚡'), "{clean_row}");
+    }
+
+    #[test]
     fn the_version_column_shows_the_numbers_and_a_dash_when_absent() {
         let mut rolls = vec![roll_n(1, RollState::Active), roll_n(2, RollState::Active)];
         rolls[0].branch = "roll/1-0101-versioned".to_string();
@@ -8431,6 +8569,7 @@ mod tests {
             hotfixes: Vec::new(),
             show_deps: false,
             tracking: HashMap::new(),
+            dirty: HashSet::new(),
             versions,
             version: None,
             table: TableState::default(),
@@ -8470,6 +8609,7 @@ mod tests {
             hotfixes: Vec::new(),
             show_deps: false,
             tracking: HashMap::new(),
+            dirty: HashSet::new(),
             versions: HashMap::new(),
             version: None,
             table: TableState::default(),
@@ -8521,6 +8661,7 @@ mod tests {
             hotfixes: Vec::new(),
             show_deps: false,
             tracking: HashMap::new(),
+            dirty: HashSet::new(),
             versions: HashMap::new(),
             version: None,
             table: TableState::default(),
@@ -8550,18 +8691,21 @@ mod tests {
 
     #[test]
     fn the_sync_column_maps_each_tracking_state_to_a_glyph() {
-        assert_eq!(sync_cell(Some(TrackState::InSync)).0, "✓");
-        assert_eq!(sync_cell(Some(TrackState::Ahead(2))).0, "↑2");
-        assert_eq!(sync_cell(Some(TrackState::Behind(3))).0, "↓3");
+        assert_eq!(sync_cell(Some(TrackState::InSync), false).0, "✓");
+        assert_eq!(sync_cell(Some(TrackState::Ahead(2)), false).0, "↑2");
+        assert_eq!(sync_cell(Some(TrackState::Behind(3)), false).0, "↓3");
         assert_eq!(
-            sync_cell(Some(TrackState::Diverged {
-                ahead: 2,
-                behind: 1
-            }))
+            sync_cell(
+                Some(TrackState::Diverged {
+                    ahead: 2,
+                    behind: 1
+                }),
+                false
+            )
             .0,
             "↑2↓1"
         );
-        assert_eq!(sync_cell(Some(TrackState::Gone)).0, "gone");
+        assert_eq!(sync_cell(Some(TrackState::Gone), false).0, "gone");
     }
 
     #[test]
@@ -8569,17 +8713,42 @@ mod tests {
         // A remote-only roll has no local copy, and a local branch may have no
         // upstream at all. Neither is "in sync", and rendering ✓ would say the
         // opposite of the truth.
-        assert_eq!(sync_cell(None).0, "—");
-        assert_eq!(sync_cell(Some(TrackState::NoUpstream)).0, "—");
+        assert_eq!(sync_cell(None, false).0, "—");
+        assert_eq!(sync_cell(Some(TrackState::NoUpstream), false).0, "—");
     }
 
     #[test]
     fn the_sync_column_is_green_in_sync_yellow_diverged_and_red_when_gone() {
-        assert_eq!(sync_cell(Some(TrackState::InSync)).1, Color::Green);
-        assert_eq!(sync_cell(Some(TrackState::Ahead(1))).1, Color::Yellow);
-        assert_eq!(sync_cell(Some(TrackState::Behind(1))).1, Color::Yellow);
-        assert_eq!(sync_cell(Some(TrackState::Gone)).1, Color::Red);
-        assert_eq!(sync_cell(None).1, Color::DarkGray);
+        assert_eq!(sync_cell(Some(TrackState::InSync), false).1, Color::Green);
+        assert_eq!(
+            sync_cell(Some(TrackState::Ahead(1)), false).1,
+            Color::Yellow
+        );
+        assert_eq!(
+            sync_cell(Some(TrackState::Behind(1)), false).1,
+            Color::Yellow
+        );
+        assert_eq!(sync_cell(Some(TrackState::Gone), false).1, Color::Red);
+        assert_eq!(sync_cell(None, false).1, Color::DarkGray);
+    }
+
+    #[test]
+    fn a_dirty_working_tree_appends_a_lightning_bolt_to_the_sync_glyph() {
+        assert_eq!(sync_cell(Some(TrackState::InSync), true).0, "✓ ⚡");
+        assert_eq!(sync_cell(Some(TrackState::Ahead(2)), true).0, "↑2 ⚡");
+        assert_eq!(sync_cell(Some(TrackState::Gone), true).0, "gone ⚡");
+        // Can't actually happen — a branch with no worktree has no working tree
+        // to be dirty in — but the glyph logic must not assume that invariant.
+        assert_eq!(sync_cell(None, true).0, "— ⚡");
+    }
+
+    #[test]
+    fn a_dirty_working_tree_turns_the_glyph_yellow_unless_the_upstream_is_gone() {
+        // A dirty tree needs attention and must not hide behind a green ✓.
+        assert_eq!(sync_cell(Some(TrackState::InSync), true).1, Color::Yellow);
+        assert_eq!(sync_cell(None, true).1, Color::Yellow);
+        // `gone` is the worse problem and keeps its red even when also dirty.
+        assert_eq!(sync_cell(Some(TrackState::Gone), true).1, Color::Red);
     }
 
     #[test]
@@ -9387,6 +9556,7 @@ mod tests {
             hotfixes: Vec::new(),
             show_deps: false,
             tracking: HashMap::new(),
+            dirty: HashSet::new(),
             versions: HashMap::new(),
             version: None,
             table: TableState::default(),
@@ -9714,6 +9884,7 @@ mod tests {
             hotfixes,
             show_deps: false,
             tracking: HashMap::new(),
+            dirty: HashSet::new(),
             versions: HashMap::new(),
             version: None,
             table,
@@ -9786,6 +9957,7 @@ mod tests {
             hotfixes: Vec::new(),
             show_deps: false,
             tracking: HashMap::new(),
+            dirty: HashSet::new(),
             versions: HashMap::new(),
             version: None,
             table,
