@@ -324,6 +324,41 @@ clean by the time anyone acts on it; a merge that failed with no conflicted
 paths keeps the plain error. Diagnosis never errors: it runs on a failing path
 and must not hide the failure it explains.
 
+### Predicting it in `rf verify`
+
+`rf verify` finds the same conflict *before* any merge, with a trial merge in the
+object store: `git merge-tree --write-tree --name-only --no-messages -z <target>
+<source>` (`git::preview_merge`). Exit 0 is clean, 1 is conflicted, and anything
+else — git older than 2.38, which lacks `--write-tree` — is reported as a
+skipped check, never a failure, since the real merge still stops on a conflict.
+Nothing is checked out, staged, or left behind but unreachable objects for `git
+gc`, so it is safe on the tree verify is about to gate.
+
+The paths go through the same attribution as above (`attribute_conflicts`, which
+`diagnose_conflicts` also calls), so verify and graduate describe one conflict
+identically. It runs only for a diverged pair — a fast-forwardable target cannot
+conflict — and before the version gate and the configured gates, since a merge
+that will stop makes their result moot. A real run fails with a typed
+`ops::PredictedConflict`; `--dry-run` reports it as a warning. Verify prints the
+fix (`rf integrate <culprit>` on a roll, else merging the target into the
+source) but never runs it: it vouches for a merge, it does not start one.
+
+`ops::verify_many` (`rf verify --all`, the TUI's `[V]`) carries the same
+`PredictedConflict` whole in `VerifyManyResult::conflict` rather than flattening
+it to its one-line `Display` the way every other failure in the pass is
+recorded — a hit for one roll in a many-roll pass still needs the attributed
+report and the fix, not just that it failed.
+
+The TUI's fix text differs from a lone `[v]`'s, though: `[i]`/`[I]` merge into
+whatever is checked out, and `verify_many` switches through every roll in the
+set before restoring HEAD to the branch the pass started from — not the
+conflicting roll. `tui::rolls::predicted_conflict_message` takes the
+checked-out branch as a parameter for exactly this: when it equals the
+conflict's source (always true for `[v]`, since that pass never leaves HEAD),
+the advice names `[i]`/`[I]` bare; otherwise it is prefixed with `[space]`
+onto the conflicting roll first, since pressing either key as-is would
+integrate into whichever branch the batch happened to land back on.
+
 ## Merge commit message format
 
 Graduation:
@@ -518,3 +553,42 @@ and commits only if they pass. This is why a gate that rewrites tracked files
 aborts the promotion — `git commit` would drop those changes and record a merge
 whose content the gates never saw. Graduation still uses `run_merge`, which
 merges and commits in one step.
+
+## Roll graph column (`tui/rolls.rs`)
+
+The leftmost table column (right after the current-branch chevron, left of
+`#`) shows two fixed lanes — main, then rolling — rather than a dynamic
+multi-lane `git log --graph` layout. `graph_glyphs(&RollState) -> (char,
+char)` is a pure mapping from state to the `(main_lane, rolling_lane)` glyph
+pair; `base_graph_glyphs`/`hotfix_graph_glyphs` give the same shape for the
+pinned base rows and hotfix rows:
+
+| row | main lane | rolling lane |
+|---|---|---|
+| stable (base row) | `●` | ` ` |
+| rolling (base row) | `│` | `●` |
+| `Active` | `│` | `○` |
+| `Blocked` | `│` | `◌` |
+| `Diverged` | `│` | `◐` |
+| `Reverted` | `│` | `↺` |
+| `Graduated` | `│` | `●` |
+| `Promoted` | `●` | `●` |
+| `Demoted` | `◐` | `●` |
+| hotfix, open | `│` | `○` |
+| hotfix, landed | `●` | `●` |
+
+**Deliberately not a dependency graph.** A roll that integrated another
+(`[i]`) already has a home for that fact — the `deps`/`dependants` columns and
+their `⚠` stale markers (see [Dependency detection](#dependency-detection-coredependenciesrs)
+above) — so this column does not draw crossing lines between arbitrary rows
+for it. Two reasons: the `branch` column already "has nothing to spare" for a
+wider deps column, and true lane packing needs unbounded width in the
+pathological case (a long chain of integrations), which a fixed two-column
+budget cannot offer. This column re-renders facts `RollState` already carries
+spatially — `●` closer to main reads as "more settled" — it does not add new
+ones. A future roll that wants real integration lines needs a new design, not
+an extension of this table: that would be a genuine multi-lane layout problem,
+not a glyph lookup.
+
+TUI-only: there is no plain-table or `--json` equivalent, the same scoping the
+existing columns already apply to narrow terminal real estate.
