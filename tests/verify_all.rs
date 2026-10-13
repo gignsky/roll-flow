@@ -127,6 +127,52 @@ fn verify_all_marks_each_roll_that_lacks_its_dev_marker() {
 }
 
 #[test]
+fn a_predicted_conflict_in_the_pass_names_the_culprit_and_the_fix() {
+    // The pass must not flatten a `PredictedConflict` to a bare one-line
+    // error: it carries the same attributed report and `rf integrate` fix
+    // that a lone `rf verify` prints, so the batch and the single check
+    // never disagree about what a conflict looks like.
+    let sb = Sandbox::plain();
+    sb.init();
+
+    let out = sb.create_roll("first", "0611");
+    assert!(out.success, "create failed: {}", out.combined());
+    sb.commit_file("shared.txt", "first\n", "first edit");
+    let out = sb.rf(&["graduate"]);
+    assert!(out.success, "graduate failed: {}", out.combined());
+
+    sb.git(&["checkout", "main"]);
+    let out = sb.create_roll("second", "0612");
+    assert!(out.success, "create failed: {}", out.combined());
+    sb.commit_file("shared.txt", "second\n", "second edit");
+    let second = sb.current_branch();
+    sb.git(&["checkout", "main"]);
+
+    let out = sb.rf(&["verify", "--all"]);
+    assert!(
+        !out.success,
+        "a predicted conflict must fail the pass: {}",
+        out.combined()
+    );
+    let text = out.combined();
+    assert!(
+        text.contains(&format!("verification failed for: {second}")),
+        "{text}"
+    );
+    assert!(text.contains("would conflict in 1 file"), "{text}");
+    assert!(text.contains("shared.txt"), "{text}");
+    assert!(
+        text.contains("it came in with roll/1-0611-first"),
+        "expected the culprit roll: {text}"
+    );
+    assert!(
+        text.contains("rf integrate roll/1-0611-first"),
+        "expected integrate advice: {text}"
+    );
+    assert_eq!(sb.current_branch(), "main", "HEAD did not come back");
+}
+
+#[test]
 fn a_roll_whose_version_is_behind_stable_fails_before_its_gates() {
     // A roll still on 0.0.1 after stable moved to 0.0.2 has missed stable's
     // release: graduating it as-is would carry a version stable already left

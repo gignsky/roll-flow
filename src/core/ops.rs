@@ -424,6 +424,32 @@ impl std::fmt::Display for MergeConflict {
 
 impl std::error::Error for MergeConflict {}
 
+/// A conflict `rf verify` predicted from a trial merge, before any merge ran.
+///
+/// The sibling of [`MergeConflict`]: same report, but nothing was attempted,
+/// aborted, or checked out, so there is nothing to say about where the user is
+/// now. Typed for the same reason — the CLI renders the report and the ways
+/// forward rather than a flat string.
+#[derive(Debug)]
+pub(crate) struct PredictedConflict {
+    pub report: ConflictReport,
+}
+
+impl std::fmt::Display for PredictedConflict {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let n = self.report.conflicts.len();
+        write!(
+            f,
+            "merging '{}' into '{}' would conflict in {n} file{}",
+            self.report.source,
+            self.report.target,
+            if n == 1 { "" } else { "s" },
+        )
+    }
+}
+
+impl std::error::Error for PredictedConflict {}
+
 impl ConflictReport {
     pub fn is_empty(&self) -> bool {
         self.conflicts.is_empty()
@@ -533,41 +559,67 @@ fn parse_target_log(out: &str) -> Vec<TargetLogEntry> {
 /// this runs on an already-failing path — a diagnosis that cannot be made
 /// must not hide the merge failure it was diagnosing.
 fn diagnose_conflicts(repo: &Path, source: &str, target: &str) -> ConflictReport {
-    let mut report = ConflictReport {
+    let paths: Vec<String> = git::capture_git(repo, &["diff", "--name-only", "--diff-filter=U"])
+        .map(|out| {
+            out.lines()
+                .map(str::trim)
+                .filter(|p| !p.is_empty())
+                .map(String::from)
+                .collect()
+        })
+        .unwrap_or_default();
+    attribute_conflicts(repo, source, target, &paths)
+}
+
+/// Attribute each conflicted path to what changed it on the target's
+/// first-parent line since the merge base.
+///
+/// Shared by the two places a conflict is found: [`diagnose_conflicts`], which
+/// reads the paths off a merge that just stopped, and [`verify`], which gets
+/// them from a trial merge in the object store before any merge is attempted.
+/// One attribution means the two describe the same conflict the same way.
+/// Best-effort for the same reason as the diagnosis: a path whose history
+/// cannot be read is reported with no culprits rather than as an error.
+fn attribute_conflicts(
+    repo: &Path,
+    source: &str,
+    target: &str,
+    paths: &[String],
+) -> ConflictReport {
+    let base = git::merge_base(repo, source, target).ok();
+    let conflicts = paths
+        .iter()
+        .map(|path| {
+            let culprits = match &base {
+                Some(base) => {
+                    let range = format!("{base}..{target}");
+                    git::capture_git(
+                        repo,
+                        &[
+                            "log",
+                            "--first-parent",
+                            "--format=%H%x09%P%x09%s",
+                            &range,
+                            "--",
+                            path,
+                        ],
+                    )
+                    .map(|out| attribute_culprits(&parse_target_log(&out), source))
+                    .unwrap_or_default()
+                }
+                None => Vec::new(),
+            };
+            Conflict {
+                path: path.clone(),
+                culprits,
+            }
+        })
+        .collect();
+    ConflictReport {
         source: source.to_string(),
         target: target.to_string(),
-        conflicts: Vec::new(),
-    };
-    let Ok(paths) = git::capture_git(repo, &["diff", "--name-only", "--diff-filter=U"]) else {
-        return report;
-    };
-    let base = git::merge_base(repo, source, target).ok();
-    for path in paths.lines().map(str::trim).filter(|p| !p.is_empty()) {
-        let culprits = match &base {
-            Some(base) => {
-                let range = format!("{base}..{target}");
-                git::capture_git(
-                    repo,
-                    &[
-                        "log",
-                        "--first-parent",
-                        "--format=%H%x09%P%x09%s",
-                        &range,
-                        "--",
-                        path,
-                    ],
-                )
-                .map(|out| attribute_culprits(&parse_target_log(&out), source))
-                .unwrap_or_default()
-            }
-            None => Vec::new(),
-        };
-        report.conflicts.push(Conflict {
-            path: path.to_string(),
-            culprits,
-        });
+        conflicts,
     }
-    report
 }
 
 /// Re-run a conflicting merge and *leave it* in the working tree.
@@ -1767,6 +1819,13 @@ pub(crate) struct VerifyOutcome {
     /// Crate-version comparison of source against target. `NotApplicable` when
     /// the repo has no `Cargo.toml` or the gate is disabled.
     pub version: VersionCheck,
+    /// Conflicts the eventual `--no-ff` merge would hit. Only ever `Some`
+    /// under `--dry-run`: a real run fails with [`PredictedConflict`] instead,
+    /// before any gate runs.
+    pub conflicts: Option<ConflictReport>,
+    /// Set when the trial merge could not be run (git older than 2.38), with
+    /// git's reason. Not a failure: the real merge still stops on a conflict.
+    pub conflict_check_skipped: Option<String>,
 }
 
 pub(crate) fn verify(config: &Config, dry_run: bool) -> Result<VerifyOutcome> {
@@ -1800,6 +1859,30 @@ pub(crate) fn verify(config: &Config, dry_run: bool) -> Result<VerifyOutcome> {
         ),
         MergeState::Diverged => diverged_note = true,
         MergeState::FastForwardable => {}
+    }
+
+    // A fast-forwardable target cannot conflict, so only a diverged pair needs
+    // the trial merge. It runs in the object store (`git merge-tree`), so the
+    // tree we are about to gate is left untouched. Checked before the version
+    // gate and the gates: a conflict means graduate/promote would stop at the
+    // merge however the gates come out, so there is no point running them.
+    let preview = if diverged_note {
+        git::preview_merge(&config.repo_root, &target, &source)?
+    } else {
+        git::MergePreview::Clean
+    };
+    let mut conflicts = None;
+    let mut conflict_check_skipped = None;
+    match preview {
+        git::MergePreview::Clean => {}
+        git::MergePreview::Unavailable(why) => conflict_check_skipped = Some(why),
+        git::MergePreview::Conflicts(paths) => {
+            let report = attribute_conflicts(&config.repo_root, &source, &target, &paths);
+            if !dry_run {
+                return Err(anyhow::Error::new(PredictedConflict { report }));
+            }
+            conflicts = Some(report);
+        }
     }
 
     // Checked before the gates so a version problem fails in milliseconds
@@ -1837,6 +1920,8 @@ pub(crate) fn verify(config: &Config, dry_run: bool) -> Result<VerifyOutcome> {
         host_notices: host_report.notices,
         failed_hosts,
         version,
+        conflicts,
+        conflict_check_skipped,
     })
 }
 
@@ -1858,6 +1943,12 @@ pub(crate) struct VerifyManyResult {
     /// The dev marker this pass committed onto the roll, when it was missing.
     pub marked: Option<Semver>,
     pub verdict: VerifyVerdict,
+    /// Set when the verdict is [`VerifyVerdict::Failed`] because the merge
+    /// `verify` tried was predicted to conflict. Carried separately from
+    /// `verdict`'s one-line reason so a renderer can print the same attributed
+    /// report and `rf integrate`/`[i]` fix a lone `rf verify` gives — the batch
+    /// and the single check must describe one conflict identically.
+    pub conflict: Option<ConflictReport>,
 }
 
 impl VerifyManyResult {
@@ -1867,6 +1958,7 @@ impl VerifyManyResult {
             outcome: None,
             marked: None,
             verdict: VerifyVerdict::Skipped(why.into()),
+            conflict: None,
         }
     }
 
@@ -1876,6 +1968,7 @@ impl VerifyManyResult {
             outcome: None,
             marked,
             verdict: VerifyVerdict::Failed(why.into()),
+            conflict: None,
         }
     }
 }
@@ -2018,13 +2111,27 @@ pub(crate) fn verify_many(config: &Config, branches: &[String]) -> Result<Vec<Ve
                     outcome: Some(outcome),
                     marked,
                     verdict,
+                    conflict: None,
                 }
             }
-            Err(err) if err.to_string().starts_with("nothing to merge") => VerifyManyResult {
-                marked,
-                ..VerifyManyResult::skipped(branch, err.to_string())
+            // Carried whole, not flattened to `err.to_string()`: a renderer
+            // needs the same attributed report and `rf integrate`/`[i]` fix a
+            // lone `rf verify` gives, so the batch and the single check never
+            // disagree about what a conflict looks like.
+            Err(err) => match err.downcast::<PredictedConflict>() {
+                Ok(conflict) => VerifyManyResult {
+                    branch: branch.clone(),
+                    outcome: None,
+                    marked,
+                    verdict: VerifyVerdict::Failed(conflict.to_string()),
+                    conflict: Some(conflict.report),
+                },
+                Err(err) if err.to_string().starts_with("nothing to merge") => VerifyManyResult {
+                    marked,
+                    ..VerifyManyResult::skipped(branch, err.to_string())
+                },
+                Err(err) => VerifyManyResult::failed(branch, marked, err.to_string()),
             },
-            Err(err) => VerifyManyResult::failed(branch, marked, err.to_string()),
         });
     }
 

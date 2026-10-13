@@ -289,6 +289,11 @@ failed version gate points at `[b]` instead, which is the key that already write
 that commit. A failed host or an unsatisfied gate marks the panel as failed
 rather than passing quietly.
 
+A predicted merge conflict fails the panel the same way, before any gate runs,
+with the same attributed report `rf verify` prints. The fix is pointed at this
+screen's keys instead of at commands: `[i]` on the culprit roll's row to take
+the conflict onto the checked-out roll, or `[I]` to integrate rolling itself.
+
 ### `[V]` — verify many at once
 
 `[V]` opens a picker — `all rolls`, `active`, `blocked`, `graduated`,

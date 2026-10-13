@@ -494,11 +494,39 @@ fn cmd_verify(dry_run: bool, bump: Option<BumpLevel>, yes: bool) -> Result<()> {
     // the time the gates (and their `--locked` cargo commands) run.
     resolve_version_gate(&config, bump, yes, false, dry_run)?;
 
-    let outcome = ops::verify(&config, dry_run)?;
+    let outcome = match ops::verify(&config, dry_run) {
+        Ok(outcome) => outcome,
+        Err(err) => {
+            let conflict = err.downcast::<ops::PredictedConflict>()?;
+            println!("{conflict}");
+            print_predicted_conflict(&config, &conflict.report);
+            bail!(
+                "verification failed: '{}' does not merge cleanly into '{}'",
+                conflict.report.source,
+                conflict.report.target
+            );
+        }
+    };
     if outcome.diverged_note {
         println!(
             "note: '{}' has commits not in '{}'; graduation/promotion will create a --no-ff merge",
             outcome.target, outcome.source
+        );
+    }
+    // Only reachable under `--dry-run`: a real run has already failed on it.
+    if let Some(report) = &outcome.conflicts {
+        println!(
+            "warning: {}",
+            ops::PredictedConflict {
+                report: report.clone()
+            }
+        );
+        print_predicted_conflict(&config, report);
+    }
+    if let Some(why) = &outcome.conflict_check_skipped {
+        println!(
+            "note: could not pre-check '{}' -> '{}' for merge conflicts ({why}); the merge itself will still stop on one",
+            outcome.source, outcome.target
         );
     }
     render_version_check(&outcome.version, &outcome.source, &outcome.target);
@@ -525,6 +553,52 @@ fn cmd_verify(dry_run: bool, bump: Option<BumpLevel>, yes: bool) -> Result<()> {
         outcome.source, outcome.target
     );
     Ok(())
+}
+
+/// Explain a conflict `rf verify` predicted, and how to clear it before
+/// graduating or promoting.
+///
+/// Uses the same report rendering as a conflict hit mid-merge, so verify and
+/// graduate describe one conflict identically. The advice differs only in
+/// tense: nothing has been merged, so verify prints the commands rather than
+/// offering to run them — it vouches for a merge, it does not start one. When
+/// the source is a roll and the conflicting change came in with other rolls,
+/// `rf integrate` is the recommended fix, as it is in `rf graduate`'s prompt:
+/// it takes the conflict onto the roll and records the dependency it revealed.
+fn print_predicted_conflict(config: &Config, report: &ops::ConflictReport) {
+    println!();
+    for line in report.render() {
+        println!("{line}");
+    }
+    println!();
+    let culprits = report.culprit_rolls();
+    let is_roll = report.source.starts_with(&config.roll_prefix);
+    if !culprits.is_empty() {
+        println!(
+            "The conflicting change is already on '{}' — it came in with {}.",
+            report.target,
+            culprits.join(", ")
+        );
+    }
+    if is_roll && !culprits.is_empty() {
+        println!(
+            "From '{}', take the conflict onto it, resolve, commit, then re-run rf verify:",
+            report.source
+        );
+        for culprit in &culprits {
+            println!("  rf integrate {culprit}");
+        }
+        println!("Or merge '{}' itself instead:", report.target);
+    } else {
+        println!(
+            "Resolve it on '{}', commit, then re-run rf verify:",
+            report.source
+        );
+    }
+    println!(
+        "  git checkout {} && git merge {}",
+        report.source, report.target
+    );
 }
 
 /// `rf verify --all [--state <set>]` — verify every roll in the set in turn.
@@ -564,10 +638,19 @@ fn cmd_verify_all(set: branches::VerifySet) -> Result<()> {
                     outcome.target, outcome.source
                 );
             }
+            if let Some(why) = &outcome.conflict_check_skipped {
+                println!(
+                    "note: could not pre-check '{}' -> '{}' for merge conflicts ({why}); the merge itself will still stop on one",
+                    outcome.source, outcome.target
+                );
+            }
             render_version_check(&outcome.version, &outcome.source, &outcome.target);
             render_gate_notices(&outcome.gate_notices);
             render_gate_notices(&outcome.host_notices);
             render_host_results(&outcome.host_results);
+        }
+        if let Some(report) = &result.conflict {
+            print_predicted_conflict(&config, report);
         }
         match &result.verdict {
             ops::VerifyVerdict::Passed => {

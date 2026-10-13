@@ -3154,7 +3154,11 @@ impl StatusApp {
             format!("rf verify --all ({}, {n})", set.label()),
             move || {
                 let results = ops::verify_many(&config, &selected)?;
-                let (lines, failed) = render_verify_many(&results);
+                // Read after the pass returns, not captured at keypress: it
+                // restores HEAD to whatever branch it started from, and that
+                // is what `[i]`/`[I]` would act on if pressed now.
+                let checked_out = git::current_branch(&config.repo_root)?;
+                let (lines, failed) = render_verify_many(&config, &checked_out, &results);
                 if failed.is_empty() {
                     Ok(JobDone::lines(lines))
                 } else {
@@ -4313,6 +4317,57 @@ fn run_delete(
     Ok(render_prune_outcome(&plan, &results))
 }
 
+/// The failed-job text for a conflict `[v]` predicted: the same attributed
+/// report `rf verify` prints, with the fix pointed at this screen's keys rather
+/// than at commands. `[i]` on a culprit's row is graduate's recommended fix;
+/// `[I]` takes all of rolling at once. Neither runs from here — verify reports.
+///
+/// `[i]`/`[I]` merge into the *checked-out* branch (the same reason the
+/// conflict modal only offers integrate for the checked-out roll), so the
+/// advice only names them bare when `checked_out == report.source`, true for
+/// a lone `[v]` since it always judges HEAD. A batch pass (`[V]`) checks out
+/// and restores many rolls in turn, so a conflicting roll other than the one
+/// `checked_out` names first needs `[space]` onto it before `[i]`/`[I]` apply
+/// there at all — offering the bare form would integrate into whatever `[V]`
+/// happened to land back on, exactly the "wrong branch" outcome graduate.md
+/// warns against.
+fn predicted_conflict_message(
+    config: &Config,
+    checked_out: &str,
+    conflict: &ops::PredictedConflict,
+) -> String {
+    let report = &conflict.report;
+    let mut lines = vec![conflict.to_string()];
+    lines.extend(report.render());
+    let culprits = report.culprit_rolls();
+    let switch_first = if report.source == checked_out {
+        String::new()
+    } else {
+        format!("`[space]` onto '{}' first, then ", report.source)
+    };
+    if report.source.starts_with(&config.roll_prefix) {
+        if !culprits.is_empty() {
+            lines.push(format!(
+                "{switch_first}[i] on {} integrates it into '{}' to resolve there",
+                culprits.join(" / "),
+                report.source
+            ));
+        }
+        if report.target == config.rolling_branch {
+            lines.push(format!(
+                "{switch_first}[I] integrates '{}' itself into '{}'",
+                report.target, report.source
+            ));
+        }
+    } else {
+        lines.push(format!(
+            "resolve it on '{}': git merge {}",
+            report.source, report.target
+        ));
+    }
+    lines.join("\n")
+}
+
 /// Run `ops::verify` and render its outcome, mirroring `main.rs`'s `cmd_verify`
 /// line for line — the same checks in the same order, so a verdict in the panel
 /// and a verdict in the terminal never disagree.
@@ -4344,7 +4399,15 @@ fn run_verify(config: &Config) -> Result<Vec<String>> {
         lines.push(format!("version marked {dev}"));
     }
 
-    let outcome = ops::verify(config, false)?;
+    let outcome = match ops::verify(config, false) {
+        Ok(outcome) => outcome,
+        Err(err) => {
+            let conflict = err.downcast::<ops::PredictedConflict>()?;
+            return Err(anyhow!(predicted_conflict_message(
+                config, &current, &conflict
+            )));
+        }
+    };
     if outcome.diverged_note {
         lines.push(format!(
             "note: '{}' has commits not in '{}'; graduation/promotion will create a --no-ff merge",
@@ -4677,7 +4740,11 @@ fn track_of(tracking: &HashMap<String, git::LocalBranch>, branch: &str) -> Optio
 /// Mirrors `run_verify`'s vocabulary roll by roll, then a summary line, so a
 /// six-roll pass reads like six `[v]` results stacked — and never offers a
 /// bump, which is a commit on one branch where this pass walks many.
-fn render_verify_many(results: &[ops::VerifyManyResult]) -> (Vec<String>, Vec<String>) {
+fn render_verify_many(
+    config: &Config,
+    checked_out: &str,
+    results: &[ops::VerifyManyResult],
+) -> (Vec<String>, Vec<String>) {
     let mut lines = Vec::new();
     let mut failed = Vec::new();
     let mut passed = 0;
@@ -4694,10 +4761,31 @@ fn render_verify_many(results: &[ops::VerifyManyResult]) -> (Vec<String>, Vec<St
                     o.target, o.source
                 ));
             }
+            if let Some(why) = &o.conflict_check_skipped {
+                lines.push(format!(
+                    "note: could not pre-check '{}' -> '{}' for merge conflicts ({why}); the merge itself will still stop on one",
+                    o.source, o.target
+                ));
+            }
             push_version_check(&mut lines, &o.version, &o.source, &o.target);
             push_gate_notices(&mut lines, &o.gate_notices);
             push_gate_notices(&mut lines, &o.host_notices);
             push_host_results(&mut lines, &o.host_results);
+        }
+        // Same attributed report and `[i]`/`[I]` fix a lone `[v]` gives (see
+        // `predicted_conflict_message`), not just the verdict's one-line
+        // reason — its first line is that same reason, so it is dropped here
+        // to avoid repeating it right before `FAILED: {why}` below.
+        if let Some(report) = &result.conflict {
+            let conflict = ops::PredictedConflict {
+                report: report.clone(),
+            };
+            lines.extend(
+                predicted_conflict_message(config, checked_out, &conflict)
+                    .lines()
+                    .skip(1)
+                    .map(str::to_string),
+            );
         }
         match &result.verdict {
             ops::VerifyVerdict::Passed => {
@@ -8615,27 +8703,31 @@ mod tests {
 
     #[test]
     fn a_verify_many_report_summarises_and_names_the_failures() {
+        let config = test_config();
         let results = vec![
             ops::VerifyManyResult {
                 branch: "roll/1-x".to_string(),
                 outcome: None,
                 marked: Some(crate::core::version::Semver::parse("0.0.1-roll1").unwrap()),
                 verdict: ops::VerifyVerdict::Passed,
+                conflict: None,
             },
             ops::VerifyManyResult {
                 branch: "roll/2-y".to_string(),
                 outcome: None,
                 marked: None,
                 verdict: ops::VerifyVerdict::Failed("gate exited 1".to_string()),
+                conflict: None,
             },
             ops::VerifyManyResult {
                 branch: "roll/3-z".to_string(),
                 outcome: None,
                 marked: None,
                 verdict: ops::VerifyVerdict::Skipped("no local copy".to_string()),
+                conflict: None,
             },
         ];
-        let (lines, failed) = render_verify_many(&results);
+        let (lines, failed) = render_verify_many(&config, "main", &results);
         assert_eq!(failed, vec!["roll/2-y"]);
         assert!(
             lines.contains(&"version marked 0.0.1-roll1".to_string()),
@@ -8648,6 +8740,71 @@ mod tests {
         );
         assert!(lines.contains(&"skipped: no local copy".to_string()));
         assert_eq!(lines.last().unwrap(), "1 passed, 1 failed, 1 skipped");
+    }
+
+    fn conflict_result(branch: &str, target: &str) -> ops::VerifyManyResult {
+        let report = ops::ConflictReport {
+            source: branch.to_string(),
+            target: target.to_string(),
+            conflicts: vec![ops::Conflict {
+                path: "shared.txt".to_string(),
+                culprits: vec![ops::Culprit {
+                    commit: "abcdef0123".to_string(),
+                    subject: "Graduate roll/1-x into rolling".to_string(),
+                    roll: Some("roll/1-x".to_string()),
+                }],
+            }],
+        };
+        ops::VerifyManyResult {
+            branch: branch.to_string(),
+            outcome: None,
+            marked: None,
+            verdict: ops::VerifyVerdict::Failed(format!(
+                "merging '{branch}' into '{target}' would conflict in 1 file"
+            )),
+            conflict: Some(report),
+        }
+    }
+
+    #[test]
+    fn a_predicted_conflict_in_the_batch_carries_the_culprit_and_the_fix() {
+        // `verify_many` must not flatten a `PredictedConflict` to its one-line
+        // `Display`: the batch report needs the same attributed detail and
+        // `[i]`/`[I]` advice a lone `[v]` gives (see `predicted_conflict_message`).
+        let config = test_config();
+        let results = vec![conflict_result("roll/2-y", &config.rolling_branch)];
+
+        // The checked-out roll is the one the conflict is on: `[i]`/`[I]`
+        // already apply there, same bare form a lone `[v]` would show.
+        let (lines, _) = render_verify_many(&config, "roll/2-y", &results);
+        let text = lines.join("\n");
+        assert!(text.contains("would conflict in 1 file"), "{text}");
+        assert!(text.contains("shared.txt"), "{text}");
+        assert!(text.contains("[i] on roll/1-x"), "{text}");
+        assert!(text.contains("[I] integrates"), "{text}");
+        assert!(!text.contains("[space]"), "{text}");
+    }
+
+    #[test]
+    fn a_predicted_conflict_on_a_roll_other_than_the_one_checked_out_says_to_switch_first() {
+        // `verify_many` restores HEAD to the branch the pass started from —
+        // not the conflicting roll — so `[i]`/`[I]` do not yet apply: pressing
+        // either now would integrate into whatever that starting branch is,
+        // not the roll the report is about.
+        let config = test_config();
+        let results = vec![conflict_result("roll/2-y", &config.rolling_branch)];
+
+        let (lines, failed) = render_verify_many(&config, "main", &results);
+        assert_eq!(failed, vec!["roll/2-y"]);
+        let text = lines.join("\n");
+        assert!(
+            text.contains("[space]` onto 'roll/2-y' first, then [i] on roll/1-x"),
+            "{text}"
+        );
+        assert!(
+            text.contains("[space]` onto 'roll/2-y' first, then [I] integrates"),
+            "{text}"
+        );
     }
 
     #[test]
@@ -8720,6 +8877,29 @@ mod tests {
         let without = draw(|f, area| app.render_header(f, area));
         assert!(without.contains(&expected), "{without}");
         assert!(without.contains("Branch: main"), "{without}");
+    }
+
+    #[test]
+    fn a_predicted_conflict_names_the_culprit_and_the_keys_that_fix_it() {
+        let config = test_config();
+        let report = ops::ConflictReport {
+            source: "roll/3-x".to_string(),
+            target: config.rolling_branch.clone(),
+            conflicts: vec![ops::Conflict {
+                path: "src/main.rs".to_string(),
+                culprits: vec![ops::Culprit {
+                    commit: "abcdef0123".to_string(),
+                    subject: "Graduate roll/8-y into rolling".to_string(),
+                    roll: Some("roll/8-y".to_string()),
+                }],
+            }],
+        };
+        let text =
+            predicted_conflict_message(&config, "roll/3-x", &ops::PredictedConflict { report });
+        assert!(text.contains("would conflict in 1 file"), "{text}");
+        assert!(text.contains("src/main.rs"), "{text}");
+        assert!(text.contains("[i] on roll/8-y"), "{text}");
+        assert!(text.contains("[I] integrates"), "{text}");
     }
 
     #[test]
