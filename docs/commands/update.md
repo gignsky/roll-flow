@@ -1,11 +1,28 @@
 # `update`
 
 ```text
-rf update [--roll <branch>]... [--dry-run]
+rf update [--roll <branch>]... [--dry-run] [--state <all|active|blocked>]
 ```
 
 Merges the stable branch into every active local roll branch, bringing them all
 up to the current baseline in one pass. Supports `--dry-run`.
+
+## Updating a named subset
+
+`--roll <branch>` (repeatable) narrows the pass to specific branches. `--state`
+narrows it to a lifecycle category instead — `active`, `blocked`, or `all`
+(the default, equivalent to the bare `rf update`) — and is mutually exclusive
+with `--roll`. Unlike [`rf verify --all --state`](verify.md#verifying-many-at-once),
+there is no separate `--all` flag to opt into the bulk pass first: `rf update`
+with no `--roll` is already the bulk pass, so `--state` just picks which rolls
+it covers.
+
+The TUI's `[U]` is the same menu: it opens a picker listing each state with how
+many rolls it currently covers, and a digit runs the merge over that set
+immediately — the picker's count is the confirmation, the same way `[b]`'s
+bump picker needs no second "are you sure?" once a level is chosen. `[u]` with
+nothing selected remains the plain "every active local roll" pass; `[U]` is
+for reaching for a narrower slice without leaving the keyboard.
 
 ## Dev versions
 

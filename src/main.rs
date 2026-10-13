@@ -116,7 +116,11 @@ fn main() -> Result<()> {
                 cmd_list_text(no_tui, deps)?;
             }
         }
-        Cmd::Update { roll, dry_run } => cmd_update(roll, dry_run)?,
+        Cmd::Update {
+            roll,
+            dry_run,
+            state,
+        } => cmd_update(roll, dry_run, state)?,
         Cmd::Prune {
             dry_run,
             local,
@@ -1685,9 +1689,19 @@ fn cmd_list_json() -> Result<()> {
     Ok(())
 }
 
-fn cmd_update(rolls: Vec<String>, dry_run: bool) -> Result<()> {
+fn cmd_update(rolls: Vec<String>, dry_run: bool, state: Option<branches::UpdateSet>) -> Result<()> {
     let config = Config::load()?;
-    let target = if rolls.is_empty() {
+    let target = if let Some(set) = state {
+        // `--roll` and `--state` are mutually exclusive (see cli/mod.rs), so
+        // this is the only other source of the target here.
+        let rolls = branches::list_rolls(&config)?;
+        let selected = set.select(&rolls);
+        if selected.is_empty() {
+            println!("no rolls to update ({})", set.label());
+            return Ok(());
+        }
+        ops::UpdateTarget::Rolls(selected)
+    } else if rolls.is_empty() {
         ops::UpdateTarget::AllActive
     } else {
         ops::UpdateTarget::Rolls(rolls)
