@@ -1,21 +1,22 @@
-//! Git merge driver for the crate's own version — the `version` line in
-//! `Cargo.toml`, and the same value repeated in `Cargo.lock`'s own
-//! `[[package]]` entry.
+//! Git merge driver for a crate or package's own version — the `version`
+//! line in its manifest (`Cargo.toml` or `package.json`), and the same value
+//! repeated in its lockfile's own entry (`Cargo.lock`'s `[[package]]`, or
+//! `package-lock.json`'s root/`packages[""]`).
 //!
 //! A roll's `-roll<N>` marker and wherever the branch it's merging with has
 //! moved to both touch the exact same line, which a plain 3-way text merge
 //! reads as a real conflict — the bug `rf update` and `rf graduate` used to
 //! work around with extra commits and rollback logic. This replaces that:
-//! wired up as the `merge` attribute for both files (see
-//! `ops::ensure_version_merge_driver`, which `rf init` and every `rf` merge
-//! call), it resolves the version line itself before a plain text merge ever
-//! gets a chance to see it as conflicting, for *every* merge that touches the
-//! files — not just the ones `rf` orchestrates.
+//! wired up as the `merge` attribute for both of the detected kind's files
+//! (see `ops::ensure_version_merge_driver`, which `rf init` and every `rf`
+//! merge call), it resolves the version line itself before a plain text merge
+//! ever gets a chance to see it as conflicting, for *every* merge that
+//! touches the files — not just the ones `rf` orchestrates.
 //!
 //! Both files, because they change in lockstep: every version rewrite
 //! refreshes the lockfile's own entry too, so two branches with different
 //! markers disagree on *both* lines, and resolving only the manifest still
-//! stops the merge on the lockfile. Only the crate's own lockfile entry is
+//! stops the merge on the lockfile. Only the package's own lockfile entry is
 //! ever touched; a dependency that moved differently on each side is a real
 //! conflict and surfaces as one.
 //!
@@ -47,7 +48,7 @@ use std::process::Command;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
 use crate::core::git;
-use crate::core::version::{self, Semver};
+use crate::core::version::{ManifestKind, Role, Semver};
 use crate::error::RfError;
 
 /// Resolve two sides of a version-line disagreement. See the module docs for
@@ -58,65 +59,52 @@ pub fn resolve(ours: Semver, theirs: Semver) -> Semver {
         .with_marker(ours.marker)
 }
 
-/// Which of the two version-carrying files is being merged. They hold the same
-/// value in different shapes, so the rule is shared and only reading and
-/// rewriting the line differ.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum VersionFile {
-    /// `Cargo.toml`: `package.version`.
-    Manifest,
-    /// `Cargo.lock`: the crate's own `[[package]]` entry, found by name.
-    Lockfile,
-}
+/// Which of a kind's two files is being merged, with the kind itself —
+/// `(ManifestKind::Cargo, Role::Manifest)` for `Cargo.toml`, and so on. They
+/// hold the same value in different shapes, so the rule is shared and only
+/// reading and rewriting the line differ, which [`ManifestKind`]'s own
+/// methods already do.
+type VersionFile = (ManifestKind, Role);
 
-impl VersionFile {
-    /// Every file the driver is attributed to.
-    pub const ALL: [VersionFile; 2] = [VersionFile::Manifest, VersionFile::Lockfile];
-
-    /// The file name this kind lives under, at the repo root or in a member.
-    pub fn file_name(self) -> &'static str {
-        match self {
-            VersionFile::Manifest => version::VERSION_FILE,
-            VersionFile::Lockfile => version::LOCK_FILE,
-        }
-    }
-
-    /// Which kind `path` is, by its file name; `None` for anything else.
-    pub fn for_path(path: &Path) -> Option<VersionFile> {
-        let name = path.file_name()?.to_str()?;
-        Self::ALL.into_iter().find(|f| f.file_name() == name)
-    }
-
-    fn read(self, text: &str, package: Option<&str>) -> Option<Semver> {
-        match self {
-            VersionFile::Manifest => version::parse_version(text),
-            VersionFile::Lockfile => version::parse_lock_package_version(text, package?),
-        }
-    }
-
-    fn rewrite(self, text: &str, package: Option<&str>, new: Semver) -> Option<String> {
-        match self {
-            VersionFile::Manifest => version::replace_package_version(text, new),
-            VersionFile::Lockfile => version::replace_lock_package_version(text, package?, new),
-        }
+fn read_version_file(
+    (kind, role): VersionFile,
+    text: &str,
+    package: Option<&str>,
+) -> Option<Semver> {
+    match role {
+        Role::Manifest => kind.parse_version(text),
+        Role::Lockfile => kind.parse_lock_version(text, package),
     }
 }
 
-/// The crate name a lockfile at `path` (repo-relative) keys its own entry by,
-/// read from the sibling `Cargo.toml` as committed at `HEAD` — ours, during a
-/// merge — falling back to the working tree's copy.
+fn rewrite_version_file(
+    (kind, role): VersionFile,
+    text: &str,
+    package: Option<&str>,
+    new: Semver,
+) -> Option<String> {
+    match role {
+        Role::Manifest => kind.replace_version(text, new),
+        Role::Lockfile => kind.replace_lock_version(text, package, new),
+    }
+}
+
+/// The crate/package name a lockfile at `path` (repo-relative) keys its own
+/// entry by, read from the sibling manifest as committed at `HEAD` — ours,
+/// during a merge — falling back to the working tree's copy.
 ///
-/// `HEAD` first because git merges `Cargo.lock` before `Cargo.toml` (index
+/// `HEAD` first because git merges the lockfile before the manifest (index
 /// order), so mid-merge the working tree's manifest is not something to lean
-/// on; a crate's name is the same on both sides in any merge this resolves.
+/// on; a package's name is the same on both sides in any merge this resolves.
 pub fn package_name(repo: &Path, path: &Path) -> Option<String> {
-    let manifest = path.with_file_name(version::VERSION_FILE);
+    let (kind, _) = ManifestKind::for_path(path)?;
+    let manifest = path.with_file_name(kind.manifest());
     let rel = manifest.to_str()?.replace('\\', "/");
     let text = match git::show_file_at_ref(repo, "HEAD", &rel) {
         Ok(Some(text)) => text,
         _ => fs::read_to_string(repo.join(&manifest)).ok()?,
     };
-    version::parse_package_name(&text)
+    kind.parse_name(&text)
 }
 
 /// Three-way merge three in-memory sides of a version-carrying file, with the
@@ -124,9 +112,10 @@ pub fn package_name(repo: &Path, path: &Path) -> Option<String> {
 ///
 /// `Ok(Some(merged))` only for a clean result. `Ok(None)` when there is
 /// nothing to resolve (no readable version on one side, no `package` name for
-/// a lockfile) or when the merge still conflicts once the version line agrees
-/// — which means something else in the file is a real conflict, and the
-/// caller must surface it rather than this deciding anything about it.
+/// a lockfile that needs one) or when the merge still conflicts once the
+/// version line agrees — which means something else in the file is a real
+/// conflict, and the caller must surface it rather than this deciding
+/// anything about it.
 pub fn merge_texts(
     file: VersionFile,
     package: Option<&str>,
@@ -134,7 +123,10 @@ pub fn merge_texts(
     ours: &str,
     theirs: &str,
 ) -> Result<Option<String>, RfError> {
-    let (Some(o), Some(t)) = (file.read(ours, package), file.read(theirs, package)) else {
+    let (Some(o), Some(t)) = (
+        read_version_file(file, ours, package),
+        read_version_file(file, theirs, package),
+    ) else {
         return Ok(None);
     };
     let resolved = resolve(o, t);
@@ -147,14 +139,13 @@ pub fn merge_texts(
     // ancestor is left as-is when it has no version to rewrite (the file was
     // added on both sides) — the merge just has less to go on.
     let (Some(ours), Some(theirs)) = (
-        file.rewrite(ours, package, resolved),
-        file.rewrite(theirs, package, resolved),
+        rewrite_version_file(file, ours, package, resolved),
+        rewrite_version_file(file, theirs, package, resolved),
     ) else {
         return Ok(None);
     };
-    let base = file
-        .rewrite(base, package, resolved)
-        .unwrap_or_else(|| base.to_string());
+    let base =
+        rewrite_version_file(file, base, package, resolved).unwrap_or_else(|| base.to_string());
 
     let (clean, merged) = merge_file(&base, &ours, &theirs)?;
     Ok(clean.then(|| String::from_utf8_lossy(&merged).into_owned()))
@@ -166,12 +157,12 @@ pub fn merge_texts(
 /// — temp files holding each side's full content. `path` is `%P`, the file's
 /// repo-relative name, which says which kind of file this is; it is optional
 /// only so a clone still configured with the older three-argument command
-/// keeps working (as the manifest-only driver it was) until the next `rf`
-/// merge rewires it. The result must land back in `ours`, which is where git
-/// reads the merged content from regardless of outcome. Returns `Ok(true)`
-/// for a clean resolution and `Ok(false)` for a real conflict (in which case
-/// `ours` already holds a normal conflict-marked merge, exactly what git would
-/// have produced with no driver at all).
+/// keeps working (as the Cargo-manifest-only driver it was) until the next
+/// `rf` merge rewires it. The result must land back in `ours`, which is where
+/// git reads the merged content from regardless of outcome. Returns
+/// `Ok(true)` for a clean resolution and `Ok(false)` for a real conflict (in
+/// which case `ours` already holds a normal conflict-marked merge, exactly
+/// what git would have produced with no driver at all).
 pub fn run(
     ancestor: &Path,
     ours: &Path,
@@ -179,11 +170,11 @@ pub fn run(
     path: Option<&Path>,
 ) -> Result<bool, RfError> {
     let file = path
-        .and_then(VersionFile::for_path)
-        .unwrap_or(VersionFile::Manifest);
+        .and_then(ManifestKind::for_path)
+        .unwrap_or((ManifestKind::Cargo, Role::Manifest));
     // Git runs a merge driver from the top of the working tree.
     let package = match (file, path) {
-        (VersionFile::Lockfile, Some(path)) => package_name(Path::new("."), path),
+        ((_, Role::Lockfile), Some(path)) => package_name(Path::new("."), path),
         _ => None,
     };
 
@@ -257,6 +248,11 @@ fn plain_merge(ancestor: &Path, ours: &Path, theirs: &Path) -> Result<bool, RfEr
     Ok(output.status.success())
 }
 
+/// Which kind/role `path`'s file name is, if any.
+pub fn for_path(path: &Path) -> Option<VersionFile> {
+    ManifestKind::for_path(path)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -321,12 +317,14 @@ mod tests {
         )
     }
 
+    const CARGO_LOCK: VersionFile = (ManifestKind::Cargo, Role::Lockfile);
+
     #[test]
     fn the_lockfile_s_own_entry_follows_the_same_rule() {
         // The reported conflict: two rolls, each wearing its own marker in
         // the lockfile, merged into one another.
         let merged = merge_texts(
-            VersionFile::Lockfile,
+            CARGO_LOCK,
             Some("roll-flow"),
             &lock("0.2.7", "1.0.0"),
             &lock("0.2.7-roll35", "1.0.0"),
@@ -339,7 +337,7 @@ mod tests {
     #[test]
     fn a_dependency_conflict_in_the_lockfile_is_left_to_the_caller() {
         let merged = merge_texts(
-            VersionFile::Lockfile,
+            CARGO_LOCK,
             Some("roll-flow"),
             &lock("0.2.7", "1.0.0"),
             &lock("0.2.7-roll35", "1.0.1"),
@@ -352,7 +350,7 @@ mod tests {
     #[test]
     fn a_lockfile_without_a_package_name_is_not_guessed_at() {
         let merged = merge_texts(
-            VersionFile::Lockfile,
+            CARGO_LOCK,
             None,
             &lock("0.2.7", "1.0.0"),
             &lock("0.2.7-roll35", "1.0.0"),
@@ -363,15 +361,62 @@ mod tests {
     }
 
     #[test]
+    fn npm_lockfile_follows_the_same_rule_with_no_name_needed() {
+        fn npm_lock(own: &str) -> String {
+            format!(
+                "{{\n  \"name\": \"fixture\",\n  \"version\": \"{own}\",\n  \
+                 \"packages\": {{ \"\": {{ \"name\": \"fixture\", \"version\": \"{own}\" }} }}\n}}"
+            )
+        }
+        let merged = merge_texts(
+            (ManifestKind::Npm, Role::Lockfile),
+            None,
+            &npm_lock("0.2.7"),
+            &npm_lock("0.2.7-roll35"),
+            &npm_lock("0.2.8-roll11"),
+        )
+        .unwrap();
+        assert_eq!(merged, Some(npm_lock("0.2.8-roll35")));
+    }
+
+    #[test]
+    fn a_dependency_conflict_in_the_npm_lockfile_is_left_to_the_caller() {
+        // Only the package's own root/`packages[""]` entry is the driver's
+        // business. Two rolls that moved the same dependency differently are
+        // a real conflict, the npm twin of
+        // `a_dependency_conflict_in_the_lockfile_is_left_to_the_caller`.
+        fn npm_lock(own: &str, dep: &str) -> String {
+            format!(
+                "{{\n  \"name\": \"fixture\",\n  \"version\": \"{own}\",\n  \
+                 \"packages\": {{\n    \"\": {{ \"name\": \"fixture\", \"version\": \"{own}\" }},\n    \
+                 \"node_modules/leftpad\": {{ \"version\": \"{dep}\" }}\n  }}\n}}"
+            )
+        }
+        let merged = merge_texts(
+            (ManifestKind::Npm, Role::Lockfile),
+            None,
+            &npm_lock("0.2.7", "1.0.0"),
+            &npm_lock("0.2.7-roll35", "1.0.1"),
+            &npm_lock("0.2.7-roll11", "1.0.2"),
+        )
+        .unwrap();
+        assert_eq!(merged, None);
+    }
+
+    #[test]
     fn files_are_recognised_by_name_at_any_depth() {
         assert_eq!(
-            VersionFile::for_path(Path::new("Cargo.lock")),
-            Some(VersionFile::Lockfile)
+            for_path(Path::new("Cargo.lock")),
+            Some((ManifestKind::Cargo, Role::Lockfile))
         );
         assert_eq!(
-            VersionFile::for_path(Path::new("crates/x/Cargo.toml")),
-            Some(VersionFile::Manifest)
+            for_path(Path::new("crates/x/Cargo.toml")),
+            Some((ManifestKind::Cargo, Role::Manifest))
         );
-        assert_eq!(VersionFile::for_path(Path::new("README.md")), None);
+        assert_eq!(
+            for_path(Path::new("package-lock.json")),
+            Some((ManifestKind::Npm, Role::Lockfile))
+        );
+        assert_eq!(for_path(Path::new("README.md")), None);
     }
 }

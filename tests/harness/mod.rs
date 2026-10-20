@@ -202,6 +202,91 @@ impl Sandbox {
         panic!("no version in Cargo.toml at {refspec}: {text}");
     }
 
+    /// A plain repo that carries a `package.json`, so the version gate and
+    /// release tagging engage through the npm arm. Deliberately not a real
+    /// npm package: no `node_modules`, no npm command has to succeed for
+    /// these tests to be meaningful, which keeps them fast and offline.
+    pub fn npm() -> Self {
+        let sb = Sandbox::plain();
+        sb.write_package_version("0.0.1");
+        sb.git(&["add", "package.json"]);
+        sb.git(&["commit", "-m", "add manifest"]);
+        sb
+    }
+
+    /// Write `package.json` with `version`, four-space indented on purpose
+    /// (the Cargo fixture's tab-vs-space equivalent), plus a nested object
+    /// carrying its own `version` key that must never be mistaken for the
+    /// package version, and no trailing newline — so formatting preservation
+    /// is exercised by every test that bumps.
+    pub fn write_package_version(&self, version: &str) {
+        self.write(
+            "package.json",
+            &format!(
+                "{{\n    \"name\": \"fixture\",\n    \"version\": \"{version}\",\n    \
+                 \"publishConfig\": {{\n        \"version\": \"9.9.9\"\n    }}\n}}"
+            ),
+        );
+    }
+
+    /// Commit a `package.json` bumped to `version` on the current branch.
+    pub fn commit_package_version(&self, version: &str) {
+        self.write_package_version(version);
+        self.git(&["add", "package.json"]);
+        self.git(&["commit", "-m", &format!("set version {version}")]);
+    }
+
+    /// Write a real-looking `package-lock.json` (lockfile v3 shape): the root
+    /// `version`, `packages[""].version` repeating it, and one dependency
+    /// entry (`leftpad`) whose own `version` must never be mistaken for the
+    /// package version.
+    pub fn write_package_lock(&self, own: &str) {
+        self.write(
+            "package-lock.json",
+            &format!(
+                "{{\n  \"name\": \"fixture\",\n  \"version\": \"{own}\",\n  \
+                 \"lockfileVersion\": 3,\n  \"packages\": {{\n    \"\": {{\n      \
+                 \"name\": \"fixture\",\n      \"version\": \"{own}\"\n    }},\n    \
+                 \"node_modules/leftpad\": {{\n      \"version\": \"1.0.0\"\n    }}\n  }}\n}}\n"
+            ),
+        );
+    }
+
+    /// Write `package-lock.json` (see [`Sandbox::write_package_lock`]) and
+    /// commit it on the current branch — unless it already says exactly
+    /// that, mirroring [`Sandbox::commit_cargo_lock`].
+    pub fn commit_package_lock(&self, own: &str) {
+        self.write_package_lock(own);
+        self.git(&["add", "package-lock.json"]);
+        if !self.git_try(&["diff", "--cached", "--quiet"]).0 {
+            self.git(&["commit", "-m", &format!("set lockfile {own}")]);
+        }
+    }
+
+    /// The `version` recorded in `package.json` at `refspec`.
+    pub fn package_version_at(&self, refspec: &str) -> String {
+        let text = self.git(&["show", &format!("{refspec}:package.json")]);
+        for line in text.lines() {
+            let trimmed = line.trim();
+            if trimmed.starts_with("\"version\"") {
+                return trimmed.split('"').nth(3).unwrap_or_default().to_string();
+            }
+        }
+        panic!("no version in package.json at {refspec}: {text}");
+    }
+
+    /// The root `version` recorded in `package-lock.json` at `refspec`.
+    pub fn package_lock_version_at(&self, refspec: &str) -> String {
+        let text = self.git(&["show", &format!("{refspec}:package-lock.json")]);
+        for line in text.lines() {
+            let trimmed = line.trim();
+            if trimmed.starts_with("\"version\"") {
+                return trimmed.split('"').nth(3).unwrap_or_default().to_string();
+            }
+        }
+        panic!("no version in package-lock.json at {refspec}: {text}");
+    }
+
     /// Flip a boolean key in the sandbox's `.roll-flow.toml` (call after
     /// `rf init`). Replaces the line in place when present, else appends it
     /// ahead of the first table header so it stays a root-level key.
@@ -209,6 +294,36 @@ impl Sandbox {
         let path = self.path().join(".roll-flow.toml");
         let existing = fs::read_to_string(&path).expect("read config");
         let new_line = format!("{key} = {value}");
+        let mut replaced = false;
+        let mut lines: Vec<String> = existing
+            .lines()
+            .map(|l| {
+                if l.trim_start().starts_with(&format!("{key} ")) {
+                    replaced = true;
+                    new_line.clone()
+                } else {
+                    l.to_string()
+                }
+            })
+            .collect();
+        if !replaced {
+            let at = lines
+                .iter()
+                .position(|l| l.trim_start().starts_with('['))
+                .unwrap_or(lines.len());
+            lines.insert(at, new_line);
+        }
+        let mut text = lines.join("\n");
+        text.push('\n');
+        fs::write(&path, text).expect("write config");
+    }
+
+    /// Like [`set_config_flag`](Self::set_config_flag), for a string-valued
+    /// key (e.g. `version_manifest = "npm"`).
+    pub fn set_config_string(&self, key: &str, value: &str) {
+        let path = self.path().join(".roll-flow.toml");
+        let existing = fs::read_to_string(&path).expect("read config");
+        let new_line = format!("{key} = \"{value}\"");
         let mut replaced = false;
         let mut lines: Vec<String> = existing
             .lines()

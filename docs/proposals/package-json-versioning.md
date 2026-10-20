@@ -1,8 +1,37 @@
 # Proposal: version `package.json` the way `rf` versions `Cargo.toml`
 
-Status: proposal, written against `develop` at `20783d7`. File and function
-names below are from that commit; line numbers are not given because they
-will drift.
+Status: implemented, on `roll/41-1016-add-package-dot-json-versions`. File
+and function names below are from the proposal as originally written against
+`develop` at `20783d7`; the implementation deviates in a few places, listed
+here rather than edited into the body below so the body still reads as the
+design that was reviewed:
+
+- Every `version` free function that reads or compares (`read_version`,
+  `check`, `check_against`, `versions_at`, `version_at`) takes a
+  `forced: Option<ManifestKind>` parameter, not just the write paths. A first
+  cut that stopped at the writes left the gate's own comparison
+  auto-detecting regardless of `version_manifest`, which could bump one
+  manifest while gating against the other.
+- `write_version` takes an explicit `ManifestKind` rather than detecting one
+  itself, since its callers already resolved one (often via the override)
+  and must write to exactly that file, not whatever plain detection would
+  pick.
+- `ManifestKind::detect`/`detect_at` (and their `forced`-aware
+  `detect_forced`/`detect_at_forced` twins) require the candidate manifest to
+  carry a *readable* version, not just exist. A `package.json` with no
+  `version` key — the ordinary starting point for most Node apps, and for
+  tooling-only manifests (prettier, husky) — reads the same as no manifest at
+  all, never as `Unreadable`.
+- The version-gate and dev-marker-ownership error messages no longer name a
+  specific file (`"version (...) is unchanged from ..."` rather than
+  `"Cargo.toml version (...) ..."`), since one message now serves two kinds.
+  `write_version`'s own "couldn't find the key" error still names the kind's
+  manifest, since that error is inherently about one specific file.
+- The merge-driver subprocess (`__merge-driver-version`) and
+  `ops::wire_driver_quietly`'s own callers have no `Config` and so are not
+  `version_manifest`-aware; only `ensure_version_merge_driver` (`rf init`) is.
+  This is harmless: attribute lines only accumulate, and a merge is resolved
+  by the file actually being merged, not by which kind was wired first.
 
 ## Why
 
@@ -20,8 +49,14 @@ semver `version` at its root and `package-lock.json` repeats it twice (root
 shape as `Cargo.toml` plus the crate's own `[[package]]` entry in
 `Cargo.lock`. The markers `rf` writes, `X.Y.Z-roll<N>` and `X.Y.Z-dev`, are
 valid npm prerelease versions, and npm orders them below the bare release
-exactly as `Semver`'s derived `Ord` does. So the whole pipeline ports without
-changing a rule.
+they mark, matching the one property `rf`'s own gates actually rely on
+(`0.2.4-dev < 0.2.4`). It is not a full match: semver §11 compares
+alphanumeric prerelease identifiers lexically, so npm itself would rank
+`-dev` below `-roll9` — the reverse of `Semver`'s derived `Ord`, which ranks
+`Roll(_) < Dev` by declaration order. This never surfaces: `rf`'s own `Ord`
+is what every comparison here uses, and a dev marker is refused outright
+before it ever reaches a tool (npm, `sort -V`) that would apply its own
+ordering to it. So the whole pipeline ports without changing a rule.
 
 ## Shape of the change
 

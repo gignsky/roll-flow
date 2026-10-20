@@ -239,11 +239,12 @@ pub(crate) fn bump_previews(current: Semver) -> [(BumpLevel, Semver); 3] {
 
 /// Whether `[b]` can do anything here, or why not.
 ///
-/// A repo with no `Cargo.toml` has no version to raise — the same condition that
-/// makes the whole release path a no-op (`VersionStatus::NotApplicable`), so
-/// refusing here keeps the key honest rather than opening a modal over nothing.
+/// A repo with no readable manifest version has nothing to raise — the same
+/// condition that makes the whole release path a no-op
+/// (`VersionStatus::NotApplicable`), so refusing here keeps the key honest
+/// rather than opening a modal over nothing.
 pub(crate) fn bump_gate(current: Option<Semver>) -> Result<Semver, String> {
-    current.ok_or_else(|| "no readable version in Cargo.toml — nothing to bump".to_string())
+    current.ok_or_else(|| "no readable version — nothing to bump".to_string())
 }
 
 /// Decide a keystroke in the force-push confirmation.
@@ -2362,7 +2363,8 @@ impl StatusApp {
         table.select(initial_selection(&bases, &rolls, &hotfixes));
         let tracking = load_tracking(&config);
         let versions = load_versions(&config, &bases, &rolls, &hotfixes);
-        let version = version::read_version(&config.repo_root).unwrap_or(None);
+        let version =
+            version::read_version(&config.repo_root, config.forced_manifest()).unwrap_or(None);
         Self {
             config,
             current_branch,
@@ -4274,7 +4276,8 @@ impl StatusApp {
         self.versions = load_versions(&self.config, &self.bases, &self.rolls, &self.hotfixes);
         // Read from the worktree, so a bump — or a branch switch that changes it —
         // shows in the header straight away.
-        self.version = version::read_version(&self.config.repo_root).unwrap_or(None);
+        self.version = version::read_version(&self.config.repo_root, self.config.forced_manifest())
+            .unwrap_or(None);
         let len = self.row_count();
         if len == 0 {
             self.table.select(None);
@@ -5080,7 +5083,7 @@ fn load_versions(
         .map(|(branch, location)| branches::content_ref(branch, location))
         .collect();
 
-    let by_ref = version::versions_at(&config.repo_root, &refs);
+    let by_ref = version::versions_at(&config.repo_root, &refs, config.forced_manifest());
     rows.iter()
         .map(|(branch, _)| *branch)
         .zip(refs.iter())
@@ -6546,6 +6549,7 @@ mod tests {
             clean_protect: Vec::new(),
             pull_mode: Default::default(),
             lazygit_command: "lazygit".to_string(),
+            version_manifest: Default::default(),
         }
     }
 
@@ -8619,6 +8623,7 @@ mod tests {
             clean_protect: Vec::new(),
             pull_mode: Default::default(),
             lazygit_command: "lazygit".to_string(),
+            version_manifest: Default::default(),
         }
     }
 
@@ -9563,8 +9568,8 @@ mod tests {
 
     #[test]
     fn bump_is_refused_in_a_repo_with_no_version() {
-        let err = bump_gate(None).expect_err("a repo with no Cargo.toml has nothing to bump");
-        assert!(err.contains("Cargo.toml"), "{err}");
+        let err = bump_gate(None).expect_err("a repo with no readable version has nothing to bump");
+        assert!(err.contains("nothing to bump"), "{err}");
         assert_eq!(bump_gate(Some(v(0, 1, 0))), Ok(v(0, 1, 0)));
     }
 
