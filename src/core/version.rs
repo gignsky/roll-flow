@@ -1,4 +1,6 @@
-//! Crate-version policy: read, compare, and bump the `version` in `Cargo.toml`.
+//! Crate-version policy: read, compare, and bump the `version` carried by a
+//! repo's manifest — `Cargo.toml` for a Rust crate, `package.json` for a Node
+//! package — plus its lockfile's own repeated copy of the same value.
 //!
 //! This mirrors, by construction, the three CI workflows that own the same
 //! policy today, so `rf` and GitHub Actions can never disagree:
@@ -13,25 +15,210 @@
 //!   [`Marker`] and [`Semver`].
 //! - `.github/workflows/tag-on-main.yml` — a version change on stable gets an
 //!   annotated `vX.Y.Z` tag, created idempotently.
-//! - `.github/workflows/release-check.yml` — the tag must match `Cargo.toml`.
+//! - `.github/workflows/release-check.yml` — the tag must match the manifest.
 //!
-//! Pure logic only: nothing here prints or prompts. Repos without a
-//! `Cargo.toml` (the dotfiles repo roll-flow was built for) yield
-//! `VersionStatus::NotApplicable` and every caller silently skips.
+//! Pure logic only: nothing here prints or prompts. A repo with neither a
+//! `Cargo.toml` nor a `package.json` (the dotfiles repo roll-flow was built
+//! for) yields `VersionStatus::NotApplicable` and every caller silently skips.
 
 use std::collections::HashMap;
 use std::fmt;
+use std::ops::Range;
 use std::path::Path;
 
 use crate::core::git;
 use crate::error::RfError;
 
-/// The file the crate version is read from and written to.
-pub const VERSION_FILE: &str = "Cargo.toml";
+// ── Manifest kind ────────────────────────────────────────────────────────────
 
-/// The lockfile that repeats the crate's own version in its `[[package]]`
-/// entry, and so changes in lockstep with every [`VERSION_FILE`] rewrite.
-pub const LOCK_FILE: &str = "Cargo.lock";
+/// Which manifest a repo carries its version in. Declared in precedence
+/// order: [`ManifestKind::detect_forced`] (with `forced: None`, plain
+/// detection) returns the first kind with a readable version, so a repo
+/// carrying both is read as `Cargo` — the conservative default, since it
+/// keeps every existing repo byte-for-byte on its prior behaviour (a Rust
+/// project with a `package.json` for tooling only is more common than the
+/// reverse).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ManifestKind {
+    Cargo,
+    Npm,
+}
+
+/// Which of a kind's two files a path is — the manifest itself, or the
+/// lockfile that repeats its version.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Role {
+    Manifest,
+    Lockfile,
+}
+
+impl ManifestKind {
+    pub const ALL: [ManifestKind; 2] = [ManifestKind::Cargo, ManifestKind::Npm];
+
+    /// The manifest file name: `Cargo.toml` or `package.json`.
+    pub fn manifest(self) -> &'static str {
+        match self {
+            ManifestKind::Cargo => "Cargo.toml",
+            ManifestKind::Npm => "package.json",
+        }
+    }
+
+    /// The lockfile name: `Cargo.lock` or `package-lock.json`.
+    pub fn lockfile(self) -> &'static str {
+        match self {
+            ManifestKind::Cargo => "Cargo.lock",
+            ManifestKind::Npm => "package-lock.json",
+        }
+    }
+
+    /// Both names, manifest first — what every commit and `git add` lists.
+    pub fn paths(self) -> [&'static str; 2] {
+        [self.manifest(), self.lockfile()]
+    }
+
+    /// The kind this working tree versions through, or `None` for a repo that
+    /// does not version this way (the dotfiles repo). `forced` (`None` for
+    /// plain detection — see [`Config::forced_manifest`](crate::core::config::Config::forced_manifest))
+    /// restricts the search to one kind rather than trying both, but it
+    /// still must carry a readable version: forcing a kind says "compare and
+    /// write through this file when it has something to version", not a
+    /// promise that the file already does.
+    ///
+    /// A manifest that exists but carries no readable version — a tooling-only
+    /// `package.json` with no `version` key is the common case; an npm
+    /// manifest without one is unremarkable in a way a Rust crate without one
+    /// never is — counts the same as a manifest that is absent: there is
+    /// nothing here for `rf` to version, and the gate must read as
+    /// `NotApplicable` rather than `Unreadable`, exactly as a repo that never
+    /// had the file at all.
+    pub fn detect_forced(repo: &Path, forced: Option<ManifestKind>) -> Option<ManifestKind> {
+        let candidates: &[ManifestKind] = match &forced {
+            Some(kind) => std::slice::from_ref(kind),
+            None => &Self::ALL,
+        };
+        candidates.iter().copied().find(|kind| {
+            std::fs::read_to_string(repo.join(kind.manifest()))
+                .ok()
+                .is_some_and(|text| kind.parse_version(&text).is_some())
+        })
+    }
+
+    /// Like [`detect_forced`](Self::detect_forced), at `refspec` rather than
+    /// the working tree, for callers reasoning about a branch that need not
+    /// be checked out (`check`, `check_against`, `versions_at` and friends).
+    pub fn detect_at_forced(
+        repo: &Path,
+        refspec: &str,
+        forced: Option<ManifestKind>,
+    ) -> Result<Option<ManifestKind>, RfError> {
+        let candidates: &[ManifestKind] = match &forced {
+            Some(kind) => std::slice::from_ref(kind),
+            None => &Self::ALL,
+        };
+        for kind in candidates {
+            if let Some(text) = git::show_file_at_ref(repo, refspec, kind.manifest())? {
+                if kind.parse_version(&text).is_some() {
+                    return Ok(Some(*kind));
+                }
+            }
+        }
+        Ok(None)
+    }
+
+    /// Which kind `path` belongs to, and whether it is the manifest or the
+    /// lockfile, by file name alone (matching at any depth, the way a merge
+    /// driver sees a workspace member's own `Cargo.toml`).
+    pub fn for_path(path: &Path) -> Option<(ManifestKind, Role)> {
+        let name = path.file_name()?.to_str()?;
+        for kind in Self::ALL {
+            if kind.manifest() == name {
+                return Some((kind, Role::Manifest));
+            }
+            if kind.lockfile() == name {
+                return Some((kind, Role::Lockfile));
+            }
+        }
+        None
+    }
+
+    /// Extract the package version from this kind's manifest text.
+    pub fn parse_version(self, text: &str) -> Option<Semver> {
+        match self {
+            ManifestKind::Cargo => parse_cargo_version(text),
+            ManifestKind::Npm => parse_npm_version(text),
+        }
+    }
+
+    /// Extract the package name from this kind's manifest text — what the
+    /// lockfile's own entry is keyed by. `None` for a kind whose lockfile
+    /// does not need one (npm's own root entry is positional, not named).
+    pub fn parse_name(self, text: &str) -> Option<String> {
+        match self {
+            ManifestKind::Cargo => parse_cargo_name(text),
+            ManifestKind::Npm => parse_npm_name(text),
+        }
+    }
+
+    /// Rewrite the version in this kind's manifest text, preserving every
+    /// other byte. `None` when no version key was found.
+    pub fn replace_version(self, text: &str, new: Semver) -> Option<String> {
+        match self {
+            ManifestKind::Cargo => replace_cargo_version(text, new),
+            ManifestKind::Npm => replace_npm_version(text, new),
+        }
+    }
+
+    /// Read the crate/package's own version from this kind's lockfile text.
+    /// `name` identifies the entry for `Cargo` (required — `None` yields
+    /// `None`) and is ignored for `Npm`, whose root entry needs no name.
+    pub fn parse_lock_version(self, text: &str, name: Option<&str>) -> Option<Semver> {
+        match self {
+            ManifestKind::Cargo => parse_cargo_lock_version(text, name?),
+            ManifestKind::Npm => parse_npm_lock_version(text),
+        }
+    }
+
+    /// Rewrite the crate/package's own version in this kind's lockfile text,
+    /// touching nothing else. See [`parse_lock_version`](Self::parse_lock_version)
+    /// for `name`.
+    pub fn replace_lock_version(
+        self,
+        text: &str,
+        name: Option<&str>,
+        new: Semver,
+    ) -> Option<String> {
+        match self {
+            ManifestKind::Cargo => replace_cargo_lock_version(text, name?, new),
+            ManifestKind::Npm => replace_npm_lock_version(text, new),
+        }
+    }
+
+    /// Where the version key lives, for a "could not find it" error.
+    fn version_key_location(self) -> &'static str {
+        match self {
+            ManifestKind::Cargo => "the [package] table",
+            ManifestKind::Npm => "the root",
+        }
+    }
+}
+
+/// Read and parse the version at `refspec`, detecting which manifest kind the
+/// ref carries (or honouring `forced` — see [`Config::forced_manifest`](crate::core::config::Config::forced_manifest)).
+/// `Ok(None)` when neither manifest exists there, or the one that does has
+/// no readable version.
+pub fn version_at(
+    repo: &Path,
+    refspec: &str,
+    forced: Option<ManifestKind>,
+) -> Result<Option<(ManifestKind, Semver)>, RfError> {
+    let Some(kind) = ManifestKind::detect_at_forced(repo, refspec, forced)? else {
+        return Ok(None);
+    };
+    let Some(text) = git::show_file_at_ref(repo, refspec, kind.manifest())? else {
+        return Ok(None);
+    };
+    Ok(kind.parse_version(&text).map(|v| (kind, v)))
+}
 
 // ── Semver ──────────────────────────────────────────────────────────────────
 
@@ -216,7 +403,7 @@ pub enum VersionStatus {
     Unchanged,
     /// Source is *below* target. Never valid; no prompt can fix it safely.
     Lower,
-    /// A `Cargo.toml` exists but its version could not be read or parsed.
+    /// A manifest exists but its version could not be read or parsed.
     Unreadable,
     /// Source still carries a dev marker — a roll's `-roll<N>`, or rolling's
     /// own `-dev`. Its own status rather than folded into `Unchanged`,
@@ -224,7 +411,7 @@ pub enum VersionStatus {
     /// does for a roll, and what a *final* `rf promote` does for rolling)
     /// rather than raise the numbers.
     DevVersion,
-    /// No `Cargo.toml` on either side, or the gate is disabled in config.
+    /// No manifest on either side, or the gate is disabled in config.
     NotApplicable,
 }
 
@@ -254,62 +441,52 @@ impl VersionCheck {
     }
 }
 
-/// Extract `package.version` from `Cargo.toml` text.
-///
-/// Parsed with the `toml` crate rather than a regex so section nesting is
-/// honoured — a `version = ...` under `[dependencies.foo]` can never be
-/// mistaken for the package version.
-pub fn parse_version(cargo_toml: &str) -> Option<Semver> {
-    let doc: toml::Value = toml::from_str(cargo_toml).ok()?;
-    let raw = doc.get("package")?.get("version")?.as_str()?;
-    Semver::parse(raw)
-}
-
-/// Read the crate version from the working tree.
-pub fn read_version(repo: &Path) -> Result<Option<Semver>, RfError> {
-    let path = repo.join(VERSION_FILE);
-    if !path.exists() {
-        return Ok(None);
-    }
-    let text = std::fs::read_to_string(&path)?;
-    Ok(parse_version(&text))
-}
-
-/// Read the crate version at each of `refs`, keyed by ref.
-///
-/// One `git cat-file --batch` for the whole set, because the caller is a table
-/// that wants a version per row on every reload. Refs without a `Cargo.toml`,
-/// or whose manifest carries a version this crate will not parse, are simply
-/// absent from the map — the column renders those as a dash, and a repo with no
-/// manifest at all yields an empty map rather than an error. Losing a version is
-/// never worth failing a reload over.
-pub fn versions_at(repo: &Path, refs: &[String]) -> HashMap<String, Semver> {
-    let specs: Vec<String> = refs.iter().map(|r| format!("{r}:{VERSION_FILE}")).collect();
-    let Ok(blobs) = git::show_files_at_refs(repo, &specs) else {
-        return HashMap::new();
-    };
-    refs.iter()
-        .zip(specs.iter())
-        .filter_map(|(r, spec)| {
-            let version = parse_version(blobs.get(spec)?)?;
-            Some((r.clone(), version))
-        })
-        .collect()
-}
-
-/// Compare the version on `source_ref` to the one on `target_ref`, the same
+/// Compare the version at `source_ref` to the one at `target_ref` — the same
 /// comparison `version-bump-check.yml` makes between a PR head and its base.
-pub fn check(repo: &Path, source_ref: &str, target_ref: &str) -> Result<VersionCheck, RfError> {
-    let head_text = git::show_file_at_ref(repo, source_ref, VERSION_FILE)?;
-    let base_text = git::show_file_at_ref(repo, target_ref, VERSION_FILE)?;
+///
+/// The manifest kind is detected independently at each ref (a side that added
+/// the manifest this very branch has none to detect on the other), and
+/// whichever is found is used to read *both* sides, so a repo that versions
+/// through one kind is never compared against a stray file of the other.
+/// `forced` overrides detection outright — see
+/// [`Config::forced_manifest`](crate::core::config::Config::forced_manifest).
+pub fn check(
+    repo: &Path,
+    source_ref: &str,
+    target_ref: &str,
+    forced: Option<ManifestKind>,
+) -> Result<VersionCheck, RfError> {
+    let head_kind = ManifestKind::detect_at_forced(repo, source_ref, forced)?;
+    let base_kind = ManifestKind::detect_at_forced(repo, target_ref, forced)?;
+    let Some(kind) = head_kind.or(base_kind) else {
+        return Ok(VersionCheck::not_applicable());
+    };
+
+    // Read a side's text only when its *own* detection succeeded — not just
+    // "the chosen `kind`'s file is present" — so a side whose manifest exists
+    // but carries no readable version (a tooling-only `package.json`, most
+    // commonly) reads as absent here too, same as `detect_at_forced` already
+    // treats it. Without this, `base_text` below would come back `Some` for
+    // that file's raw content, `base` would still be `None` once parsed, and
+    // the "added by this branch" arm — which tests `base_text.is_none()` —
+    // would miss, reporting `Unreadable` for the ordinary case of a roll
+    // introducing the first version a tooling-only manifest never had.
+    let head_text = match head_kind {
+        Some(_) => git::show_file_at_ref(repo, source_ref, kind.manifest())?,
+        None => None,
+    };
+    let base_text = match base_kind {
+        Some(_) => git::show_file_at_ref(repo, target_ref, kind.manifest())?,
+        None => None,
+    };
 
     // No manifest on either side: this repo doesn't version this way. Skip.
     if head_text.is_none() && base_text.is_none() {
         return Ok(VersionCheck::not_applicable());
     }
 
-    let head = head_text.as_deref().and_then(parse_version);
-    let base = base_text.as_deref().and_then(parse_version);
+    let head = head_text.as_deref().and_then(|t| kind.parse_version(t));
+    let base = base_text.as_deref().and_then(|t| kind.parse_version(t));
 
     let status = match (head, base) {
         // Checked ahead of the comparison: a dev version can be numerically
@@ -334,7 +511,7 @@ pub fn check(repo: &Path, source_ref: &str, target_ref: &str) -> Result<VersionC
 ///
 /// A per-roll promotion step needs to gate on the *finalized* (marker-
 /// stripped) version a graduation commit will carry once landed on stable,
-/// not the raw `-dev` value still sitting in that commit's `Cargo.toml` —
+/// not the raw `-dev` value still sitting in that commit's manifest —
 /// `check` alone would report `DevVersion` on every single per-roll
 /// promotion step otherwise, since the raw value never actually reaches
 /// stable; finalizing is exactly what landing it does.
@@ -347,12 +524,20 @@ pub fn check_against(
     repo: &Path,
     head: Option<Semver>,
     target_ref: &str,
+    forced: Option<ManifestKind>,
 ) -> Result<VersionCheck, RfError> {
-    let base_text = git::show_file_at_ref(repo, target_ref, VERSION_FILE)?;
+    let kind = ManifestKind::detect_at_forced(repo, target_ref, forced)?;
+    let base_text = match kind {
+        Some(k) => git::show_file_at_ref(repo, target_ref, k.manifest())?,
+        None => None,
+    };
     if head.is_none() && base_text.is_none() {
         return Ok(VersionCheck::not_applicable());
     }
-    let base = base_text.as_deref().and_then(parse_version);
+    let base = match (kind, base_text.as_deref()) {
+        (Some(k), Some(t)) => k.parse_version(t),
+        _ => None,
+    };
     let status = match (head, base) {
         (Some(h), _) if h.has_marker() => VersionStatus::DevVersion,
         (Some(_), None) if base_text.is_none() => VersionStatus::Ok,
@@ -364,19 +549,92 @@ pub fn check_against(
     Ok(VersionCheck { head, base, status })
 }
 
+/// Read the crate version from the working tree, honouring `forced` — see
+/// [`Config::forced_manifest`](crate::core::config::Config::forced_manifest).
+pub fn read_version(repo: &Path, forced: Option<ManifestKind>) -> Result<Option<Semver>, RfError> {
+    let Some(kind) = ManifestKind::detect_forced(repo, forced) else {
+        return Ok(None);
+    };
+    read_version_for(repo, kind)
+}
+
+/// Like [`read_version`], but from an already-resolved kind rather than
+/// auto-detecting — what a `Config::manifest_kind`-aware write path uses so
+/// the value it bumps and the file it then writes
+/// ([`write_version`]) agree on which kind, even in a repo carrying both
+/// manifests. `Ok(None)` when that kind's manifest doesn't exist here.
+pub fn read_version_for(repo: &Path, kind: ManifestKind) -> Result<Option<Semver>, RfError> {
+    let path = repo.join(kind.manifest());
+    if !path.exists() {
+        return Ok(None);
+    }
+    let text = std::fs::read_to_string(&path)?;
+    Ok(kind.parse_version(&text))
+}
+
+/// Read the crate version at each of `refs`, keyed by ref. `forced` restricts
+/// every ref to that one kind instead of trying both — see
+/// [`Config::forced_manifest`](crate::core::config::Config::forced_manifest).
+///
+/// One `git cat-file --batch` for the whole set (both manifest names per ref,
+/// so a repo of either kind is covered in the same round trip), because the
+/// caller is a table that wants a version per row on every reload. Refs with
+/// neither manifest, or whose manifest carries a version this crate will not
+/// parse, are simply absent from the map — the column renders those as a
+/// dash, and a repo with no manifest at all yields an empty map rather than
+/// an error. Losing a version is never worth failing a reload over.
+pub fn versions_at(
+    repo: &Path,
+    refs: &[String],
+    forced: Option<ManifestKind>,
+) -> HashMap<String, Semver> {
+    let kinds: &[ManifestKind] = match &forced {
+        Some(kind) => std::slice::from_ref(kind),
+        None => &ManifestKind::ALL,
+    };
+    let mut specs = Vec::with_capacity(refs.len() * kinds.len());
+    for r in refs {
+        for kind in kinds {
+            specs.push(format!("{r}:{}", kind.manifest()));
+        }
+    }
+    let Ok(blobs) = git::show_files_at_refs(repo, &specs) else {
+        return HashMap::new();
+    };
+    let mut out = HashMap::new();
+    for r in refs {
+        for kind in kinds {
+            let spec = format!("{r}:{}", kind.manifest());
+            if let Some(version) = blobs.get(&spec).and_then(|text| kind.parse_version(text)) {
+                out.insert(r.clone(), version);
+                break;
+            }
+        }
+    }
+    out
+}
+
 // ── Write ───────────────────────────────────────────────────────────────────
 
-/// Rewrite the package version in the working tree's `Cargo.toml`.
+/// Rewrite the package version in the working tree's manifest.
 ///
-/// Deliberately line-based rather than a `toml` serialize round-trip: that
-/// would reorder keys and strip every comment in the manifest. We locate the
-/// `[package]` table and replace the first `version = "..."` inside it.
-pub fn write_version(repo: &Path, new: Semver) -> Result<(), RfError> {
-    let path = repo.join(VERSION_FILE);
+/// Deliberately line/byte-based rather than a serialize round-trip: that
+/// would reorder keys and strip comments (TOML) or reformat whitespace
+/// (JSON). We locate the version key directly and replace only its value.
+///
+/// `kind` is the caller's already-resolved manifest kind rather than
+/// something this function detects itself: a caller honouring
+/// `Config::manifest_kind`'s override must write to *that* kind's file, not
+/// whatever plain [`ManifestKind::detect`] would pick in a repo carrying
+/// both — so the resolution happens once, at the caller, and this just
+/// writes.
+pub fn write_version(repo: &Path, kind: ManifestKind, new: Semver) -> Result<(), RfError> {
+    let path = repo.join(kind.manifest());
     let text = std::fs::read_to_string(&path)?;
-    let rewritten = replace_package_version(&text, new).ok_or_else(|| {
+    let rewritten = kind.replace_version(&text, new).ok_or_else(|| {
         RfError::Git(format!(
-            "could not find a `version` key in the [package] table of {}",
+            "could not find a `version` key in {} of {}",
+            kind.version_key_location(),
             path.display()
         ))
     })?;
@@ -384,10 +642,23 @@ pub fn write_version(repo: &Path, new: Semver) -> Result<(), RfError> {
     Ok(())
 }
 
-/// Pure half of [`write_version`], so the formatting-preservation behaviour can
-/// be unit-tested without touching a repo. Returns `None` if no version key was
-/// found in `[package]`.
-pub fn replace_package_version(text: &str, new: Semver) -> Option<String> {
+// ── Cargo arm ────────────────────────────────────────────────────────────────
+
+/// Extract `package.version` from `Cargo.toml` text.
+///
+/// Parsed with the `toml` crate rather than a regex so section nesting is
+/// honoured — a `version = ...` under `[dependencies.foo]` can never be
+/// mistaken for the package version.
+fn parse_cargo_version(cargo_toml: &str) -> Option<Semver> {
+    let doc: toml::Value = toml::from_str(cargo_toml).ok()?;
+    let raw = doc.get("package")?.get("version")?.as_str()?;
+    Semver::parse(raw)
+}
+
+/// Pure half of [`write_version`]'s Cargo arm, so the formatting-preservation
+/// behaviour can be unit-tested without touching a repo. Returns `None` if no
+/// version key was found in `[package]`.
+fn replace_cargo_version(text: &str, new: Semver) -> Option<String> {
     let mut out = String::with_capacity(text.len());
     let mut in_package = false;
     let mut replaced = false;
@@ -422,7 +693,7 @@ pub fn replace_package_version(text: &str, new: Semver) -> Option<String> {
 
 /// Extract `package.name` from `Cargo.toml` text — what the lockfile's own
 /// `[[package]]` entry is keyed by.
-pub fn parse_package_name(cargo_toml: &str) -> Option<String> {
+fn parse_cargo_name(cargo_toml: &str) -> Option<String> {
     let doc: toml::Value = toml::from_str(cargo_toml).ok()?;
     Some(doc.get("package")?.get("name")?.as_str()?.to_string())
 }
@@ -430,7 +701,7 @@ pub fn parse_package_name(cargo_toml: &str) -> Option<String> {
 /// The crate's own version as `Cargo.lock` records it, under the
 /// `[[package]]` entry named `name`. `None` when there is no such entry, or
 /// when it cannot be told apart from another (see [`lock_own_version_line`]).
-pub fn parse_lock_package_version(cargo_lock: &str, name: &str) -> Option<Semver> {
+fn parse_cargo_lock_version(cargo_lock: &str, name: &str) -> Option<Semver> {
     let lines: Vec<&str> = cargo_lock.lines().collect();
     let line = lines[lock_own_version_line(&lines, name)?];
     Semver::parse(line.split('"').nth(1)?)
@@ -439,13 +710,13 @@ pub fn parse_lock_package_version(cargo_lock: &str, name: &str) -> Option<Semver
 /// Rewrite the crate's own `version` in `Cargo.lock` text, leaving every
 /// other byte — the lockfile's own top-level `version = 4`, every dependency
 /// entry — exactly as it was. Line-based for the same reason as
-/// [`replace_package_version`], and `None` under the same conditions as
-/// [`parse_lock_package_version`].
+/// [`replace_cargo_version`], and `None` under the same conditions as
+/// [`parse_cargo_lock_version`].
 ///
 /// This is the one lockfile change `cargo update --workspace` makes after a
 /// version rewrite, done without cargo: no network, no toolchain, and no
 /// chance of moving a dependency as a side effect.
-pub fn replace_lock_package_version(cargo_lock: &str, name: &str, new: Semver) -> Option<String> {
+fn replace_cargo_lock_version(cargo_lock: &str, name: &str, new: Semver) -> Option<String> {
     let lines: Vec<&str> = cargo_lock.lines().collect();
     let at = lock_own_version_line(&lines, name)?;
     let mut out = String::with_capacity(cargo_lock.len());
@@ -516,6 +787,226 @@ fn is_key(trimmed: &str, key: &str) -> bool {
     trimmed
         .strip_prefix(key)
         .is_some_and(|rest| rest.trim_start().starts_with('='))
+}
+
+// ── Npm arm ──────────────────────────────────────────────────────────────────
+
+/// Extract `version` from `package.json` text. Validated through
+/// `serde_json` first, so malformed JSON reads as unreadable rather than
+/// whatever the byte scanner happens to find.
+fn parse_npm_version(package_json: &str) -> Option<Semver> {
+    serde_json::from_str::<serde_json::Value>(package_json).ok()?;
+    let range = json_string_at(package_json, &["version"])?;
+    Semver::parse(&package_json[range])
+}
+
+/// Extract `name` from `package.json` text — what `merge_driver` and error
+/// messages name the package by. The npm lockfile does not need it (its root
+/// entry is positional), but the signature stays uniform with the Cargo arm.
+fn parse_npm_name(package_json: &str) -> Option<String> {
+    serde_json::from_str::<serde_json::Value>(package_json).ok()?;
+    let range = json_string_at(package_json, &["name"])?;
+    Some(package_json[range].to_string())
+}
+
+/// Rewrite `version` in `package.json` text, splicing the new value into the
+/// same byte range and leaving every other byte — indentation, key order, a
+/// missing trailing newline — untouched. `None` when the key is absent.
+fn replace_npm_version(text: &str, new: Semver) -> Option<String> {
+    let range = json_string_at(text, &["version"])?;
+    Some(splice(text, &[(range, new)]))
+}
+
+/// The root `version` in `package-lock.json` text. Present in every lockfile
+/// version (1, 2 and 3).
+fn parse_npm_lock_version(text: &str) -> Option<Semver> {
+    serde_json::from_str::<serde_json::Value>(text).ok()?;
+    let range = json_string_at(text, &["version"])?;
+    Semver::parse(&text[range])
+}
+
+/// Rewrite the root `version` in `package-lock.json` text, and, when present
+/// (lockfile v2/v3), `packages[""].version` alongside it. Returns the text
+/// with only the root changed — not `None` — when there is no `packages[""]`
+/// entry (v1), since that shape has nothing more to keep in sync.
+fn replace_npm_lock_version(text: &str, new: Semver) -> Option<String> {
+    let root = json_string_at(text, &["version"])?;
+    let mut edits = vec![(root, new)];
+    if let Some(own) = json_string_at(text, &["packages", "", "version"]) {
+        edits.push((own, new));
+    }
+    Some(splice(text, &edits))
+}
+
+/// Replace each byte range in `edits` with the given version's text,
+/// back-to-front so earlier ranges stay valid as later ones shift the string.
+fn splice(text: &str, edits: &[(Range<usize>, Semver)]) -> String {
+    let mut ordered: Vec<&(Range<usize>, Semver)> = edits.iter().collect();
+    ordered.sort_by_key(|(r, _)| r.start);
+    let mut out = String::with_capacity(text.len() + 8 * ordered.len());
+    let mut cursor = 0;
+    for (range, new) in ordered {
+        out.push_str(&text[cursor..range.start]);
+        out.push_str(&new.to_string());
+        cursor = range.end;
+    }
+    out.push_str(&text[cursor..]);
+    out
+}
+
+/// Byte range of the string value at `path` (e.g. `["version"]`, or
+/// `["packages", "", "version"]` for a lockfile v2/v3 entry), excluding the
+/// quotes. `None` when the path is absent or the value there is not a
+/// string.
+///
+/// A small scanner, no allocation beyond the key stack: walk the bytes
+/// tracking string state (honouring `\"`), container nesting, and for each
+/// object level the key currently being valued. Array elements push `None`
+/// onto that stack rather than a string, so a `"version"` nested inside
+/// `"workspaces": [...]` (or any array) can never match a string-keyed path —
+/// the path lengths might agree, but an array slot never equals `Some(key)`.
+fn json_string_at(text: &str, path: &[&str]) -> Option<Range<usize>> {
+    let bytes = text.as_bytes();
+    let (_, found) = scan_json_value(bytes, 0, &[], path);
+    found
+}
+
+fn skip_json_ws(bytes: &[u8], mut i: usize) -> usize {
+    while matches!(bytes.get(i), Some(b' ' | b'\t' | b'\n' | b'\r')) {
+        i += 1;
+    }
+    i
+}
+
+/// Scan one JSON value. `current` is the key-path leading to this value.
+/// Returns the index just past the value, and the target's range if this
+/// value (or one nested inside it) is the match.
+fn scan_json_value(
+    bytes: &[u8],
+    i: usize,
+    current: &[Option<String>],
+    target: &[&str],
+) -> (usize, Option<Range<usize>>) {
+    let i = skip_json_ws(bytes, i);
+    match bytes.get(i) {
+        Some(b'"') => {
+            let (end, range) = scan_json_string(bytes, i);
+            let matched = json_path_matches(current, target).then_some(range);
+            (end, matched)
+        }
+        Some(b'{') => scan_json_object(bytes, i, current, target),
+        Some(b'[') => scan_json_array(bytes, i, current, target),
+        Some(_) => (scan_json_scalar(bytes, i), None),
+        None => (i, None),
+    }
+}
+
+fn json_path_matches(current: &[Option<String>], target: &[&str]) -> bool {
+    current.len() == target.len()
+        && current
+            .iter()
+            .zip(target.iter())
+            .all(|(c, t)| c.as_deref() == Some(*t))
+}
+
+fn scan_json_object(
+    bytes: &[u8],
+    i: usize,
+    current: &[Option<String>],
+    target: &[&str],
+) -> (usize, Option<Range<usize>>) {
+    let mut i = i + 1; // skip '{'
+    let mut found = None;
+    loop {
+        i = skip_json_ws(bytes, i);
+        match bytes.get(i) {
+            Some(b'}') | None => {
+                i = i.saturating_add(1);
+                break;
+            }
+            Some(b',') => i += 1,
+            Some(b'"') => {
+                let (key_end, key_range) = scan_json_string(bytes, i);
+                let key = String::from_utf8_lossy(&bytes[key_range]).into_owned();
+                i = skip_json_ws(bytes, key_end);
+                if bytes.get(i) != Some(&b':') {
+                    break;
+                }
+                i += 1;
+                let mut child = current.to_vec();
+                child.push(Some(key));
+                let (next_i, child_found) = scan_json_value(bytes, i, &child, target);
+                if found.is_none() {
+                    found = child_found;
+                }
+                i = next_i;
+            }
+            _ => break,
+        }
+    }
+    (i, found)
+}
+
+fn scan_json_array(
+    bytes: &[u8],
+    i: usize,
+    current: &[Option<String>],
+    target: &[&str],
+) -> (usize, Option<Range<usize>>) {
+    let mut i = i + 1; // skip '['
+    let mut found = None;
+    let mut child = current.to_vec();
+    child.push(None);
+    loop {
+        i = skip_json_ws(bytes, i);
+        match bytes.get(i) {
+            Some(b']') | None => {
+                i = i.saturating_add(1);
+                break;
+            }
+            Some(b',') => i += 1,
+            _ => {
+                let (next_i, child_found) = scan_json_value(bytes, i, &child, target);
+                if found.is_none() {
+                    found = child_found;
+                }
+                if next_i <= i {
+                    break; // malformed input; avoid looping forever
+                }
+                i = next_i;
+            }
+        }
+    }
+    (i, found)
+}
+
+/// `i` points at the opening `"`. Returns the index just past the closing
+/// quote, and the range of the content between the quotes (escapes included
+/// verbatim, not decoded — every path and value this module compares against
+/// is plain ASCII with no escapes).
+fn scan_json_string(bytes: &[u8], i: usize) -> (usize, Range<usize>) {
+    let start = i + 1;
+    let mut j = start;
+    while j < bytes.len() {
+        match bytes[j] {
+            b'\\' => j += 2,
+            b'"' => break,
+            _ => j += 1,
+        }
+    }
+    let end = j.min(bytes.len());
+    (end + 1, start..end)
+}
+
+/// Skip a number, `true`, `false`, or `null` — anything that isn't a string,
+/// object or array — up to the next structural byte.
+fn scan_json_scalar(bytes: &[u8], i: usize) -> usize {
+    let mut j = i;
+    while j < bytes.len() && !matches!(bytes[j], b',' | b'}' | b']' | b' ' | b'\t' | b'\n' | b'\r')
+    {
+        j += 1;
+    }
+    j
 }
 
 #[cfg(test)]
@@ -655,7 +1146,7 @@ clap = { version = "4.6.1" }
 [dependencies.serde]
 version = "1.0.228"
 "#;
-        assert_eq!(parse_version(manifest), Semver::parse("0.1.2"));
+        assert_eq!(parse_cargo_version(manifest), Semver::parse("0.1.2"));
     }
 
     #[test]
@@ -667,13 +1158,13 @@ version = "1.0.228"
                         \n\
                         [dependencies]\n\
                         toml = \"1.1.2\"\n";
-        let out = replace_package_version(manifest, Semver::parse("0.1.3").unwrap()).unwrap();
+        let out = replace_cargo_version(manifest, Semver::parse("0.1.3").unwrap()).unwrap();
         assert!(out.contains("version = \"0.1.3\""));
         assert!(out.contains("name = \"roll-flow\"  # the binary"));
         assert!(out.contains("edition = \"2021\""));
         // The dependency version must be untouched.
         assert!(out.contains("toml = \"1.1.2\""));
-        assert_eq!(parse_version(&out), Semver::parse("0.1.3"));
+        assert_eq!(parse_cargo_version(&out), Semver::parse("0.1.3"));
     }
 
     #[test]
@@ -683,7 +1174,7 @@ version = "1.0.228"
                         \n\
                         [package]\n\
                         version = \"0.1.2\"\n";
-        let out = replace_package_version(manifest, Semver::parse("0.2.0").unwrap()).unwrap();
+        let out = replace_cargo_version(manifest, Semver::parse("0.2.0").unwrap()).unwrap();
         assert!(out.contains("version = \"9.9.9\""));
         assert!(out.contains("version = \"0.2.0\""));
     }
@@ -692,7 +1183,7 @@ version = "1.0.228"
     fn rewrite_reports_missing_version_key() {
         let manifest = "[package]\nname = \"x\"\n";
         assert_eq!(
-            replace_package_version(manifest, Semver::parse("1.0.0").unwrap()),
+            replace_cargo_version(manifest, Semver::parse("1.0.0").unwrap()),
             None
         );
     }
@@ -711,11 +1202,11 @@ version = "1.0.228"
     #[test]
     fn the_lockfile_s_own_entry_is_read_and_rewritten_alone() {
         assert_eq!(
-            parse_lock_package_version(LOCK, "roll-flow"),
+            parse_cargo_lock_version(LOCK, "roll-flow"),
             Semver::parse("0.2.7-roll35")
         );
         let next = Semver::parse("0.2.8-roll35").unwrap();
-        let out = replace_lock_package_version(LOCK, "roll-flow", next).unwrap();
+        let out = replace_cargo_lock_version(LOCK, "roll-flow", next).unwrap();
         assert_eq!(out, LOCK.replace("0.2.7-roll35", "0.2.8-roll35"));
         // The lockfile format's own `version = 4` and the dependency are left
         // exactly as they were.
@@ -726,22 +1217,173 @@ version = "1.0.228"
     #[test]
     fn a_registry_entry_is_never_the_crate_s_own() {
         // Named like a dependency that carries a `source`: not ours.
-        assert_eq!(parse_lock_package_version(LOCK, "serde"), None);
+        assert_eq!(parse_cargo_lock_version(LOCK, "serde"), None);
         let v = Semver::parse("9.9.9").unwrap();
-        assert_eq!(replace_lock_package_version(LOCK, "serde", v), None);
-        assert_eq!(parse_lock_package_version(LOCK, "absent"), None);
+        assert_eq!(replace_cargo_lock_version(LOCK, "serde", v), None);
+        assert_eq!(parse_cargo_lock_version(LOCK, "absent"), None);
     }
 
     #[test]
     fn an_ambiguous_own_entry_is_left_alone() {
         let twice = format!("{LOCK}\n[[package]]\nname = \"roll-flow\"\nversion = \"0.1.0\"\n");
-        assert_eq!(parse_lock_package_version(&twice, "roll-flow"), None);
+        assert_eq!(parse_cargo_lock_version(&twice, "roll-flow"), None);
     }
 
     #[test]
     fn the_package_name_is_read_from_the_manifest() {
         let toml = "[package]\nname = \"roll-flow\"\nversion = \"0.2.7\"\n";
-        assert_eq!(parse_package_name(toml).as_deref(), Some("roll-flow"));
-        assert_eq!(parse_package_name("[workspace]\n"), None);
+        assert_eq!(parse_cargo_name(toml).as_deref(), Some("roll-flow"));
+        assert_eq!(parse_cargo_name("[workspace]\n"), None);
+    }
+
+    // ── ManifestKind ─────────────────────────────────────────────────────────
+
+    #[test]
+    fn for_path_recognises_either_kind_at_any_depth() {
+        assert_eq!(
+            ManifestKind::for_path(Path::new("Cargo.toml")),
+            Some((ManifestKind::Cargo, Role::Manifest))
+        );
+        assert_eq!(
+            ManifestKind::for_path(Path::new("crates/x/Cargo.lock")),
+            Some((ManifestKind::Cargo, Role::Lockfile))
+        );
+        assert_eq!(
+            ManifestKind::for_path(Path::new("package.json")),
+            Some((ManifestKind::Npm, Role::Manifest))
+        );
+        assert_eq!(
+            ManifestKind::for_path(Path::new("packages/app/package-lock.json")),
+            Some((ManifestKind::Npm, Role::Lockfile))
+        );
+        assert_eq!(ManifestKind::for_path(Path::new("README.md")), None);
+    }
+
+    #[test]
+    fn manifest_kind_dispatches_version_and_name_by_kind() {
+        let cargo = "[package]\nname = \"c\"\nversion = \"0.1.0\"\n";
+        let npm = r#"{"name": "n", "version": "0.1.0"}"#;
+        assert_eq!(
+            ManifestKind::Cargo.parse_version(cargo),
+            Semver::parse("0.1.0")
+        );
+        assert_eq!(ManifestKind::Npm.parse_version(npm), Semver::parse("0.1.0"));
+        assert_eq!(ManifestKind::Cargo.parse_name(cargo).as_deref(), Some("c"));
+        assert_eq!(ManifestKind::Npm.parse_name(npm).as_deref(), Some("n"));
+    }
+
+    // ── json_string_at / npm manifest ────────────────────────────────────────
+
+    #[test]
+    fn json_string_at_finds_the_root_key_despite_nested_namesakes() {
+        let text = r#"{
+  "name": "x",
+  "engines": { "node": ">=18" },
+  "publishConfig": { "version": "9.9.9" },
+  "version": "1.2.3"
+}"#;
+        let range = json_string_at(text, &["version"]).expect("root version found");
+        assert_eq!(&text[range], "1.2.3");
+    }
+
+    #[test]
+    fn json_string_at_ignores_an_array_element_of_the_same_name() {
+        let text = r#"{"workspaces": ["version"], "version": "1.0.0"}"#;
+        let range = json_string_at(text, &["version"]).unwrap();
+        assert_eq!(&text[range], "1.0.0");
+    }
+
+    #[test]
+    fn json_string_at_survives_an_escaped_quote_elsewhere() {
+        let text = r#"{"description": "a \"quoted\" word", "version": "2.0.0"}"#;
+        let range = json_string_at(text, &["version"]).unwrap();
+        assert_eq!(&text[range], "2.0.0");
+    }
+
+    #[test]
+    fn json_string_at_misses_an_absent_key() {
+        assert_eq!(json_string_at(r#"{"name": "x"}"#, &["version"]), None);
+    }
+
+    #[test]
+    fn json_string_at_finds_a_nested_lockfile_path() {
+        let text = r#"{"version": "1.0.0", "packages": {"": {"name": "x", "version": "1.0.0"}}}"#;
+        let range = json_string_at(text, &["packages", "", "version"]).unwrap();
+        assert_eq!(&text[range], "1.0.0");
+    }
+
+    #[test]
+    fn npm_version_is_read_from_the_root_not_a_nested_object() {
+        let manifest = "{\n    \"name\": \"fixture\",\n    \"publishConfig\": {\n        \"version\": \"9.9.9\"\n    },\n    \"version\": \"0.1.2\"\n}";
+        assert_eq!(parse_npm_version(manifest), Semver::parse("0.1.2"));
+    }
+
+    #[test]
+    fn npm_rewrite_preserves_four_space_indent_and_missing_trailing_newline() {
+        let manifest =
+            "{\n    \"name\": \"fixture\",\n    \"version\": \"0.1.2\",\n    \"private\": true\n}";
+        let out = replace_npm_version(manifest, Semver::parse("0.1.3").unwrap()).unwrap();
+        assert_eq!(
+            out,
+            "{\n    \"name\": \"fixture\",\n    \"version\": \"0.1.3\",\n    \"private\": true\n}"
+        );
+        assert!(!out.ends_with('\n'));
+    }
+
+    #[test]
+    fn npm_rewrite_reports_a_missing_version_key() {
+        assert_eq!(
+            replace_npm_version("{\"name\": \"x\"}", Semver::parse("1.0.0").unwrap()),
+            None
+        );
+    }
+
+    #[test]
+    fn a_private_package_with_no_version_reads_as_unreadable() {
+        assert_eq!(parse_npm_version(r#"{"name": "x", "private": true}"#), None);
+    }
+
+    #[test]
+    fn malformed_npm_json_is_unreadable_rather_than_scanned() {
+        assert_eq!(parse_npm_version("{\"version\": \"1.0.0\" "), None);
+    }
+
+    const NPM_LOCK_V3: &str = r#"{
+  "name": "fixture",
+  "version": "0.2.7-roll35",
+  "lockfileVersion": 3,
+  "packages": {
+    "": {
+      "name": "fixture",
+      "version": "0.2.7-roll35"
+    },
+    "node_modules/leftpad": {
+      "version": "1.0.0"
+    }
+  }
+}"#;
+
+    #[test]
+    fn npm_lock_both_entries_move_together() {
+        assert_eq!(
+            parse_npm_lock_version(NPM_LOCK_V3),
+            Semver::parse("0.2.7-roll35")
+        );
+        let next = Semver::parse("0.2.8-roll35").unwrap();
+        let out = replace_npm_lock_version(NPM_LOCK_V3, next).unwrap();
+        assert_eq!(out, NPM_LOCK_V3.replace("0.2.7-roll35", "0.2.8-roll35"));
+        // The dependency's own version is left untouched.
+        assert!(out.contains("\"node_modules/leftpad\""));
+        assert!(out.contains("\"version\": \"1.0.0\""));
+    }
+
+    #[test]
+    fn npm_lock_v1_without_a_packages_table_still_rewrites_the_root() {
+        let v1 = r#"{"name": "fixture", "version": "0.1.0", "lockfileVersion": 1}"#;
+        let out = replace_npm_lock_version(v1, Semver::parse("0.2.0").unwrap()).unwrap();
+        assert_eq!(
+            out,
+            r#"{"name": "fixture", "version": "0.2.0", "lockfileVersion": 1}"#
+        );
     }
 }

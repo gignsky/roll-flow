@@ -208,7 +208,13 @@ fn cmd_init(
     // `ops::ensure_version_merge_driver`), so a repo whose config is already
     // up to date on a fresh clone still needs this wired up here.
     if ops::ensure_version_merge_driver(&overridden)? {
-        println!("Configured the version merge driver for Cargo.toml and Cargo.lock");
+        if let Some(kind) = overridden.manifest_kind() {
+            println!(
+                "Configured the version merge driver for {} and {}",
+                kind.manifest(),
+                kind.lockfile()
+            );
+        }
     }
 
     // A fresh file is the detected state rendered whole.
@@ -736,13 +742,15 @@ fn resolve_version_gate(
     // the finalized value alone already satisfies the gate, or immediately
     // before the bump below, so a promotion that ultimately fails (no bump
     // resolved) doesn't leave rolling finalized with nothing to show for it.
+    let forced_kind = config.forced_manifest();
     let needs_finalize = config.dev_versions
-        && version::read_version(&config.repo_root)?.is_some_and(|v| v.has_marker());
+        && version::read_version(&config.repo_root, forced_kind)?.is_some_and(|v| v.has_marker());
     let check = if !config.version_gate {
         VersionCheck::not_applicable()
     } else if config.dev_versions {
-        let finalized_head = version::read_version(&config.repo_root)?.map(|v| v.release());
-        version::check_against(&config.repo_root, finalized_head, &target_ref)?
+        let finalized_head =
+            version::read_version(&config.repo_root, forced_kind)?.map(|v| v.release());
+        version::check_against(&config.repo_root, finalized_head, &target_ref, forced_kind)?
     } else {
         ops::version_check(config, &source, &target_ref)?
     };
@@ -1390,7 +1398,7 @@ fn confirm_final_promotion(
     finalize: bool,
     yes: bool,
 ) -> Result<bool> {
-    let has_version = version::read_version(&config.repo_root)?.is_some();
+    let has_version = version::read_version(&config.repo_root, config.forced_manifest())?.is_some();
     if dry_run || !config.dev_versions || !has_version || finalize {
         return Ok(true);
     }
@@ -2195,7 +2203,7 @@ pub(crate) fn version_column(
         .iter()
         .map(|r| branches::content_ref(&r.branch, &r.location))
         .collect();
-    let by_ref = version::versions_at(&config.repo_root, &refs);
+    let by_ref = version::versions_at(&config.repo_root, &refs, config.forced_manifest());
 
     let by_branch: HashMap<String, String> = rolls
         .iter()

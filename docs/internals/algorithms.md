@@ -410,14 +410,55 @@ those three shapes.
 
 ## Version gate and release tags (`core/version.rs`)
 
-When the repo has a `Cargo.toml`, `rf verify` and `rf promote` require the
-`[package]` version on the source branch to be strictly greater than the
-target's, and `rf promote` creates an annotated `vX.Y.Z` tag on the promotion
-merge commit (skipping an existing tag rather than erroring); `rf graduate`
-creates the equivalent `v<X.Y.Z>-dev` tag on rolling's new tip. Repos without a
-`Cargo.toml` — including the dotfiles repo — get `VersionStatus::NotApplicable`
-and skip all of it. Configurable via `version_gate`, `tag_on_promote`,
-`tag_on_graduate`, `push_tag`, `dev_versions`.
+When the repo has a `Cargo.toml` (or, for a Node repo, a `package.json`),
+`rf verify` and `rf promote` require the manifest's version on the source
+branch to be strictly greater than the target's, and `rf promote` creates an
+annotated `vX.Y.Z` tag on the promotion merge commit (skipping an existing tag
+rather than erroring); `rf graduate` creates the equivalent `v<X.Y.Z>-dev` tag
+on rolling's new tip. A repo with neither manifest — including the dotfiles
+repo — gets `VersionStatus::NotApplicable` and skips all of it. Configurable
+via `version_gate`, `tag_on_promote`, `tag_on_graduate`, `push_tag`,
+`dev_versions`.
+
+**`ManifestKind` is the one place that knows which files.** Everything below
+this section narrates the policy against `Cargo.toml`/`Cargo.lock`, since
+that is where it was built and the narrative is clearest against one concrete
+shape — but every mention of either file name is really
+`ManifestKind::Cargo.manifest()`/`.lockfile()`, and the same rule, the same
+`Marker`/`Semver`, and the same merge driver apply verbatim to
+`ManifestKind::Npm` (`package.json`/`package-lock.json`). `ManifestKind::detect`
+(working tree) and `::detect_at` (a ref) pick Cargo when a repo carries both
+and additionally require a readable version — a `package.json` that exists
+but carries no `version` key (tooling-only: prettier, husky) reads the same
+as one that is absent, never as `Unreadable`. Every `version` free function
+that reads or compares (`read_version`, `check`, `check_against`,
+`versions_at`, `version_at`) takes a `forced: Option<ManifestKind>` that
+overrides this detection outright — `Config::forced_manifest`, driven by the
+`version_manifest` config key (`docs/config.md`), for the rare repo carrying
+both manifests that needs one kind named explicitly. Every caller already
+has a `Config` in scope and passes `config.forced_manifest()` (or, for a few
+sites that need the resolved kind itself rather than just overriding
+detection, `Config::manifest_kind`/`manifest_kind_at`). The one thing it does
+not reach is the merge-driver subprocess, which has no `Config` at all and
+keeps plain auto-detection — harmless, since the driver's job is only to
+settle a version-line conflict on whichever files a merge actually touches.
+See `docs/proposals/package-json-versioning.md` for the original design; the
+implementation above is the `forced`-threading it left as an open question,
+resolved in favour of full coverage once a first cut that stopped at the
+write paths proved inconsistent (the gate's own comparison still auto-
+detected, so a forced kind's bump was gated against the wrong file). The npm
+arm's one structural difference: its manifest/lockfile are JSON,
+hand-formatted, so reading and rewriting goes through a small byte-level
+scanner (`version::json_string_at`) instead of the `toml` crate, and a
+version-only lockfile refresh needs no toolchain invoked at all (unlike
+Cargo's best-effort `cargo update --workspace`), since an npm root version
+change implies nothing else in the lockfile. (The proposal's claim that npm
+orders a dev marker the same way `Semver`'s derived `Ord` does only holds
+for "below the bare release" — semver prerelease identifiers compare
+lexically, so npm itself would rank `-dev` below `-roll9`, the reverse of
+`Ord`'s `Roll(_) < Dev`. This never matters to `rf`: its own `Ord` is what
+every gate and comparison here actually uses, and a dev marker never reaches
+a tool that would apply npm's ordering to it.)
 
 The gate and the tag are per promotion *step*, not per invocation: a per-roll
 promotion compares each roll's graduation commit against stable as that step is

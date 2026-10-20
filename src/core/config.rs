@@ -3,6 +3,7 @@ use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
 
+use crate::core::version;
 use crate::error::RfError;
 
 const CONFIG_NAME: &str = ".roll-flow.toml";
@@ -175,6 +176,68 @@ pub struct Config {
     /// `lazygit` on `PATH`.
     #[serde(default = "default_lazygit")]
     pub lazygit_command: String,
+    /// Which manifest this repo versions through, when it carries both a
+    /// `Cargo.toml` and a `package.json`. `Auto` (default) prefers `Cargo` —
+    /// the same choice [`version::ManifestKind::detect`] makes with no
+    /// config at all. Set to `npm` for a repo (a Tauri app, say) that
+    /// versions through `package.json` despite also carrying a `Cargo.toml`
+    /// for tooling.
+    ///
+    /// Reaches every `version` free function that reads or compares — not
+    /// just the writes — via [`Config::forced_manifest`] (passed as that
+    /// function's own `forced` parameter) and [`Config::manifest_kind`]/
+    /// [`Config::manifest_kind_at`] (for the handful of call sites that
+    /// already resolve a kind for other reasons, e.g. to pick which lockfile
+    /// to refresh). What `apply_version_bump`/`apply_dev_version`/
+    /// `finalize_rolling` read as "current", what the version gate compares,
+    /// and what they then write all agree on which manifest. It does not
+    /// reach the merge-driver subprocess, which has no `Config` at all and
+    /// keeps auto-detecting — harmless, since its only job is to settle a
+    /// version-line conflict on whichever files a merge actually touches,
+    /// and attribute lines for the other kind's files are simply never
+    /// matched. A repo carrying both manifests and needing this at all is
+    /// expected to be the rare exception, not the common case this key
+    /// exists to unblock.
+    #[serde(default)]
+    pub version_manifest: VersionManifest,
+}
+
+/// Forces which of [`version::ManifestKind`]'s variants a repo versions
+/// through, for the rare repo that carries both manifests and wants the one
+/// `ManifestKind::detect`'s Cargo-first default would not pick.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "lowercase")]
+pub enum VersionManifest {
+    #[default]
+    Auto,
+    Cargo,
+    Npm,
+}
+
+impl VersionManifest {
+    /// The kind this setting pins, or `None` for `Auto` (plain detection).
+    pub fn forced(self) -> Option<version::ManifestKind> {
+        match self {
+            VersionManifest::Auto => None,
+            VersionManifest::Cargo => Some(version::ManifestKind::Cargo),
+            VersionManifest::Npm => Some(version::ManifestKind::Npm),
+        }
+    }
+
+    /// The kind to use in the working tree, honouring a forced choice. See
+    /// [`version::ManifestKind::detect_forced`].
+    pub fn resolve(self, repo: &Path) -> Option<version::ManifestKind> {
+        version::ManifestKind::detect_forced(repo, self.forced())
+    }
+
+    /// Like [`resolve`](Self::resolve), at a ref rather than the working tree.
+    pub fn resolve_at(
+        self,
+        repo: &Path,
+        refspec: &str,
+    ) -> Result<Option<version::ManifestKind>, RfError> {
+        version::ManifestKind::detect_at_forced(repo, refspec, self.forced())
+    }
 }
 
 impl Config {
@@ -202,6 +265,7 @@ impl Config {
         "clean_protect",
         "pull_mode",
         "lazygit_command",
+        "version_manifest",
     ];
 
     /// Hosts that are currently active (inactive ones are offline/rebuilding).
@@ -416,6 +480,7 @@ impl Config {
             clean_protect: vec![],
             pull_mode: PullMode::default(),
             lazygit_command: default_lazygit(),
+            version_manifest: VersionManifest::default(),
         })
     }
 
@@ -456,6 +521,29 @@ impl Config {
 
     pub fn config_path(repo_root: &Path) -> PathBuf {
         repo_root.join(CONFIG_NAME)
+    }
+
+    /// The manifest kind this repo's working tree versions through,
+    /// honouring `version_manifest`. See that field's doc comment for scope.
+    pub fn manifest_kind(&self) -> Option<version::ManifestKind> {
+        self.version_manifest.resolve(&self.repo_root)
+    }
+
+    /// Like [`manifest_kind`](Self::manifest_kind), at a ref rather than the
+    /// working tree.
+    pub fn manifest_kind_at(
+        &self,
+        refspec: &str,
+    ) -> Result<Option<version::ManifestKind>, RfError> {
+        self.version_manifest.resolve_at(&self.repo_root, refspec)
+    }
+
+    /// The raw `version_manifest` override, if any was set — `None` for
+    /// `Auto`. Passed to the `version` free functions (`read_version`,
+    /// `check`, `check_against`, `versions_at`, `version_at`) so a repo
+    /// carrying both manifests compares and reads the same kind it writes.
+    pub fn forced_manifest(&self) -> Option<version::ManifestKind> {
+        self.version_manifest.forced()
     }
 
     /// True when rf is configured to assist rather than drive the workflow.
@@ -679,6 +767,7 @@ mod tests {
             clean_protect: vec![],
             pull_mode: PullMode::default(),
             lazygit_command: default_lazygit(),
+            version_manifest: super::VersionManifest::default(),
         };
         let updated = cfg.with_overrides(
             Some("rolling".to_string()),
@@ -716,6 +805,7 @@ mod tests {
             clean_protect: vec![],
             pull_mode: PullMode::default(),
             lazygit_command: default_lazygit(),
+            version_manifest: super::VersionManifest::default(),
         };
         let rendered = cfg.to_toml_string().expect("render");
         assert!(
