@@ -128,18 +128,34 @@ fn print_rolls_table(
     // Present only when this machine's host is known to the config and has at
     // least been looked at — a dotfiles-shaped repo pays for this column, a
     // repo with no hosts modeled (like roll-flow's own) never sees it.
-    let build_hdr = rebuild_status
-        .map(|_| "  build".to_string())
-        .unwrap_or_default();
-    let build_col = |branch: &str| {
-        rebuild_status
-            .map(|s| format!("  {}", rebuild::gutter_glyphs(s, branch)))
-            .unwrap_or_default()
+    // Placed in the left gutter, right after the current-branch chevron,
+    // rather than at the far right — it's a per-row marker, not a detail
+    // like `version`/`deps`. Padded like any other non-last column, so the
+    // columns after it stay aligned.
+    let build_w = rebuild_status.map(|s| {
+        rolls
+            .iter()
+            .map(|r| rebuild::gutter_label(s, &r.branch).chars().count())
+            .max()
+            .unwrap_or(0)
+            .max("build".len())
+    });
+    let build_hdr = match build_w {
+        Some(w) => format!("{:<w$}  ", "build", w = w),
+        None => String::new(),
+    };
+    let build_col = |branch: &str| match (rebuild_status, build_w) {
+        (Some(s), Some(w)) => format!("{:<w$}  ", rebuild::gutter_label(s, branch), w = w),
+        _ => String::new(),
+    };
+    let build_sep = match build_w {
+        Some(w) => format!("{}  ", "─".repeat(w)),
+        None => String::new(),
     };
 
     // Header
     println!(
-        "  {num:>nw$}  {name:<ew$}  {loc:<3}  {state:<sw$}{ver_hdr}{deps_hdr}{build_hdr}",
+        "  {build_hdr}{num:>nw$}  {name:<ew$}  {loc:<3}  {state:<sw$}{ver_hdr}{deps_hdr}",
         num = "#",
         name = "roll",
         loc = "loc",
@@ -161,7 +177,7 @@ fn print_rolls_table(
         sw = state_w,
     );
     println!(
-        "  {sep_n}  {sep_e}  ───  {sep_s}{sep_v}{sep_d}{sep_b}",
+        "  {build_sep}{sep_n}  {sep_e}  ───  {sep_s}{sep_v}{sep_d}",
         sep_n = "─".repeat(num_w),
         sep_e = "─".repeat(name_w),
         sep_s = "─".repeat(state_w),
@@ -172,11 +188,6 @@ fn print_rolls_table(
         },
         sep_d = if show_deps {
             format!("  {}  {}", "─".repeat(dep_w), "─".repeat(dependant_w))
-        } else {
-            String::new()
-        },
-        sep_b = if rebuild_status.is_some() {
-            format!("  {}", "─".repeat(rebuild::GUTTER_WIDTH))
         } else {
             String::new()
         },
@@ -194,25 +205,25 @@ fn print_rolls_table(
             String::new()
         };
         println!(
-            "{cur} {num:>nw$}  {name:<ew$}  {loc:<3}  {state:<sw$}{ver_col}{deps_col}{build_col}",
+            "{cur} {build_col}{num:>nw$}  {name:<ew$}  {loc:<3}  {state:<sw$}{ver_col}{deps_col}",
             cur = cur_marker,
+            build_col = build_col(&roll.branch),
             ver_col = version_col(&roll.branch),
             num = roll.number,
             name = roll.branch,
             loc = location_symbol(&roll.location),
             state = roll.state.label(),
-            build_col = build_col(&roll.branch),
             nw = num_w,
             ew = name_w,
             sw = state_w,
         );
     }
-    crate::print_hotfix_rows(hotfixes, name_w, state_w);
+    crate::print_hotfix_rows(hotfixes, name_w, state_w, build_w);
     println!();
     println!("  loc: L=local  R=remote  B=both");
     if rebuild_status.is_some() {
         println!(
-            "  build: N/n/b=nixos switch/test/boot  H/h=home switch/test — most recent local rebuild"
+            "  build: N/NT/NB=nixos switch/test/boot  H/HT=home switch/test — most recent local rebuild"
         );
     }
     if show_deps {

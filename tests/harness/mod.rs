@@ -417,6 +417,29 @@ impl Sandbox {
         self.git(&["commit", "--allow-empty", "-m", msg]);
     }
 
+    /// [`commit_empty`](Self::commit_empty) with an explicit committer/author
+    /// Unix timestamp. A sandbox otherwise builds its whole history inside
+    /// one second, so commits that must be *provably* ordered by time (not
+    /// just by creation order) — `core::rebuild`'s time-based supersede,
+    /// unlike most of this harness's git-log-order-sensitive tests — need
+    /// this rather than [`rf_with_env`](Self::rf_with_env)'s date env vars,
+    /// since this commits directly via `git`, not through `rf`.
+    pub fn commit_empty_at(&self, msg: &str, unix_ts: i64) {
+        let date = format!("@{unix_ts} +0000");
+        let output = Command::new("git")
+            .current_dir(self.path())
+            .env("GIT_AUTHOR_DATE", &date)
+            .env("GIT_COMMITTER_DATE", &date)
+            .args(["commit", "--allow-empty", "-m", msg])
+            .output()
+            .expect("run git");
+        assert!(
+            output.status.success(),
+            "git commit --allow-empty failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+
     // ── convenience workflow steps ────────────────────────────────────────
 
     /// `rf init`.
@@ -793,6 +816,28 @@ impl Sandbox {
         let here = self.current_branch();
         self.git(&["checkout", branch]);
         self.commit_empty(&format!("{host_id}: generation {generation} ({mode})"));
+        if here != branch {
+            self.git(&["checkout", &here]);
+        }
+    }
+
+    /// [`add_nixos_rebuild`](Self::add_nixos_rebuild), at an explicit
+    /// committer Unix timestamp — see
+    /// [`commit_empty_at`](Self::commit_empty_at).
+    pub fn add_nixos_rebuild_at(
+        &self,
+        branch: &str,
+        host_id: &str,
+        generation: u32,
+        mode: &str,
+        unix_ts: i64,
+    ) {
+        let here = self.current_branch();
+        self.git(&["checkout", branch]);
+        self.commit_empty_at(
+            &format!("{host_id}: generation {generation} ({mode})"),
+            unix_ts,
+        );
         if here != branch {
             self.git(&["checkout", &here]);
         }

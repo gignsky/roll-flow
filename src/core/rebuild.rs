@@ -25,10 +25,6 @@ use crate::core::git;
 /// hatch when auto-detection gets a real machine wrong.
 pub const HOST_IDENTIFIER_ENV: &str = "RF_HOST_IDENTIFIER";
 
-/// Number of gutter slots [`gutter_glyphs`] renders — nixos switch/test/boot,
-/// home switch/test.
-pub const GUTTER_WIDTH: usize = 5;
-
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RebuildMarker {
     /// The roll's branch name, or `config.rolling_branch`/`config.stable_branch`
@@ -36,6 +32,10 @@ pub struct RebuildMarker {
     /// that still has a ref.
     pub branch: String,
     pub commit: String,
+    /// Committer-date Unix timestamp (`%ct`) — compared across branches by
+    /// [`supersede`], since ancestry can't order two commits on unrelated
+    /// branches (see that function's doc comment).
+    pub committed_at: i64,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -189,13 +189,16 @@ fn parse_home_marker(subject: &str, username: &str, host_id: &str) -> Option<Reb
 
 // ── Discovery ─────────────────────────────────────────────────────────────────
 
+/// `(commit hash, committer-date Unix timestamp)`.
+type Hit = (String, i64);
+
 #[derive(Debug, Default)]
 struct Discovered {
-    nixos_switch: Option<String>,
-    nixos_test: Option<String>,
-    nixos_boot: Option<String>,
-    home_switch: Option<String>,
-    home_test: Option<String>,
+    nixos_switch: Option<Hit>,
+    nixos_test: Option<Hit>,
+    nixos_boot: Option<Hit>,
+    home_switch: Option<Hit>,
+    home_test: Option<Hit>,
 }
 
 impl Discovered {
@@ -223,35 +226,36 @@ impl Discovered {
 fn discover(repo: &Path, host_id: &str, username: &str) -> Discovered {
     let mut found = Discovered::default();
     let home_enabled = !username.is_empty();
-    let Ok(out) = git::capture_git(repo, &["log", "--all", "--format=%H%x09%s"]) else {
+    let Ok(out) = git::capture_git(repo, &["log", "--all", "--format=%H%x09%ct%x09%s"]) else {
         return found;
     };
     for line in out.lines() {
-        let Some((hash, subject)) = line.split_once('\t') else {
+        let mut fields = line.splitn(3, '\t');
+        let (Some(hash), Some(committed_at), Some(subject)) =
+            (fields.next(), fields.next(), fields.next())
+        else {
             continue;
         };
+        let Ok(committed_at) = committed_at.parse::<i64>() else {
+            continue;
+        };
+        let hit = || (hash.to_string(), committed_at);
         if let Some(mode) = parse_nixos_marker(subject, host_id) {
             match mode {
                 RebuildMode::Switch if found.nixos_switch.is_none() => {
-                    found.nixos_switch = Some(hash.to_string())
+                    found.nixos_switch = Some(hit())
                 }
-                RebuildMode::Boot if found.nixos_boot.is_none() => {
-                    found.nixos_boot = Some(hash.to_string())
-                }
-                RebuildMode::Test if found.nixos_test.is_none() => {
-                    found.nixos_test = Some(hash.to_string())
-                }
+                RebuildMode::Boot if found.nixos_boot.is_none() => found.nixos_boot = Some(hit()),
+                RebuildMode::Test if found.nixos_test.is_none() => found.nixos_test = Some(hit()),
                 _ => {}
             }
         } else if home_enabled {
             if let Some(mode) = parse_home_marker(subject, username, host_id) {
                 match mode {
                     RebuildMode::Switch if found.home_switch.is_none() => {
-                        found.home_switch = Some(hash.to_string())
+                        found.home_switch = Some(hit())
                     }
-                    RebuildMode::Test if found.home_test.is_none() => {
-                        found.home_test = Some(hash.to_string())
-                    }
+                    RebuildMode::Test if found.home_test.is_none() => found.home_test = Some(hit()),
                     _ => {}
                 }
             }
@@ -294,28 +298,32 @@ type Bucket = (String, HashSet<String>);
 /// still only on an unlanded hotfix branch (not an attribution candidate
 /// today).
 fn attribute_hash(
-    hash: &str,
+    hit: &Hit,
     stable: &Bucket,
     rolling: &Bucket,
     roll_buckets: &[(u32, Bucket)],
 ) -> Option<RebuildMarker> {
-    if stable.1.contains(hash) {
+    let (hash, committed_at) = hit;
+    if stable.1.contains(hash.as_str()) {
         return Some(RebuildMarker {
             branch: stable.0.clone(),
-            commit: hash.to_string(),
+            commit: hash.clone(),
+            committed_at: *committed_at,
         });
     }
-    if rolling.1.contains(hash) {
+    if rolling.1.contains(hash.as_str()) {
         return Some(RebuildMarker {
             branch: rolling.0.clone(),
-            commit: hash.to_string(),
+            commit: hash.clone(),
+            committed_at: *committed_at,
         });
     }
     for (_, (branch, set)) in roll_buckets {
-        if set.contains(hash) {
+        if set.contains(hash.as_str()) {
             return Some(RebuildMarker {
                 branch: branch.clone(),
-                commit: hash.to_string(),
+                commit: hash.clone(),
+                committed_at: *committed_at,
             });
         }
     }
@@ -340,17 +348,19 @@ fn attribute_hash(
 /// than where it originated.
 fn attribute_fallback(
     repo: &Path,
-    hash: &str,
+    hit: &Hit,
     stable_ref: Option<&str>,
     rolling_ref: Option<&str>,
     stable_branch: &str,
     rolling_branch: &str,
 ) -> Option<RebuildMarker> {
+    let (hash, committed_at) = hit;
     if let Some(s) = stable_ref {
         if git::is_ancestor(repo, hash, s).unwrap_or(false) {
             return Some(RebuildMarker {
                 branch: stable_branch.to_string(),
-                commit: hash.to_string(),
+                commit: hash.clone(),
+                committed_at: *committed_at,
             });
         }
     }
@@ -358,16 +368,27 @@ fn attribute_fallback(
         if git::is_ancestor(repo, hash, r).unwrap_or(false) {
             return Some(RebuildMarker {
                 branch: rolling_branch.to_string(),
-                commit: hash.to_string(),
+                commit: hash.clone(),
+                committed_at: *committed_at,
             });
         }
     }
     None
 }
 
-fn supersede(repo: &Path, candidate: &mut Option<RebuildMarker>, switch: &Option<RebuildMarker>) {
+/// Hide `candidate` (a `test`/`boot` marker) once `switch` is at least as
+/// recent, by commit timestamp rather than ancestry.
+///
+/// Ancestry alone can't make this call: a switch on one branch and a test on
+/// an unrelated one (say, a plain `switch` on `main` and an earlier `test` on
+/// an active roll) have no ancestor relationship at all, so an
+/// ancestry-based check would leave the test marker visible forever once its
+/// roll stops gaining commits, reading as if that roll were still "the
+/// current story" long after a newer, unrelated switch has made it not. Time
+/// is the only ordering two unrelated branches share.
+fn supersede(candidate: &mut Option<RebuildMarker>, switch: &Option<RebuildMarker>) {
     if let (Some(c), Some(s)) = (candidate.as_ref(), switch.as_ref()) {
-        if git::is_ancestor(repo, &c.commit, &s.commit).unwrap_or(false) {
+        if s.committed_at >= c.committed_at {
             *candidate = None;
         }
     }
@@ -434,12 +455,12 @@ pub fn detect(
             .unwrap_or_default(),
     );
 
-    let attribute = |hash: &Option<String>| -> Option<RebuildMarker> {
-        let hash = hash.as_ref()?;
-        attribute_hash(hash, &stable_bucket, &rolling_bucket, &roll_buckets).or_else(|| {
+    let attribute = |hit: &Option<Hit>| -> Option<RebuildMarker> {
+        let hit = hit.as_ref()?;
+        attribute_hash(hit, &stable_bucket, &rolling_bucket, &roll_buckets).or_else(|| {
             attribute_fallback(
                 repo,
-                hash,
+                hit,
                 stable_ref.as_deref(),
                 rolling_ref.as_deref(),
                 &config.stable_branch,
@@ -459,13 +480,14 @@ pub fn detect(
         boot: None,
     };
 
-    // Hide a test/boot marker once a newer switch has already caught up to or
-    // passed it — it no longer tells the user anything the switch doesn't.
-    // `test`/`boot` are never compared against each other: they are parallel
-    // states (ran-but-not-persisted vs staged-for-next-boot), not competing.
-    supersede(repo, &mut nixos.test, &nixos.switch);
-    supersede(repo, &mut nixos.boot, &nixos.switch);
-    supersede(repo, &mut home.test, &home.switch);
+    // Hide a test/boot marker once a switch at least as recent exists,
+    // anywhere — see `supersede`'s doc comment for why this is by time, not
+    // ancestry. `test`/`boot` are never compared against each other: they
+    // are parallel states (ran-but-not-persisted vs staged-for-next-boot),
+    // not competing.
+    supersede(&mut nixos.test, &nixos.switch);
+    supersede(&mut nixos.boot, &nixos.switch);
+    supersede(&mut home.test, &home.switch);
 
     Some(RebuildStatus {
         host_id: host_id.to_string(),
@@ -513,27 +535,27 @@ fn push_channel_parts(
     }
 }
 
-/// Fixed [`GUTTER_WIDTH`]-char slot string for `branch`'s row: `N`/`n`/`b` for
-/// nixos switch/test/boot, `H`/`h` for home switch/test, space when that slot
-/// doesn't point at this branch. Shared by the TUI and both plain-table
-/// renderers so the glyph scheme is defined in exactly one place.
-pub fn gutter_glyphs(status: &RebuildStatus, branch: &str) -> String {
-    let slot = |marker: &Option<RebuildMarker>, glyph: char| -> char {
+/// Space-joined labels for whichever of `status`'s markers point at
+/// `branch`'s row — `N` (nixos switch), `NT` (nixos test), `NB` (nixos
+/// boot), `H` (home switch), `HT` (home test) — in that fixed order; empty
+/// when none do. Shared by the TUI and both plain-table renderers so the
+/// label scheme is defined in exactly one place. Unlike a fixed-width glyph
+/// row, this grows with however many labels actually apply (almost always
+/// 0 or 1); callers that need a column width measure this across every row,
+/// the same way `version`/`deps` size themselves to their content.
+pub fn gutter_label(status: &RebuildStatus, branch: &str) -> String {
+    let mut labels: Vec<&str> = Vec::new();
+    let mut push = |marker: &Option<RebuildMarker>, label: &'static str| {
         if marker.as_ref().is_some_and(|m| m.branch == branch) {
-            glyph
-        } else {
-            ' '
+            labels.push(label);
         }
     };
-    [
-        slot(&status.nixos.switch, 'N'),
-        slot(&status.nixos.test, 'n'),
-        slot(&status.nixos.boot, 'b'),
-        slot(&status.home.switch, 'H'),
-        slot(&status.home.test, 'h'),
-    ]
-    .iter()
-    .collect()
+    push(&status.nixos.switch, "N");
+    push(&status.nixos.test, "NT");
+    push(&status.nixos.boot, "NB");
+    push(&status.home.switch, "H");
+    push(&status.home.test, "HT");
+    labels.join(" ")
 }
 
 #[cfg(test)]
@@ -612,14 +634,19 @@ mod tests {
     }
 
     fn marker(branch: &str) -> Option<RebuildMarker> {
+        marker_at(branch, 0)
+    }
+
+    fn marker_at(branch: &str, committed_at: i64) -> Option<RebuildMarker> {
         Some(RebuildMarker {
             branch: branch.to_string(),
             commit: "deadbeef".to_string(),
+            committed_at,
         })
     }
 
     #[test]
-    fn gutter_glyphs_marks_only_the_matching_slots() {
+    fn gutter_label_lists_only_the_matching_labels() {
         let status = RebuildStatus {
             host_id: "merlin".to_string(),
             nixos: ChannelStatus {
@@ -633,10 +660,27 @@ mod tests {
                 boot: None,
             },
         };
-        assert_eq!(gutter_glyphs(&status, "rolling"), "N  H ");
-        assert_eq!(gutter_glyphs(&status, "roll/41-x"), " n   ");
-        assert_eq!(gutter_glyphs(&status, "main"), "     ");
-        assert_eq!(gutter_glyphs(&status, "rolling").len(), GUTTER_WIDTH);
+        assert_eq!(gutter_label(&status, "rolling"), "N H");
+        assert_eq!(gutter_label(&status, "roll/41-x"), "NT");
+        assert_eq!(gutter_label(&status, "main"), "");
+    }
+
+    #[test]
+    fn gutter_label_joins_every_matching_label_on_the_same_row() {
+        let status = RebuildStatus {
+            host_id: "merlin".to_string(),
+            nixos: ChannelStatus {
+                switch: marker("rolling"),
+                test: marker("rolling"),
+                boot: marker("rolling"),
+            },
+            home: ChannelStatus {
+                switch: marker("rolling"),
+                test: marker("rolling"),
+                boot: None,
+            },
+        };
+        assert_eq!(gutter_label(&status, "rolling"), "N NT NB H HT");
     }
 
     #[test]
@@ -660,5 +704,40 @@ mod tests {
             home: ChannelStatus::default(),
         };
         assert_eq!(format_summary_line(&empty), None);
+    }
+
+    #[test]
+    fn supersede_hides_an_older_test_once_a_newer_switch_exists_on_any_branch() {
+        // No ancestry relationship at all between "rolling" and "main" here —
+        // this is exactly the cross-branch case `supersede`'s doc comment
+        // describes: a switch on main with no relation to an earlier test on
+        // an active roll.
+        let mut test = marker_at("roll/41-x", 100);
+        let switch = marker_at("main", 200);
+        supersede(&mut test, &switch);
+        assert_eq!(test, None, "a later switch, anywhere, must hide the test");
+    }
+
+    #[test]
+    fn supersede_keeps_an_older_switchs_test_visible() {
+        let mut test = marker_at("roll/41-x", 200);
+        let switch = marker_at("main", 100);
+        supersede(&mut test, &switch);
+        assert_eq!(
+            test,
+            marker_at("roll/41-x", 200),
+            "a test newer than the switch must stay visible"
+        );
+    }
+
+    #[test]
+    fn supersede_is_a_noop_with_no_switch_or_no_candidate() {
+        let mut test = marker_at("roll/41-x", 100);
+        supersede(&mut test, &None);
+        assert_eq!(test, marker_at("roll/41-x", 100));
+
+        let mut none = None;
+        supersede(&mut none, &marker_at("main", 100));
+        assert_eq!(none, None);
     }
 }

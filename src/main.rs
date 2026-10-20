@@ -2084,19 +2084,33 @@ fn cmd_list_text(no_tui: bool, deps: bool) -> Result<()> {
     let (dep_w, dependant_w) = dep_column_widths(&rolls);
     // Empty in a repo with no `Cargo.toml`, which drops the column entirely.
     let (versions, ver_w) = version_column(&config, &rolls);
-    let build_hdr = rebuild_status
-        .as_ref()
-        .map(|_| "  build".to_string())
-        .unwrap_or_default();
-    let build_col = |branch: &str| {
-        rebuild_status
-            .as_ref()
-            .map(|s| format!("  {}", rebuild::gutter_glyphs(s, branch)))
-            .unwrap_or_default()
+    // Placed in the left gutter, right after the current-branch chevron,
+    // rather than at the far right — it's a per-row marker, not a detail
+    // like `version`/`deps`. Padded like any other non-last column, so the
+    // columns after it stay aligned.
+    let build_w = rebuild_status.as_ref().map(|s| {
+        rolls
+            .iter()
+            .map(|r| rebuild::gutter_label(s, &r.branch).chars().count())
+            .max()
+            .unwrap_or(0)
+            .max("build".len())
+    });
+    let build_hdr = match build_w {
+        Some(w) => format!("{:<w$}  ", "build", w = w),
+        None => String::new(),
+    };
+    let build_col = |branch: &str| match (rebuild_status.as_ref(), build_w) {
+        (Some(s), Some(w)) => format!("{:<w$}  ", rebuild::gutter_label(s, branch), w = w),
+        _ => String::new(),
+    };
+    let build_sep = match build_w {
+        Some(w) => format!("{}  ", "─".repeat(w)),
+        None => String::new(),
     };
 
     println!(
-        "  {num:>3}  {name:<nw$}  {loc:<3}  {state:<sw$}{ver_hdr}{deps_hdr}{build_hdr}",
+        "  {build_hdr}{num:>3}  {name:<nw$}  {loc:<3}  {state:<sw$}{ver_hdr}{deps_hdr}",
         num = "#",
         name = "branch",
         loc = "loc",
@@ -2117,7 +2131,7 @@ fn cmd_list_text(no_tui: bool, deps: bool) -> Result<()> {
         sw = state_w,
     );
     println!(
-        "  ───  {sep_e}  ───  {sep_s}{sep_v}{sep_d}{sep_b}",
+        "  {build_sep}───  {sep_e}  ───  {sep_s}{sep_v}{sep_d}",
         sep_e = "─".repeat(name_w),
         sep_s = "─".repeat(state_w),
         sep_v = if versions.is_empty() {
@@ -2127,11 +2141,6 @@ fn cmd_list_text(no_tui: bool, deps: bool) -> Result<()> {
         },
         sep_d = if deps {
             format!("  {}  {}", "─".repeat(dep_w), "─".repeat(dependant_w))
-        } else {
-            String::new()
-        },
-        sep_b = if rebuild_status.is_some() {
-            format!("  {}", "─".repeat(rebuild::GUTTER_WIDTH))
         } else {
             String::new()
         },
@@ -2164,17 +2173,17 @@ fn cmd_list_text(no_tui: bool, deps: bool) -> Result<()> {
             }
         };
         println!(
-            "{cur} {num:>3}  {name:<nw$}  {loc:<3}  {state:<sw$}{ver_col}{deps_col}{build_col}",
+            "{cur} {build_col}{num:>3}  {name:<nw$}  {loc:<3}  {state:<sw$}{ver_col}{deps_col}",
+            build_col = build_col(&roll.branch),
             num = roll.number,
             name = roll.branch,
             loc = roll.location.symbol(),
             state = roll.state.label(),
-            build_col = build_col(&roll.branch),
             nw = name_w,
             sw = state_w,
         );
     }
-    print_hotfix_rows(&hotfixes, name_w, state_w);
+    print_hotfix_rows(&hotfixes, name_w, state_w, build_w);
 
     // The same footnote `rf status --no-tui` prints, with or without `--deps`:
     // a cycle is what explains two rows each `⛔ blocked` on the other.
@@ -2197,16 +2206,29 @@ fn cmd_list_text(no_tui: bool, deps: bool) -> Result<()> {
 /// so the columns line up with the rolls above; a hotfix name wider than every
 /// roll's simply runs long, which beats re-measuring the whole table for a tier
 /// that is usually empty.
-pub(crate) fn print_hotfix_rows(hotfixes: &[branches::HotfixInfo], name_w: usize, state_w: usize) {
+pub(crate) fn print_hotfix_rows(
+    hotfixes: &[branches::HotfixInfo],
+    name_w: usize,
+    state_w: usize,
+    build_w: Option<usize>,
+) {
+    // Blank padding the width of the `build` column, if present — hotfixes
+    // never carry a rebuild marker, but the column sits ahead of `#` here
+    // (left gutter, like the TUI), so the rows below still need to line up.
+    let build_pad = build_w.map(|w| " ".repeat(w) + "  ").unwrap_or_default();
     // A thin rule between the tiers, as the TUI draws: rolls and hotfixes
     // number independently, so a roll 1 and an h1 should not read as one list.
     if !hotfixes.is_empty() {
-        println!("  {}", "┄".repeat(3 + 2 + name_w + 2 + 3 + 2 + state_w));
+        let build_rule_w = build_w.map(|w| w + 2).unwrap_or(0);
+        println!(
+            "  {}",
+            "┄".repeat(build_rule_w + 3 + 2 + name_w + 2 + 3 + 2 + state_w)
+        );
     }
     for hotfix in hotfixes {
         let cur = if hotfix.is_current { ">" } else { " " };
         println!(
-            "{cur} {num:>3}  {name:<nw$}  {loc:<3}  {state:<sw$}",
+            "{cur} {build_pad}{num:>3}  {name:<nw$}  {loc:<3}  {state:<sw$}",
             num = format!("h{}", hotfix.number),
             name = hotfix.branch,
             loc = hotfix.location.symbol(),

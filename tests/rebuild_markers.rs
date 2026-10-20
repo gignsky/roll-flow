@@ -185,12 +185,36 @@ fn nixos_test_on_an_active_roll_is_not_superseded_without_a_switch() {
 }
 
 #[test]
-fn a_later_switch_supersedes_an_earlier_test_on_the_same_roll() {
+fn a_later_switch_on_an_unrelated_branch_still_supersedes_an_older_test() {
+    // The exact real-world shape reported against `~/.dotfiles`: a plain
+    // `switch` on `main` with no ancestry relationship at all to an earlier
+    // `test` on an active, unmerged roll. Ancestry alone could never relate
+    // these two commits, which is why supersede is time-based.
     let sb = Sandbox::nixos();
     sb.init();
     sb.create_roll("feature", "0611");
-    sb.add_nixos_rebuild("roll/1-0611-feature", "merlin", 10, "test");
-    sb.add_nixos_rebuild("roll/1-0611-feature", "merlin", 11, "switch");
+    sb.add_nixos_rebuild_at("roll/1-0611-feature", "merlin", 10, "test", 1_000_000_000);
+    sb.add_nixos_rebuild_at("main", "merlin", 1, "switch", 1_000_000_100);
+
+    let status = sb.status_json_with_env(&[("RF_HOST_IDENTIFIER", "merlin")]);
+    assert_eq!(status["local_rebuild"]["nixos"]["switch"], "main");
+    assert!(
+        status["local_rebuild"]["nixos"]["test"].is_null(),
+        "a later switch, even on an unrelated branch, must hide the older test: {status}"
+    );
+}
+
+#[test]
+fn a_later_switch_supersedes_an_earlier_test_on_the_same_roll() {
+    // Explicit, well-separated timestamps: supersede is time-based (see
+    // `core::rebuild::supersede`'s doc comment), and a sandbox otherwise
+    // builds its whole history inside one second, which would make this
+    // test's ordering a matter of machine speed rather than a fact.
+    let sb = Sandbox::nixos();
+    sb.init();
+    sb.create_roll("feature", "0611");
+    sb.add_nixos_rebuild_at("roll/1-0611-feature", "merlin", 10, "test", 1_000_000_000);
+    sb.add_nixos_rebuild_at("roll/1-0611-feature", "merlin", 11, "switch", 1_000_000_100);
 
     let status = sb.status_json_with_env(&[("RF_HOST_IDENTIFIER", "merlin")]);
     assert_eq!(
@@ -205,11 +229,13 @@ fn a_later_switch_supersedes_an_earlier_test_on_the_same_roll() {
 
 #[test]
 fn a_boot_ahead_of_the_switch_is_not_superseded() {
+    // Explicit, well-separated timestamps — see the comment in
+    // `a_later_switch_supersedes_an_earlier_test_on_the_same_roll`.
     let sb = Sandbox::nixos();
     sb.init();
     sb.create_roll("feature", "0611");
-    sb.add_nixos_rebuild("roll/1-0611-feature", "merlin", 10, "switch");
-    sb.add_nixos_rebuild("roll/1-0611-feature", "merlin", 11, "boot");
+    sb.add_nixos_rebuild_at("roll/1-0611-feature", "merlin", 10, "switch", 1_000_000_000);
+    sb.add_nixos_rebuild_at("roll/1-0611-feature", "merlin", 11, "boot", 1_000_000_100);
 
     let status = sb.status_json_with_env(&[("RF_HOST_IDENTIFIER", "merlin")]);
     assert_eq!(

@@ -309,11 +309,17 @@ remains genuinely unattributed is narrower still: a commit still only on an
 unlanded hotfix branch (not an attribution candidate today).
 
 **Superseding.** After attribution, a `test`/`boot` marker is dropped once
-the channel's `switch` marker's commit is equal to or a descendant of it
-(`git merge-base --is-ancestor`) — it no longer tells the user anything the
-switch doesn't. `test` and `boot` are never compared against each other:
-they are parallel states (ran-but-not-persisted vs. staged-for-next-boot),
-not competing ones.
+the channel's `switch` marker is at least as recent, compared by **commit
+timestamp (`%ct`), not ancestry**. Ancestry can't make this call: a `switch`
+on `main` and an earlier `test` on an active, unmerged roll have no ancestor
+relationship at all — a real case found against `~/.dotfiles` — so an
+ancestry-based check left the stale test visible indefinitely, reading as if
+that roll were still "the current story" long after an unrelated switch had
+made it not. Time is the only ordering two unrelated branches share.
+`discover` already carries each hit's timestamp alongside its hash for
+exactly this. `test` and `boot` are never compared against each other: they
+are parallel states (ran-but-not-persisted vs. staged-for-next-boot), not
+competing ones.
 
 ## Revert detection (`core/branches.rs`)
 

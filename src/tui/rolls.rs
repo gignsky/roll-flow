@@ -4440,6 +4440,28 @@ impl StatusApp {
     }
 
     fn render_table(&mut self, f: &mut Frame, area: Rect) {
+        // Present only when this machine's host is recognized — see
+        // `core::rebuild::detect` — so a repo that models no hosts (like
+        // roll-flow's own) never sees this column at all. Sized to the
+        // longest label actually on screen (almost always 0 or 1 label; more
+        // than one on the same row is rare but not impossible), the same way
+        // the `version` column sizes itself to its longest cell. Placed in
+        // the left gutter, right after the graph column, rather than at the
+        // far right — it's a per-row marker like the graph glyphs, not a
+        // detail like `version`/`deps`.
+        let build_width = self.rebuild_status.as_ref().map(|status| {
+            self.bases
+                .iter()
+                .map(|b| &b.branch)
+                .chain(self.rolls.iter().map(|r| &r.branch))
+                .chain(self.hotfixes.iter().map(|h| &h.branch))
+                .map(|branch| rebuild::gutter_label(status, branch).chars().count())
+                .max()
+                .unwrap_or(0)
+                .max("build".len())
+        });
+        let show_build = build_width.is_some();
+
         let mut col_constraints = vec![
             // The current-branch chevron, narrow and always present so the
             // columns after it do not shift as HEAD moves.
@@ -4447,13 +4469,18 @@ impl StatusApp {
             // The graph column: two lane glyphs (main, rolling) plus a cell of
             // breathing room. TUI-only — see graph_glyphs' doc comment.
             Constraint::Length(3),
+        ];
+        if let Some(width) = build_width {
+            col_constraints.push(Constraint::Length(width as u16));
+        }
+        col_constraints.extend([
             Constraint::Length(4),
             Constraint::Fill(1),
             Constraint::Length(3),
             // `↑12↓12` at its widest.
             Constraint::Length(7),
             Constraint::Length(13),
-        ];
+        ]);
         // Present only in repos that have a `Cargo.toml`, the same rule the
         // header version follows — so a dotfiles repo pays nothing for it.
         // Sized to the longest cell on screen (a dev marker like `-roll10`
@@ -4477,24 +4504,19 @@ impl StatusApp {
             // `branch` is the Fill column that pays for anything wider.
             col_constraints.push(Constraint::Length(10));
         }
-        // Present only when this machine's host is recognized — see
-        // `core::rebuild::detect` — so a repo that models no hosts (like
-        // roll-flow's own) never sees this column at all.
-        let show_build = self.rebuild_status.is_some();
-        if show_build {
-            col_constraints.push(Constraint::Length(rebuild::GUTTER_WIDTH as u16));
-        }
 
         let bold = Style::default().add_modifier(Modifier::BOLD);
-        let mut header_cells = vec![
-            Cell::from(""),
-            Cell::from(""),
+        let mut header_cells = vec![Cell::from(""), Cell::from("")];
+        if show_build {
+            header_cells.push(Cell::from("build").style(bold));
+        }
+        header_cells.extend([
             Cell::from("#").style(bold),
             Cell::from("branch").style(bold),
             Cell::from("loc").style(bold),
             Cell::from("sync").style(bold),
             Cell::from("state").style(bold),
-        ];
+        ]);
         if show_versions {
             header_cells.push(Cell::from("version").style(bold));
         }
@@ -4504,9 +4526,6 @@ impl StatusApp {
             header_cells.push(
                 Cell::from("dependants").style(Style::default().add_modifier(Modifier::BOLD)),
             );
-        }
-        if show_build {
-            header_cells.push(Cell::from("build").style(bold));
         }
         let table_header = Row::new(header_cells)
             .style(Style::default().add_modifier(Modifier::UNDERLINED))
@@ -4520,7 +4539,7 @@ impl StatusApp {
             Cell::from(
                 rebuild_status
                     .as_ref()
-                    .map(|s| rebuild::gutter_glyphs(s, branch))
+                    .map(|s| rebuild::gutter_label(s, branch))
                     .unwrap_or_default(),
             )
         };
@@ -4543,12 +4562,17 @@ impl StatusApp {
                             .add_modifier(Modifier::BOLD),
                     ),
                     Cell::from(graph_cell(base_graph_glyphs(base.role))),
+                ];
+                if show_build {
+                    cells.push(build_cell(&base.branch));
+                }
+                cells.extend([
                     Cell::from(""),
                     Cell::from(base.branch.clone()).style(base_style.fg(base.role.color())),
                     Cell::from(base.location.symbol()).style(base_style),
                     Cell::from(sync_text).style(Style::default().fg(sync_color)),
                     Cell::from(base.role.label()).style(Style::default().fg(base.role.color())),
-                ];
+                ]);
                 if show_versions {
                     cells.push(
                         Cell::from(version_cell(versions.get(&base.branch).copied()))
@@ -4558,9 +4582,6 @@ impl StatusApp {
                 if show_deps {
                     cells.push(Cell::from(""));
                     cells.push(Cell::from(""));
-                }
-                if show_build {
-                    cells.push(build_cell(&base.branch));
                 }
                 Row::new(cells)
             })
@@ -4580,12 +4601,17 @@ impl StatusApp {
                         .add_modifier(Modifier::BOLD),
                 ),
                 Cell::from(graph_cell(graph_glyphs(&roll.state))),
+            ];
+            if show_build {
+                cells.push(build_cell(&roll.branch));
+            }
+            cells.extend([
                 Cell::from(roll.number.to_string()).style(base_style),
                 Cell::from(roll.branch.clone()).style(base_style),
                 Cell::from(roll.location.symbol()).style(base_style),
                 Cell::from(sync_text).style(Style::default().fg(sync_color)),
                 Cell::from(roll.state.label()).style(Style::default().fg(row_state_color)),
-            ];
+            ]);
             if show_versions {
                 cells.push(
                     Cell::from(version_cell(versions.get(&roll.branch).copied())).style(base_style),
@@ -4594,9 +4620,6 @@ impl StatusApp {
             if show_deps {
                 cells.push(Cell::from(branches::format_deps(roll)));
                 cells.push(Cell::from(branches::format_roll_numbers(&roll.dependents)));
-            }
-            if show_build {
-                cells.push(build_cell(&roll.branch));
             }
             Row::new(cells)
         }));
@@ -4618,12 +4641,17 @@ impl StatusApp {
                         .add_modifier(Modifier::BOLD),
                 ),
                 Cell::from(graph_cell(hotfix_graph_glyphs(hotfix.state))),
+            ];
+            if show_build {
+                cells.push(build_cell(&hotfix.branch));
+            }
+            cells.extend([
                 Cell::from(format!("h{}", hotfix.number)).style(base_style.fg(color)),
                 Cell::from(hotfix.branch.clone()).style(base_style.fg(color)),
                 Cell::from(hotfix.location.symbol()).style(base_style),
                 Cell::from(sync_text).style(Style::default().fg(sync_color)),
                 Cell::from(hotfix.state.label()).style(Style::default().fg(color)),
-            ];
+            ]);
             if show_versions {
                 cells.push(
                     Cell::from(version_cell(versions.get(&hotfix.branch).copied()))
@@ -4633,9 +4661,6 @@ impl StatusApp {
             if show_deps {
                 cells.push(Cell::from(""));
                 cells.push(Cell::from(""));
-            }
-            if show_build {
-                cells.push(build_cell(&hotfix.branch));
             }
             // The first hotfix row keeps a blank line above it, which the rule
             // below is drawn into: the tiers number independently, so they
@@ -9070,6 +9095,7 @@ mod tests {
                 switch: Some(rebuild::RebuildMarker {
                     branch: "rolling".to_string(),
                     commit: "deadbeef".to_string(),
+                    committed_at: 0,
                 }),
                 test: None,
                 boot: None,
