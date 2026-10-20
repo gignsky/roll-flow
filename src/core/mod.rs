@@ -6,5 +6,6 @@ pub mod history;
 pub mod merge_driver;
 pub mod ops;
 pub mod proc;
+pub mod rebuild;
 pub mod sync;
 pub mod version;

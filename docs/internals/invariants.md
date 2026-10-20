@@ -127,6 +127,22 @@ long list — that keeps two rolls adding rules in different areas from collidin
 
 - Active hosts only. Never require verification from inactive hosts.
 
+## Local rebuild markers
+
+- `core::rebuild` never shells out to `nixos-rebuild`/`home-manager` and never
+  reads `/nix/var/nix/profiles/system` or `/run/current-system`. It only reads
+  commit messages the dotfiles repo's own rebuild scripts
+  (`scripts/nixos-rebuild.sh`, `scripts/home-switch.sh`) already write — pure
+  git-log scanning, the same "core never runs nix" rule config auto-detection
+  follows.
+- Unlike [Verification](#verification) above, this one is **not**
+  active-hosts-only on purpose: it is informational, not a gate, so a host
+  marked inactive (mid-reinstall, say) still shows what it last rebuilt. It
+  gates on a different, wider question — is this host known to
+  `config.hosts`/`config.host_active` *at all* — so a repo that models no
+  hosts (`hosts = []`, `host_active = {}`, the shape roll-flow's own
+  `.roll-flow.toml` is in) always shows nothing.
+
 ## Deletion safety
 
 - Deleting a branch requires more than promoted state. Promotion is read off commit

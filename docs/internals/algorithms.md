@@ -226,6 +226,101 @@ graduated rolls whose changes are in this roll's baseline. This is a promotion o
 constraint (this roll can't go to main before those do), not a graduation blocker. The
 `--basic` flag skips Method 4.
 
+## Local rebuild markers (`core/rebuild.rs`)
+
+**Not to be confused with the "Verification" section above** — that design
+(`core/verification.rs`, `rf test-all`, `Flake-Check:`/`Host-Results:`
+commits) was never built; this module is a separate, much narrower, purely
+informational one that *is* shipped. It answers "what did *this machine*
+most recently rebuild, locally" — for `rf status`/`rf list`'s `build` gutter
+column and `--json` output — and gates nothing. `rf` never shells out to
+`nixos-rebuild`/`home-manager` or reads profile symlinks here; it only reads
+commit messages the dotfiles repo's own rebuild scripts
+(`scripts/nixos-rebuild.sh`, `scripts/home-switch.sh`) already write:
+
+- NixOS: `<host-id>: generation <N> (switch|boot|test)`, or
+  `<host-id>: unknown generation (switch|boot|test)`.
+- Home-manager switch: `<username>@<host-id>: ... id <N> -> ... (current)`.
+- Home-manager test build: `<username>@<host-id>: test build (no generation created)`
+  (home-manager has no "boot" concept).
+
+`<host-id>` is `<flake-target>@<physical-host>` on WSL, else the plain flake
+target — `core::rebuild::current_host_identifier` mirrors dotfiles' own
+`scripts/host-detection-lib.sh` to compute it (hostname, `nixos`→`wsl` under
+WSL, `cmd.exe`/`.physical-host`/`hostname` for the physical host), with a
+`RF_HOST_IDENTIFIER` env var as both a manual override and the seam
+integration tests use to fake a host deterministically.
+
+**Gating.** Invisible unless the current host's flake-target (the part
+before any `@physical-host`) is known to `config.hosts`/`config.host_active`
+at all — not `active_hosts()`: a host marked inactive (e.g. mid-reinstall)
+should still show what it last rebuilt. A repo that models no hosts at
+all — `hosts = []`, `host_active = {}`, the shape roll-flow's own
+`.roll-flow.toml` is in — always shows nothing, by construction.
+
+**Discovery.** One `git log --all` pass (already newest-first) finds the
+most recent commit matching each of five shapes: nixos switch/test/boot,
+home switch/test. Kept as its own pass, independent of attribution below: a
+commit whose owning roll has since been pruned belongs to none of the
+ownership sets attribution builds, so folding discovery into that walk would
+silently miss exactly the commit this feature is about.
+
+**Attribution.** Naming which roll (or `rolling`/`stable`) a found commit
+belongs to is *not* a plain `is_ancestor` check against each roll in turn —
+that reproduces the exact false-positive the dependency-detection methods
+above warn about: every roll forks from stable, so a commit made directly on
+stable long ago is an ancestor of nearly every roll created afterwards too,
+and checking rolls first would misreport it as belonging to whichever roll
+happens to be checked first.
+
+Instead, three plain sets — `git rev-list --first-parent <ref>` for stable,
+for rolling, and for each roll in the current list — are checked in a fixed
+order: **stable, then rolling, then rolls** (ascending by number, which is
+only ever a deterministic tie-break — see below). No exclusion is needed:
+this codebase's merges are always `--no-ff` (see
+[invariants.md](invariants.md)), which keeps the branch being merged
+*into*'s own tip as the first parent, so content merged in from elsewhere —
+a roll's own work via its graduation merge, a dependency's via `[i]`/`rf
+integrate` — sits on the *second*-parent side and never appears on another
+ref's first-parent chain, no matter how long ago or how many tiers later
+that merge happened. A roll's own commits are therefore never found on
+stable's or rolling's set, so checking those two first costs a roll nothing;
+it only catches the ancient-shared-baseline case before a roll's set ever
+gets a chance to claim it. (One non-obvious consequence, found by testing
+this against a repo with history: `^<ref>` always excludes `<ref>`'s
+*immediate* parents regardless of parent index, `--exclude-first-parent-only`
+or not — only commits *further back* on the excluded side are protected by
+that flag. An earlier version of this attribution tried to bound each roll's
+set with that flag; it does not do what it looks like it does, and that
+version silently lost a roll's own commits the moment anything downstream
+merged the roll in.)
+
+A commit matching none of the three sets falls back to a plain ancestor
+check, in the same **stable, then rolling** order: the common real case is a
+roll's own switch/test/boot commit after that roll has graduated, promoted,
+and had its branch pruned, so there is no roll set left to claim it either —
+it was only ever introduced to rolling/stable through a merge's second
+parent, which `--first-parent` never walks, and is absent from every set
+above for exactly the reason that keeps those sets sound. The plain check
+here cannot reintroduce the false-positive above — it only ever resolves to
+`rolling`/`stable`, never to a specific roll, and only runs once every
+still-existing roll's own set has already failed to claim the commit. What
+remains genuinely unattributed is narrower still: a commit still only on an
+unlanded hotfix branch (not an attribution candidate today).
+
+**Superseding.** After attribution, a `test`/`boot` marker is dropped once
+the channel's `switch` marker is at least as recent, compared by **commit
+timestamp (`%ct`), not ancestry**. Ancestry can't make this call: a `switch`
+on `main` and an earlier `test` on an active, unmerged roll have no ancestor
+relationship at all — a real case found against `~/.dotfiles` — so an
+ancestry-based check left the stale test visible indefinitely, reading as if
+that roll were still "the current story" long after an unrelated switch had
+made it not. Time is the only ordering two unrelated branches share.
+`discover` already carries each hit's timestamp alongside its hash for
+exactly this. `test` and `boot` are never compared against each other: they
+are parallel states (ran-but-not-persisted vs. staged-for-next-boot), not
+competing ones.
+
 ## Revert detection (`core/branches.rs`)
 
 A roll's graduation (or promotion) merge is a normal commit — someone can
