@@ -5,7 +5,7 @@ use anyhow::Result;
 use crate::core::{
     branches::{self, BranchLocation, HotfixInfo, RollInfo},
     config::Config,
-    git,
+    git, rebuild,
 };
 
 /// `show_deps` drives the `deps` / `dependants` columns. Unlike `rf list`, where
@@ -25,13 +25,28 @@ pub fn run(no_tui: bool, show_deps: bool) -> Result<()> {
     let current_roll = branches::get_current_roll(&config)?;
     print_header(&config, &current_branch);
     print_current_roll_line(&config, &current_roll);
+
+    let rebuild_status = rebuild::current_host_identifier(repo)
+        .and_then(|host_id| rebuild::detect(&config, repo, &rolls, &host_id));
+    if let Some(line) = rebuild_status
+        .as_ref()
+        .and_then(rebuild::format_summary_line)
+    {
+        println!("{line}");
+    }
     println!();
 
     let hotfixes = branches::list_hotfixes(&config)?;
     if rolls.is_empty() && hotfixes.is_empty() {
         println!("  (no roll branches found)");
     } else {
-        print_rolls_table(&config, &rolls, &hotfixes, show_deps);
+        print_rolls_table(
+            &config,
+            &rolls,
+            &hotfixes,
+            show_deps,
+            rebuild_status.as_ref(),
+        );
     }
 
     Ok(())
@@ -75,6 +90,7 @@ fn print_rolls_table(
     rolls: &[RollInfo],
     hotfixes: &[HotfixInfo],
     show_deps: bool,
+    rebuild_status: Option<&rebuild::RebuildStatus>,
 ) {
     // Compute column widths dynamically — over the hotfix names too, since
     // they share the columns.
@@ -109,9 +125,21 @@ fn print_rolls_table(
         }
     };
 
+    // Present only when this machine's host is known to the config and has at
+    // least been looked at — a dotfiles-shaped repo pays for this column, a
+    // repo with no hosts modeled (like roll-flow's own) never sees it.
+    let build_hdr = rebuild_status
+        .map(|_| "  build".to_string())
+        .unwrap_or_default();
+    let build_col = |branch: &str| {
+        rebuild_status
+            .map(|s| format!("  {}", rebuild::gutter_glyphs(s, branch)))
+            .unwrap_or_default()
+    };
+
     // Header
     println!(
-        "  {num:>nw$}  {name:<ew$}  {loc:<3}  {state:<sw$}{ver_hdr}{deps_hdr}",
+        "  {num:>nw$}  {name:<ew$}  {loc:<3}  {state:<sw$}{ver_hdr}{deps_hdr}{build_hdr}",
         num = "#",
         name = "roll",
         loc = "loc",
@@ -133,7 +161,7 @@ fn print_rolls_table(
         sw = state_w,
     );
     println!(
-        "  {sep_n}  {sep_e}  ───  {sep_s}{sep_v}{sep_d}",
+        "  {sep_n}  {sep_e}  ───  {sep_s}{sep_v}{sep_d}{sep_b}",
         sep_n = "─".repeat(num_w),
         sep_e = "─".repeat(name_w),
         sep_s = "─".repeat(state_w),
@@ -144,6 +172,11 @@ fn print_rolls_table(
         },
         sep_d = if show_deps {
             format!("  {}  {}", "─".repeat(dep_w), "─".repeat(dependant_w))
+        } else {
+            String::new()
+        },
+        sep_b = if rebuild_status.is_some() {
+            format!("  {}", "─".repeat(rebuild::GUTTER_WIDTH))
         } else {
             String::new()
         },
@@ -161,13 +194,14 @@ fn print_rolls_table(
             String::new()
         };
         println!(
-            "{cur} {num:>nw$}  {name:<ew$}  {loc:<3}  {state:<sw$}{ver_col}{deps_col}",
+            "{cur} {num:>nw$}  {name:<ew$}  {loc:<3}  {state:<sw$}{ver_col}{deps_col}{build_col}",
             cur = cur_marker,
             ver_col = version_col(&roll.branch),
             num = roll.number,
             name = roll.branch,
             loc = location_symbol(&roll.location),
             state = roll.state.label(),
+            build_col = build_col(&roll.branch),
             nw = num_w,
             ew = name_w,
             sw = state_w,
@@ -176,6 +210,11 @@ fn print_rolls_table(
     crate::print_hotfix_rows(hotfixes, name_w, state_w);
     println!();
     println!("  loc: L=local  R=remote  B=both");
+    if rebuild_status.is_some() {
+        println!(
+            "  build: N/n/b=nixos switch/test/boot  H/h=home switch/test — most recent local rebuild"
+        );
+    }
     if show_deps {
         println!("  deps: rolls this one integrated  |  dependants: rolls that integrated it");
         println!(

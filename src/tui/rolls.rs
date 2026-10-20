@@ -37,7 +37,7 @@ use crate::core::{
     },
     config::{Config, PullMode},
     git::{self, TrackState},
-    history, ops, proc,
+    history, ops, proc, rebuild,
     sync::{self, PullPlan, PushOutcome, SyncTarget},
     version::{self, BumpLevel, Semver, VersionCheck, VersionStatus},
 };
@@ -709,6 +709,15 @@ struct StatusApp {
     /// `None` in repos with no `Cargo.toml`, where the header omits it and `[b]`
     /// refuses.
     version: Option<Semver>,
+    /// This machine's host identifier, resolved once at startup (WSL
+    /// interop, if any, is a real subprocess call — not something to redo on
+    /// every reload). `None` when it could not be determined at all.
+    host_id: Option<String>,
+    /// This machine's most recent local nixos/home-manager rebuild,
+    /// recomputed on reload like `versions` is. `None` when `host_id` is
+    /// unset or not known to `config.hosts`/`host_active` — see
+    /// `core::rebuild::detect`.
+    rebuild_status: Option<rebuild::RebuildStatus>,
     table: TableState,
     mode: Mode,
     /// Transient one-line feedback (e.g. why an action was rejected), cleared on
@@ -2363,6 +2372,10 @@ impl StatusApp {
         let tracking = load_tracking(&config);
         let versions = load_versions(&config, &bases, &rolls, &hotfixes);
         let version = version::read_version(&config.repo_root).unwrap_or(None);
+        let host_id = rebuild::current_host_identifier(&config.repo_root);
+        let rebuild_status = host_id
+            .as_deref()
+            .and_then(|id| rebuild::detect(&config, &config.repo_root, &rolls, id));
         Self {
             config,
             current_branch,
@@ -2373,6 +2386,8 @@ impl StatusApp {
             tracking,
             versions,
             version,
+            host_id,
+            rebuild_status,
             table,
             mode: Mode::Browsing,
             message: None,
@@ -4275,6 +4290,10 @@ impl StatusApp {
         // Read from the worktree, so a bump — or a branch switch that changes it —
         // shows in the header straight away.
         self.version = version::read_version(&self.config.repo_root).unwrap_or(None);
+        self.rebuild_status = self
+            .host_id
+            .as_deref()
+            .and_then(|id| rebuild::detect(&self.config, &self.config.repo_root, &self.rolls, id));
         let len = self.row_count();
         if len == 0 {
             self.table.select(None);
@@ -4458,6 +4477,13 @@ impl StatusApp {
             // `branch` is the Fill column that pays for anything wider.
             col_constraints.push(Constraint::Length(10));
         }
+        // Present only when this machine's host is recognized — see
+        // `core::rebuild::detect` — so a repo that models no hosts (like
+        // roll-flow's own) never sees this column at all.
+        let show_build = self.rebuild_status.is_some();
+        if show_build {
+            col_constraints.push(Constraint::Length(rebuild::GUTTER_WIDTH as u16));
+        }
 
         let bold = Style::default().add_modifier(Modifier::BOLD);
         let mut header_cells = vec![
@@ -4479,6 +4505,9 @@ impl StatusApp {
                 Cell::from("dependants").style(Style::default().add_modifier(Modifier::BOLD)),
             );
         }
+        if show_build {
+            header_cells.push(Cell::from("build").style(bold));
+        }
         let table_header = Row::new(header_cells)
             .style(Style::default().add_modifier(Modifier::UNDERLINED))
             .height(1);
@@ -4486,6 +4515,15 @@ impl StatusApp {
         let show_deps = self.show_deps;
         let tracking = &self.tracking;
         let versions = &self.versions;
+        let rebuild_status = &self.rebuild_status;
+        let build_cell = |branch: &str| {
+            Cell::from(
+                rebuild_status
+                    .as_ref()
+                    .map(|s| rebuild::gutter_glyphs(s, branch))
+                    .unwrap_or_default(),
+            )
+        };
         // Base branches are pinned above the rolls: no number and no state, the
         // `state` column carrying their role instead.
         let mut rows: Vec<Row> = self
@@ -4521,6 +4559,9 @@ impl StatusApp {
                     cells.push(Cell::from(""));
                     cells.push(Cell::from(""));
                 }
+                if show_build {
+                    cells.push(build_cell(&base.branch));
+                }
                 Row::new(cells)
             })
             .collect();
@@ -4553,6 +4594,9 @@ impl StatusApp {
             if show_deps {
                 cells.push(Cell::from(branches::format_deps(roll)));
                 cells.push(Cell::from(branches::format_roll_numbers(&roll.dependents)));
+            }
+            if show_build {
+                cells.push(build_cell(&roll.branch));
             }
             Row::new(cells)
         }));
@@ -4589,6 +4633,9 @@ impl StatusApp {
             if show_deps {
                 cells.push(Cell::from(""));
                 cells.push(Cell::from(""));
+            }
+            if show_build {
+                cells.push(build_cell(&hotfix.branch));
             }
             // The first hotfix row keeps a blank line above it, which the rule
             // below is drawn into: the tiers number independently, so they
@@ -6639,6 +6686,8 @@ mod tests {
             show_deps: false,
             tracking: HashMap::new(),
             versions: HashMap::new(),
+            host_id: None,
+            rebuild_status: None,
             version: None,
             table: TableState::default(),
             mode: Mode::Browsing,
@@ -6704,6 +6753,8 @@ mod tests {
             show_deps: false,
             tracking: HashMap::new(),
             versions: HashMap::new(),
+            host_id: None,
+            rebuild_status: None,
             version: None,
             table: TableState::default(),
             mode: Mode::Browsing,
@@ -6744,6 +6795,8 @@ mod tests {
             show_deps: false,
             tracking: HashMap::new(),
             versions: HashMap::new(),
+            host_id: None,
+            rebuild_status: None,
             version: None,
             table: TableState::default(),
             mode: Mode::Browsing,
@@ -8510,6 +8563,8 @@ mod tests {
             show_deps: false,
             tracking: HashMap::new(),
             versions: HashMap::new(),
+            host_id: None,
+            rebuild_status: None,
             version: None,
             table: TableState::default(),
             mode: Mode::Browsing,
@@ -8903,6 +8958,8 @@ mod tests {
             show_deps: false,
             tracking,
             versions: HashMap::new(),
+            host_id: None,
+            rebuild_status: None,
             version: None,
             table: TableState::default(),
             mode: Mode::Browsing,
@@ -8962,6 +9019,8 @@ mod tests {
             tracking: HashMap::new(),
             versions,
             version: None,
+            host_id: None,
+            rebuild_status: None,
             table: TableState::default(),
             mode: Mode::Browsing,
             message: None,
@@ -8989,6 +9048,93 @@ mod tests {
     }
 
     #[test]
+    fn the_build_column_marks_a_recognized_hosts_recent_rebuild_on_the_right_row() {
+        let rolls = vec![roll_n(1, RollState::Active)];
+        let bases = vec![
+            BaseBranch {
+                role: BaseRole::Stable,
+                branch: "main".to_string(),
+                location: BranchLocation::Local,
+                is_current: false,
+            },
+            BaseBranch {
+                role: BaseRole::Rolling,
+                branch: "rolling".to_string(),
+                location: BranchLocation::Local,
+                is_current: false,
+            },
+        ];
+        let rebuild_status = Some(rebuild::RebuildStatus {
+            host_id: "merlin".to_string(),
+            nixos: rebuild::ChannelStatus {
+                switch: Some(rebuild::RebuildMarker {
+                    branch: "rolling".to_string(),
+                    commit: "deadbeef".to_string(),
+                }),
+                test: None,
+                boot: None,
+            },
+            home: rebuild::ChannelStatus::default(),
+        });
+
+        let mut app = StatusApp {
+            config: test_config(),
+            current_branch: "main".to_string(),
+            bases,
+            rolls,
+            hotfixes: Vec::new(),
+            show_deps: true,
+            tracking: HashMap::new(),
+            versions: HashMap::new(),
+            version: None,
+            host_id: Some("merlin".to_string()),
+            rebuild_status,
+            table: TableState::default(),
+            mode: Mode::Browsing,
+            message: None,
+            job: None,
+            job_title: String::new(),
+            job_moves_head: false,
+            queue: Queue::default(),
+            quit_armed: false,
+            deferred_mode: None,
+            panel: None,
+            panel_maximized: false,
+            panel_rect: None,
+            pending_g: false,
+            pending_push: None,
+            pending_pull: None,
+            command_history: Vec::new(),
+        };
+        let out = draw(|f, area| app.render_table(f, area));
+
+        assert!(out.contains("build"), "no build header:\n{out}");
+        let rolling_row = out
+            .lines()
+            .find(|l| l.contains("rolling"))
+            .expect("rolling base row");
+        assert!(
+            rolling_row.contains('N'),
+            "nixos switch marker missing on the rolling row: {rolling_row}"
+        );
+        let roll_row = out
+            .lines()
+            .find(|l| l.contains("roll/1-0101-x"))
+            .expect("roll row");
+        assert!(
+            !roll_row.contains('N'),
+            "the marker must only appear on the row it points at: {roll_row}"
+        );
+        // Even with `show_deps` also on, the branch column must still read the
+        // full branch name — the table's width budget is scarce (see
+        // `docs/internals/algorithms.md`'s "Roll graph column" section).
+        assert!(
+            out.contains("roll/1-0101-x"),
+            "branch name got truncated:\n{out}"
+        );
+    }
+
+    #[test]
     fn the_version_column_is_absent_in_a_repo_with_no_manifest() {
         // The whole opt-in rule: no `Cargo.toml` anywhere, no column, no cost to
         // the `branch` column. This is every dotfiles repo.
@@ -9001,6 +9147,8 @@ mod tests {
             show_deps: false,
             tracking: HashMap::new(),
             versions: HashMap::new(),
+            host_id: None,
+            rebuild_status: None,
             version: None,
             table: TableState::default(),
             mode: Mode::Browsing,
@@ -9053,6 +9201,8 @@ mod tests {
             show_deps: false,
             tracking: HashMap::new(),
             versions: HashMap::new(),
+            host_id: None,
+            rebuild_status: None,
             version: None,
             table: TableState::default(),
             mode: Mode::Browsing,
@@ -10122,6 +10272,8 @@ mod tests {
             show_deps: false,
             tracking: HashMap::new(),
             versions: HashMap::new(),
+            host_id: None,
+            rebuild_status: None,
             version: None,
             table: TableState::default(),
             mode: Mode::Browsing,
@@ -10450,6 +10602,8 @@ mod tests {
             show_deps: false,
             tracking: HashMap::new(),
             versions: HashMap::new(),
+            host_id: None,
+            rebuild_status: None,
             version: None,
             table,
             mode: Mode::Browsing,
@@ -10523,6 +10677,8 @@ mod tests {
             show_deps: false,
             tracking: HashMap::new(),
             versions: HashMap::new(),
+            host_id: None,
+            rebuild_status: None,
             version: None,
             table,
             mode: Mode::Browsing,

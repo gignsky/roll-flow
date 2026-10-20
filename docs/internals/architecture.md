@@ -35,6 +35,7 @@ src/
     clean.rs           stale-branch detection across all remotes
     version.rs         version gate and release tags
     merge_driver.rs    git merge driver resolving the version in Cargo.toml/.lock
+    rebuild.rs         this machine's last local nixos/home-manager rebuild
 ```
 
 Three notes on that layout:

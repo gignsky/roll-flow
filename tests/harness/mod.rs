@@ -725,6 +725,24 @@ impl Sandbox {
         serde_json::from_str(&out.stdout).expect("parse status --json")
     }
 
+    /// [`list_json`](Self::list_json) with extra environment variables — for
+    /// `RF_HOST_IDENTIFIER`, which fakes this machine's host identity so
+    /// `core::rebuild` detection is deterministic under test regardless of
+    /// the real machine running `cargo test`.
+    pub fn list_json_with_env(&self, env: &[(&str, &str)]) -> serde_json::Value {
+        let out = self.rf_with_env(&["list", "--json"], env);
+        assert!(out.success, "list --json failed: {}", out.combined());
+        serde_json::from_str(&out.stdout).expect("parse list --json")
+    }
+
+    /// [`status_json`](Self::status_json) with extra environment variables —
+    /// see [`list_json_with_env`](Self::list_json_with_env).
+    pub fn status_json_with_env(&self, env: &[(&str, &str)]) -> serde_json::Value {
+        let out = self.rf_with_env(&["status", "--json"], env);
+        assert!(out.success, "status --json failed: {}", out.combined());
+        serde_json::from_str(&out.stdout).expect("parse status --json")
+    }
+
     /// Reported state label for a roll branch (e.g. `"active"`,
     /// `"✓ graduated"`, `"✓ promoted"`), or `None` if `rf` doesn't list it.
     pub fn roll_state(&self, branch: &str) -> Option<String> {
@@ -763,6 +781,47 @@ impl Sandbox {
         let here = self.current_branch();
         self.git(&["checkout", branch]);
         self.commit_empty(&format!("{host}: generation {generation}"));
+        if here != branch {
+            self.git(&["checkout", &here]);
+        }
+    }
+
+    /// Append a NixOS rebuild-marker commit (`<host_id>: generation <N>
+    /// (<mode>)`) to `branch` — the real shape `scripts/nixos-rebuild.sh`
+    /// writes. `mode` is `"switch"`, `"boot"`, or `"test"`.
+    pub fn add_nixos_rebuild(&self, branch: &str, host_id: &str, generation: u32, mode: &str) {
+        let here = self.current_branch();
+        self.git(&["checkout", branch]);
+        self.commit_empty(&format!("{host_id}: generation {generation} ({mode})"));
+        if here != branch {
+            self.git(&["checkout", &here]);
+        }
+    }
+
+    /// Append a home-manager *switch* rebuild-marker commit
+    /// (`<username>@<host_id>: ... id <N> -> ... (current)`) to `branch` —
+    /// the real shape `scripts/home-switch.sh` writes.
+    pub fn add_home_switch(&self, branch: &str, username: &str, host_id: &str, generation: u32) {
+        let here = self.current_branch();
+        self.git(&["checkout", branch]);
+        self.commit_empty(&format!(
+            "{username}@{host_id}: 2026-01-01 00:00 : id {generation} -> /nix/store/x-home-manager-generation (current)"
+        ));
+        if here != branch {
+            self.git(&["checkout", &here]);
+        }
+    }
+
+    /// Append a home-manager *test build* marker commit
+    /// (`<username>@<host_id>: test build (no generation created)`) to
+    /// `branch` — `home-switch.sh`'s `-t`/`--test` shape, which builds but
+    /// never activates or creates a generation.
+    pub fn add_home_test_build(&self, branch: &str, username: &str, host_id: &str) {
+        let here = self.current_branch();
+        self.git(&["checkout", branch]);
+        self.commit_empty(&format!(
+            "{username}@{host_id}: test build (no generation created)"
+        ));
         if here != branch {
             self.git(&["checkout", &here]);
         }
