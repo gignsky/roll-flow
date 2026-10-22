@@ -202,6 +202,91 @@ impl Sandbox {
         panic!("no version in Cargo.toml at {refspec}: {text}");
     }
 
+    /// A plain repo that carries a `package.json`, so the version gate and
+    /// release tagging engage through the npm arm. Deliberately not a real
+    /// npm package: no `node_modules`, no npm command has to succeed for
+    /// these tests to be meaningful, which keeps them fast and offline.
+    pub fn npm() -> Self {
+        let sb = Sandbox::plain();
+        sb.write_package_version("0.0.1");
+        sb.git(&["add", "package.json"]);
+        sb.git(&["commit", "-m", "add manifest"]);
+        sb
+    }
+
+    /// Write `package.json` with `version`, four-space indented on purpose
+    /// (the Cargo fixture's tab-vs-space equivalent), plus a nested object
+    /// carrying its own `version` key that must never be mistaken for the
+    /// package version, and no trailing newline — so formatting preservation
+    /// is exercised by every test that bumps.
+    pub fn write_package_version(&self, version: &str) {
+        self.write(
+            "package.json",
+            &format!(
+                "{{\n    \"name\": \"fixture\",\n    \"version\": \"{version}\",\n    \
+                 \"publishConfig\": {{\n        \"version\": \"9.9.9\"\n    }}\n}}"
+            ),
+        );
+    }
+
+    /// Commit a `package.json` bumped to `version` on the current branch.
+    pub fn commit_package_version(&self, version: &str) {
+        self.write_package_version(version);
+        self.git(&["add", "package.json"]);
+        self.git(&["commit", "-m", &format!("set version {version}")]);
+    }
+
+    /// Write a real-looking `package-lock.json` (lockfile v3 shape): the root
+    /// `version`, `packages[""].version` repeating it, and one dependency
+    /// entry (`leftpad`) whose own `version` must never be mistaken for the
+    /// package version.
+    pub fn write_package_lock(&self, own: &str) {
+        self.write(
+            "package-lock.json",
+            &format!(
+                "{{\n  \"name\": \"fixture\",\n  \"version\": \"{own}\",\n  \
+                 \"lockfileVersion\": 3,\n  \"packages\": {{\n    \"\": {{\n      \
+                 \"name\": \"fixture\",\n      \"version\": \"{own}\"\n    }},\n    \
+                 \"node_modules/leftpad\": {{\n      \"version\": \"1.0.0\"\n    }}\n  }}\n}}\n"
+            ),
+        );
+    }
+
+    /// Write `package-lock.json` (see [`Sandbox::write_package_lock`]) and
+    /// commit it on the current branch — unless it already says exactly
+    /// that, mirroring [`Sandbox::commit_cargo_lock`].
+    pub fn commit_package_lock(&self, own: &str) {
+        self.write_package_lock(own);
+        self.git(&["add", "package-lock.json"]);
+        if !self.git_try(&["diff", "--cached", "--quiet"]).0 {
+            self.git(&["commit", "-m", &format!("set lockfile {own}")]);
+        }
+    }
+
+    /// The `version` recorded in `package.json` at `refspec`.
+    pub fn package_version_at(&self, refspec: &str) -> String {
+        let text = self.git(&["show", &format!("{refspec}:package.json")]);
+        for line in text.lines() {
+            let trimmed = line.trim();
+            if trimmed.starts_with("\"version\"") {
+                return trimmed.split('"').nth(3).unwrap_or_default().to_string();
+            }
+        }
+        panic!("no version in package.json at {refspec}: {text}");
+    }
+
+    /// The root `version` recorded in `package-lock.json` at `refspec`.
+    pub fn package_lock_version_at(&self, refspec: &str) -> String {
+        let text = self.git(&["show", &format!("{refspec}:package-lock.json")]);
+        for line in text.lines() {
+            let trimmed = line.trim();
+            if trimmed.starts_with("\"version\"") {
+                return trimmed.split('"').nth(3).unwrap_or_default().to_string();
+            }
+        }
+        panic!("no version in package-lock.json at {refspec}: {text}");
+    }
+
     /// Flip a boolean key in the sandbox's `.roll-flow.toml` (call after
     /// `rf init`). Replaces the line in place when present, else appends it
     /// ahead of the first table header so it stays a root-level key.
@@ -209,6 +294,36 @@ impl Sandbox {
         let path = self.path().join(".roll-flow.toml");
         let existing = fs::read_to_string(&path).expect("read config");
         let new_line = format!("{key} = {value}");
+        let mut replaced = false;
+        let mut lines: Vec<String> = existing
+            .lines()
+            .map(|l| {
+                if l.trim_start().starts_with(&format!("{key} ")) {
+                    replaced = true;
+                    new_line.clone()
+                } else {
+                    l.to_string()
+                }
+            })
+            .collect();
+        if !replaced {
+            let at = lines
+                .iter()
+                .position(|l| l.trim_start().starts_with('['))
+                .unwrap_or(lines.len());
+            lines.insert(at, new_line);
+        }
+        let mut text = lines.join("\n");
+        text.push('\n');
+        fs::write(&path, text).expect("write config");
+    }
+
+    /// Like [`set_config_flag`](Self::set_config_flag), for a string-valued
+    /// key (e.g. `version_manifest = "npm"`).
+    pub fn set_config_string(&self, key: &str, value: &str) {
+        let path = self.path().join(".roll-flow.toml");
+        let existing = fs::read_to_string(&path).expect("read config");
+        let new_line = format!("{key} = \"{value}\"");
         let mut replaced = false;
         let mut lines: Vec<String> = existing
             .lines()
@@ -415,6 +530,29 @@ impl Sandbox {
     /// history like generation-bump commits).
     pub fn commit_empty(&self, msg: &str) {
         self.git(&["commit", "--allow-empty", "-m", msg]);
+    }
+
+    /// [`commit_empty`](Self::commit_empty) with an explicit committer/author
+    /// Unix timestamp. A sandbox otherwise builds its whole history inside
+    /// one second, so commits that must be *provably* ordered by time (not
+    /// just by creation order) — `core::rebuild`'s time-based supersede,
+    /// unlike most of this harness's git-log-order-sensitive tests — need
+    /// this rather than [`rf_with_env`](Self::rf_with_env)'s date env vars,
+    /// since this commits directly via `git`, not through `rf`.
+    pub fn commit_empty_at(&self, msg: &str, unix_ts: i64) {
+        let date = format!("@{unix_ts} +0000");
+        let output = Command::new("git")
+            .current_dir(self.path())
+            .env("GIT_AUTHOR_DATE", &date)
+            .env("GIT_COMMITTER_DATE", &date)
+            .args(["commit", "--allow-empty", "-m", msg])
+            .output()
+            .expect("run git");
+        assert!(
+            output.status.success(),
+            "git commit --allow-empty failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
     }
 
     // ── convenience workflow steps ────────────────────────────────────────
@@ -725,6 +863,24 @@ impl Sandbox {
         serde_json::from_str(&out.stdout).expect("parse status --json")
     }
 
+    /// [`list_json`](Self::list_json) with extra environment variables — for
+    /// `RF_HOST_IDENTIFIER`, which fakes this machine's host identity so
+    /// `core::rebuild` detection is deterministic under test regardless of
+    /// the real machine running `cargo test`.
+    pub fn list_json_with_env(&self, env: &[(&str, &str)]) -> serde_json::Value {
+        let out = self.rf_with_env(&["list", "--json"], env);
+        assert!(out.success, "list --json failed: {}", out.combined());
+        serde_json::from_str(&out.stdout).expect("parse list --json")
+    }
+
+    /// [`status_json`](Self::status_json) with extra environment variables —
+    /// see [`list_json_with_env`](Self::list_json_with_env).
+    pub fn status_json_with_env(&self, env: &[(&str, &str)]) -> serde_json::Value {
+        let out = self.rf_with_env(&["status", "--json"], env);
+        assert!(out.success, "status --json failed: {}", out.combined());
+        serde_json::from_str(&out.stdout).expect("parse status --json")
+    }
+
     /// Reported state label for a roll branch (e.g. `"active"`,
     /// `"✓ graduated"`, `"✓ promoted"`), or `None` if `rf` doesn't list it.
     pub fn roll_state(&self, branch: &str) -> Option<String> {
@@ -763,6 +919,69 @@ impl Sandbox {
         let here = self.current_branch();
         self.git(&["checkout", branch]);
         self.commit_empty(&format!("{host}: generation {generation}"));
+        if here != branch {
+            self.git(&["checkout", &here]);
+        }
+    }
+
+    /// Append a NixOS rebuild-marker commit (`<host_id>: generation <N>
+    /// (<mode>)`) to `branch` — the real shape `scripts/nixos-rebuild.sh`
+    /// writes. `mode` is `"switch"`, `"boot"`, or `"test"`.
+    pub fn add_nixos_rebuild(&self, branch: &str, host_id: &str, generation: u32, mode: &str) {
+        let here = self.current_branch();
+        self.git(&["checkout", branch]);
+        self.commit_empty(&format!("{host_id}: generation {generation} ({mode})"));
+        if here != branch {
+            self.git(&["checkout", &here]);
+        }
+    }
+
+    /// [`add_nixos_rebuild`](Self::add_nixos_rebuild), at an explicit
+    /// committer Unix timestamp — see
+    /// [`commit_empty_at`](Self::commit_empty_at).
+    pub fn add_nixos_rebuild_at(
+        &self,
+        branch: &str,
+        host_id: &str,
+        generation: u32,
+        mode: &str,
+        unix_ts: i64,
+    ) {
+        let here = self.current_branch();
+        self.git(&["checkout", branch]);
+        self.commit_empty_at(
+            &format!("{host_id}: generation {generation} ({mode})"),
+            unix_ts,
+        );
+        if here != branch {
+            self.git(&["checkout", &here]);
+        }
+    }
+
+    /// Append a home-manager *switch* rebuild-marker commit
+    /// (`<username>@<host_id>: ... id <N> -> ... (current)`) to `branch` —
+    /// the real shape `scripts/home-switch.sh` writes.
+    pub fn add_home_switch(&self, branch: &str, username: &str, host_id: &str, generation: u32) {
+        let here = self.current_branch();
+        self.git(&["checkout", branch]);
+        self.commit_empty(&format!(
+            "{username}@{host_id}: 2026-01-01 00:00 : id {generation} -> /nix/store/x-home-manager-generation (current)"
+        ));
+        if here != branch {
+            self.git(&["checkout", &here]);
+        }
+    }
+
+    /// Append a home-manager *test build* marker commit
+    /// (`<username>@<host_id>: test build (no generation created)`) to
+    /// `branch` — `home-switch.sh`'s `-t`/`--test` shape, which builds but
+    /// never activates or creates a generation.
+    pub fn add_home_test_build(&self, branch: &str, username: &str, host_id: &str) {
+        let here = self.current_branch();
+        self.git(&["checkout", branch]);
+        self.commit_empty(&format!(
+            "{username}@{host_id}: test build (no generation created)"
+        ));
         if here != branch {
             self.git(&["checkout", &here]);
         }

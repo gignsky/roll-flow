@@ -12,7 +12,7 @@ use serde::Serialize;
 
 use cli::{Cli, Cmd};
 use core::version::{self, BumpLevel, VersionCheck, VersionStatus};
-use core::{branches, config::Config, git, ops};
+use core::{branches, config::Config, git, ops, rebuild};
 
 fn main() -> Result<()> {
     let cli = Cli::parse();
@@ -208,7 +208,13 @@ fn cmd_init(
     // `ops::ensure_version_merge_driver`), so a repo whose config is already
     // up to date on a fresh clone still needs this wired up here.
     if ops::ensure_version_merge_driver(&overridden)? {
-        println!("Configured the version merge driver for Cargo.toml and Cargo.lock");
+        if let Some(kind) = overridden.manifest_kind() {
+            println!(
+                "Configured the version merge driver for {} and {}",
+                kind.manifest(),
+                kind.lockfile()
+            );
+        }
     }
 
     // A fresh file is the detected state rendered whole.
@@ -736,13 +742,15 @@ fn resolve_version_gate(
     // the finalized value alone already satisfies the gate, or immediately
     // before the bump below, so a promotion that ultimately fails (no bump
     // resolved) doesn't leave rolling finalized with nothing to show for it.
+    let forced_kind = config.forced_manifest();
     let needs_finalize = config.dev_versions
-        && version::read_version(&config.repo_root)?.is_some_and(|v| v.has_marker());
+        && version::read_version(&config.repo_root, forced_kind)?.is_some_and(|v| v.has_marker());
     let check = if !config.version_gate {
         VersionCheck::not_applicable()
     } else if config.dev_versions {
-        let finalized_head = version::read_version(&config.repo_root)?.map(|v| v.release());
-        version::check_against(&config.repo_root, finalized_head, &target_ref)?
+        let finalized_head =
+            version::read_version(&config.repo_root, forced_kind)?.map(|v| v.release());
+        version::check_against(&config.repo_root, finalized_head, &target_ref, forced_kind)?
     } else {
         ops::version_check(config, &source, &target_ref)?
     };
@@ -1390,7 +1398,7 @@ fn confirm_final_promotion(
     finalize: bool,
     yes: bool,
 ) -> Result<bool> {
-    let has_version = version::read_version(&config.repo_root)?.is_some();
+    let has_version = version::read_version(&config.repo_root, config.forced_manifest())?.is_some();
     if dry_run || !config.dev_versions || !has_version || finalize {
         return Ok(true);
     }
@@ -1653,12 +1661,17 @@ fn cmd_status_json() -> Result<()> {
         reason: readiness.reason,
     };
 
+    let local_rebuild = rebuild::current_host_identifier(&config.repo_root)
+        .and_then(|host_id| rebuild::detect(&config, &config.repo_root, &rolls, &host_id))
+        .map(JsonLocalRebuild::from);
+
     let payload = StatusPayload {
         current_branch: current,
         detached_head: detached,
         tier,
         clean_working_tree: clean,
         pending_roll_branches: rolls.into_iter().map(|r| r.branch).collect(),
+        local_rebuild,
         hotfixes: hotfixes
             .into_iter()
             .map(|h| JsonHotfix {
@@ -1682,9 +1695,11 @@ fn cmd_status_json() -> Result<()> {
 fn cmd_list_json() -> Result<()> {
     let config = Config::load()?;
     let rolls = branches::list_rolls(&config)?;
+    let rebuild_status = rebuild::current_host_identifier(&config.repo_root)
+        .and_then(|host_id| rebuild::detect(&config, &config.repo_root, &rolls, &host_id));
     println!(
         "{}",
-        serde_json::to_string_pretty(&rolls_for_json(&config, rolls))?
+        serde_json::to_string_pretty(&rolls_for_json(&config, rolls, rebuild_status.as_ref()))?
     );
     Ok(())
 }
@@ -2040,10 +2055,29 @@ fn cmd_list_text(no_tui: bool, deps: bool) -> Result<()> {
         return tui::rolls::run(config, current, rolls, deps);
     }
 
+    // Computed before the early return below: a rebuilt-directly-on-rolling
+    // switch has no roll row to attach to at all, which is exactly the
+    // no-rolls case this summary line most needs to cover (e.g. right after
+    // `rf prune` clears every roll).
+    let rebuild_status = rebuild::current_host_identifier(&config.repo_root)
+        .and_then(|host_id| rebuild::detect(&config, &config.repo_root, &rolls, &host_id));
+    let summary_line = rebuild_status
+        .as_ref()
+        .and_then(rebuild::format_summary_line);
+
     let hotfixes = branches::list_hotfixes(&config)?;
     if rolls.is_empty() && hotfixes.is_empty() {
+        if let Some(line) = summary_line {
+            println!("{line}");
+            println!();
+        }
         println!("(no roll branches)");
         return Ok(());
+    }
+
+    if let Some(line) = summary_line {
+        println!("{line}");
+        println!();
     }
 
     let name_w = rolls
@@ -2058,9 +2092,33 @@ fn cmd_list_text(no_tui: bool, deps: bool) -> Result<()> {
     let (dep_w, dependant_w) = dep_column_widths(&rolls);
     // Empty in a repo with no `Cargo.toml`, which drops the column entirely.
     let (versions, ver_w) = version_column(&config, &rolls);
+    // Placed in the left gutter, right after the current-branch chevron,
+    // rather than at the far right — it's a per-row marker, not a detail
+    // like `version`/`deps`. Padded like any other non-last column, so the
+    // columns after it stay aligned.
+    let build_w = rebuild_status.as_ref().map(|s| {
+        rolls
+            .iter()
+            .map(|r| rebuild::gutter_label(s, &r.branch).chars().count())
+            .max()
+            .unwrap_or(0)
+            .max("build".len())
+    });
+    let build_hdr = match build_w {
+        Some(w) => format!("{:<w$}  ", "build", w = w),
+        None => String::new(),
+    };
+    let build_col = |branch: &str| match (rebuild_status.as_ref(), build_w) {
+        (Some(s), Some(w)) => format!("{:<w$}  ", rebuild::gutter_label(s, branch), w = w),
+        _ => String::new(),
+    };
+    let build_sep = match build_w {
+        Some(w) => format!("{}  ", "─".repeat(w)),
+        None => String::new(),
+    };
 
     println!(
-        "  {num:>3}  {name:<nw$}  {loc:<3}  {state:<sw$}{ver_hdr}{deps_hdr}",
+        "  {build_hdr}{num:>3}  {name:<nw$}  {loc:<3}  {state:<sw$}{ver_hdr}{deps_hdr}",
         num = "#",
         name = "branch",
         loc = "loc",
@@ -2081,7 +2139,7 @@ fn cmd_list_text(no_tui: bool, deps: bool) -> Result<()> {
         sw = state_w,
     );
     println!(
-        "  ───  {sep_e}  ───  {sep_s}{sep_v}{sep_d}",
+        "  {build_sep}───  {sep_e}  ───  {sep_s}{sep_v}{sep_d}",
         sep_e = "─".repeat(name_w),
         sep_s = "─".repeat(state_w),
         sep_v = if versions.is_empty() {
@@ -2123,7 +2181,8 @@ fn cmd_list_text(no_tui: bool, deps: bool) -> Result<()> {
             }
         };
         println!(
-            "{cur} {num:>3}  {name:<nw$}  {loc:<3}  {state:<sw$}{ver_col}{deps_col}",
+            "{cur} {build_col}{num:>3}  {name:<nw$}  {loc:<3}  {state:<sw$}{ver_col}{deps_col}",
+            build_col = build_col(&roll.branch),
             num = roll.number,
             name = roll.branch,
             loc = roll.location.symbol(),
@@ -2132,7 +2191,7 @@ fn cmd_list_text(no_tui: bool, deps: bool) -> Result<()> {
             sw = state_w,
         );
     }
-    print_hotfix_rows(&hotfixes, name_w, state_w);
+    print_hotfix_rows(&hotfixes, name_w, state_w, build_w);
 
     // The same footnote `rf status --no-tui` prints, with or without `--deps`:
     // a cycle is what explains two rows each `⛔ blocked` on the other.
@@ -2155,16 +2214,29 @@ fn cmd_list_text(no_tui: bool, deps: bool) -> Result<()> {
 /// so the columns line up with the rolls above; a hotfix name wider than every
 /// roll's simply runs long, which beats re-measuring the whole table for a tier
 /// that is usually empty.
-pub(crate) fn print_hotfix_rows(hotfixes: &[branches::HotfixInfo], name_w: usize, state_w: usize) {
+pub(crate) fn print_hotfix_rows(
+    hotfixes: &[branches::HotfixInfo],
+    name_w: usize,
+    state_w: usize,
+    build_w: Option<usize>,
+) {
+    // Blank padding the width of the `build` column, if present — hotfixes
+    // never carry a rebuild marker, but the column sits ahead of `#` here
+    // (left gutter, like the TUI), so the rows below still need to line up.
+    let build_pad = build_w.map(|w| " ".repeat(w) + "  ").unwrap_or_default();
     // A thin rule between the tiers, as the TUI draws: rolls and hotfixes
     // number independently, so a roll 1 and an h1 should not read as one list.
     if !hotfixes.is_empty() {
-        println!("  {}", "┄".repeat(3 + 2 + name_w + 2 + 3 + 2 + state_w));
+        let build_rule_w = build_w.map(|w| w + 2).unwrap_or(0);
+        println!(
+            "  {}",
+            "┄".repeat(build_rule_w + 3 + 2 + name_w + 2 + 3 + 2 + state_w)
+        );
     }
     for hotfix in hotfixes {
         let cur = if hotfix.is_current { ">" } else { " " };
         println!(
-            "{cur} {num:>3}  {name:<nw$}  {loc:<3}  {state:<sw$}",
+            "{cur} {build_pad}{num:>3}  {name:<nw$}  {loc:<3}  {state:<sw$}",
             num = format!("h{}", hotfix.number),
             name = hotfix.branch,
             loc = hotfix.location.symbol(),
@@ -2195,7 +2267,7 @@ pub(crate) fn version_column(
         .iter()
         .map(|r| branches::content_ref(&r.branch, &r.location))
         .collect();
-    let by_ref = version::versions_at(&config.repo_root, &refs);
+    let by_ref = version::versions_at(&config.repo_root, &refs, config.forced_manifest());
 
     let by_branch: HashMap<String, String> = rolls
         .iter()
@@ -2250,11 +2322,72 @@ struct StatusPayload {
     tier: String,
     clean_working_tree: bool,
     pending_roll_branches: Vec<String>,
+    /// This machine's most recent local nixos/home-manager rebuild, or `null`
+    /// when the host isn't known to `hosts`/`host_active` at all (as in a
+    /// repo, like roll-flow's own, that models no hosts). See
+    /// `core::rebuild` — informational only, unrelated to `promotion` below.
+    local_rebuild: Option<JsonLocalRebuild>,
     /// Every `hotfix/*` branch, open or landed. Added as its own array rather
     /// than folded into the roll list, so scripted consumers reading rolls are
     /// not handed a branch with no roll number.
     hotfixes: Vec<JsonHotfix>,
     promotion: PromotionReadiness,
+}
+
+#[derive(Serialize)]
+struct JsonLocalRebuild {
+    host: String,
+    nixos: JsonChannelRebuild,
+    home: JsonChannelRebuild,
+}
+
+/// `switch`/`test`/`boot` are branch names (a roll's, or `rolling`/`stable`
+/// when the commit landed directly there) — `null` when nothing was found or
+/// a newer switch has already superseded it. `home.boot` is always `null`.
+#[derive(Serialize)]
+struct JsonChannelRebuild {
+    switch: Option<String>,
+    test: Option<String>,
+    boot: Option<String>,
+}
+
+impl From<rebuild::RebuildStatus> for JsonLocalRebuild {
+    fn from(status: rebuild::RebuildStatus) -> Self {
+        fn channel(c: rebuild::ChannelStatus) -> JsonChannelRebuild {
+            JsonChannelRebuild {
+                switch: c.switch.map(|m| m.branch),
+                test: c.test.map(|m| m.branch),
+                boot: c.boot.map(|m| m.branch),
+            }
+        }
+        JsonLocalRebuild {
+            host: status.host_id,
+            nixos: channel(status.nixos),
+            home: channel(status.home),
+        }
+    }
+}
+
+/// Labels (`"nixos:switch"`, `"home:test"`, ...) for whichever of `status`'s
+/// markers point at `branch` — the per-roll echo of [`JsonLocalRebuild`] for
+/// `rf list --json`, which has no base rows to carry the "it's a branch, not
+/// a roll" outcome.
+fn recent_rebuild_labels(status: Option<&rebuild::RebuildStatus>, branch: &str) -> Vec<String> {
+    let Some(status) = status else {
+        return Vec::new();
+    };
+    let mut labels = Vec::new();
+    let mut check = |marker: &Option<rebuild::RebuildMarker>, label: &str| {
+        if marker.as_ref().is_some_and(|m| m.branch == branch) {
+            labels.push(label.to_string());
+        }
+    };
+    check(&status.nixos.switch, "nixos:switch");
+    check(&status.nixos.test, "nixos:test");
+    check(&status.nixos.boot, "nixos:boot");
+    check(&status.home.switch, "home:switch");
+    check(&status.home.test, "home:test");
+    labels
 }
 
 #[derive(Serialize)]
@@ -2299,6 +2432,12 @@ struct JsonRoll {
     /// [`branches::DepCycle`]. Every member's row carries the same object, so
     /// a script can tell which member graduates without re-deriving it.
     cycle: Option<JsonCycle>,
+    /// Which of this machine's local rebuilds, if any, landed exactly here —
+    /// see [`recent_rebuild_labels`]. Empty on every roll when the host isn't
+    /// recognized, or when nothing rebuilt here points at a roll at all (the
+    /// common case: a plain switch directly on `rolling`/`main`, which
+    /// `local_rebuild` in `rf status --json` carries instead).
+    recent_rebuilds: Vec<String>,
 }
 
 #[derive(Serialize)]
@@ -2317,7 +2456,11 @@ struct JsonCycle {
     advice: String,
 }
 
-fn rolls_for_json(config: &Config, rolls: Vec<branches::RollInfo>) -> Vec<JsonRoll> {
+fn rolls_for_json(
+    config: &Config,
+    rolls: Vec<branches::RollInfo>,
+    rebuild_status: Option<&rebuild::RebuildStatus>,
+) -> Vec<JsonRoll> {
     let (versions, _) = version_column(config, &rolls);
     let cycles: Vec<Option<JsonCycle>> = rolls
         .iter()
@@ -2337,6 +2480,7 @@ fn rolls_for_json(config: &Config, rolls: Vec<branches::RollInfo>) -> Vec<JsonRo
         .map(|(r, cycle)| JsonRoll {
             cycle,
             version: versions.get(&r.branch).cloned(),
+            recent_rebuilds: recent_rebuild_labels(rebuild_status, &r.branch),
             branch: r.branch,
             number: r.number,
             state: r.state.label().to_string(),

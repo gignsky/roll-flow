@@ -124,7 +124,7 @@ pub enum Cmd {
         date: Option<String>,
         #[arg(long)]
         dry_run: bool,
-        /// Skip marking the new branch's Cargo.toml version as
+        /// Skip marking the new branch's manifest version as
         /// `X.Y.Z-roll<N>`, overriding `dev_versions` in the config.
         #[arg(long)]
         no_dev_version: bool,
@@ -152,7 +152,7 @@ pub enum Cmd {
     Verify {
         #[arg(long)]
         dry_run: bool,
-        /// Bump the Cargo.toml version by this level and commit it before the
+        /// Bump the manifest version by this level and commit it before the
         /// gates run, instead of prompting. Only acts when a bump is needed.
         #[arg(long, value_name = "LEVEL")]
         bump: Option<BumpLevel>,
@@ -212,7 +212,7 @@ pub enum Cmd {
         /// Justification recorded as `Force-Reason:` in the merge commit.
         #[arg(long)]
         reason: Option<String>,
-        /// Bump the Cargo.toml version by this level and commit it before the
+        /// Bump the manifest version by this level and commit it before the
         /// gates run, instead of prompting. Only acts when a bump is needed.
         #[arg(long, value_name = "LEVEL")]
         bump: Option<BumpLevel>,
@@ -379,10 +379,11 @@ pub enum Cmd {
     /// Print program version.
     Version,
 
-    /// Internal: git merge driver for the crate's own version in Cargo.toml and
-    /// Cargo.lock. Invoked by git itself (wired up by `rf init` and before every
-    /// `rf` merge, via clone-local attributes and git config) — never meant to
-    /// be run by hand. Hidden from `--help`.
+    /// Internal: git merge driver for the crate/package's own version — the
+    /// detected manifest (`Cargo.toml` or `package.json`) and its lockfile.
+    /// Invoked by git itself (wired up by `rf init` and before every `rf`
+    /// merge, via clone-local attributes and git config) — never meant to be
+    /// run by hand. Hidden from `--help`.
     #[command(name = "__merge-driver-version", hide = true)]
     MergeDriverVersion {
         /// Git's `%O`: the common ancestor's content.
@@ -391,9 +392,10 @@ pub enum Cmd {
         ours: std::path::PathBuf,
         /// Git's `%B`: their side.
         theirs: std::path::PathBuf,
-        /// Git's `%P`: the file's repo-relative path, which says whether this is
-        /// the manifest or the lockfile. Optional so a clone still configured
-        /// with the older three-argument command keeps resolving Cargo.toml.
+        /// Git's `%P`: the file's repo-relative path, which says which kind
+        /// and which of the manifest/lockfile it is. Optional so a clone
+        /// still configured with the older three-argument command keeps
+        /// resolving `Cargo.toml`.
         path: Option<std::path::PathBuf>,
     },
 }

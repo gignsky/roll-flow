@@ -37,7 +37,7 @@ use crate::core::{
     },
     config::{Config, PullMode},
     git::{self, TrackState},
-    history, ops, proc,
+    history, ops, proc, rebuild,
     sync::{self, PullPlan, PushOutcome, SyncTarget},
     version::{self, BumpLevel, Semver, VersionCheck, VersionStatus},
 };
@@ -190,10 +190,41 @@ pub(crate) fn pull_many_key(code: KeyCode) -> PullManyOutcome {
     }
 }
 
-/// How many rolls each set would pull, in menu order. Mirrors
-/// [`verify_set_counts`].
-pub(crate) fn pull_set_counts(rolls: &[RollInfo]) -> [(PullSet, usize); 6] {
-    PullSet::ALL.map(|set| (set, set.select(rolls).len()))
+/// The `(branch, location)` rows a pull over `set` covers: the pinned stable
+/// and rolling branches first, as the table lists them, then the set's rolls.
+///
+/// The bases are in only for the sets that are not a lifecycle subset —
+/// `All`, and `Local` (which keeps just the bases with a local copy). A base
+/// has no roll state, so `Active`/`Blocked`/`Graduated`/`Diverged` cannot
+/// name it.
+pub(crate) fn pull_set_rows(
+    set: PullSet,
+    bases: &[BaseBranch],
+    rolls: &[RollInfo],
+) -> Vec<(String, BranchLocation)> {
+    let has_local = |l: &BranchLocation| matches!(l, BranchLocation::Local | BranchLocation::Both);
+    let base_rows = bases
+        .iter()
+        .filter(|b| match set {
+            PullSet::All => true,
+            PullSet::Local => has_local(&b.location),
+            _ => false,
+        })
+        .map(|b| (b.branch.clone(), b.location.clone()));
+    let selected = set.select(rolls);
+    let roll_rows = selected.iter().filter_map(|branch| {
+        rolls
+            .iter()
+            .find(|r| &r.branch == branch)
+            .map(|r| (r.branch.clone(), r.location.clone()))
+    });
+    base_rows.chain(roll_rows).collect()
+}
+
+/// How many branches each set would pull, in menu order. Mirrors
+/// [`verify_set_counts`], plus the bases [`pull_set_rows`] adds.
+pub(crate) fn pull_set_counts(bases: &[BaseBranch], rolls: &[RollInfo]) -> [(PullSet, usize); 6] {
+    PullSet::ALL.map(|set| (set, pull_set_rows(set, bases, rolls).len()))
 }
 
 /// What a keypress in the `[U]` picker resolves to. Mirrors
@@ -239,11 +270,12 @@ pub(crate) fn bump_previews(current: Semver) -> [(BumpLevel, Semver); 3] {
 
 /// Whether `[b]` can do anything here, or why not.
 ///
-/// A repo with no `Cargo.toml` has no version to raise — the same condition that
-/// makes the whole release path a no-op (`VersionStatus::NotApplicable`), so
-/// refusing here keeps the key honest rather than opening a modal over nothing.
+/// A repo with no readable manifest version has nothing to raise — the same
+/// condition that makes the whole release path a no-op
+/// (`VersionStatus::NotApplicable`), so refusing here keeps the key honest
+/// rather than opening a modal over nothing.
 pub(crate) fn bump_gate(current: Option<Semver>) -> Result<Semver, String> {
-    current.ok_or_else(|| "no readable version in Cargo.toml — nothing to bump".to_string())
+    current.ok_or_else(|| "no readable version — nothing to bump".to_string())
 }
 
 /// Decide a keystroke in the force-push confirmation.
@@ -272,10 +304,13 @@ fn sync_error(err: sync::SyncFailure) -> anyhow::Error {
 ///
 /// `track` is `None` when the branch has no local copy, which is not the same as
 /// having no upstream — a remote-only roll has nothing to compare, so it shows a
-/// dash rather than claiming to be in sync. Pure, so the whole table is testable
+/// dash rather than claiming to be in sync. `dirty` is a separate fact — this
+/// branch's worktree has uncommitted changes — and is appended as its own glyph
+/// rather than folded into one of the match arms above, since it is orthogonal to
+/// how the branch sits against its upstream. Pure, so the whole table is testable
 /// without a terminal.
-pub(crate) fn sync_cell(track: Option<TrackState>) -> (String, Color) {
-    match track {
+pub(crate) fn sync_cell(track: Option<TrackState>, dirty: bool) -> (String, Color) {
+    let (mut text, mut color) = match track {
         None | Some(TrackState::NoUpstream) => ("—".to_string(), Color::DarkGray),
         Some(TrackState::Gone) => ("gone".to_string(), Color::Red),
         Some(TrackState::InSync) => ("✓".to_string(), Color::Green),
@@ -284,7 +319,16 @@ pub(crate) fn sync_cell(track: Option<TrackState>) -> (String, Color) {
         Some(TrackState::Diverged { ahead, behind }) => {
             (format!("↑{ahead}↓{behind}"), Color::Yellow)
         }
+    };
+    if dirty {
+        text.push_str(" ⚡");
+        // Uncommitted changes always need attention and must not hide behind a
+        // green ✓ — but a `gone` upstream is the worse problem, so it keeps red.
+        if color != Color::Red {
+            color = Color::Yellow;
+        }
     }
+    (text, color)
 }
 
 /// The marker shown against the checked-out branch.
@@ -701,6 +745,9 @@ struct StatusApp {
     /// Upstream tracking state per local branch, refreshed on reload. Sourced in
     /// one `for-each-ref` rather than an `ahead_behind` call per row.
     tracking: HashMap<String, git::LocalBranch>,
+    /// Branches whose worktree has uncommitted changes, refreshed on reload.
+    /// Drawn as a ⚡ in the `sync` column. See [`load_dirty`].
+    dirty: HashSet<String>,
     /// The `[package]` version at each visible branch's tip, refreshed on
     /// reload. Sourced in one `cat-file --batch` rather than a `git show` per
     /// row, the same reason `tracking` is one `for-each-ref`.
@@ -709,6 +756,15 @@ struct StatusApp {
     /// `None` in repos with no `Cargo.toml`, where the header omits it and `[b]`
     /// refuses.
     version: Option<Semver>,
+    /// This machine's host identifier, resolved once at startup (WSL
+    /// interop, if any, is a real subprocess call — not something to redo on
+    /// every reload). `None` when it could not be determined at all.
+    host_id: Option<String>,
+    /// This machine's most recent local nixos/home-manager rebuild,
+    /// recomputed on reload like `versions` is. `None` when `host_id` is
+    /// unset or not known to `config.hosts`/`host_active` — see
+    /// `core::rebuild::detect`.
+    rebuild_status: Option<rebuild::RebuildStatus>,
     table: TableState,
     mode: Mode,
     /// Transient one-line feedback (e.g. why an action was rejected), cleared on
@@ -1219,7 +1275,7 @@ pub(crate) const BINDINGS: &[Binding] = &[
     Binding {
         keys: "pp",
         // "all" earns its place here too, for the same reason `PP`'s does.
-        label: "pull all rolls, or a set of them",
+        label: "pull all branches, or a set of them",
         group: "sync",
         hint: None,
         // Mirrors `PP`'s replay exactly, over `PULL_CHORD_WINDOW` instead.
@@ -2361,8 +2417,14 @@ impl StatusApp {
         let mut table = TableState::default();
         table.select(initial_selection(&bases, &rolls, &hotfixes));
         let tracking = load_tracking(&config);
+        let dirty = load_dirty(&tracking);
         let versions = load_versions(&config, &bases, &rolls, &hotfixes);
-        let version = version::read_version(&config.repo_root).unwrap_or(None);
+        let version =
+            version::read_version(&config.repo_root, config.forced_manifest()).unwrap_or(None);
+        let host_id = rebuild::current_host_identifier(&config.repo_root);
+        let rebuild_status = host_id
+            .as_deref()
+            .and_then(|id| rebuild::detect(&config, &config.repo_root, &rolls, id));
         Self {
             config,
             current_branch,
@@ -2371,8 +2433,11 @@ impl StatusApp {
             hotfixes,
             show_deps,
             tracking,
+            dirty,
             versions,
             version,
+            host_id,
+            rebuild_status,
             table,
             mode: Mode::Browsing,
             message: None,
@@ -3406,7 +3471,7 @@ impl StatusApp {
             return;
         }
         self.mode = Mode::PullMany {
-            counts: pull_set_counts(&self.rolls),
+            counts: pull_set_counts(&self.bases, &self.rolls),
         };
     }
 
@@ -3428,20 +3493,11 @@ impl StatusApp {
     /// share a panel and a reload, and a half-finished sweep reads best as a
     /// single scroll.
     fn execute_pull_many(&mut self, set: PullSet) {
-        let selected = set.select(&self.rolls);
-        if selected.is_empty() {
-            self.message = Some(format!("no rolls to pull ({})", set.label()));
+        let rows = pull_set_rows(set, &self.bases, &self.rolls);
+        if rows.is_empty() {
+            self.message = Some(format!("no branches to pull ({})", set.label()));
             return;
         }
-        let rows: Vec<(String, BranchLocation)> = selected
-            .iter()
-            .filter_map(|branch| {
-                self.rolls
-                    .iter()
-                    .find(|r| &r.branch == branch)
-                    .map(|r| (r.branch.clone(), r.location.clone()))
-            })
-            .collect();
         let plan = plan_pull_many(
             &rows,
             &self.current_branch,
@@ -4271,10 +4327,16 @@ impl StatusApp {
         self.rolls = branches::list_rolls(&self.config)?;
         self.hotfixes = branches::list_hotfixes(&self.config).unwrap_or_default();
         self.tracking = load_tracking(&self.config);
+        self.dirty = load_dirty(&self.tracking);
         self.versions = load_versions(&self.config, &self.bases, &self.rolls, &self.hotfixes);
         // Read from the worktree, so a bump — or a branch switch that changes it —
         // shows in the header straight away.
-        self.version = version::read_version(&self.config.repo_root).unwrap_or(None);
+        self.version = version::read_version(&self.config.repo_root, self.config.forced_manifest())
+            .unwrap_or(None);
+        self.rebuild_status = self
+            .host_id
+            .as_deref()
+            .and_then(|id| rebuild::detect(&self.config, &self.config.repo_root, &self.rolls, id));
         let len = self.row_count();
         if len == 0 {
             self.table.select(None);
@@ -4421,6 +4483,28 @@ impl StatusApp {
     }
 
     fn render_table(&mut self, f: &mut Frame, area: Rect) {
+        // Present only when this machine's host is recognized — see
+        // `core::rebuild::detect` — so a repo that models no hosts (like
+        // roll-flow's own) never sees this column at all. Sized to the
+        // longest label actually on screen (almost always 0 or 1 label; more
+        // than one on the same row is rare but not impossible), the same way
+        // the `version` column sizes itself to its longest cell. Placed in
+        // the left gutter, right after the graph column, rather than at the
+        // far right — it's a per-row marker like the graph glyphs, not a
+        // detail like `version`/`deps`.
+        let build_width = self.rebuild_status.as_ref().map(|status| {
+            self.bases
+                .iter()
+                .map(|b| &b.branch)
+                .chain(self.rolls.iter().map(|r| &r.branch))
+                .chain(self.hotfixes.iter().map(|h| &h.branch))
+                .map(|branch| rebuild::gutter_label(status, branch).chars().count())
+                .max()
+                .unwrap_or(0)
+                .max("build".len())
+        });
+        let show_build = build_width.is_some();
+
         let mut col_constraints = vec![
             // The current-branch chevron, narrow and always present so the
             // columns after it do not shift as HEAD moves.
@@ -4428,13 +4512,18 @@ impl StatusApp {
             // The graph column: two lane glyphs (main, rolling) plus a cell of
             // breathing room. TUI-only — see graph_glyphs' doc comment.
             Constraint::Length(3),
+        ];
+        if let Some(width) = build_width {
+            col_constraints.push(Constraint::Length(width as u16));
+        }
+        col_constraints.extend([
             Constraint::Length(4),
             Constraint::Fill(1),
             Constraint::Length(3),
             // `↑12↓12` at its widest.
             Constraint::Length(7),
             Constraint::Length(13),
-        ];
+        ]);
         // Present only in repos that have a `Cargo.toml`, the same rule the
         // header version follows — so a dotfiles repo pays nothing for it.
         // Sized to the longest cell on screen (a dev marker like `-roll10`
@@ -4460,15 +4549,17 @@ impl StatusApp {
         }
 
         let bold = Style::default().add_modifier(Modifier::BOLD);
-        let mut header_cells = vec![
-            Cell::from(""),
-            Cell::from(""),
+        let mut header_cells = vec![Cell::from(""), Cell::from("")];
+        if show_build {
+            header_cells.push(Cell::from("build").style(bold));
+        }
+        header_cells.extend([
             Cell::from("#").style(bold),
             Cell::from("branch").style(bold),
             Cell::from("loc").style(bold),
             Cell::from("sync").style(bold),
             Cell::from("state").style(bold),
-        ];
+        ]);
         if show_versions {
             header_cells.push(Cell::from("version").style(bold));
         }
@@ -4485,7 +4576,17 @@ impl StatusApp {
 
         let show_deps = self.show_deps;
         let tracking = &self.tracking;
+        let dirty = &self.dirty;
         let versions = &self.versions;
+        let rebuild_status = &self.rebuild_status;
+        let build_cell = |branch: &str| {
+            Cell::from(
+                rebuild_status
+                    .as_ref()
+                    .map(|s| rebuild::gutter_label(s, branch))
+                    .unwrap_or_default(),
+            )
+        };
         // Base branches are pinned above the rolls: no number and no state, the
         // `state` column carrying their role instead.
         let mut rows: Vec<Row> = self
@@ -4497,7 +4598,10 @@ impl StatusApp {
                 } else {
                     Style::default()
                 };
-                let (sync_text, sync_color) = sync_cell(track_of(tracking, &base.branch));
+                let (sync_text, sync_color) = sync_cell(
+                    track_of(tracking, &base.branch),
+                    dirty.contains(&base.branch),
+                );
                 let mut cells = vec![
                     Cell::from(current_marker(base.is_current)).style(
                         Style::default()
@@ -4505,12 +4609,17 @@ impl StatusApp {
                             .add_modifier(Modifier::BOLD),
                     ),
                     Cell::from(graph_cell(base_graph_glyphs(base.role))),
+                ];
+                if show_build {
+                    cells.push(build_cell(&base.branch));
+                }
+                cells.extend([
                     Cell::from(""),
                     Cell::from(base.branch.clone()).style(base_style.fg(base.role.color())),
                     Cell::from(base.location.symbol()).style(base_style),
                     Cell::from(sync_text).style(Style::default().fg(sync_color)),
                     Cell::from(base.role.label()).style(Style::default().fg(base.role.color())),
-                ];
+                ]);
                 if show_versions {
                     cells.push(
                         Cell::from(version_cell(versions.get(&base.branch).copied()))
@@ -4531,7 +4640,10 @@ impl StatusApp {
             } else {
                 Style::default()
             };
-            let (sync_text, sync_color) = sync_cell(track_of(tracking, &roll.branch));
+            let (sync_text, sync_color) = sync_cell(
+                track_of(tracking, &roll.branch),
+                dirty.contains(&roll.branch),
+            );
             let mut cells = vec![
                 Cell::from(current_marker(roll.is_current)).style(
                     Style::default()
@@ -4539,12 +4651,17 @@ impl StatusApp {
                         .add_modifier(Modifier::BOLD),
                 ),
                 Cell::from(graph_cell(graph_glyphs(&roll.state))),
+            ];
+            if show_build {
+                cells.push(build_cell(&roll.branch));
+            }
+            cells.extend([
                 Cell::from(roll.number.to_string()).style(base_style),
                 Cell::from(roll.branch.clone()).style(base_style),
                 Cell::from(roll.location.symbol()).style(base_style),
                 Cell::from(sync_text).style(Style::default().fg(sync_color)),
                 Cell::from(roll.state.label()).style(Style::default().fg(row_state_color)),
-            ];
+            ]);
             if show_versions {
                 cells.push(
                     Cell::from(version_cell(versions.get(&roll.branch).copied())).style(base_style),
@@ -4565,7 +4682,10 @@ impl StatusApp {
             } else {
                 Style::default()
             };
-            let (sync_text, sync_color) = sync_cell(track_of(tracking, &hotfix.branch));
+            let (sync_text, sync_color) = sync_cell(
+                track_of(tracking, &hotfix.branch),
+                dirty.contains(&hotfix.branch),
+            );
             let color = hotfix_color(hotfix.state);
             let mut cells = vec![
                 Cell::from(current_marker(hotfix.is_current)).style(
@@ -4574,12 +4694,17 @@ impl StatusApp {
                         .add_modifier(Modifier::BOLD),
                 ),
                 Cell::from(graph_cell(hotfix_graph_glyphs(hotfix.state))),
+            ];
+            if show_build {
+                cells.push(build_cell(&hotfix.branch));
+            }
+            cells.extend([
                 Cell::from(format!("h{}", hotfix.number)).style(base_style.fg(color)),
                 Cell::from(hotfix.branch.clone()).style(base_style.fg(color)),
                 Cell::from(hotfix.location.symbol()).style(base_style),
                 Cell::from(sync_text).style(Style::default().fg(sync_color)),
                 Cell::from(hotfix.state.label()).style(Style::default().fg(color)),
-            ];
+            ]);
             if show_versions {
                 cells.push(
                     Cell::from(version_cell(versions.get(&hotfix.branch).copied()))
@@ -5053,6 +5178,39 @@ fn load_tracking(config: &Config) -> HashMap<String, git::LocalBranch> {
         .unwrap_or_default()
 }
 
+/// Branches whose worktree currently has uncommitted changes.
+///
+/// `tracking` already carries each branch's worktree path for free — the same
+/// `for-each-ref` that answers the sync column answers this too, so no second
+/// git call is needed to find out *which* branches are checked out anywhere.
+/// Grouped by path first so a path shared by nothing (the ordinary case: one
+/// worktree, one branch) costs exactly one `git status`, same as a path shared
+/// by several branches would (which cannot happen for distinct worktrees, but
+/// keeps this correct if a caller ever hands in stale duplicate paths). A
+/// branch with no worktree (not checked out anywhere) is never dirty — there is
+/// no working tree for it to be dirty in. A worktree whose status can't be read
+/// degrades to "clean" rather than failing the reload, the same degrade
+/// `load_tracking` itself uses for a failed git call.
+fn load_dirty(tracking: &HashMap<String, git::LocalBranch>) -> HashSet<String> {
+    let mut branches_by_path: HashMap<&str, Vec<&str>> = HashMap::new();
+    for branch in tracking.values() {
+        if !branch.worktree.is_empty() {
+            branches_by_path
+                .entry(branch.worktree.as_str())
+                .or_default()
+                .push(branch.name.as_str());
+        }
+    }
+    let mut dirty = HashSet::new();
+    for (path, names) in branches_by_path {
+        let clean = git::working_tree_clean(std::path::Path::new(path)).unwrap_or(true);
+        if !clean {
+            dirty.extend(names.into_iter().map(String::from));
+        }
+    }
+    dirty
+}
+
 /// Read the crate version at every branch on screen, keyed by branch name.
 ///
 /// The refspec per row follows the same local-first order as
@@ -5080,7 +5238,7 @@ fn load_versions(
         .map(|(branch, location)| branches::content_ref(branch, location))
         .collect();
 
-    let by_ref = version::versions_at(&config.repo_root, &refs);
+    let by_ref = version::versions_at(&config.repo_root, &refs, config.forced_manifest());
     rows.iter()
         .map(|(branch, _)| *branch)
         .zip(refs.iter())
@@ -5231,7 +5389,7 @@ fn render_verify_many_modal(f: &mut Frame, area: Rect, counts: &[(VerifySet, usi
 fn render_pull_many_modal(f: &mut Frame, area: Rect, counts: &[(PullSet, usize); 6]) {
     let mut lines = vec![
         Line::from(Span::styled(
-            "Pull which rolls?",
+            "Pull which branches?",
             Style::default().add_modifier(Modifier::BOLD),
         )),
         Line::from(""),
@@ -5241,7 +5399,7 @@ fn render_pull_many_modal(f: &mut Frame, area: Rect, counts: &[(PullSet, usize);
             Span::styled(format!("[{}] ", i + 1), Style::default().fg(Color::Yellow)),
             Span::raw(format!("{:<24}", set.label())),
             Span::styled(
-                format!("{n} roll{}", if *n == 1 { "" } else { "s" }),
+                format!("{n} branch{}", if *n == 1 { "" } else { "es" }),
                 Style::default().fg(Color::DarkGray),
             ),
         ]));
@@ -6546,6 +6704,7 @@ mod tests {
             clean_protect: Vec::new(),
             pull_mode: Default::default(),
             lazygit_command: "lazygit".to_string(),
+            version_manifest: Default::default(),
         }
     }
 
@@ -6638,7 +6797,10 @@ mod tests {
             hotfixes: Vec::new(),
             show_deps: false,
             tracking: HashMap::new(),
+            dirty: HashSet::new(),
             versions: HashMap::new(),
+            host_id: None,
+            rebuild_status: None,
             version: None,
             table: TableState::default(),
             mode: Mode::Browsing,
@@ -6703,7 +6865,10 @@ mod tests {
             hotfixes: Vec::new(),
             show_deps: false,
             tracking: HashMap::new(),
+            dirty: HashSet::new(),
             versions: HashMap::new(),
+            host_id: None,
+            rebuild_status: None,
             version: None,
             table: TableState::default(),
             mode: Mode::Browsing,
@@ -6743,7 +6908,10 @@ mod tests {
             hotfixes: Vec::new(),
             show_deps: false,
             tracking: HashMap::new(),
+            dirty: HashSet::new(),
             versions: HashMap::new(),
+            host_id: None,
+            rebuild_status: None,
             version: None,
             table: TableState::default(),
             mode: Mode::Browsing,
@@ -6795,6 +6963,26 @@ mod tests {
         assert!(
             cargo_toml.contains("0.0.1-roll1"),
             "marker not written: {cargo_toml}"
+        );
+    }
+
+    #[test]
+    fn load_dirty_flags_the_checked_out_branch_only_once_it_has_uncommitted_changes() {
+        let dir = sandbox_repo();
+        let mut cfg = config("main", "rolling");
+        cfg.repo_root = dir.path().to_path_buf();
+
+        let tracking = load_tracking(&cfg);
+        assert!(
+            load_dirty(&tracking).is_empty(),
+            "a freshly committed repo must not read as dirty"
+        );
+
+        std::fs::write(dir.path().join("work.txt"), "edited\n").expect("edit work.txt");
+        let dirty = load_dirty(&tracking);
+        assert!(
+            dirty.contains("roll/1-0101-late"),
+            "the checked-out branch must be flagged once its worktree is edited: {dirty:?}"
         );
     }
 
@@ -8509,7 +8697,10 @@ mod tests {
             hotfixes: Vec::new(),
             show_deps: false,
             tracking: HashMap::new(),
+            dirty: HashSet::new(),
             versions: HashMap::new(),
+            host_id: None,
+            rebuild_status: None,
             version: None,
             table: TableState::default(),
             mode: Mode::Browsing,
@@ -8619,6 +8810,7 @@ mod tests {
             clean_protect: Vec::new(),
             pull_mode: Default::default(),
             lazygit_command: "lazygit".to_string(),
+            version_manifest: Default::default(),
         }
     }
 
@@ -8902,7 +9094,10 @@ mod tests {
             hotfixes: Vec::new(),
             show_deps: false,
             tracking,
+            dirty: HashSet::new(),
             versions: HashMap::new(),
+            host_id: None,
+            rebuild_status: None,
             version: None,
             table: TableState::default(),
             mode: Mode::Browsing,
@@ -8944,6 +9139,61 @@ mod tests {
     }
 
     #[test]
+    fn the_sync_column_shows_a_bolt_only_on_the_row_with_uncommitted_changes() {
+        let cfg = config("main", "rolling");
+        let mut rolls = vec![roll_n(1, RollState::Active), roll_n(2, RollState::Active)];
+        rolls[0].branch = "roll/1-0101-dirty".to_string();
+        rolls[1].branch = "roll/2-0102-clean".to_string();
+
+        let mut dirty = HashSet::new();
+        dirty.insert("roll/1-0101-dirty".to_string());
+
+        let mut app = StatusApp {
+            config: cfg,
+            current_branch: "roll/1-0101-dirty".to_string(),
+            bases: Vec::new(),
+            rolls,
+            hotfixes: Vec::new(),
+            show_deps: false,
+            tracking: HashMap::new(),
+            dirty,
+            versions: HashMap::new(),
+            version: None,
+            host_id: None,
+            rebuild_status: None,
+            table: TableState::default(),
+            mode: Mode::Browsing,
+            message: None,
+            job: None,
+            job_title: String::new(),
+            job_moves_head: false,
+            queue: Queue::default(),
+            quit_armed: false,
+            deferred_mode: None,
+            panel: None,
+            panel_maximized: false,
+            panel_rect: None,
+            pending_g: false,
+            pending_push: None,
+            pending_pull: None,
+            command_history: Vec::new(),
+        };
+
+        let out = draw(|f, area| app.render_table(f, area));
+        let dirty_row = out
+            .lines()
+            .find(|l| l.contains("roll/1-0101-dirty"))
+            .expect("dirty roll row");
+        let clean_row = out
+            .lines()
+            .find(|l| l.contains("roll/2-0102-clean"))
+            .expect("clean roll row");
+
+        assert!(dirty_row.contains('⚡'), "{dirty_row}");
+        assert!(!clean_row.contains('⚡'), "{clean_row}");
+    }
+
+    #[test]
     fn the_version_column_shows_the_numbers_and_a_dash_when_absent() {
         let mut rolls = vec![roll_n(1, RollState::Active), roll_n(2, RollState::Active)];
         rolls[0].branch = "roll/1-0101-versioned".to_string();
@@ -8960,8 +9210,11 @@ mod tests {
             hotfixes: Vec::new(),
             show_deps: false,
             tracking: HashMap::new(),
+            dirty: HashSet::new(),
             versions,
             version: None,
+            host_id: None,
+            rebuild_status: None,
             table: TableState::default(),
             mode: Mode::Browsing,
             message: None,
@@ -8989,6 +9242,95 @@ mod tests {
     }
 
     #[test]
+    fn the_build_column_marks_a_recognized_hosts_recent_rebuild_on_the_right_row() {
+        let rolls = vec![roll_n(1, RollState::Active)];
+        let bases = vec![
+            BaseBranch {
+                role: BaseRole::Stable,
+                branch: "main".to_string(),
+                location: BranchLocation::Local,
+                is_current: false,
+            },
+            BaseBranch {
+                role: BaseRole::Rolling,
+                branch: "rolling".to_string(),
+                location: BranchLocation::Local,
+                is_current: false,
+            },
+        ];
+        let rebuild_status = Some(rebuild::RebuildStatus {
+            host_id: "merlin".to_string(),
+            nixos: rebuild::ChannelStatus {
+                switch: Some(rebuild::RebuildMarker {
+                    branch: "rolling".to_string(),
+                    commit: "deadbeef".to_string(),
+                    committed_at: 0,
+                }),
+                test: None,
+                boot: None,
+            },
+            home: rebuild::ChannelStatus::default(),
+        });
+
+        let mut app = StatusApp {
+            config: test_config(),
+            current_branch: "main".to_string(),
+            bases,
+            rolls,
+            hotfixes: Vec::new(),
+            show_deps: true,
+            tracking: HashMap::new(),
+            dirty: HashSet::new(),
+            versions: HashMap::new(),
+            version: None,
+            host_id: Some("merlin".to_string()),
+            rebuild_status,
+            table: TableState::default(),
+            mode: Mode::Browsing,
+            message: None,
+            job: None,
+            job_title: String::new(),
+            job_moves_head: false,
+            queue: Queue::default(),
+            quit_armed: false,
+            deferred_mode: None,
+            panel: None,
+            panel_maximized: false,
+            panel_rect: None,
+            pending_g: false,
+            pending_push: None,
+            pending_pull: None,
+            command_history: Vec::new(),
+        };
+        let out = draw(|f, area| app.render_table(f, area));
+
+        assert!(out.contains("build"), "no build header:\n{out}");
+        let rolling_row = out
+            .lines()
+            .find(|l| l.contains("rolling"))
+            .expect("rolling base row");
+        assert!(
+            rolling_row.contains('N'),
+            "nixos switch marker missing on the rolling row: {rolling_row}"
+        );
+        let roll_row = out
+            .lines()
+            .find(|l| l.contains("roll/1-0101-x"))
+            .expect("roll row");
+        assert!(
+            !roll_row.contains('N'),
+            "the marker must only appear on the row it points at: {roll_row}"
+        );
+        // Even with `show_deps` also on, the branch column must still read the
+        // full branch name — the table's width budget is scarce (see
+        // `docs/internals/algorithms.md`'s "Roll graph column" section).
+        assert!(
+            out.contains("roll/1-0101-x"),
+            "branch name got truncated:\n{out}"
+        );
+    }
+
+    #[test]
     fn the_version_column_is_absent_in_a_repo_with_no_manifest() {
         // The whole opt-in rule: no `Cargo.toml` anywhere, no column, no cost to
         // the `branch` column. This is every dotfiles repo.
@@ -9000,7 +9342,10 @@ mod tests {
             hotfixes: Vec::new(),
             show_deps: false,
             tracking: HashMap::new(),
+            dirty: HashSet::new(),
             versions: HashMap::new(),
+            host_id: None,
+            rebuild_status: None,
             version: None,
             table: TableState::default(),
             mode: Mode::Browsing,
@@ -9052,7 +9397,10 @@ mod tests {
             hotfixes: Vec::new(),
             show_deps: false,
             tracking: HashMap::new(),
+            dirty: HashSet::new(),
             versions: HashMap::new(),
+            host_id: None,
+            rebuild_status: None,
             version: None,
             table: TableState::default(),
             mode: Mode::Browsing,
@@ -9082,18 +9430,21 @@ mod tests {
 
     #[test]
     fn the_sync_column_maps_each_tracking_state_to_a_glyph() {
-        assert_eq!(sync_cell(Some(TrackState::InSync)).0, "✓");
-        assert_eq!(sync_cell(Some(TrackState::Ahead(2))).0, "↑2");
-        assert_eq!(sync_cell(Some(TrackState::Behind(3))).0, "↓3");
+        assert_eq!(sync_cell(Some(TrackState::InSync), false).0, "✓");
+        assert_eq!(sync_cell(Some(TrackState::Ahead(2)), false).0, "↑2");
+        assert_eq!(sync_cell(Some(TrackState::Behind(3)), false).0, "↓3");
         assert_eq!(
-            sync_cell(Some(TrackState::Diverged {
-                ahead: 2,
-                behind: 1
-            }))
+            sync_cell(
+                Some(TrackState::Diverged {
+                    ahead: 2,
+                    behind: 1
+                }),
+                false
+            )
             .0,
             "↑2↓1"
         );
-        assert_eq!(sync_cell(Some(TrackState::Gone)).0, "gone");
+        assert_eq!(sync_cell(Some(TrackState::Gone), false).0, "gone");
     }
 
     #[test]
@@ -9101,17 +9452,42 @@ mod tests {
         // A remote-only roll has no local copy, and a local branch may have no
         // upstream at all. Neither is "in sync", and rendering ✓ would say the
         // opposite of the truth.
-        assert_eq!(sync_cell(None).0, "—");
-        assert_eq!(sync_cell(Some(TrackState::NoUpstream)).0, "—");
+        assert_eq!(sync_cell(None, false).0, "—");
+        assert_eq!(sync_cell(Some(TrackState::NoUpstream), false).0, "—");
     }
 
     #[test]
     fn the_sync_column_is_green_in_sync_yellow_diverged_and_red_when_gone() {
-        assert_eq!(sync_cell(Some(TrackState::InSync)).1, Color::Green);
-        assert_eq!(sync_cell(Some(TrackState::Ahead(1))).1, Color::Yellow);
-        assert_eq!(sync_cell(Some(TrackState::Behind(1))).1, Color::Yellow);
-        assert_eq!(sync_cell(Some(TrackState::Gone)).1, Color::Red);
-        assert_eq!(sync_cell(None).1, Color::DarkGray);
+        assert_eq!(sync_cell(Some(TrackState::InSync), false).1, Color::Green);
+        assert_eq!(
+            sync_cell(Some(TrackState::Ahead(1)), false).1,
+            Color::Yellow
+        );
+        assert_eq!(
+            sync_cell(Some(TrackState::Behind(1)), false).1,
+            Color::Yellow
+        );
+        assert_eq!(sync_cell(Some(TrackState::Gone), false).1, Color::Red);
+        assert_eq!(sync_cell(None, false).1, Color::DarkGray);
+    }
+
+    #[test]
+    fn a_dirty_working_tree_appends_a_lightning_bolt_to_the_sync_glyph() {
+        assert_eq!(sync_cell(Some(TrackState::InSync), true).0, "✓ ⚡");
+        assert_eq!(sync_cell(Some(TrackState::Ahead(2)), true).0, "↑2 ⚡");
+        assert_eq!(sync_cell(Some(TrackState::Gone), true).0, "gone ⚡");
+        // Can't actually happen — a branch with no worktree has no working tree
+        // to be dirty in — but the glyph logic must not assume that invariant.
+        assert_eq!(sync_cell(None, true).0, "— ⚡");
+    }
+
+    #[test]
+    fn a_dirty_working_tree_turns_the_glyph_yellow_unless_the_upstream_is_gone() {
+        // A dirty tree needs attention and must not hide behind a green ✓.
+        assert_eq!(sync_cell(Some(TrackState::InSync), true).1, Color::Yellow);
+        assert_eq!(sync_cell(None, true).1, Color::Yellow);
+        // `gone` is the worse problem and keeps its red even when also dirty.
+        assert_eq!(sync_cell(Some(TrackState::Gone), true).1, Color::Red);
     }
 
     #[test]
@@ -9246,9 +9622,62 @@ mod tests {
         assert_eq!(names(PullSet::Diverged), vec![4]);
         assert_eq!(names(PullSet::Local), vec![1, 2, 3, 4]);
 
-        let counts = pull_set_counts(&rolls);
+        let counts = pull_set_counts(&[], &rolls);
         assert_eq!(counts[0], (PullSet::All, 5));
         assert_eq!(counts[5], (PullSet::Local, 4));
+    }
+
+    fn base(role: BaseRole, branch: &str, location: BranchLocation) -> BaseBranch {
+        BaseBranch {
+            role,
+            branch: branch.to_string(),
+            location,
+            is_current: false,
+        }
+    }
+
+    #[test]
+    fn pull_all_and_local_cover_the_stable_and_rolling_branches_too() {
+        let bases = vec![
+            base(BaseRole::Stable, "main", BranchLocation::Both),
+            base(BaseRole::Rolling, "rolling", BranchLocation::Remote),
+        ];
+        let rolls = vec![roll_n(1, RollState::Active)];
+        let names = |set: PullSet| -> Vec<String> {
+            pull_set_rows(set, &bases, &rolls)
+                .into_iter()
+                .map(|(b, _)| b)
+                .collect()
+        };
+        // Bases come first, as they do in the table, and keep their location
+        // so a remote-only `rolling` still resolves to a fetch.
+        assert_eq!(
+            names(PullSet::All),
+            vec!["main", "rolling", "roll/1-0101-x"]
+        );
+        assert_eq!(
+            pull_set_rows(PullSet::All, &bases, &rolls)[1].1,
+            BranchLocation::Remote
+        );
+        // `Local` is "has a local copy": the remote-only base drops out.
+        assert_eq!(names(PullSet::Local), vec!["main", "roll/1-0101-x"]);
+        // A lifecycle subset names rolls; the bases have no lifecycle state.
+        for set in [
+            PullSet::Active,
+            PullSet::Blocked,
+            PullSet::Graduated,
+            PullSet::Diverged,
+        ] {
+            assert!(
+                !names(set).iter().any(|b| b == "main" || b == "rolling"),
+                "{set:?}"
+            );
+        }
+
+        let counts = pull_set_counts(&bases, &rolls);
+        assert_eq!(counts[0], (PullSet::All, 3));
+        assert_eq!(counts[1], (PullSet::Active, 1));
+        assert_eq!(counts[5], (PullSet::Local, 2));
     }
 
     #[test]
@@ -9317,12 +9746,12 @@ mod tests {
             roll_n(1, RollState::Active),
             roll_n(2, RollState::Graduated),
         ];
-        let counts = pull_set_counts(&rolls);
+        let counts = pull_set_counts(&[], &rolls);
         let out = draw(|f, area| render_pull_many_modal(f, area, &counts));
-        assert!(out.contains("[1] all rolls"), "{out}");
-        assert!(out.contains("2 rolls"), "{out}");
+        assert!(out.contains("[1] all branches"), "{out}");
+        assert!(out.contains("2 branches"), "{out}");
         assert!(out.contains("[2] active"), "{out}");
-        assert!(out.contains("1 roll "), "{out}");
+        assert!(out.contains("1 branch "), "{out}");
         assert!(out.contains("[n] cancel"), "{out}");
     }
 
@@ -9563,8 +9992,8 @@ mod tests {
 
     #[test]
     fn bump_is_refused_in_a_repo_with_no_version() {
-        let err = bump_gate(None).expect_err("a repo with no Cargo.toml has nothing to bump");
-        assert!(err.contains("Cargo.toml"), "{err}");
+        let err = bump_gate(None).expect_err("a repo with no readable version has nothing to bump");
+        assert!(err.contains("nothing to bump"), "{err}");
         assert_eq!(bump_gate(Some(v(0, 1, 0))), Ok(v(0, 1, 0)));
     }
 
@@ -10121,7 +10550,10 @@ mod tests {
             hotfixes: Vec::new(),
             show_deps: false,
             tracking: HashMap::new(),
+            dirty: HashSet::new(),
             versions: HashMap::new(),
+            host_id: None,
+            rebuild_status: None,
             version: None,
             table: TableState::default(),
             mode: Mode::Browsing,
@@ -10449,7 +10881,10 @@ mod tests {
             hotfixes,
             show_deps: false,
             tracking: HashMap::new(),
+            dirty: HashSet::new(),
             versions: HashMap::new(),
+            host_id: None,
+            rebuild_status: None,
             version: None,
             table,
             mode: Mode::Browsing,
@@ -10522,7 +10957,10 @@ mod tests {
             hotfixes: Vec::new(),
             show_deps: false,
             tracking: HashMap::new(),
+            dirty: HashSet::new(),
             versions: HashMap::new(),
+            host_id: None,
+            rebuild_status: None,
             version: None,
             table,
             mode: Mode::Browsing,
