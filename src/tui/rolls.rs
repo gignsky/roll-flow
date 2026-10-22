@@ -190,10 +190,41 @@ pub(crate) fn pull_many_key(code: KeyCode) -> PullManyOutcome {
     }
 }
 
-/// How many rolls each set would pull, in menu order. Mirrors
-/// [`verify_set_counts`].
-pub(crate) fn pull_set_counts(rolls: &[RollInfo]) -> [(PullSet, usize); 6] {
-    PullSet::ALL.map(|set| (set, set.select(rolls).len()))
+/// The `(branch, location)` rows a pull over `set` covers: the pinned stable
+/// and rolling branches first, as the table lists them, then the set's rolls.
+///
+/// The bases are in only for the sets that are not a lifecycle subset —
+/// `All`, and `Local` (which keeps just the bases with a local copy). A base
+/// has no roll state, so `Active`/`Blocked`/`Graduated`/`Diverged` cannot
+/// name it.
+pub(crate) fn pull_set_rows(
+    set: PullSet,
+    bases: &[BaseBranch],
+    rolls: &[RollInfo],
+) -> Vec<(String, BranchLocation)> {
+    let has_local = |l: &BranchLocation| matches!(l, BranchLocation::Local | BranchLocation::Both);
+    let base_rows = bases
+        .iter()
+        .filter(|b| match set {
+            PullSet::All => true,
+            PullSet::Local => has_local(&b.location),
+            _ => false,
+        })
+        .map(|b| (b.branch.clone(), b.location.clone()));
+    let selected = set.select(rolls);
+    let roll_rows = selected.iter().filter_map(|branch| {
+        rolls
+            .iter()
+            .find(|r| &r.branch == branch)
+            .map(|r| (r.branch.clone(), r.location.clone()))
+    });
+    base_rows.chain(roll_rows).collect()
+}
+
+/// How many branches each set would pull, in menu order. Mirrors
+/// [`verify_set_counts`], plus the bases [`pull_set_rows`] adds.
+pub(crate) fn pull_set_counts(bases: &[BaseBranch], rolls: &[RollInfo]) -> [(PullSet, usize); 6] {
+    PullSet::ALL.map(|set| (set, pull_set_rows(set, bases, rolls).len()))
 }
 
 /// What a keypress in the `[U]` picker resolves to. Mirrors
@@ -1244,7 +1275,7 @@ pub(crate) const BINDINGS: &[Binding] = &[
     Binding {
         keys: "pp",
         // "all" earns its place here too, for the same reason `PP`'s does.
-        label: "pull all rolls, or a set of them",
+        label: "pull all branches, or a set of them",
         group: "sync",
         hint: None,
         // Mirrors `PP`'s replay exactly, over `PULL_CHORD_WINDOW` instead.
@@ -3440,7 +3471,7 @@ impl StatusApp {
             return;
         }
         self.mode = Mode::PullMany {
-            counts: pull_set_counts(&self.rolls),
+            counts: pull_set_counts(&self.bases, &self.rolls),
         };
     }
 
@@ -3462,20 +3493,11 @@ impl StatusApp {
     /// share a panel and a reload, and a half-finished sweep reads best as a
     /// single scroll.
     fn execute_pull_many(&mut self, set: PullSet) {
-        let selected = set.select(&self.rolls);
-        if selected.is_empty() {
-            self.message = Some(format!("no rolls to pull ({})", set.label()));
+        let rows = pull_set_rows(set, &self.bases, &self.rolls);
+        if rows.is_empty() {
+            self.message = Some(format!("no branches to pull ({})", set.label()));
             return;
         }
-        let rows: Vec<(String, BranchLocation)> = selected
-            .iter()
-            .filter_map(|branch| {
-                self.rolls
-                    .iter()
-                    .find(|r| &r.branch == branch)
-                    .map(|r| (r.branch.clone(), r.location.clone()))
-            })
-            .collect();
         let plan = plan_pull_many(
             &rows,
             &self.current_branch,
@@ -5367,7 +5389,7 @@ fn render_verify_many_modal(f: &mut Frame, area: Rect, counts: &[(VerifySet, usi
 fn render_pull_many_modal(f: &mut Frame, area: Rect, counts: &[(PullSet, usize); 6]) {
     let mut lines = vec![
         Line::from(Span::styled(
-            "Pull which rolls?",
+            "Pull which branches?",
             Style::default().add_modifier(Modifier::BOLD),
         )),
         Line::from(""),
@@ -5377,7 +5399,7 @@ fn render_pull_many_modal(f: &mut Frame, area: Rect, counts: &[(PullSet, usize);
             Span::styled(format!("[{}] ", i + 1), Style::default().fg(Color::Yellow)),
             Span::raw(format!("{:<24}", set.label())),
             Span::styled(
-                format!("{n} roll{}", if *n == 1 { "" } else { "s" }),
+                format!("{n} branch{}", if *n == 1 { "" } else { "es" }),
                 Style::default().fg(Color::DarkGray),
             ),
         ]));
@@ -9600,9 +9622,62 @@ mod tests {
         assert_eq!(names(PullSet::Diverged), vec![4]);
         assert_eq!(names(PullSet::Local), vec![1, 2, 3, 4]);
 
-        let counts = pull_set_counts(&rolls);
+        let counts = pull_set_counts(&[], &rolls);
         assert_eq!(counts[0], (PullSet::All, 5));
         assert_eq!(counts[5], (PullSet::Local, 4));
+    }
+
+    fn base(role: BaseRole, branch: &str, location: BranchLocation) -> BaseBranch {
+        BaseBranch {
+            role,
+            branch: branch.to_string(),
+            location,
+            is_current: false,
+        }
+    }
+
+    #[test]
+    fn pull_all_and_local_cover_the_stable_and_rolling_branches_too() {
+        let bases = vec![
+            base(BaseRole::Stable, "main", BranchLocation::Both),
+            base(BaseRole::Rolling, "rolling", BranchLocation::Remote),
+        ];
+        let rolls = vec![roll_n(1, RollState::Active)];
+        let names = |set: PullSet| -> Vec<String> {
+            pull_set_rows(set, &bases, &rolls)
+                .into_iter()
+                .map(|(b, _)| b)
+                .collect()
+        };
+        // Bases come first, as they do in the table, and keep their location
+        // so a remote-only `rolling` still resolves to a fetch.
+        assert_eq!(
+            names(PullSet::All),
+            vec!["main", "rolling", "roll/1-0101-x"]
+        );
+        assert_eq!(
+            pull_set_rows(PullSet::All, &bases, &rolls)[1].1,
+            BranchLocation::Remote
+        );
+        // `Local` is "has a local copy": the remote-only base drops out.
+        assert_eq!(names(PullSet::Local), vec!["main", "roll/1-0101-x"]);
+        // A lifecycle subset names rolls; the bases have no lifecycle state.
+        for set in [
+            PullSet::Active,
+            PullSet::Blocked,
+            PullSet::Graduated,
+            PullSet::Diverged,
+        ] {
+            assert!(
+                !names(set).iter().any(|b| b == "main" || b == "rolling"),
+                "{set:?}"
+            );
+        }
+
+        let counts = pull_set_counts(&bases, &rolls);
+        assert_eq!(counts[0], (PullSet::All, 3));
+        assert_eq!(counts[1], (PullSet::Active, 1));
+        assert_eq!(counts[5], (PullSet::Local, 2));
     }
 
     #[test]
@@ -9671,12 +9746,12 @@ mod tests {
             roll_n(1, RollState::Active),
             roll_n(2, RollState::Graduated),
         ];
-        let counts = pull_set_counts(&rolls);
+        let counts = pull_set_counts(&[], &rolls);
         let out = draw(|f, area| render_pull_many_modal(f, area, &counts));
-        assert!(out.contains("[1] all rolls"), "{out}");
-        assert!(out.contains("2 rolls"), "{out}");
+        assert!(out.contains("[1] all branches"), "{out}");
+        assert!(out.contains("2 branches"), "{out}");
         assert!(out.contains("[2] active"), "{out}");
-        assert!(out.contains("1 roll "), "{out}");
+        assert!(out.contains("1 branch "), "{out}");
         assert!(out.contains("[n] cancel"), "{out}");
     }
 

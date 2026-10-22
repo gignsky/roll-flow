@@ -926,12 +926,12 @@ impl PullSet {
 
     pub fn label(self) -> &'static str {
         match self {
-            PullSet::All => "all rolls",
+            PullSet::All => "all branches",
             PullSet::Active => "active",
             PullSet::Blocked => "blocked",
             PullSet::Graduated => "graduated",
             PullSet::Diverged => "diverged",
-            PullSet::Local => "rolls with a local copy",
+            PullSet::Local => "branches with a local copy",
         }
     }
 
