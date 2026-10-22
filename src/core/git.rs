@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
@@ -610,6 +610,27 @@ pub fn parse_merge_tree_conflicts(stdout: &[u8]) -> Vec<String> {
         }
     }
     paths
+}
+
+/// Every commit on `ref_`'s own first-parent chain (`git rev-list
+/// --first-parent <ref_>`) — the commits that were committed *directly* onto
+/// `ref_` at some point (plus whatever `ref_` inherited the same way, back to
+/// the root), as opposed to brought in as a merge's second parent.
+///
+/// This is the distinction `rf core::rebuild` needs: a `--no-ff` merge (the
+/// only kind this codebase makes — see
+/// [invariants.md](../../docs/internals/invariants.md)) always keeps the
+/// branch being merged *into*'s own tip as the first parent, so content
+/// merged in from elsewhere — a roll's work via its graduation merge, a
+/// dependency via `[i]`/`rf integrate` — sits on the *second*-parent side and
+/// never appears here, no matter how long ago or how many tiers later. A
+/// roll's own commits, conversely, stay on its own first-parent chain forever,
+/// whether or not — and however long after — that roll graduates: nothing
+/// about being merged elsewhere moves or rewrites the roll's own ref.
+pub fn first_parent_ancestors(repo: &Path, ref_: &str) -> HashSet<String> {
+    capture_git(repo, &["rev-list", "--first-parent", ref_])
+        .map(|out| out.lines().map(str::to_string).collect())
+        .unwrap_or_default()
 }
 
 /// Return the best common ancestor of `a` and `b`.

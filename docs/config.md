@@ -26,6 +26,7 @@ host_gates = []
 clean_protect = []
 pull_mode = "ff-only"
 lazygit_command = "lazygit"
+version_manifest = "auto"
 
 [host_active]
 ganoslal = true
@@ -77,6 +78,7 @@ the layers are merged; everything else has a default.
 | `clean_protect` | `[]` | never — hand-edited | `rf clean` |
 | `pull_mode` | `"ff-only"` | fresh file | the TUI's `[p]` |
 | `lazygit_command` | `"lazygit"` | fresh file | the TUI's `gg` |
+| `version_manifest` | `"auto"` | fresh file | `rf start` / `rf graduate` / `rf promote`'s own version writes, in a repo carrying both a `Cargo.toml` and a `package.json` |
 
 Gate entries are shell commands run in repo root. Any failure blocks
 verify/graduate/promote.
@@ -130,7 +132,20 @@ repo where `nix eval` would not.
 `version_gate`, `tag_on_promote`, `tag_on_graduate`, `push_tag`, and
 `dev_versions` control the release behavior described in
 [Versioning and release tags](../README.md#versioning-and-release-tags). All
-five default to `true` and are inert in repos without a `Cargo.toml`.
+five default to `true` and are inert in a repo with neither a `Cargo.toml`
+nor a `package.json`.
+
+`version_manifest` matters only to a repo carrying *both* manifests — a
+Tauri app, say, with a `Cargo.toml` for the Rust side and a `package.json`
+that is the one actually released. `"auto"` (the default) prefers `Cargo`,
+matching the behavior every existing repo already had; set it to `"npm"` to
+version through `package.json` instead. It reaches every command that reads
+or writes a version through `Config` — `rf start`/`rf verify`/`rf graduate`/
+`rf promote`, status display, the TUI's version column — so the file written
+and the file compared always agree. It does not reach the merge-driver
+subprocess (which has no `Config` at all); that keeps auto-detecting, which
+is harmless since its only job is to stop a version-line conflict on
+whichever files a merge actually touches.
 
 `clean_protect` names branches [`rf clean`](commands/clean.md) must never delete,
 on top of the stable and rolling branches and each remote's default branch, which

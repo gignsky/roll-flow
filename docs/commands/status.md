@@ -96,6 +96,36 @@ dependencies and no detail overlay, but `[space]`, `[p]`/`[P]`/`[f]` and
 `[d]elete` work on them as on any other row. `--json` carries them as their own
 `hotfixes` array rather than mixed into the roll list.
 
+## Build column
+
+In a repo whose config models this machine's host (`hosts`/`host_active` —
+every dotfiles repo, never roll-flow's own), the table carries a `build`
+column: which roll (or `rolling`/`main`, when it isn't a roll) this machine
+most recently rebuilt, read from commit messages dotfiles' own rebuild
+scripts already write. It sits in the left gutter, right after the
+current-branch chevron (and, in the TUI, the graph column) — a per-row
+marker like those, not a trailing detail like `version`/`deps`. Up to five
+labels, space-joined on whichever single row each points at: `N`/`NT`/`NB`
+for the most recent NixOS switch/test/boot, `H`/`HT` for the most recent
+home-manager switch/test — home-manager has no "boot" concept. A
+`NT`/`NB`/`HT` label disappears once a later switch has caught up to or
+passed it, since it then tells you nothing the switch doesn't.
+
+`--no-tui` prints a one-line summary above the table instead of relying on
+the column alone — the common case, a plain switch directly on
+`rolling`/`main`, has no roll row to attach a column cell to at all:
+
+```text
+last rebuild (merlin): nixos switch→rolling · nixos test→roll/41-x · home switch→rolling
+```
+
+`--json` carries the same data as a top-level `local_rebuild` object
+(`host`, `nixos`/`home`, each `{switch, test, boot}` as branch-name strings
+or `null`) — see [`list`](list.md) for the per-roll echo of this in `rf list
+--json`. See
+[Local rebuild markers](../internals/algorithms.md#local-rebuild-markers-corerebuildrs)
+for how a commit is attributed to a roll vs. a branch.
+
 ## Keys
 
 The status bar carries the handful you need before you know the rest exist:
@@ -166,7 +196,9 @@ rows: it merges the roll under the cursor into the roll wearing the chevron — 
 [`integrate`](integrate.md#from-the-tui). The `sync` column reports each branch against
 its upstream: `✓` in sync, `↑2` ahead, `↓1` behind, `↑2↓1` diverged, `gone` once
 the upstream is deleted, and `—` when there is nothing to compare (no upstream,
-or no local copy).
+or no local copy). A `⚡` appended to any of those means that branch's worktree
+has uncommitted changes — only possible for a branch checked out somewhere,
+local or in a linked `git worktree`.
 
 ## Running commands
 

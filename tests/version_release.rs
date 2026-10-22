@@ -750,3 +750,262 @@ fn graduating_past_an_advanced_rolling_branch_does_not_conflict_on_the_marker() 
     );
     assert_eq!(sb.cargo_version_at("rolling"), "0.0.2-dev");
 }
+
+// ── npm arm ──────────────────────────────────────────────────────────────────
+
+#[test]
+fn npm_promote_refuses_an_unchanged_version() {
+    let sb = Sandbox::npm();
+    sb.init();
+    graduate_one(&sb, "feature", "0611");
+
+    let out = sb.rf(&["promote", "--final"]);
+    assert!(
+        !out.success,
+        "promote should refuse an unbumped version: {}",
+        out.combined()
+    );
+    assert!(
+        out.combined().contains("unchanged from 'main'"),
+        "error should name the unchanged version: {}",
+        out.combined()
+    );
+}
+
+#[test]
+fn npm_promote_bumps_commits_merges_and_tags() {
+    let sb = Sandbox::npm();
+    sb.init();
+    graduate_one(&sb, "feature", "0611");
+
+    let out = sb.rf(&["promote", "--bump", "patch", "--yes"]);
+    assert!(out.success, "promote failed: {}", out.combined());
+
+    assert!(
+        sb.has_commit_subject("main", "chore(release): bump version to 0.0.2"),
+        "expected a chore(release) commit to reach main"
+    );
+    assert_eq!(sb.package_version_at("main"), "0.0.2");
+    assert!(sb.has_commit_subject("main", "Promote"));
+    assert!(sb.tag_exists("v0.0.2"), "tags: {:?}", sb.tags());
+}
+
+#[test]
+fn npm_new_roll_is_marked_and_graduation_resolves_it() {
+    // The npm twin of `a_new_roll_is_marked_with_its_number_and_graduation_resolves_it`:
+    // the same marker lifecycle, read and written through `package.json`
+    // (and its lockfile) instead of `Cargo.toml`.
+    let sb = Sandbox::npm();
+    sb.init();
+
+    let out = sb.create_roll("dev-marked", "0611");
+    assert!(out.success, "create failed: {}", out.combined());
+    let branch = sb.current_branch();
+    assert_eq!(sb.package_version_at("HEAD"), "0.0.1-roll1");
+
+    sb.commit_file("work.txt", "work\n", "do the work");
+    let out = sb.rf(&["graduate"]);
+    assert!(out.success, "graduate failed: {}", out.combined());
+
+    // The roll branch itself is untouched; rolling's merge commit carries the
+    // roll's marker swapped for rolling's own `-dev`.
+    assert_eq!(sb.package_version_at(&branch), "0.0.1-roll1");
+    assert_eq!(sb.package_version_at("rolling"), "0.0.1-dev");
+
+    sb.git(&["checkout", "rolling"]);
+    let out = sb.rf(&["promote", "--final"]);
+    assert!(
+        !out.success,
+        "promote should still demand a bump: {}",
+        out.combined()
+    );
+}
+
+#[test]
+fn npm_promote_commits_both_lockfile_fields_matching_the_manifest() {
+    let sb = Sandbox::npm();
+    sb.init();
+    sb.commit_package_lock("0.0.1");
+    graduate_one(&sb, "feature", "0611");
+
+    let out = sb.rf(&["promote", "--bump", "patch", "--yes"]);
+    assert!(out.success, "promote failed: {}", out.combined());
+    assert_eq!(sb.package_version_at("main"), "0.0.2");
+    assert_eq!(
+        sb.package_lock_version_at("main"),
+        "0.0.2",
+        "the lockfile's root version must track the bump"
+    );
+}
+
+#[test]
+fn npm_lockfile_markers_from_two_rolls_merge_through_the_driver() {
+    // The npm twin of the Cargo merge-driver coverage in `version_merge.rs`,
+    // exercised here through the actual graduate path rather than unit-level
+    // `merge_texts` calls: rolling moved (simulating another roll's bump)
+    // since this roll branched, so the roll's own marker and rolling's new
+    // version touch the same `package.json`/`package-lock.json` lines.
+    let sb = Sandbox::npm();
+    sb.init();
+    sb.commit_package_lock("0.0.1");
+    let out = sb.create_roll("solo", "0611");
+    assert!(out.success, "{}", out.combined());
+    let branch = sb.current_branch();
+    assert_eq!(sb.package_version_at("HEAD"), "0.0.1-roll1");
+    sb.commit_file("work.txt", "work\n", "work");
+
+    sb.git(&["checkout", "rolling"]);
+    sb.commit_package_version("0.0.2");
+    sb.commit_package_lock("0.0.2");
+    sb.git(&["checkout", &branch]);
+
+    let out = sb.rf(&["graduate"]);
+    assert!(
+        out.success,
+        "graduate should not conflict: {}",
+        out.combined()
+    );
+    assert_eq!(sb.package_version_at("rolling"), "0.0.2-dev");
+    assert_eq!(sb.package_lock_version_at("rolling"), "0.0.2-dev");
+}
+
+#[test]
+fn a_repo_with_both_manifests_versions_through_cargo_by_default() {
+    let sb = Sandbox::cargo();
+    sb.write_package_version("0.0.1");
+    sb.git(&["add", "package.json"]);
+    sb.git(&["commit", "-m", "add package.json too"]);
+    sb.init();
+
+    let out = sb.create_roll("both", "0611");
+    assert!(out.success, "create failed: {}", out.combined());
+    // Cargo wins by default: the roll marker lands in Cargo.toml, and
+    // package.json is untouched.
+    assert_eq!(sb.cargo_version_at("HEAD"), "0.0.1-roll1");
+    assert_eq!(sb.package_version_at("HEAD"), "0.0.1");
+}
+
+#[test]
+fn a_tooling_only_package_json_with_no_version_key_is_unaffected() {
+    // A package.json without a `version` field is unremarkable (prettier,
+    // husky, commitlint configs often look like this) in a way a Cargo.toml
+    // without one never is. It must read the same as no manifest at all —
+    // `NotApplicable`, not `Unreadable` — or every rf-managed repo with a
+    // tooling-only package.json would have promote start failing the moment
+    // this feature landed.
+    let sb = Sandbox::plain();
+    sb.write("package.json", "{\"name\": \"tooling\", \"private\": true}");
+    sb.git(&["add", "package.json"]);
+    sb.git(&["commit", "-m", "tooling config, no version"]);
+    sb.init();
+    graduate_one(&sb, "feature", "0611");
+
+    let out = sb.rf(&["promote"]);
+    assert!(out.success, "promote failed: {}", out.combined());
+    assert!(sb.has_commit_subject("main", "Promote"));
+    assert!(sb.tags().is_empty(), "nothing to tag without a version");
+}
+
+#[test]
+fn a_roll_can_add_the_first_version_to_a_tooling_only_package_json() {
+    // The normal way a Node app starts using rf: main's package.json has no
+    // `version` field yet (most apps ship without one), and the roll is the
+    // one introducing it. `check` must read that as "a manifest added by
+    // this branch" (Ok, a bump from nothing) rather than `Unreadable` — the
+    // base having no readable version must count the same as the base having
+    // no file at all.
+    let sb = Sandbox::plain();
+    sb.write("package.json", "{\"name\": \"x\", \"private\": true}");
+    sb.git(&["add", "package.json"]);
+    sb.git(&["commit", "-m", "tooling config, no version"]);
+    sb.init();
+    sb.set_config_flag("dev_versions", false);
+
+    let out = sb.create_roll("feature", "0611");
+    assert!(out.success, "create failed: {}", out.combined());
+    sb.commit_package_version("0.1.0");
+    let out = sb.rf(&["graduate"]);
+    assert!(out.success, "graduate failed: {}", out.combined());
+    sb.git(&["checkout", "rolling"]);
+
+    let out = sb.rf(&["promote", "--yes"]);
+    assert!(out.success, "promote failed: {}", out.combined());
+    assert_eq!(sb.package_version_at("main"), "0.1.0");
+    assert!(sb.tag_exists("v0.1.0"), "tags: {:?}", sb.tags());
+}
+
+#[test]
+fn version_manifest_npm_forced_also_lets_a_roll_add_the_first_version() {
+    // The forced-override twin: `version_manifest = "npm"` must not make
+    // `detect_at_forced` claim the target has a readable npm version when it
+    // doesn't — forcing a kind is not a promise that kind already has one.
+    let sb = Sandbox::cargo();
+    sb.write("package.json", "{\"name\": \"x\", \"private\": true}");
+    sb.git(&["add", "package.json"]);
+    sb.git(&["commit", "-m", "add tooling-only package.json too"]);
+    sb.init();
+    sb.set_config_string("version_manifest", "npm");
+
+    let out = sb.create_roll("feature", "0611");
+    assert!(out.success, "create failed: {}", out.combined());
+    sb.commit_package_version("0.1.0-roll1");
+    let out = sb.rf(&["graduate"]);
+    assert!(out.success, "graduate failed: {}", out.combined());
+    sb.git(&["checkout", "rolling"]);
+
+    let out = sb.rf(&["promote", "--yes"]);
+    assert!(out.success, "promote failed: {}", out.combined());
+    assert_eq!(sb.package_version_at("main"), "0.1.0");
+    assert!(sb.tag_exists("v0.1.0"), "tags: {:?}", sb.tags());
+}
+
+#[test]
+fn version_manifest_npm_forces_the_npm_arm_through_promote_too() {
+    // The write-path override alone (covered by
+    // `version_manifest_npm_forces_the_npm_arm_in_a_repo_with_both_manifests`)
+    // is not enough: the gate's read and the bump's write must agree on the
+    // same kind all the way through `rf promote`, including the per-ref
+    // comparison against stable (`run_promote_step`'s `check_against`).
+    let sb = Sandbox::cargo();
+    sb.write_package_version("0.0.1");
+    sb.git(&["add", "package.json"]);
+    sb.git(&["commit", "-m", "add package.json too"]);
+    sb.init();
+    sb.set_config_string("version_manifest", "npm");
+    graduate_one(&sb, "feature", "0611");
+
+    let out = sb.rf(&["promote", "--bump", "patch", "--yes"]);
+    assert!(out.success, "promote failed: {}", out.combined());
+    assert_eq!(sb.package_version_at("main"), "0.0.2");
+    assert_eq!(
+        sb.cargo_version_at("main"),
+        "0.0.1",
+        "Cargo.toml must stay untouched when the override picks npm"
+    );
+    assert!(sb.tag_exists("v0.0.2"), "tags: {:?}", sb.tags());
+    // If the gate's own comparison auto-detected Cargo instead of honouring
+    // the override, it would see Cargo's 0.0.1 as Unchanged against rolling
+    // (also 0.0.1) and bump package.json straight to a `-dev` marker inside
+    // `run_promote_step`'s in-merge finalize — landing a leftover bump commit
+    // that was never actually gated against npm's own value.
+    assert!(
+        !sb.has_commit_subject("main", "0.0.2-dev"),
+        "a dev-marked bump commit means the gate compared the wrong manifest"
+    );
+}
+
+#[test]
+fn version_manifest_npm_forces_the_npm_arm_in_a_repo_with_both_manifests() {
+    let sb = Sandbox::cargo();
+    sb.write_package_version("0.0.1");
+    sb.git(&["add", "package.json"]);
+    sb.git(&["commit", "-m", "add package.json too"]);
+    sb.init();
+    sb.set_config_string("version_manifest", "npm");
+
+    let out = sb.create_roll("both", "0611");
+    assert!(out.success, "create failed: {}", out.combined());
+    assert_eq!(sb.package_version_at("HEAD"), "0.0.1-roll1");
+    // Cargo.toml is untouched: the override picked npm as authoritative.
+    assert_eq!(sb.cargo_version_at("HEAD"), "0.0.1");
+}
