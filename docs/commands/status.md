@@ -235,10 +235,16 @@ forced push *ahead* of the queue and releases it, `n` leaves it held.
 Two guards keep a chain from doing something you did not ask for:
 
 - Keys that act on the **checked-out branch** — `[i]`, `[I]`, `[b]`, `[v]`,
-  `[p]`, `[P]`, `PP` — are refused while a queued or running `space` switch or
+  `[p]` — are refused while a queued or running `space` switch or
   `[c]` create is pending, because they capture the branch when pressed and
   would act on a different one by the time their turn came. Press them again
   once the switch has run.
+- `[P]` and `PP` are **not** refused: a push names its branch, so it is queued
+  like any other command. The branch is fixed when you press the key (the
+  selected row, or the plan `PP` showed), never read from HEAD when the push
+  finally runs. Push `roll/45`, queue a `space` switch to `roll/44`, then `[P]`
+  again, and the second push goes to `roll/44`. A rejected push still holds the
+  queue and asks before forcing, exactly as above.
 - `q` with commands queued only warns the first time; a second `q` quits and
   drops them.
 
