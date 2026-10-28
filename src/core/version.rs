@@ -103,6 +103,42 @@ impl ManifestKind {
         })
     }
 
+    /// Every kind this working tree versions through, in [`ALL`](Self::ALL)
+    /// order: a repo carrying a readable version in *both* manifests (a Tauri
+    /// app, a Rust backend with a JS front end that is released with it) is
+    /// versioned through both, and each has to clear the gate. `forced`
+    /// narrows it to that one kind, as for [`detect_forced`](Self::detect_forced).
+    pub fn detect_all_forced(repo: &Path, forced: Option<ManifestKind>) -> Vec<ManifestKind> {
+        let candidates: &[ManifestKind] = match &forced {
+            Some(kind) => std::slice::from_ref(kind),
+            None => &Self::ALL,
+        };
+        candidates
+            .iter()
+            .copied()
+            .filter(|kind| Self::detect_forced(repo, Some(*kind)).is_some())
+            .collect()
+    }
+
+    /// [`detect_all_forced`](Self::detect_all_forced) at `refspec`.
+    pub fn detect_all_at_forced(
+        repo: &Path,
+        refspec: &str,
+        forced: Option<ManifestKind>,
+    ) -> Result<Vec<ManifestKind>, RfError> {
+        let candidates: &[ManifestKind] = match &forced {
+            Some(kind) => std::slice::from_ref(kind),
+            None => &Self::ALL,
+        };
+        let mut found = Vec::new();
+        for kind in candidates {
+            if Self::detect_at_forced(repo, refspec, Some(*kind))?.is_some() {
+                found.push(*kind);
+            }
+        }
+        Ok(found)
+    }
+
     /// Like [`detect_forced`](Self::detect_forced), at `refspec` rather than
     /// the working tree, for callers reasoning about a branch that need not
     /// be checked out (`check`, `check_against`, `versions_at` and friends).
@@ -418,6 +454,8 @@ pub enum VersionStatus {
 /// The two versions being compared plus the verdict.
 #[derive(Debug, Clone)]
 pub struct VersionCheck {
+    /// Which manifest this compared. `None` when nothing was applicable.
+    pub kind: Option<ManifestKind>,
     pub head: Option<Semver>,
     pub base: Option<Semver>,
     pub status: VersionStatus,
@@ -426,10 +464,31 @@ pub struct VersionCheck {
 impl VersionCheck {
     pub fn not_applicable() -> VersionCheck {
         VersionCheck {
+            kind: None,
             head: None,
             base: None,
             status: VersionStatus::NotApplicable,
         }
+    }
+
+    /// The one verdict a set of per-manifest checks amounts to: the most
+    /// serious unsatisfied check (`Lower`, then `Unreadable`, `DevVersion`,
+    /// `Unchanged`), else the first that passed, else `NotApplicable`. A repo
+    /// with one manifest gets that manifest's own check back unchanged.
+    pub fn worst(checks: &[VersionCheck]) -> VersionCheck {
+        let rank = |status: VersionStatus| match status {
+            VersionStatus::Lower => 0,
+            VersionStatus::Unreadable => 1,
+            VersionStatus::DevVersion => 2,
+            VersionStatus::Unchanged => 3,
+            VersionStatus::Ok => 4,
+            VersionStatus::NotApplicable => 5,
+        };
+        checks
+            .iter()
+            .min_by_key(|c| rank(c.status))
+            .cloned()
+            .unwrap_or_else(VersionCheck::not_applicable)
     }
 
     /// True when the check neither blocks nor has anything to report.
@@ -503,7 +562,35 @@ pub fn check(
         _ => VersionStatus::Unreadable,
     };
 
-    Ok(VersionCheck { head, base, status })
+    Ok(VersionCheck {
+        kind: Some(kind),
+        head,
+        base,
+        status,
+    })
+}
+
+/// [`check`] once per manifest the repo versions through: every kind found at
+/// either ref, in [`ManifestKind::ALL`] order. Empty when the repo versions
+/// through none. `forced` narrows it to one kind, which then behaves exactly
+/// as `check` always has.
+pub fn check_all(
+    repo: &Path,
+    source_ref: &str,
+    target_ref: &str,
+    forced: Option<ManifestKind>,
+) -> Result<Vec<VersionCheck>, RfError> {
+    let mut checks = Vec::new();
+    for kind in ManifestKind::ALL {
+        if forced.is_some_and(|f| f != kind) {
+            continue;
+        }
+        let check = check(repo, source_ref, target_ref, Some(kind))?;
+        if check.status != VersionStatus::NotApplicable {
+            checks.push(check);
+        }
+    }
+    Ok(checks)
 }
 
 /// Like [`check`], but against an already-resolved `head` rather than reading
@@ -546,7 +633,12 @@ pub fn check_against(
         (Some(_), Some(_)) => VersionStatus::Lower,
         _ => VersionStatus::Unreadable,
     };
-    Ok(VersionCheck { head, base, status })
+    Ok(VersionCheck {
+        kind,
+        head,
+        base,
+        status,
+    })
 }
 
 /// Read the crate version from the working tree, honouring `forced` — see

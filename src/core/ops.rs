@@ -1310,10 +1310,24 @@ pub(crate) fn version_check(
     source_ref: &str,
     target_ref: &str,
 ) -> Result<VersionCheck> {
+    Ok(VersionCheck::worst(&version_checks(
+        config, source_ref, target_ref,
+    )?))
+}
+
+/// One [`VersionCheck`] per manifest the repo versions through (see
+/// [`Config::manifest_kinds`]) — empty when the gate is off or the repo has
+/// none. A repo carrying a readable version in both `Cargo.toml` and
+/// `package.json` has to clear the gate in both.
+pub(crate) fn version_checks(
+    config: &Config,
+    source_ref: &str,
+    target_ref: &str,
+) -> Result<Vec<VersionCheck>> {
     if !config.version_gate {
-        return Ok(VersionCheck::not_applicable());
+        return Ok(Vec::new());
     }
-    Ok(version::check(
+    Ok(version::check_all(
         &config.repo_root,
         source_ref,
         target_ref,
@@ -1336,6 +1350,12 @@ pub(crate) fn version_gate_error(
         .base
         .map(|v| v.to_string())
         .unwrap_or_else(|| "<unreadable>".to_string());
+    // Name the file when there is one to name, so a repo versioned through two
+    // manifests says which one failed.
+    let head = match check.kind {
+        Some(kind) => format!("{} {head}", kind.manifest()),
+        None => head,
+    };
     match check.status {
         VersionStatus::Unchanged => anyhow!(
             "version ({head}) on '{source}' is unchanged from '{target}'; \
@@ -1374,18 +1394,43 @@ pub(crate) fn apply_version_bump(
     config: &Config,
     level: BumpLevel,
     reason: &str,
-) -> Result<(Semver, Semver)> {
+    kinds: &[ManifestKind],
+) -> Result<Vec<(ManifestKind, Semver, Semver)>> {
     let repo = &config.repo_root;
-    let kind = config
-        .manifest_kind()
-        .ok_or_else(|| anyhow!("no readable version to bump"))?;
-    let current = version::read_version_for(repo, kind)?
-        .ok_or_else(|| anyhow!("no readable version to bump"))?;
-    let next = current.bump(level);
+    let mut bumps = Vec::new();
+    for &kind in kinds {
+        let current = version::read_version_for(repo, kind)?
+            .ok_or_else(|| anyhow!("no readable version in {} to bump", kind.manifest()))?;
+        bumps.push((kind, current, current.bump(level)));
+    }
+    if bumps.is_empty() {
+        bail!("no readable version to bump");
+    }
 
-    let message = format!("chore(release): bump version to {next} for {reason}");
-    commit_version_change(config, kind, next, &message)?;
-    Ok((current, next))
+    let message = format!(
+        "chore(release): bump version to {} for {reason}",
+        describe_versions(bumps.iter().map(|&(kind, _, next)| (kind, next)))
+    );
+    let changes: Vec<_> = bumps.iter().map(|&(kind, _, next)| (kind, next)).collect();
+    commit_version_changes(config, &changes, &message)?;
+    Ok(bumps)
+}
+
+/// `0.2.4` for one manifest; `Cargo.toml 0.2.4, package.json 1.3.0` for
+/// several — what a commit message or a status line says about a set of
+/// version changes, naming the files only when there is more than one.
+pub(crate) fn describe_versions(
+    versions: impl IntoIterator<Item = (ManifestKind, Semver)>,
+) -> String {
+    let versions: Vec<_> = versions.into_iter().collect();
+    match versions.as_slice() {
+        [(_, only)] => only.to_string(),
+        many => many
+            .iter()
+            .map(|(kind, v)| format!("{} {v}", kind.manifest()))
+            .collect::<Vec<_>>()
+            .join(", "),
+    }
 }
 
 /// Strip rolling's dev marker back to a bare release version, ahead of a
@@ -1397,23 +1442,32 @@ pub(crate) fn apply_version_bump(
 /// `Ok(None)` when there's nothing to strip: dev versions are off, there's no
 /// readable version, or it's already bare (a repeat `rf promote` after one
 /// that already finalized, say).
-pub(crate) fn finalize_rolling(config: &Config) -> Result<Option<(Semver, Semver)>> {
+pub(crate) fn finalize_rolling(config: &Config) -> Result<Vec<(ManifestKind, Semver, Semver)>> {
     if !config.dev_versions {
-        return Ok(None);
+        return Ok(Vec::new());
     }
-    let Some(kind) = config.manifest_kind() else {
-        return Ok(None);
-    };
-    let Some(current) = version::read_version_for(&config.repo_root, kind)? else {
-        return Ok(None);
-    };
-    if !current.has_marker() {
-        return Ok(None);
+    let mut finalized = Vec::new();
+    for kind in config.manifest_kinds() {
+        let Some(current) = version::read_version_for(&config.repo_root, kind)? else {
+            continue;
+        };
+        if current.has_marker() {
+            finalized.push((kind, current, current.release()));
+        }
     }
-    let next = current.release();
-    let message = format!("chore(release): finalize {next} for promotion");
-    commit_version_change(config, kind, next, &message)?;
-    Ok(Some((current, next)))
+    if finalized.is_empty() {
+        return Ok(Vec::new());
+    }
+    let message = format!(
+        "chore(release): finalize {} for promotion",
+        describe_versions(finalized.iter().map(|&(kind, _, next)| (kind, next)))
+    );
+    let changes: Vec<_> = finalized
+        .iter()
+        .map(|&(kind, _, next)| (kind, next))
+        .collect();
+    commit_version_changes(config, &changes, &message)?;
+    Ok(finalized)
 }
 
 /// Write `next` into the manifest, refresh the lockfile, and commit both.
@@ -1426,17 +1480,24 @@ pub(crate) fn finalize_rolling(config: &Config) -> Result<Option<(Semver, Semver
 /// fails against a stale one. `kind` is the caller's already-resolved
 /// manifest kind (via `Config::manifest_kind`), so the value just read and
 /// the file about to be written always agree.
-fn commit_version_change(
+fn commit_version_changes(
     config: &Config,
-    kind: ManifestKind,
-    next: Semver,
+    changes: &[(ManifestKind, Semver)],
     message: &str,
 ) -> Result<()> {
     let repo = &config.repo_root;
-    version::write_version(repo, kind, next)?;
-    refresh_lockfile(repo, kind);
-    git::commit_paths(repo, &kind.paths(), message)
-        .with_context(|| format!("failed to commit the version change to {next}"))
+    let mut paths: Vec<&str> = Vec::new();
+    for &(kind, next) in changes {
+        version::write_version(repo, kind, next)?;
+        refresh_lockfile(repo, kind);
+        paths.extend(kind.paths());
+    }
+    git::commit_paths(repo, &paths, message).with_context(|| {
+        format!(
+            "failed to commit the version change to {}",
+            describe_versions(changes.iter().copied())
+        )
+    })
 }
 
 /// Mark the checked-out roll branch's version as roll `number`'s dev version:
@@ -1449,20 +1510,28 @@ fn commit_version_change(
 ///
 /// `Ok(None)` when the repo has no readable version, which is every repo
 /// without a `Cargo.toml`; marking is a convenience, never a precondition.
-pub(crate) fn apply_dev_version(config: &Config, number: u32) -> Result<Option<Semver>> {
-    let Some(kind) = config.manifest_kind() else {
-        return Ok(None);
-    };
-    let Some(current) = version::read_version_for(&config.repo_root, kind)? else {
-        return Ok(None);
-    };
-    if current.marker == Marker::Roll(number) {
-        return Ok(None);
+pub(crate) fn apply_dev_version(
+    config: &Config,
+    number: u32,
+) -> Result<Vec<(ManifestKind, Semver)>> {
+    let mut marked = Vec::new();
+    for kind in config.manifest_kinds() {
+        let Some(current) = version::read_version_for(&config.repo_root, kind)? else {
+            continue;
+        };
+        if current.marker != Marker::Roll(number) {
+            marked.push((kind, current.as_roll(number)));
+        }
     }
-    let next = current.as_roll(number);
-    let message = format!("chore(version): mark {next} as roll {number}'s dev version");
-    commit_version_change(config, kind, next, &message)?;
-    Ok(Some(next))
+    if marked.is_empty() {
+        return Ok(marked);
+    }
+    let message = format!(
+        "chore(version): mark {} as roll {number}'s dev version",
+        describe_versions(marked.iter().copied())
+    );
+    commit_version_changes(config, &marked, &message)?;
+    Ok(marked)
 }
 
 /// Apply `branch`'s own dev marker ahead of its gates, if it needs one —
@@ -1479,12 +1548,12 @@ pub(crate) fn apply_dev_version(config: &Config, number: u32) -> Result<Option<S
 pub(crate) fn apply_dev_version_for_branch(
     config: &Config,
     branch: &str,
-) -> Result<Option<Semver>> {
+) -> Result<Vec<(ManifestKind, Semver)>> {
     if !config.dev_versions {
-        return Ok(None);
+        return Ok(Vec::new());
     }
     let Some(number) = branches::parse_roll_number(branch, &config.roll_prefix) else {
-        return Ok(None);
+        return Ok(Vec::new());
     };
     apply_dev_version(config, number)
 }
@@ -1514,19 +1583,21 @@ fn check_dev_marker_ownership(config: &Config, branch: &str) -> Result<()> {
     let Some(number) = branches::parse_roll_number(branch, &config.roll_prefix) else {
         return Ok(());
     };
-    let Some((_, current)) =
-        version::version_at(&config.repo_root, branch, config.forced_manifest())?
-    else {
-        return Ok(());
-    };
-    match current.marker {
-        Marker::Roll(owner) if owner != number => bail!(
-            "version ({current}) on '{branch}' carries roll {owner}'s dev marker, \
-             not its own (roll {number}); the version history has been mixed with another \
-             roll's and needs a manual fix before this can continue"
-        ),
-        _ => Ok(()),
+    for kind in config.manifest_kinds_at(branch)? {
+        let Some((_, current)) = version::version_at(&config.repo_root, branch, Some(kind))? else {
+            continue;
+        };
+        match current.marker {
+            Marker::Roll(owner) if owner != number => bail!(
+                "version ({} {current}) on '{branch}' carries roll {owner}'s dev marker, \
+                 not its own (roll {number}); the version history has been mixed with another \
+                 roll's and needs a manual fix before this can continue",
+                kind.manifest()
+            ),
+            _ => {}
+        }
     }
+    Ok(())
 }
 
 /// The name the version merge driver is registered under, in both the
@@ -1573,9 +1644,10 @@ pub(crate) fn ensure_version_merge_driver(config: &Config) -> Result<bool> {
 /// [`settle_version_only_conflicts`]/the driver's own `run` match a file by
 /// its name regardless of which kind was wired first.
 fn wire_version_merge_driver(repo: &Path, forced: Option<ManifestKind>) -> Result<bool> {
-    let Some(kind) = ManifestKind::detect_forced(repo, forced) else {
+    let kinds = ManifestKind::detect_all_forced(repo, forced);
+    if kinds.is_empty() {
         return Ok(false);
-    };
+    }
 
     let mut changed = false;
 
@@ -1584,7 +1656,7 @@ fn wire_version_merge_driver(repo: &Path, forced: Option<ManifestKind>) -> Resul
     let attrs_path = repo.join(attrs_rel);
     let existing = std::fs::read_to_string(&attrs_path).unwrap_or_default();
     let mut next = existing.clone();
-    for file in kind.paths() {
+    for file in kinds.iter().flat_map(|kind| kind.paths()) {
         let line = format!("{file} merge={VERSION_MERGE_DRIVER}");
         if !next.lines().any(|l| l.trim() == line) {
             if !next.is_empty() && !next.ends_with('\n') {
@@ -1843,6 +1915,10 @@ pub(crate) struct VerifyOutcome {
     /// Crate-version comparison of source against target. `NotApplicable` when
     /// the repo has no `Cargo.toml` or the gate is disabled.
     pub version: VersionCheck,
+    /// Every manifest's comparison (`version` is the worst of these). More than
+    /// one entry for a repo versioned through both `Cargo.toml` and
+    /// `package.json`.
+    pub versions: Vec<VersionCheck>,
     /// Conflicts the eventual `--no-ff` merge would hit. Only ever `Some`
     /// under `--dry-run`: a real run fails with [`PredictedConflict`] instead,
     /// before any gate runs.
@@ -1914,13 +1990,14 @@ pub(crate) fn verify(config: &Config, dry_run: bool) -> Result<VerifyOutcome> {
     // the bump requirement; graduating a roll into rolling has no bump
     // requirement (deliberately, matching what `rf promote` enforces) but
     // still checks the dev marker it does carry is actually this roll's own.
-    let version = match route {
-        Route::Promote => version_check(config, &source, &target)?,
+    let versions = match route {
+        Route::Promote => version_checks(config, &source, &target)?,
         Route::Graduate { .. } => {
             check_dev_marker_ownership(config, &source)?;
-            VersionCheck::not_applicable()
+            Vec::new()
         }
     };
+    let version = VersionCheck::worst(&versions);
 
     let report = run_gates(
         &config.repo_root,
@@ -1944,6 +2021,7 @@ pub(crate) fn verify(config: &Config, dry_run: bool) -> Result<VerifyOutcome> {
         host_notices: host_report.notices,
         failed_hosts,
         version,
+        versions,
         conflicts,
         conflict_check_skipped,
     })
@@ -1965,7 +2043,7 @@ pub(crate) struct VerifyManyResult {
     /// `None` when the roll was skipped before `verify` could run.
     pub outcome: Option<VerifyOutcome>,
     /// The dev marker this pass committed onto the roll, when it was missing.
-    pub marked: Option<Semver>,
+    pub marked: Option<String>,
     pub verdict: VerifyVerdict,
     /// Set when the verdict is [`VerifyVerdict::Failed`] because the merge
     /// `verify` tried was predicted to conflict. Carried separately from
@@ -1986,7 +2064,7 @@ impl VerifyManyResult {
         }
     }
 
-    fn failed(branch: &str, marked: Option<Semver>, why: impl Into<String>) -> Self {
+    fn failed(branch: &str, marked: Option<String>, why: impl Into<String>) -> Self {
         VerifyManyResult {
             branch: branch.to_string(),
             outcome: None,
@@ -2013,24 +2091,27 @@ fn version_behind_stable(config: &Config) -> Result<Option<String>> {
         return Ok(None);
     }
     let repo = &config.repo_root;
-    let forced = config.forced_manifest();
-    let Some(head) = version::read_version(repo, forced)? else {
-        return Ok(None);
-    };
     let Some(stable_ref) = git::resolve_branch(repo, &config.stable_branch) else {
         return Ok(None);
     };
-    let Some((_, stable)) = version::version_at(repo, &stable_ref, forced)? else {
-        return Ok(None);
-    };
-    if head.release() >= stable.release() {
-        return Ok(None);
+    for kind in config.manifest_kinds() {
+        let Some(head) = version::read_version_for(repo, kind)? else {
+            continue;
+        };
+        let Some((_, stable)) = version::version_at(repo, &stable_ref, Some(kind))? else {
+            continue;
+        };
+        if head.release() >= stable.release() {
+            continue;
+        }
+        return Ok(Some(format!(
+            "{} version {head} is behind '{}' ({stable}); run `rf update` (or [u] in the TUI) \
+             to bring it up to date",
+            kind.manifest(),
+            config.stable_branch
+        )));
     }
-    Ok(Some(format!(
-        "version {head} is behind '{}' ({stable}); run `rf update` (or [u] in the TUI) \
-         to bring it up to date",
-        config.stable_branch
-    )))
+    Ok(None)
 }
 
 /// The verdict `verify`'s outcome amounts to, so the CLI's `rf verify`, the
@@ -2100,7 +2181,7 @@ pub(crate) fn verify_many(config: &Config, branches: &[String]) -> Result<Vec<Ve
             continue;
         }
         let marked = match apply_dev_version_for_branch(config, branch) {
-            Ok(marked) => marked,
+            Ok(marked) => (!marked.is_empty()).then(|| describe_versions(marked)),
             Err(err) => {
                 results.push(VerifyManyResult::failed(
                     branch,
@@ -2283,18 +2364,15 @@ pub(crate) fn graduate(
     // took, so it's unconditional rather than trying to detect which case
     // happened. The kind is read from whichever side has a manifest, roll
     // first — rolling may have none yet on the very first graduation ever.
-    let kind = config
-        .manifest_kind_at(roll)?
-        .or(config.manifest_kind_at(rolling)?);
-    let (ours_before, theirs_before) = match kind {
-        Some(kind) => (
-            git::show_file_at_ref(repo, rolling, kind.manifest())?
-                .and_then(|t| kind.parse_version(&t)),
-            git::show_file_at_ref(repo, roll, kind.manifest())?
-                .and_then(|t| kind.parse_version(&t)),
-        ),
-        None => (None, None),
-    };
+    //
+    // Per manifest: a repo versioned through both `Cargo.toml` and
+    // `package.json` resolves each to its own answer.
+    let mut kinds = config.manifest_kinds_at(roll)?;
+    for kind in config.manifest_kinds_at(rolling)? {
+        if !kinds.contains(&kind) {
+            kinds.push(kind);
+        }
+    }
 
     // Deliberately *not* `merge_driver::resolve` (which keeps "ours's" own
     // marker, whatever it already is) — that rule is right for `[i]`/`[I]`/
@@ -2307,24 +2385,32 @@ pub(crate) fn graduate(
     // numbers are maxed from both sides. `ours_before` is `None` only when
     // rolling has never had a manifest at all (this graduation introduces
     // it), in which case there's nothing on rolling's side to max against.
-    let resolved = kind.and_then(|kind| {
-        theirs_before.map(|theirs| {
-            let numeric = match ours_before {
-                Some(ours) => ours.release().max(theirs.release()),
-                None => theirs.release(),
-            };
-            let resolved = if config.dev_versions {
+    let mut resolved: Vec<(ManifestKind, Semver)> = Vec::new();
+    for kind in kinds {
+        let ours_before = git::show_file_at_ref(repo, rolling, kind.manifest())?
+            .and_then(|t| kind.parse_version(&t));
+        let theirs_before = git::show_file_at_ref(repo, roll, kind.manifest())?
+            .and_then(|t| kind.parse_version(&t));
+        let Some(theirs) = theirs_before else {
+            continue;
+        };
+        let numeric = match ours_before {
+            Some(ours) => ours.release().max(theirs.release()),
+            None => theirs.release(),
+        };
+        resolved.push((
+            kind,
+            if config.dev_versions {
                 numeric.as_rolling_dev()
             } else {
                 numeric
-            };
-            (kind, resolved)
-        })
-    });
+            },
+        ));
+    }
 
     let subject = format!("Graduate {roll} into {rolling}");
     let merge_outcome = merge_gated(repo, roll, rolling, &subject, None, || {
-        if let Some((kind, resolved)) = resolved {
+        for &(kind, resolved) in &resolved {
             reconcile_staged_version(repo, kind, resolved)?;
         }
         run_gates(repo, &config.roll_to_rolling_gates, dry_run, force)
@@ -2358,7 +2444,7 @@ pub(crate) fn graduate(
         )
     })?;
 
-    let tag_outcome = tag_graduation(config, resolved.map(|(_, v)| v), tag)?;
+    let tag_outcome = tag_graduation(config, resolved.first().map(|&(_, v)| v), tag)?;
 
     Ok(GraduateOutcome {
         roll: roll.to_string(),
@@ -2918,8 +3004,12 @@ pub(crate) struct PromoteStep {
     pub host_results: Vec<HostResult>,
     /// Dry-run notices for the host gates.
     pub host_notices: Vec<GateNotice>,
-    /// Crate-version comparison of rolling against stable.
+    /// Crate-version comparison of rolling against stable. For a repo versioned
+    /// through several manifests, the first one's (the one the tag names).
     pub version: VersionCheck,
+    /// Every manifest's comparison, `version` included; empty only when the
+    /// step ran before any was made.
+    pub versions: Vec<VersionCheck>,
     /// What happened to the `vX.Y.Z` release tag.
     pub tag: TagOutcome,
     /// True when this step raised the version inside its own merge commit —
@@ -3297,6 +3387,15 @@ fn rolling_commit_order(config: &Config) -> HashMap<String, usize> {
 }
 
 /// Run one planned step: stage the merge, gate the result, commit if it passes.
+/// One manifest's part of a promotion step: its verdict against stable and what
+/// has to be written into the staged merge to satisfy it.
+struct KindPlan {
+    kind: ManifestKind,
+    version: VersionCheck,
+    in_merge_bump: Option<(Semver, Semver)>,
+    staged_write: Option<Semver>,
+}
+
 fn run_promote_step(
     config: &Config,
     stable_ref: &str,
@@ -3325,53 +3424,81 @@ fn run_promote_step(
     // that raw value never actually reaches stable. `raw_head` is kept
     // alongside so the staged tree below can tell whether anything needs
     // rewriting at all.
-    let kind = config.manifest_kind_at(&step.source)?;
-    let raw_head = match kind {
-        Some(kind) => git::show_file_at_ref(repo, &step.source, kind.manifest())?
-            .and_then(|t| kind.parse_version(&t)),
-        None => None,
-    };
-    let finalized_head = raw_head.map(|v| v.release());
-    let mut version = if config.version_gate {
-        version::check_against(repo, finalized_head, stable_ref, config.forced_manifest())?
-    } else {
-        VersionCheck::not_applicable()
-    };
+    //
+    // A repo versioned through more than one manifest (Cargo.toml *and*
+    // package.json) is planned per manifest: each has its own head, its own
+    // verdict against stable, its own bump and its own marker to strip, and
+    // each must clear the gate.
+    let mut plans: Vec<KindPlan> = Vec::new();
+    for kind in config.manifest_kinds_at(&step.source)? {
+        let raw_head = git::show_file_at_ref(repo, &step.source, kind.manifest())?
+            .and_then(|t| kind.parse_version(&t));
+        let finalized_head = raw_head.map(|v| v.release());
+        let version = if config.version_gate {
+            version::check_against(repo, finalized_head, stable_ref, Some(kind))?
+        } else {
+            VersionCheck::not_applicable()
+        };
+
+        // An unchanged version with a bump level in hand is not a failure but
+        // a plan: raise it inside the merge. Only `Unchanged` qualifies — a
+        // version *lower* than stable is never one level away from right, and
+        // an unreadable one cannot be raised at all.
+        let in_merge_bump = match (version.status, version.head, bump) {
+            (VersionStatus::Unchanged, Some(head), Some(level)) if !dry_run => {
+                Some((head, head.bump(level)))
+            }
+            _ => None,
+        };
+
+        // Whatever must actually land in the staged manifest: the bumped value
+        // if one was just computed, otherwise the finalized one if that
+        // differs from what the commit itself carries (i.e. it still has a
+        // marker to drop). `None` when there is truly nothing to change — no
+        // marker, no bump — which keeps a repo with `dev_versions` off (or an
+        // already-bare graduation) byte-identical to before this existed.
+        let staged_write = in_merge_bump.map(|(_, next)| next).or_else(|| {
+            if dry_run {
+                return None;
+            }
+            match (raw_head, finalized_head) {
+                (Some(raw), Some(finalized)) if raw != finalized => Some(finalized),
+                _ => None,
+            }
+        });
+        plans.push(KindPlan {
+            kind,
+            version,
+            in_merge_bump,
+            staged_write,
+        });
+    }
+    if plans.is_empty() {
+        // The source has no readable manifest. Still compared against stable's
+        // — a base with a version and a head without one reads `Unreadable`.
+        let version = if config.version_gate {
+            version::check_against(repo, None, stable_ref, config.forced_manifest())?
+        } else {
+            VersionCheck::not_applicable()
+        };
+        plans.push(KindPlan {
+            kind: ManifestKind::Cargo,
+            version,
+            in_merge_bump: None,
+            staged_write: None,
+        });
+    }
     let mut version_bypass = Vec::new();
 
-    // An unchanged version with a bump level in hand is not a failure but a
-    // plan: raise it inside the merge. Only `Unchanged` qualifies — a version
-    // that is *lower* than stable is never one level away from right, and an
-    // unreadable one cannot be raised at all.
-    let in_merge_bump = match (version.status, version.head, bump) {
-        (VersionStatus::Unchanged, Some(head), Some(level)) if !dry_run => {
-            Some((head, head.bump(level)))
+    for plan in &plans {
+        if plan.version.is_satisfied() || plan.in_merge_bump.is_some() {
+            continue;
         }
-        _ => None,
-    };
-
-    // Whatever must actually land in the staged `Cargo.toml`: the bumped value
-    // if one was just computed, otherwise the finalized one if that differs
-    // from what the commit itself carries (i.e. it still has a marker to
-    // drop). `None` when there is truly nothing to change — no marker, no
-    // bump — which keeps a repo with `dev_versions` off (or an
-    // already-bare graduation) byte-identical to before this existed.
-    let staged_write = in_merge_bump.map(|(_, next)| next).or_else(|| {
-        if dry_run {
-            return None;
-        }
-        match (raw_head, finalized_head) {
-            (Some(raw), Some(finalized)) if raw != finalized => Some(finalized),
-            _ => None,
-        }
-    });
-
-    if !version.is_satisfied() && in_merge_bump.is_none() {
         // `--dry-run` previews rather than enforces, exactly as it does for the
         // configured gates (which are printed, not executed). The rendered
         // status line still reports that the version would block a real run.
         if !force.enabled && !dry_run {
-            return Err(version_gate_error(&version, &label, stable));
+            return Err(version_gate_error(&plan.version, &label, stable));
         }
         // Under --force the gate is recorded in the merge trailer exactly like a
         // bypassed shell gate, so the override leaves the same audit trail.
@@ -3382,6 +3509,8 @@ fn run_promote_step(
             });
         }
     }
+    let mut version =
+        VersionCheck::worst(&plans.iter().map(|p| p.version.clone()).collect::<Vec<_>>());
 
     // Gates run against the staged merge result, so `report` is produced inside
     // `merge_gated`. In dry-run nothing is staged and nothing is merged.
@@ -3392,7 +3521,11 @@ fn run_promote_step(
         // not left in the worktree: `merge_gated` refuses to commit unstaged
         // tracked changes, precisely so a gate cannot smuggle edits past it,
         // and this is not a gate's edit but part of what is being merged.
-        if let (Some(next), Some(kind)) = (staged_write, kind) {
+        for plan in &plans {
+            let Some(next) = plan.staged_write else {
+                continue;
+            };
+            let kind = plan.kind;
             version::write_version(repo, kind, next)?;
             refresh_lockfile(repo, kind);
             // Only what exists: a manifest with no lockfile (fixture
@@ -3420,13 +3553,18 @@ fn run_promote_step(
 
     if dry_run {
         let (report, host_report) = run_checks()?;
-        let tag_outcome = match (tag && config.tag_on_promote, version.head) {
+        // The tag names the first manifest's version, but the step reports the
+        // worst verdict: a bump still owed by *any* manifest keeps the tag
+        // name unknowable.
+        let primary = plans[0].version.clone();
+        let tag_outcome = match (tag && config.tag_on_promote, primary.head) {
             // The version still has to move, so the eventual tag name is not
             // knowable here — claiming the current one would be wrong.
             (true, Some(_)) if !version.is_satisfied() => TagOutcome::WouldCreateAfterBump,
             (true, Some(v)) => TagOutcome::WouldCreate { tag: v.tag() },
             _ => TagOutcome::Skipped,
         };
+        let versions: Vec<VersionCheck> = plans.iter().map(|p| p.version.clone()).collect();
         return Ok(PromoteStep {
             roll: step.roll,
             source: step.source,
@@ -3435,6 +3573,7 @@ fn run_promote_step(
             host_results: host_report.results,
             host_notices: host_report.notices,
             version,
+            versions,
             tag: tag_outcome,
             bumped: false,
             bumped_from: None,
@@ -3461,15 +3600,24 @@ fn run_promote_step(
     }
 
     // Once merged, the version the tag must name is the raised one, and the
-    // check reports it as satisfied — which it now is.
-    let bumped_from = in_merge_bump.map(|(from, next)| {
-        version = VersionCheck {
-            head: Some(next),
-            base: version.base,
-            status: VersionStatus::Ok,
-        };
-        from
-    });
+    // check reports it as satisfied — which it now is. The tag names the
+    // first manifest's version (`Cargo.toml` before `package.json`).
+    let mut bumped_from = None;
+    for plan in &mut plans {
+        if let Some((from, next)) = plan.in_merge_bump {
+            plan.version = VersionCheck {
+                kind: plan.version.kind,
+                head: Some(next),
+                base: plan.version.base,
+                status: VersionStatus::Ok,
+            };
+            bumped_from.get_or_insert(from);
+        }
+    }
+    let versions: Vec<VersionCheck> = plans.iter().map(|p| p.version.clone()).collect();
+    if let Some(first) = versions.first() {
+        version = first.clone();
+    }
 
     // Tag last of all, so it points at the commit the trailer amend produced
     // rather than the one it replaced.
@@ -3483,6 +3631,7 @@ fn run_promote_step(
         host_results: host_report.results,
         host_notices: host_report.notices,
         version,
+        versions,
         tag: tag_outcome,
         bumped: bumped_from.is_some(),
         bumped_from,

@@ -39,7 +39,7 @@ use crate::core::{
     git::{self, TrackState},
     history, ops, proc, rebuild,
     sync::{self, PullPlan, PushOutcome, SyncTarget},
-    version::{self, BumpLevel, Semver, VersionCheck, VersionStatus},
+    version::{self, BumpLevel, ManifestKind, Semver, VersionCheck, VersionStatus},
 };
 
 /// A workflow operation reachable from the view. Navigation, quit and refresh
@@ -268,14 +268,57 @@ pub(crate) fn bump_previews(current: Semver) -> [(BumpLevel, Semver); 3] {
     ]
 }
 
+/// One manifest the bump modal can raise: which file, what it says now, and
+/// whether it still owes a bump to get past the stable branch (`None` when
+/// that could not be told — no stable to compare against).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct BumpManifest {
+    pub kind: ManifestKind,
+    pub current: Semver,
+    pub owes: Option<bool>,
+}
+
+/// What a keystroke in the manifest picker (the first step of the bump modal,
+/// shown only when a repo is versioned through more than one manifest) asks for.
+#[derive(Clone, PartialEq, Eq, Debug)]
+pub(crate) enum BumpPick {
+    Ignore,
+    Cancel,
+    /// Indices into the modal's manifests.
+    Chosen(Vec<usize>),
+}
+
+/// Decide a keystroke in the manifest picker over `count` manifests: a digit
+/// picks that one, `a` picks them all.
+pub(crate) fn bump_pick_key(code: KeyCode, count: usize) -> BumpPick {
+    match code {
+        KeyCode::Char('a') | KeyCode::Char('A') => BumpPick::Chosen((0..count).collect()),
+        KeyCode::Char(c @ '1'..='9') => {
+            let index = c as usize - '1' as usize;
+            if index < count {
+                BumpPick::Chosen(vec![index])
+            } else {
+                BumpPick::Ignore
+            }
+        }
+        KeyCode::Char('n') | KeyCode::Char('N') | KeyCode::Esc => BumpPick::Cancel,
+        _ => BumpPick::Ignore,
+    }
+}
+
 /// Whether `[b]` can do anything here, or why not.
 ///
 /// A repo with no readable manifest version has nothing to raise — the same
 /// condition that makes the whole release path a no-op
 /// (`VersionStatus::NotApplicable`), so refusing here keeps the key honest
 /// rather than opening a modal over nothing.
-pub(crate) fn bump_gate(current: Option<Semver>) -> Result<Semver, String> {
-    current.ok_or_else(|| "no readable version — nothing to bump".to_string())
+pub(crate) fn bump_gate(
+    manifests: Vec<(ManifestKind, Semver)>,
+) -> Result<Vec<(ManifestKind, Semver)>, String> {
+    if manifests.is_empty() {
+        return Err("no readable version — nothing to bump".to_string());
+    }
+    Ok(manifests)
 }
 
 /// Decide a keystroke in the force-push confirmation.
@@ -405,7 +448,11 @@ enum Mode {
     /// Pick a semver level to raise. Holds the version read when the modal
     /// opened, so the previews it shows and the bump it applies agree.
     Bump {
-        current: Semver,
+        manifests: Vec<BumpManifest>,
+        /// Which of `manifests` the level will apply to. `None` while the
+        /// picker step is still showing — a repo with a single manifest skips
+        /// it and opens with that one already picked.
+        picked: Option<Vec<usize>>,
     },
     /// `[V]`: pick which set of rolls to verify in one pass. Holds the counts
     /// read when the modal opened, so the numbers it shows and the set it
@@ -1714,7 +1761,13 @@ pub(crate) fn verify_route_for(config: &Config, current_branch: &str) -> Option<
 
 /// Render a version check the way `main.rs` prints it, so the TUI and the CLI
 /// report the same comparison in the same words.
-fn push_version_check(lines: &mut Vec<String>, check: &VersionCheck, source: &str, target: &str) {
+fn push_version_check(
+    lines: &mut Vec<String>,
+    check: &VersionCheck,
+    source: &str,
+    target: &str,
+    named: bool,
+) {
     let verdict = match check.status {
         VersionStatus::Ok => "OK",
         VersionStatus::Unchanged => "UNCHANGED",
@@ -1733,8 +1786,12 @@ fn push_version_check(lines: &mut Vec<String>, check: &VersionCheck, source: &st
         .base
         .map(|v| v.to_string())
         .unwrap_or_else(|| "none".to_string());
+    let file = match (named, check.kind) {
+        (true, Some(kind)) => format!(" ({})", kind.manifest()),
+        _ => String::new(),
+    };
     lines.push(format!(
-        "Version: {head} on '{source}' (base '{target}' {base}) {verdict}"
+        "Version{file}: {head} on '{source}' (base '{target}' {base}) {verdict}"
     ));
 }
 
@@ -3387,8 +3444,39 @@ impl StatusApp {
         if self.waits_on_head("[b]") {
             return;
         }
-        match bump_gate(self.version) {
-            Ok(current) => self.mode = Mode::Bump { current },
+        let read: Vec<(ManifestKind, Semver)> = self
+            .config
+            .manifest_kinds()
+            .into_iter()
+            .filter_map(|kind| {
+                version::read_version_for(&self.config.repo_root, kind)
+                    .ok()
+                    .flatten()
+                    .map(|v| (kind, v))
+            })
+            .collect();
+        match bump_gate(read) {
+            Ok(read) => {
+                let stable =
+                    git::resolve_branch(&self.config.repo_root, &self.config.stable_branch);
+                let manifests: Vec<BumpManifest> = read
+                    .into_iter()
+                    .map(|(kind, current)| BumpManifest {
+                        kind,
+                        current,
+                        owes: stable.as_deref().and_then(|stable| {
+                            let (_, base) =
+                                version::version_at(&self.config.repo_root, stable, Some(kind))
+                                    .ok()
+                                    .flatten()?;
+                            Some(current.release() <= base.release())
+                        }),
+                    })
+                    .collect();
+                // One manifest: nothing to drill into.
+                let picked = (manifests.len() == 1).then(|| vec![0]);
+                self.mode = Mode::Bump { manifests, picked };
+            }
             Err(msg) => self.message = Some(msg),
         }
     }
@@ -3606,19 +3694,35 @@ impl StatusApp {
     }
 
     /// Handle a keypress while the bump picker is open.
+    ///
+    /// Two steps when the repo is versioned through more than one manifest:
+    /// first which of them to raise, then by how much. With one, only the
+    /// second.
     fn handle_bump(&mut self, code: KeyCode) {
+        let Mode::Bump { manifests, picked } = &mut self.mode else {
+            return;
+        };
+        let Some(chosen) = picked.clone() else {
+            match bump_pick_key(code, manifests.len()) {
+                BumpPick::Ignore => {}
+                BumpPick::Cancel => self.mode = Mode::Browsing,
+                BumpPick::Chosen(indices) => *picked = Some(indices),
+            }
+            return;
+        };
+        let kinds: Vec<ManifestKind> = chosen.iter().map(|&i| manifests[i].kind).collect();
         match bump_key(code) {
             BumpOutcome::Ignore => {}
             BumpOutcome::Cancel => self.mode = Mode::Browsing,
             BumpOutcome::Level(level) => {
                 self.mode = Mode::Browsing;
-                self.execute_bump(level);
+                self.execute_bump(level, kinds);
             }
         }
     }
 
     /// Write the bumped version, refresh the lockfile and commit, as a job.
-    fn execute_bump(&mut self, level: BumpLevel) {
+    fn execute_bump(&mut self, level: BumpLevel, kinds: Vec<ManifestKind>) {
         let config = self.config.clone();
         let branch = self.current_branch.clone();
         self.start_job(format!("rf bump {level}"), move || {
@@ -3626,9 +3730,15 @@ impl StatusApp {
             // `git::commit_paths` stages its two files and then commits the whole
             // index. Graduate and promote take the same precaution.
             ops::ensure_clean_state(&config)?;
-            let (from, to) = ops::apply_version_bump(&config, level, &branch)?;
+            let bumped = ops::apply_version_bump(&config, level, &branch, &kinds)?;
+            let (from, to): (Vec<_>, Vec<_>) = bumped
+                .iter()
+                .map(|&(kind, from, to)| ((kind, from), (kind, to)))
+                .unzip();
             Ok(JobDone::lines(vec![format!(
-                "Bumped {from} → {to} ({level}) on '{branch}'"
+                "Bumped {} → {} ({level}) on '{branch}'",
+                ops::describe_versions(from),
+                ops::describe_versions(to)
             )]))
         });
     }
@@ -4412,7 +4522,13 @@ impl StatusApp {
                 render_create_input(f, area, &self.config, slug, *kind)
             }
             Mode::Delete { preview } => render_delete_modal(f, area, &self.config, preview),
-            Mode::Bump { current } => render_bump_modal(f, area, *current, &self.current_branch),
+            Mode::Bump { manifests, picked } => match picked {
+                None => render_bump_pick_modal(f, area, manifests, &self.current_branch),
+                Some(indices) => {
+                    let chosen: Vec<BumpManifest> = indices.iter().map(|&i| manifests[i]).collect();
+                    render_bump_levels_modal(f, area, &chosen, &self.current_branch)
+                }
+            },
             Mode::VerifyMany { counts } => render_verify_many_modal(f, area, counts),
             Mode::PullMany { counts } => render_pull_many_modal(f, area, counts),
             Mode::UpdateMany { counts } => render_update_many_modal(f, area, counts),
@@ -4921,8 +5037,9 @@ fn run_verify(config: &Config) -> Result<Vec<String>> {
 
     let mut lines = Vec::new();
     let current = git::current_branch(&config.repo_root)?;
-    if let Some(dev) = ops::apply_dev_version_for_branch(config, &current)? {
-        lines.push(format!("version marked {dev}"));
+    let marked = ops::apply_dev_version_for_branch(config, &current)?;
+    if !marked.is_empty() {
+        lines.push(format!("version marked {}", ops::describe_versions(marked)));
     }
 
     let outcome = match ops::verify(config, false) {
@@ -4940,12 +5057,15 @@ fn run_verify(config: &Config) -> Result<Vec<String>> {
             outcome.target, outcome.source
         ));
     }
-    push_version_check(
-        &mut lines,
-        &outcome.version,
-        &outcome.source,
-        &outcome.target,
-    );
+    for check in &outcome.versions {
+        push_version_check(
+            &mut lines,
+            check,
+            &outcome.source,
+            &outcome.target,
+            outcome.versions.len() > 1,
+        );
+    }
     push_gate_notices(&mut lines, &outcome.gate_notices);
     push_gate_notices(&mut lines, &outcome.host_notices);
     push_host_results(&mut lines, &outcome.host_results);
@@ -5288,7 +5408,7 @@ fn render_verify_many(
     let mut skipped = 0;
     for result in results {
         lines.push(format!("── {} ──", result.branch));
-        if let Some(dev) = result.marked {
+        if let Some(dev) = &result.marked {
             lines.push(format!("version marked {dev}"));
         }
         if let Some(o) = &result.outcome {
@@ -5304,7 +5424,15 @@ fn render_verify_many(
                     o.source, o.target
                 ));
             }
-            push_version_check(&mut lines, &o.version, &o.source, &o.target);
+            for check in &o.versions {
+                push_version_check(
+                    &mut lines,
+                    check,
+                    &o.source,
+                    &o.target,
+                    o.versions.len() > 1,
+                );
+            }
             push_gate_notices(&mut lines, &o.gate_notices);
             push_gate_notices(&mut lines, &o.host_notices);
             push_host_results(&mut lines, &o.host_results);
@@ -5466,6 +5594,105 @@ fn render_update_many_modal(f: &mut Frame, area: Rect, counts: &[(UpdateSet, usi
 
 /// abstract, `0.2.0 → 0.3.0` is not, and seeing all three at once is what makes
 /// picking the right one obvious.
+/// The manifest picker: one row per manifest with what it says now and
+/// whether it still owes a bump past stable, plus `[a]` for all of them.
+fn render_bump_pick_modal(f: &mut Frame, area: Rect, manifests: &[BumpManifest], branch: &str) {
+    let mut lines = vec![
+        Line::from(format!("Bump which version?  (on {branch})")),
+        Line::from(""),
+    ];
+    for (i, m) in manifests.iter().enumerate() {
+        let status = match m.owes {
+            Some(true) => "  — needs a bump",
+            Some(false) => "  — already ahead of the stable branch",
+            None => "",
+        };
+        lines.push(Line::from(vec![
+            Span::styled(format!("[{}] ", i + 1), Style::default().fg(Color::Yellow)),
+            Span::raw(format!("{} ", m.kind.manifest())),
+            Span::styled(
+                m.current.to_string(),
+                Style::default().add_modifier(Modifier::BOLD),
+            ),
+            Span::raw(status),
+        ]));
+    }
+    lines.push(Line::from(vec![
+        Span::styled("[a] ", Style::default().fg(Color::Yellow)),
+        Span::raw("all of them"),
+    ]));
+    lines.push(Line::from(""));
+    lines.push(Line::from(Span::styled(
+        "[n] cancel",
+        Style::default().fg(Color::Yellow),
+    )));
+    let width = lines
+        .iter()
+        .map(|l| l.width())
+        .max()
+        .unwrap_or(32)
+        .clamp(28, 90) as u16;
+    let modal = centered_rect(area, width + 4, lines.len() as u16 + 2);
+    f.render_widget(Clear, modal);
+    f.render_widget(
+        Paragraph::new(lines).block(Block::bordered().title(Span::styled(
+            " bump version ",
+            Style::default().add_modifier(Modifier::BOLD),
+        ))),
+        modal,
+    );
+}
+
+/// The level step. A single manifest renders exactly as it always has; several
+/// list every manifest's resulting version on each row.
+fn render_bump_levels_modal(f: &mut Frame, area: Rect, chosen: &[BumpManifest], branch: &str) {
+    if let [only] = chosen {
+        return render_bump_modal(f, area, only.current, branch);
+    }
+    let mut lines = vec![
+        Line::from(format!("Bumping {} manifests  (on {branch})", chosen.len())),
+        Line::from(""),
+    ];
+    for m in chosen {
+        lines.push(Line::from(format!("{}: {}", m.kind.manifest(), m.current)));
+    }
+    lines.push(Line::from(""));
+    for (i, level) in [BumpLevel::Patch, BumpLevel::Minor, BumpLevel::Major]
+        .into_iter()
+        .enumerate()
+    {
+        let results = chosen
+            .iter()
+            .map(|m| format!("{} {}", m.kind.manifest(), m.current.bump(level)))
+            .collect::<Vec<_>>()
+            .join(", ");
+        lines.push(Line::from(vec![
+            Span::styled(format!("[{}] ", i + 1), Style::default().fg(Color::Yellow)),
+            Span::raw(format!("{level} → {results}")),
+        ]));
+    }
+    lines.push(Line::from(""));
+    lines.push(Line::from(Span::styled(
+        "[n] cancel",
+        Style::default().fg(Color::Yellow),
+    )));
+    let width = lines
+        .iter()
+        .map(|l| l.width())
+        .max()
+        .unwrap_or(32)
+        .clamp(28, 100) as u16;
+    let modal = centered_rect(area, width + 4, lines.len() as u16 + 2);
+    f.render_widget(Clear, modal);
+    f.render_widget(
+        Paragraph::new(lines).block(Block::bordered().title(Span::styled(
+            " bump version ",
+            Style::default().add_modifier(Modifier::BOLD),
+        ))),
+        modal,
+    );
+}
+
 fn render_bump_modal(f: &mut Frame, area: Rect, current: Semver, branch: &str) {
     let mut lines = vec![
         Line::from(vec![
@@ -7754,9 +7981,15 @@ mod tests {
             let mut lines = Vec::new();
             push_version_check(
                 &mut lines,
-                &VersionCheck { head, base, status },
+                &VersionCheck {
+                    kind: None,
+                    head,
+                    base,
+                    status,
+                },
                 "rolling",
                 "main",
+                false,
             );
             lines
         };
@@ -9871,7 +10104,7 @@ mod tests {
             ops::VerifyManyResult {
                 branch: "roll/1-x".to_string(),
                 outcome: None,
-                marked: Some(crate::core::version::Semver::parse("0.0.1-roll1").unwrap()),
+                marked: Some("0.0.1-roll1".to_string()),
                 verdict: ops::VerifyVerdict::Passed,
                 conflict: None,
             },
@@ -9992,9 +10225,11 @@ mod tests {
 
     #[test]
     fn bump_is_refused_in_a_repo_with_no_version() {
-        let err = bump_gate(None).expect_err("a repo with no readable version has nothing to bump");
+        let err =
+            bump_gate(Vec::new()).expect_err("a repo with no readable version has nothing to bump");
         assert!(err.contains("nothing to bump"), "{err}");
-        assert_eq!(bump_gate(Some(v(0, 1, 0))), Ok(v(0, 1, 0)));
+        let one = vec![(ManifestKind::Cargo, v(0, 1, 0))];
+        assert_eq!(bump_gate(one.clone()), Ok(one));
     }
 
     #[test]
@@ -10012,6 +10247,54 @@ mod tests {
         assert!(out.contains("[2] minor → 0.3.0"), "{out}");
         assert!(out.contains("[3] major → 1.0.0"), "{out}");
         assert!(out.contains("[n] cancel"), "{out}");
+    }
+
+    #[test]
+    fn the_manifest_picker_chooses_one_or_all_and_rejects_what_is_not_listed() {
+        assert_eq!(
+            bump_pick_key(KeyCode::Char('1'), 2),
+            BumpPick::Chosen(vec![0])
+        );
+        assert_eq!(
+            bump_pick_key(KeyCode::Char('2'), 2),
+            BumpPick::Chosen(vec![1])
+        );
+        assert_eq!(bump_pick_key(KeyCode::Char('3'), 2), BumpPick::Ignore);
+        assert_eq!(
+            bump_pick_key(KeyCode::Char('a'), 2),
+            BumpPick::Chosen(vec![0, 1])
+        );
+        assert_eq!(bump_pick_key(KeyCode::Esc, 2), BumpPick::Cancel);
+        assert_eq!(bump_pick_key(KeyCode::Char('n'), 2), BumpPick::Cancel);
+        assert_eq!(bump_pick_key(KeyCode::Char('x'), 2), BumpPick::Ignore);
+    }
+
+    #[test]
+    fn the_bump_picker_names_each_manifest_and_what_it_still_owes() {
+        let manifests = [
+            BumpManifest {
+                kind: ManifestKind::Cargo,
+                current: v(0, 2, 0),
+                owes: Some(true),
+            },
+            BumpManifest {
+                kind: ManifestKind::Npm,
+                current: v(1, 4, 0),
+                owes: Some(false),
+            },
+        ];
+        let out = draw(|f, area| render_bump_pick_modal(f, area, &manifests, "rolling"));
+        assert!(out.contains("[1] Cargo.toml 0.2.0"), "{out}");
+        assert!(out.contains("needs a bump"), "{out}");
+        assert!(out.contains("[2] package.json 1.4.0"), "{out}");
+        assert!(out.contains("already ahead"), "{out}");
+        assert!(out.contains("[a] all of them"), "{out}");
+
+        let out = draw(|f, area| render_bump_levels_modal(f, area, &manifests, "rolling"));
+        assert!(
+            out.contains("[1] patch → Cargo.toml 0.2.1, package.json 1.4.1"),
+            "{out}"
+        );
     }
 
     #[test]

@@ -399,7 +399,32 @@ magnitude apart by the shift key alone is a mistake waiting to happen; the digit
 also carry the ordering. Every row shows the version it would produce, so the
 choice needs no semver arithmetic in your head.
 
-It writes `Cargo.toml`, refreshes `Cargo.lock`, and commits both as
+### More than one manifest
+
+A repo versioned through both `Cargo.toml` and `package.json` (see
+[`version_manifest`](../config.md)) gets a **drill-down**: `[b]` first asks
+*which* version to raise, then by how much.
+
+```text
+┌ bump version ─────────────────────────────────────────────────┐
+│Bump which version?  (on rolling)                              │
+│                                                               │
+│[1] Cargo.toml 0.2.0-dev  — needs a bump                       │
+│[2] package.json 1.4.0  — already ahead of the stable branch   │
+│[a] all of them                                                │
+│                                                               │
+│[n] cancel                                                     │
+└───────────────────────────────────────────────────────────────┘
+```
+
+Each row says whether that manifest still owes a bump past the stable branch,
+which is what a promotion needs — it is refused until every manifest has one.
+`[1]`/`[2]` pick one, `[a]` raises them all by the same level, and the level
+step then lists each chosen manifest's resulting version. One commit carries
+every file it changed.
+
+For one manifest it writes `Cargo.toml` (or `package.json`), refreshes the
+lockfile, and commits both as
 `chore(release): bump version to <X> for <branch>` — identical to what
 `rf promote --bump` does, and the reason a clean working tree is required: the
 commit stages its two files and then commits the index, so anything else staged

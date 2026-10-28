@@ -176,28 +176,23 @@ pub struct Config {
     /// `lazygit` on `PATH`.
     #[serde(default = "default_lazygit")]
     pub lazygit_command: String,
-    /// Which manifest this repo versions through, when it carries both a
-    /// `Cargo.toml` and a `package.json`. `Auto` (default) prefers `Cargo` —
-    /// the same choice [`version::ManifestKind::detect`] makes with no
-    /// config at all. Set to `npm` for a repo (a Tauri app, say) that
-    /// versions through `package.json` despite also carrying a `Cargo.toml`
-    /// for tooling.
+    /// Which manifest(s) this repo versions through. `Auto` (default) tracks
+    /// *every* manifest with a readable version — a repo carrying both a
+    /// `Cargo.toml` and a versioned `package.json` is versioned through both,
+    /// and each must clear the gate ([`Config::manifest_kinds`]). `Cargo` or
+    /// `Npm` pins one, for a repo whose other manifest exists only for
+    /// tooling.
     ///
     /// Reaches every `version` free function that reads or compares — not
     /// just the writes — via [`Config::forced_manifest`] (passed as that
-    /// function's own `forced` parameter) and [`Config::manifest_kind`]/
-    /// [`Config::manifest_kind_at`] (for the handful of call sites that
-    /// already resolve a kind for other reasons, e.g. to pick which lockfile
-    /// to refresh). What `apply_version_bump`/`apply_dev_version`/
-    /// `finalize_rolling` read as "current", what the version gate compares,
-    /// and what they then write all agree on which manifest. It does not
-    /// reach the merge-driver subprocess, which has no `Config` at all and
-    /// keeps auto-detecting — harmless, since its only job is to settle a
-    /// version-line conflict on whichever files a merge actually touches,
-    /// and attribute lines for the other kind's files are simply never
-    /// matched. A repo carrying both manifests and needing this at all is
-    /// expected to be the rare exception, not the common case this key
-    /// exists to unblock.
+    /// function's own `forced` parameter) and [`Config::manifest_kinds`]/
+    /// [`Config::manifest_kinds_at`]. What `apply_version_bump`/
+    /// `apply_dev_version`/`finalize_rolling` read as "current", what the
+    /// version gate compares, and what they then write all agree on which
+    /// manifests. It does not reach the merge-driver subprocess, which has no
+    /// `Config` at all and keeps auto-detecting — harmless, since its only job
+    /// is to settle a version-line conflict on whichever files a merge
+    /// actually touches.
     #[serde(default)]
     pub version_manifest: VersionManifest,
 }
@@ -536,6 +531,24 @@ impl Config {
         refspec: &str,
     ) -> Result<Option<version::ManifestKind>, RfError> {
         self.version_manifest.resolve_at(&self.repo_root, refspec)
+    }
+
+    /// Every manifest kind this repo's working tree versions through. With
+    /// `version_manifest = "auto"` that is each of `Cargo.toml` and
+    /// `package.json` carrying a readable version — a repo with both is
+    /// versioned through both. A pinned `cargo`/`npm` yields only that kind.
+    pub fn manifest_kinds(&self) -> Vec<version::ManifestKind> {
+        version::ManifestKind::detect_all_forced(&self.repo_root, self.forced_manifest())
+    }
+
+    /// [`manifest_kinds`](Self::manifest_kinds) at a ref rather than the
+    /// working tree.
+    pub fn manifest_kinds_at(&self, refspec: &str) -> Result<Vec<version::ManifestKind>, RfError> {
+        version::ManifestKind::detect_all_at_forced(
+            &self.repo_root,
+            refspec,
+            self.forced_manifest(),
+        )
     }
 
     /// The raw `version_manifest` override, if any was set — `None` for

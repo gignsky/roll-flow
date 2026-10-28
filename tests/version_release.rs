@@ -869,20 +869,71 @@ fn npm_lockfile_markers_from_two_rolls_merge_through_the_driver() {
     assert_eq!(sb.package_lock_version_at("rolling"), "0.0.2-dev");
 }
 
-#[test]
-fn a_repo_with_both_manifests_versions_through_cargo_by_default() {
+/// A Cargo project that also carries a versioned `package.json` (Tauri-style
+/// apps, a Rust backend released together with its JS front end).
+fn dual() -> Sandbox {
     let sb = Sandbox::cargo();
     sb.write_package_version("0.0.1");
     sb.git(&["add", "package.json"]);
     sb.git(&["commit", "-m", "add package.json too"]);
     sb.init();
+    sb
+}
+
+#[test]
+fn a_repo_with_both_manifests_marks_both() {
+    let sb = dual();
 
     let out = sb.create_roll("both", "0611");
     assert!(out.success, "create failed: {}", out.combined());
-    // Cargo wins by default: the roll marker lands in Cargo.toml, and
-    // package.json is untouched.
+    assert_eq!(sb.cargo_version_at("HEAD"), "0.0.1-roll1");
+    assert_eq!(sb.package_version_at("HEAD"), "0.0.1-roll1");
+}
+
+#[test]
+fn pinning_version_manifest_keeps_the_other_manifest_out_of_it() {
+    let sb = dual();
+    sb.set_config_string("version_manifest", "cargo");
+
+    let out = sb.create_roll("pinned", "0611");
+    assert!(out.success, "create failed: {}", out.combined());
     assert_eq!(sb.cargo_version_at("HEAD"), "0.0.1-roll1");
     assert_eq!(sb.package_version_at("HEAD"), "0.0.1");
+}
+
+#[test]
+fn both_manifests_are_graduated_bumped_and_promoted_together() {
+    let sb = dual();
+    graduate_one(&sb, "feature", "0611");
+    assert_eq!(sb.cargo_version_at("rolling"), "0.0.1-dev");
+    assert_eq!(sb.package_version_at("rolling"), "0.0.1-dev");
+
+    let out = sb.rf(&["promote", "--bump", "patch", "--yes"]);
+    assert!(out.success, "promote failed: {}", out.combined());
+
+    assert_eq!(sb.cargo_version_at("main"), "0.0.2");
+    assert_eq!(sb.package_version_at("main"), "0.0.2");
+    assert!(sb.tag_exists("v0.0.2"), "tags: {:?}", sb.tags());
+}
+
+#[test]
+fn promote_names_the_manifest_that_still_owes_a_bump() {
+    let sb = dual();
+    graduate_one(&sb, "feature", "0611");
+
+    // Rolling already moved Cargo.toml past main by hand; package.json has not.
+    sb.commit_cargo_version("0.0.2");
+    let out = sb.rf(&["promote", "--final"]);
+    assert!(
+        !out.success,
+        "promote should demand a bump: {}",
+        out.combined()
+    );
+    assert!(
+        out.combined().contains("package.json"),
+        "the failure should name the manifest that owes the bump: {}",
+        out.combined()
+    );
 }
 
 #[test]

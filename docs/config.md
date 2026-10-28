@@ -78,7 +78,7 @@ the layers are merged; everything else has a default.
 | `clean_protect` | `[]` | never — hand-edited | `rf clean` |
 | `pull_mode` | `"ff-only"` | fresh file | the TUI's `[p]` |
 | `lazygit_command` | `"lazygit"` | fresh file | the TUI's `gg` |
-| `version_manifest` | `"auto"` | fresh file | `rf start` / `rf graduate` / `rf promote`'s own version writes, in a repo carrying both a `Cargo.toml` and a `package.json` |
+| `version_manifest` | `"auto"` | fresh file | which manifest(s) the version gate and `rf start` / `rf graduate` / `rf promote`'s version writes use: `auto` tracks every one with a version, `cargo`/`npm` pin one |
 
 Gate entries are shell commands run in repo root. Any failure blocks
 verify/graduate/promote.
@@ -136,15 +136,20 @@ five default to `true` and are inert in a repo with neither a `Cargo.toml`
 nor a `package.json`.
 
 `version_manifest` matters only to a repo carrying *both* manifests — a
-Tauri app, say, with a `Cargo.toml` for the Rust side and a `package.json`
-that is the one actually released. `"auto"` (the default) prefers `Cargo`,
-matching the behavior every existing repo already had; set it to `"npm"` to
-version through `package.json` instead. It reaches every command that reads
-or writes a version through `Config` — `rf start`/`rf verify`/`rf graduate`/
-`rf promote`, status display, the TUI's version column — so the file written
-and the file compared always agree. It does not reach the merge-driver
-subprocess (which has no `Config` at all); that keeps auto-detecting, which
-is harmless since its only job is to stop a version-line conflict on
+Tauri app, say, or a Rust backend released together with its JS front end.
+`"auto"` (the default) versions through **both**: every manifest with a
+readable version is marked `-roll<N>` on `rf start`, resolved on `rf graduate`,
+finalized on `rf promote`, and must clear the version gate on its own, so a
+promotion is refused until *each* is ahead of the stable branch. Where a bump is
+needed, `rf promote` (and the TUI's `[b]`) lets you pick which manifest to
+raise — see [`promote`](commands/promote.md#more-than-one-manifest). The release
+tag names `Cargo.toml`'s version when there are two. Pin `"cargo"` or `"npm"` to
+version through that file alone — the right setting when the other one only
+exists for tooling and its `version` is not meant to track releases. It reaches
+every command that reads or writes a version through `Config`, so the files
+written and the files compared always agree. Only manifests at the repo root are
+read. The merge-driver subprocess has no `Config` and keeps auto-detecting,
+which is harmless since its only job is to stop a version-line conflict on
 whichever files a merge actually touches.
 
 `clean_protect` names branches [`rf clean`](commands/clean.md) must never delete,

@@ -11,7 +11,7 @@ use clap::Parser;
 use serde::Serialize;
 
 use cli::{Cli, Cmd};
-use core::version::{self, BumpLevel, VersionCheck, VersionStatus};
+use core::version::{self, BumpLevel, ManifestKind, VersionCheck, VersionStatus};
 use core::{branches, config::Config, git, ops, rebuild};
 
 fn main() -> Result<()> {
@@ -414,8 +414,9 @@ fn cmd_create(slug: &str, date: Option<String>, dry_run: bool, no_dev_version: b
     // a dry run must not leave one behind. A repo with no `Cargo.toml` reports
     // `None` and nothing is said.
     if !dry_run && config.dev_versions && !no_dev_version {
-        if let Some(dev) = ops::apply_dev_version(&config, outcome.number)? {
-            println!("version marked {dev}");
+        let marked = ops::apply_dev_version(&config, outcome.number)?;
+        if !marked.is_empty() {
+            println!("version marked {}", ops::describe_versions(marked));
         }
     }
     Ok(())
@@ -495,8 +496,9 @@ fn cmd_verify(dry_run: bool, bump: Option<BumpLevel>, yes: bool) -> Result<()> {
     // so it has to land before the `--locked` gates run. A dry run leaves it.
     let current = git::current_branch(&config.repo_root)?;
     if !dry_run {
-        if let Some(dev) = ops::apply_dev_version_for_branch(&config, &current)? {
-            println!("version marked {dev}");
+        let marked = ops::apply_dev_version_for_branch(&config, &current)?;
+        if !marked.is_empty() {
+            println!("version marked {}", ops::describe_versions(marked));
         }
     }
 
@@ -539,7 +541,7 @@ fn cmd_verify(dry_run: bool, bump: Option<BumpLevel>, yes: bool) -> Result<()> {
             outcome.source, outcome.target
         );
     }
-    render_version_check(&outcome.version, &outcome.source, &outcome.target);
+    render_version_checks(&outcome.versions, &outcome.source, &outcome.target);
     render_gate_notices(&outcome.gate_notices);
     render_gate_notices(&outcome.host_notices);
     render_host_results(&outcome.host_results);
@@ -638,7 +640,7 @@ fn cmd_verify_all(set: branches::VerifySet) -> Result<()> {
     let mut skipped = 0;
     for result in &results {
         println!("\n── {} ──", result.branch);
-        if let Some(dev) = result.marked {
+        if let Some(dev) = &result.marked {
             println!("version marked {dev}");
         }
         if let Some(outcome) = &result.outcome {
@@ -654,7 +656,7 @@ fn cmd_verify_all(set: branches::VerifySet) -> Result<()> {
                     outcome.source, outcome.target
                 );
             }
-            render_version_check(&outcome.version, &outcome.source, &outcome.target);
+            render_version_checks(&outcome.versions, &outcome.source, &outcome.target);
             render_gate_notices(&outcome.gate_notices);
             render_gate_notices(&outcome.host_notices);
             render_host_results(&outcome.host_results);
@@ -742,25 +744,51 @@ fn resolve_version_gate(
     // the finalized value alone already satisfies the gate, or immediately
     // before the bump below, so a promotion that ultimately fails (no bump
     // resolved) doesn't leave rolling finalized with nothing to show for it.
-    let forced_kind = config.forced_manifest();
-    let needs_finalize = config.dev_versions
-        && version::read_version(&config.repo_root, forced_kind)?.is_some_and(|v| v.has_marker());
-    let check = if !config.version_gate {
-        VersionCheck::not_applicable()
+    let kinds = config.manifest_kinds();
+    let mut needs_finalize = false;
+    if config.dev_versions {
+        for &kind in &kinds {
+            if version::read_version_for(&config.repo_root, kind)?.is_some_and(|v| v.has_marker()) {
+                needs_finalize = true;
+            }
+        }
+    }
+    // One check per manifest the repo versions through: a repo carrying both
+    // `Cargo.toml` and `package.json` has to clear the gate in each.
+    let checks: Vec<VersionCheck> = if !config.version_gate {
+        Vec::new()
     } else if config.dev_versions {
-        let finalized_head =
-            version::read_version(&config.repo_root, forced_kind)?.map(|v| v.release());
-        version::check_against(&config.repo_root, finalized_head, &target_ref, forced_kind)?
+        let mut checks = Vec::new();
+        for &kind in &kinds {
+            let finalized_head =
+                version::read_version_for(&config.repo_root, kind)?.map(|v| v.release());
+            let check =
+                version::check_against(&config.repo_root, finalized_head, &target_ref, Some(kind))?;
+            if check.status != VersionStatus::NotApplicable {
+                checks.push(check);
+            }
+        }
+        checks
     } else {
-        ops::version_check(config, &source, &target_ref)?
+        ops::version_checks(config, &source, &target_ref)?
     };
+    let check = VersionCheck::worst(&checks);
 
     let finalize_now = |dry_run: bool| -> Result<()> {
         if !needs_finalize || dry_run {
             return Ok(());
         }
-        if let Some((from, to)) = ops::finalize_rolling(config)? {
-            println!("Finalized {from} -> {to} (chore(release) commit on '{source}')");
+        let finalized = ops::finalize_rolling(config)?;
+        if !finalized.is_empty() {
+            let (from, to): (Vec<_>, Vec<_>) = finalized
+                .iter()
+                .map(|&(kind, from, to)| ((kind, from), (kind, to)))
+                .unzip();
+            println!(
+                "Finalized {} -> {} (chore(release) commit on '{source}')",
+                ops::describe_versions(from),
+                ops::describe_versions(to)
+            );
         }
         Ok(())
     };
@@ -772,15 +800,30 @@ fn resolve_version_gate(
 
     // A version *below* the target is never fixable by bumping one level, and
     // silently jumping it would hide a bad merge. Always a hard error.
-    if check.status == VersionStatus::Lower {
-        return Err(ops::version_gate_error(&check, &source, &target));
+    if let Some(lower) = checks.iter().find(|c| c.status == VersionStatus::Lower) {
+        return Err(ops::version_gate_error(lower, &source, &target));
     }
 
-    let head = check
-        .head
-        .map(|v| v.to_string())
-        .unwrap_or_else(|| "<unreadable>".to_string());
-    println!("Version: {head} on '{source}' is unchanged from '{target}'; a bump is required");
+    // The manifests that actually owe a bump: unchanged from the target. A
+    // manifest already ahead of it needs nothing, whatever its neighbour does.
+    let owing: Vec<ManifestKind> = checks
+        .iter()
+        .filter(|c| c.status == VersionStatus::Unchanged)
+        .filter_map(|c| c.kind)
+        .collect();
+    for c in checks.iter().filter(|c| !c.is_satisfied()) {
+        let head = c
+            .head
+            .map(|v| v.to_string())
+            .unwrap_or_else(|| "<unreadable>".to_string());
+        let file = match (checks.len() > 1, c.kind) {
+            (true, Some(kind)) => format!(" ({})", kind.manifest()),
+            _ => String::new(),
+        };
+        println!(
+            "Version{file}: {head} on '{source}' is unchanged from '{target}'; a bump is required"
+        );
+    }
 
     if dry_run {
         if needs_finalize {
@@ -799,10 +842,22 @@ fn resolve_version_gate(
         );
     }
 
+    // Which manifests to bump: all that owe one, unless the user is at a
+    // terminal with more than one to choose from — then they pick.
+    let mut chosen = owing.clone();
     let level = match bump {
         Some(level) => Some(level),
         None if yes => Some(BumpLevel::Patch),
-        None if std::io::stdin().is_terminal() => prompt_bump_level()?,
+        None if std::io::stdin().is_terminal() => {
+            if owing.len() > 1 {
+                chosen = prompt_bump_kinds(&owing)?;
+            }
+            if chosen.is_empty() {
+                None
+            } else {
+                prompt_bump_level()?
+            }
+        }
         None => {
             if forced {
                 None
@@ -821,9 +876,43 @@ fn resolve_version_gate(
     };
 
     finalize_now(false)?;
-    let (from, to) = ops::apply_version_bump(config, level, &source)?;
-    println!("Bumped version {from} -> {to} (chore(release) commit on '{current}')");
+    let bumped = ops::apply_version_bump(config, level, &source, &chosen)?;
+    let (from, to): (Vec<_>, Vec<_>) = bumped
+        .iter()
+        .map(|&(kind, from, to)| ((kind, from), (kind, to)))
+        .unzip();
+    println!(
+        "Bumped version {} -> {} (chore(release) commit on '{current}')",
+        ops::describe_versions(from),
+        ops::describe_versions(to)
+    );
     Ok(())
+}
+
+/// Ask which manifests to bump when more than one owes a bump. An empty answer
+/// is "all"; `n` declines every one.
+fn prompt_bump_kinds(owing: &[ManifestKind]) -> Result<Vec<ManifestKind>> {
+    use std::io::Write;
+    println!("These manifests are unchanged from the target:");
+    for (i, kind) in owing.iter().enumerate() {
+        println!("  [{}] {}", i + 1, kind.manifest());
+    }
+    print!("Bump which? [a]ll / number / [n]one: ");
+    std::io::stdout().flush()?;
+    let mut line = String::new();
+    std::io::stdin().read_line(&mut line)?;
+    Ok(match line.trim() {
+        "" | "a" | "all" => owing.to_vec(),
+        "n" | "none" => Vec::new(),
+        n => match n
+            .parse::<usize>()
+            .ok()
+            .and_then(|i| owing.get(i.wrapping_sub(1)))
+        {
+            Some(kind) => vec![*kind],
+            None => Vec::new(),
+        },
+    })
 }
 
 /// Ask which field to raise. `None` means the user declined.
@@ -845,7 +934,15 @@ fn prompt_bump_level() -> Result<Option<BumpLevel>> {
 
 /// Render the version comparison line. Silent when the repo does not version
 /// through `Cargo.toml`, so unaffected repos see no new output.
-fn render_version_check(check: &VersionCheck, source: &str, target: &str) {
+fn render_version_checks(checks: &[VersionCheck], source: &str, target: &str) {
+    for check in checks {
+        render_version_check(check, source, target, checks.len() > 1);
+    }
+}
+
+/// `named` adds the manifest's file name, for a repo versioned through more
+/// than one — a single-manifest repo's output is unchanged.
+fn render_version_check(check: &VersionCheck, source: &str, target: &str, named: bool) {
     if check.status == VersionStatus::NotApplicable {
         return;
     }
@@ -865,7 +962,11 @@ fn render_version_check(check: &VersionCheck, source: &str, target: &str) {
         VersionStatus::DevVersion => "DEV",
         VersionStatus::NotApplicable => return,
     };
-    println!("Version: {head} on '{source}' (base '{target}' {base}) {verdict}");
+    let file = match (named, check.kind) {
+        (true, Some(kind)) => format!(" ({})", kind.manifest()),
+        _ => String::new(),
+    };
+    println!("Version{file}: {head} on '{source}' (base '{target}' {base}) {verdict}");
 }
 
 /// Offer to push a freshly created release tag.
@@ -1525,7 +1626,7 @@ fn offer_update(config: &Config, yes: bool) -> Result<()> {
 /// prints exactly what it always did for that case.
 fn print_promote(outcome: &ops::PromoteOutcome) {
     for step in &outcome.steps {
-        render_version_check(&step.version, &step.source, &outcome.stable);
+        render_version_checks(&step.versions, &step.source, &outcome.stable);
         render_gate_notices(&step.gate_notices);
         render_gate_notices(&step.host_notices);
         render_host_results(&step.host_results);
