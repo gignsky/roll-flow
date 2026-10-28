@@ -43,6 +43,17 @@ pub enum Followup {
     SelectBranch(String),
     /// The push was rejected as non-fast-forward. Ask whether to force it.
     OfferForcePush { branch: String, remote: String },
+    /// A graduation or promotion stopped on conflicts and was unwound. Offer
+    /// the ways forward — the diagnosis itself is already in the panel.
+    OfferConflictResolution {
+        source: String,
+        target: String,
+        /// Rolls already on the target that touched the conflicted paths.
+        culprits: Vec<String>,
+        /// True when `source` is the checked-out roll, so the culprits can be
+        /// integrated into it from here.
+        can_integrate: bool,
+    },
 }
 
 /// A successful job's result: lines to append to the panel, plus an optional
@@ -82,8 +93,9 @@ pub struct Job {
 pub enum JobProgress {
     /// Still running; any output received has been appended to the panel.
     Running,
-    /// Finished. Carries the follow-up, if the job asked for one.
-    Finished(Option<Followup>),
+    /// Finished. `ok` is false for an error or a panic — what holds the
+    /// queue behind it — and `next` is the follow-up, if the job asked for one.
+    Finished { ok: bool, next: Option<Followup> },
 }
 
 impl Job {
@@ -116,7 +128,10 @@ impl Job {
             // report.
             Err(TryRecvError::Disconnected) => {
                 panel.finish_failed(vec!["the operation panicked".to_string()]);
-                JobProgress::Finished(None)
+                JobProgress::Finished {
+                    ok: false,
+                    next: None,
+                }
             }
             Ok(result) => {
                 // Both senders are dropped by now, so this terminates at
@@ -127,11 +142,17 @@ impl Job {
                 match result {
                     Ok(done) => {
                         panel.finish_ok(done.lines);
-                        JobProgress::Finished(done.next)
+                        JobProgress::Finished {
+                            ok: true,
+                            next: done.next,
+                        }
                     }
                     Err(err) => {
                         panel.finish_failed(error_lines(&err));
-                        JobProgress::Finished(None)
+                        JobProgress::Finished {
+                            ok: false,
+                            next: None,
+                        }
                     }
                 }
             }
@@ -164,6 +185,8 @@ enum Kind {
     Stderr,
     Result,
     Error,
+    /// The divider a queued command opens with when it continues a panel.
+    Header,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -196,6 +219,21 @@ impl Panel {
             autoscroll: true,
             tick: 0,
         }
+    }
+
+    /// Continue this panel with the next queued command rather than replacing
+    /// it: the previous command's output stays above a divider naming the new
+    /// one, and the border goes back to running.
+    ///
+    /// A chain is one plan the user made, so it reads as one log — replacing
+    /// the panel would wipe each step's result the instant the next began. The
+    /// border still means what it always did, *this* command's state; a
+    /// failure ends the chain, so a red panel always ends with the failure.
+    pub fn chain(&mut self, title: impl Into<String>) {
+        self.title = title.into();
+        self.push(Kind::Header, format!("── {} ──", self.title));
+        self.status = Status::Running;
+        self.scroll_to_end();
     }
 
     /// Read only by tests today; the renderer reaches `self.status` directly.
@@ -344,9 +382,47 @@ pub fn panel_rect(area: Rect, content_lines: usize) -> Rect {
     }
 }
 
-/// Draw `panel` over the bottom-right of `area`.
-pub fn render(f: &mut Frame, area: Rect, panel: &Panel) {
-    let rect = panel_rect(area, panel.lines.len());
+/// Inset `area` by a couple of cells on every side, for a maximized panel.
+///
+/// Unlike [`panel_rect`] this ignores content length — maximizing is about
+/// giving a long result room to breathe, not shrinking to fit it. Clamped the
+/// same way `panel_rect` is, so a tiny frame still yields a rect that fits
+/// inside it rather than panicking in the renderer.
+pub fn expanded_rect(area: Rect) -> Rect {
+    const MARGIN: u16 = 2;
+    let width = area.width.saturating_sub(MARGIN * 2).max(1).min(area.width);
+    let height = area
+        .height
+        .saturating_sub(MARGIN * 2)
+        .max(1)
+        .min(area.height);
+    let x = area.x + (area.width.saturating_sub(width)) / 2;
+    let y = area.y + (area.height.saturating_sub(height)) / 2;
+    Rect {
+        x,
+        y,
+        width,
+        height,
+    }
+}
+
+/// Draw `panel` over `area`, anchored bottom-right unless `maximized`, in
+/// which case it fills most of the frame. `footer`, when given, replaces the
+/// default bottom hint — the queue's state is the caller's to describe.
+/// Returns the rect it drew into, so the caller can hit-test a later mouse
+/// click against it.
+pub fn render(
+    f: &mut Frame,
+    area: Rect,
+    panel: &Panel,
+    maximized: bool,
+    footer: Option<String>,
+) -> Rect {
+    let rect = if maximized {
+        expanded_rect(area)
+    } else {
+        panel_rect(area, panel.lines.len())
+    };
     let spinner = SPINNER[(panel.tick / 3) % SPINNER.len()];
     let (color, mark) = status_style(panel.status, spinner);
 
@@ -359,15 +435,18 @@ pub fn render(f: &mut Frame, area: Rect, panel: &Panel) {
                 Kind::Stderr => Style::default().fg(Color::Gray),
                 Kind::Result => Style::default().fg(Color::Green),
                 Kind::Error => Style::default().fg(Color::Red),
+                Kind::Header => Style::default()
+                    .fg(Color::Cyan)
+                    .add_modifier(Modifier::BOLD),
             };
             Line::from(Span::styled(line.text.clone(), style))
         })
         .collect();
 
-    let hint = if panel.is_running() {
-        String::new()
-    } else {
-        " [esc] close ".to_string()
+    let hint = match footer {
+        Some(footer) => format!(" {footer} "),
+        None if panel.is_running() => String::new(),
+        None => " [esc] close ".to_string(),
     };
     let block = Block::bordered()
         .border_style(Style::default().fg(color))
@@ -379,6 +458,7 @@ pub fn render(f: &mut Frame, area: Rect, panel: &Panel) {
 
     f.render_widget(Clear, rect);
     f.render_widget(Paragraph::new(lines).block(block), rect);
+    rect
 }
 
 #[cfg(test)]
@@ -451,6 +531,24 @@ mod tests {
     }
 
     #[test]
+    fn chaining_keeps_the_previous_output_and_runs_again() {
+        let mut p = panel_with(2);
+        p.finish_ok(vec!["done".to_string()]);
+        p.scroll_up(1);
+        p.chain("rf create");
+        assert_eq!(p.title, "rf create");
+        assert_eq!(p.status(), Status::Running);
+        assert_eq!(
+            texts(&p, 10),
+            vec!["line 0", "line 1", "done", "── rf create ──"],
+            "the earlier command's output must survive the chain"
+        );
+        // And the view follows the new command, not the old scroll position.
+        p.push(Kind::Stdout, "new".to_string());
+        assert_eq!(texts(&p, 1), vec!["new"]);
+    }
+
+    #[test]
     fn dropping_an_old_line_keeps_a_scrolled_reader_on_the_same_text() {
         let mut p = panel_with(SCROLLBACK);
         p.scroll_up(10);
@@ -505,6 +603,50 @@ mod tests {
     }
 
     #[test]
+    fn expanded_rect_fills_most_of_the_frame() {
+        let area = Rect {
+            x: 0,
+            y: 0,
+            width: 100,
+            height: 40,
+        };
+        let r = expanded_rect(area);
+        assert!(r.width > 80, "width {} should dominate the frame", r.width);
+        assert!(
+            r.height > 30,
+            "height {} should dominate the frame",
+            r.height
+        );
+        assert!(r.x >= area.x);
+        assert!(r.y >= area.y);
+        assert!(r.x + r.width <= area.x + area.width);
+        assert!(r.y + r.height <= area.y + area.height);
+    }
+
+    #[test]
+    fn expanded_rect_fits_inside_tiny_frames() {
+        for (w, h) in [(10u16, 4u16), (1, 1), (0, 0), (100, 2)] {
+            let area = Rect {
+                x: 2,
+                y: 3,
+                width: w,
+                height: h,
+            };
+            let r = expanded_rect(area);
+            assert!(r.width <= area.width, "{w}x{h} width {}", r.width);
+            assert!(r.height <= area.height, "{w}x{h} height {}", r.height);
+            assert!(
+                r.x + r.width <= area.x + area.width,
+                "{w}x{h} overflows right"
+            );
+            assert!(
+                r.y + r.height <= area.y + area.height,
+                "{w}x{h} overflows bottom"
+            );
+        }
+    }
+
+    #[test]
     fn a_tiny_area_yields_a_rect_that_still_fits_inside_it() {
         // A panel wider than its frame would panic inside ratatui rather than
         // clipping, so the clamp has to hold at every size.
@@ -527,6 +669,35 @@ mod tests {
                 "{w}x{h} overflows bottom"
             );
         }
+    }
+
+    #[test]
+    fn render_returns_the_small_rect_unless_maximized() {
+        use ratatui::{backend::TestBackend, Terminal};
+
+        let panel = panel_with(3);
+        let area = Rect {
+            x: 0,
+            y: 0,
+            width: 100,
+            height: 40,
+        };
+        let mut term = Terminal::new(TestBackend::new(100, 40)).unwrap();
+
+        let small = term
+            .draw(|f| {
+                let r = render(f, area, &panel, false, None);
+                assert_eq!(r, panel_rect(area, panel.lines.len()));
+            })
+            .unwrap();
+        let _ = small;
+
+        term.draw(|f| {
+            let r = render(f, area, &panel, true, None);
+            assert_eq!(r, expanded_rect(area));
+            assert_ne!(r, panel_rect(area, panel.lines.len()));
+        })
+        .unwrap();
     }
 
     #[test]
@@ -578,7 +749,7 @@ mod tests {
         let next = loop {
             match job.drain(&mut panel) {
                 JobProgress::Running => std::thread::yield_now(),
-                JobProgress::Finished(next) => break next,
+                JobProgress::Finished { next, .. } => break next,
             }
         };
 
@@ -597,12 +768,13 @@ mod tests {
     fn a_failing_job_lands_as_a_failed_panel_carrying_the_error() {
         let mut panel = Panel::new("test");
         let mut job = Job::spawn(|| anyhow::bail!("nope"));
-        loop {
-            if let JobProgress::Finished(_) = job.drain(&mut panel) {
-                break;
+        let ok = loop {
+            if let JobProgress::Finished { ok, .. } = job.drain(&mut panel) {
+                break ok;
             }
             std::thread::yield_now();
-        }
+        };
+        assert!(!ok, "a failure must report as one, or the queue runs on");
         assert_eq!(panel.status(), Status::Failed);
         assert!(panel.lines.back().unwrap().text.contains("nope"));
     }
@@ -612,9 +784,10 @@ mod tests {
         let mut panel = Panel::new("test");
         let mut job = Job::spawn(|| panic!("boom"));
         // Without the Disconnected arm this loop would never terminate, and the
-        // view would refuse every mutating key forever.
+        // view would never start another command — the queue would wait on it
+        // forever.
         loop {
-            if let JobProgress::Finished(_) = job.drain(&mut panel) {
+            if let JobProgress::Finished { .. } = job.drain(&mut panel) {
                 break;
             }
             std::thread::yield_now();
@@ -635,7 +808,7 @@ mod tests {
             ))
         });
         let next = loop {
-            if let JobProgress::Finished(next) = job.drain(&mut panel) {
+            if let JobProgress::Finished { next, .. } = job.drain(&mut panel) {
                 break next;
             }
             std::thread::yield_now();

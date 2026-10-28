@@ -23,7 +23,7 @@ fn promote_roll(sb: &Sandbox, slug: &str, date: &str) -> String {
     assert!(out.success, "graduate failed: {}", out.combined());
 
     sb.git(&["checkout", "rolling"]);
-    let out = sb.rf(&["promote"]);
+    let out = sb.rf(&["promote", "--yes"]);
     assert!(out.success, "promote failed: {}", out.combined());
 
     sb.git(&["checkout", "main"]);
@@ -243,5 +243,58 @@ fn reports_nothing_to_prune_when_no_rolls_are_promoted() {
         out.combined().contains("no promoted roll branches"),
         "unexpected output: {}",
         out.combined()
+    );
+}
+
+/// Create a hotfix with one commit and leave HEAD on `main`. Lands it first
+/// when `land` is set, which is the hotfix tier's equivalent of promotion.
+fn hotfix(sb: &Sandbox, slug: &str, land: bool) -> String {
+    let out = sb.rf(&["hotfix", slug, "--date", "0720"]);
+    assert!(out.success, "hotfix create failed: {}", out.combined());
+    let branch = sb.current_branch();
+    sb.commit_file(&format!("{slug}.txt"), "fix\n", &format!("{slug} fix"));
+    if land {
+        let out = sb.rf(&["hotfix", "--land"]);
+        assert!(out.success, "hotfix land failed: {}", out.combined());
+    }
+    sb.git(&["checkout", "main"]);
+    branch
+}
+
+#[test]
+fn prunes_a_landed_hotfix_and_keeps_an_open_one() {
+    // A landed hotfix is on stable exactly as a promoted roll is, so prune
+    // winds it up the same way — both copies, behind the same containment
+    // check. One still open has not landed and must survive.
+    let sb = Sandbox::with_origin();
+    sb.init();
+    let landed = hotfix(&sb, "urgent", true);
+    sb.push_branch(&landed);
+    let open = hotfix(&sb, "pending", false);
+    sb.push_branch(&open);
+
+    let out = sb.rf(&["prune", "--yes"]);
+    assert!(out.success, "prune failed: {}", out.combined());
+    let text = out.combined();
+    assert!(
+        text.contains(&landed),
+        "plan should name the hotfix: {text}"
+    );
+    // Hotfix numbering is its own; the plan must not pass `hotfix/1` off as
+    // roll 1.
+    assert!(text.contains("h1"), "hotfix should be numbered h1: {text}");
+
+    assert!(
+        !sb.branch_exists(&landed),
+        "local landed hotfix kept: {text}"
+    );
+    assert!(
+        !sb.remote_branch_exists(&landed),
+        "origin landed hotfix kept: {text}"
+    );
+    assert!(sb.branch_exists(&open), "open hotfix must survive prune");
+    assert!(
+        sb.remote_branch_exists(&open),
+        "open hotfix must survive on origin"
     );
 }

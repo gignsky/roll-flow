@@ -31,7 +31,7 @@ fn promote_roll(sb: &Sandbox, slug: &str, date: &str) -> String {
     let branch = graduate_roll(sb, slug, date);
 
     sb.git(&["checkout", "rolling"]);
-    let out = sb.rf(&["promote"]);
+    let out = sb.rf(&["promote", "--yes"]);
     assert!(out.success, "promote failed: {}", out.combined());
 
     sb.git(&["checkout", "main"]);
@@ -341,8 +341,58 @@ fn reports_when_there_is_nothing_to_tidy() {
     let out = sb.rf(&["tidy", "--yes"]);
     assert!(out.success, "tidy failed: {}", out.combined());
     assert!(
-        out.combined().contains("no local roll branches to tidy"),
+        out.combined()
+            .contains("no local roll branches or hotfixes to tidy"),
         "an empty plan should say so: {}",
         out.combined()
+    );
+}
+
+/// Create a hotfix with one commit and leave HEAD on `main`, landing it first
+/// when `land` is set.
+fn hotfix(sb: &Sandbox, slug: &str, land: bool) -> String {
+    let out = sb.rf(&["hotfix", slug, "--date", "0720"]);
+    assert!(out.success, "hotfix create failed: {}", out.combined());
+    let branch = sb.current_branch();
+    sb.commit_file(&format!("{slug}.txt"), "fix\n", &format!("{slug} fix"));
+    if land {
+        let out = sb.rf(&["hotfix", "--land"]);
+        assert!(out.success, "hotfix land failed: {}", out.combined());
+    }
+    sb.git(&["checkout", "main"]);
+    branch
+}
+
+#[test]
+fn hotfixes_follow_the_state_they_correspond_to() {
+    // A landed hotfix is the hotfix tier's "promoted", an open one its
+    // "active": the default selection (graduated, promoted) clears the landed
+    // one only, and asking for active widens it to the open one too — which,
+    // like an active roll, still has to be fully pushed to count as safe.
+    let sb = Sandbox::with_origin();
+    sb.init();
+    let landed = hotfix(&sb, "urgent", true);
+    let open = hotfix(&sb, "pending", false);
+    sb.push_branch(&open);
+
+    let out = sb.rf(&["tidy", "--yes"]);
+    assert!(out.success, "tidy failed: {}", out.combined());
+    assert!(
+        !sb.branch_exists(&landed),
+        "landed hotfix kept: {}",
+        out.combined()
+    );
+    assert!(sb.branch_exists(&open), "open hotfix tidied by default");
+
+    let out = sb.rf(&["tidy", "--state", "active", "--yes"]);
+    assert!(out.success, "tidy failed: {}", out.combined());
+    assert!(
+        !sb.branch_exists(&open),
+        "pushed open hotfix kept: {}",
+        out.combined()
+    );
+    assert!(
+        sb.remote_branch_exists(&open),
+        "tidy must never touch origin"
     );
 }
