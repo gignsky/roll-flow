@@ -1,33 +1,69 @@
 use anyhow::Result;
 use crossterm::{
-    event::{DisableMouseCapture, EnableMouseCapture},
+    event::{
+        DisableMouseCapture, EnableMouseCapture, KeyboardEnhancementFlags,
+        PopKeyboardEnhancementFlags, PushKeyboardEnhancementFlags,
+    },
     execute,
     terminal::{disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen},
 };
 use ratatui::{backend::CrosstermBackend, Terminal};
 use std::io::{self, Stdout};
 use std::panic;
+use std::sync::OnceLock;
 
 pub mod output;
+pub mod queue;
 pub mod rolls;
 
 pub type Tui = Terminal<CrosstermBackend<Stdout>>;
+
+/// Whether this terminal understands the kitty keyboard-enhancement protocol,
+/// which is what lets `Shift+Enter` arrive distinguishable from a plain
+/// `Enter` (see `tui::rolls`' `:` command runner). Queried once and cached:
+/// the query itself is a synchronous round trip with the terminal, which is
+/// fine to pay once at startup but not on every suspend/resume, and the
+/// panic hook below must not attempt it fresh — a query mid-panic is exactly
+/// the kind of thing that can hang a process that is already in trouble.
+fn keyboard_enhancement_supported() -> bool {
+    *KEYBOARD_ENHANCEMENT
+        .get_or_init(|| crossterm::terminal::supports_keyboard_enhancement().unwrap_or(false))
+}
+
+static KEYBOARD_ENHANCEMENT: OnceLock<bool> = OnceLock::new();
 
 pub fn enter() -> Result<Tui> {
     let prev = panic::take_hook();
     panic::set_hook(Box::new(move |info| {
         let _ = disable_raw_mode();
+        // Cached by the time any panic can happen — `enable_raw_mode` below
+        // runs, and the query, before this hook can ever fire.
+        if keyboard_enhancement_supported() {
+            let _ = execute!(io::stdout(), PopKeyboardEnhancementFlags);
+        }
         let _ = execute!(io::stdout(), LeaveAlternateScreen, DisableMouseCapture);
         prev(info);
     }));
     enable_raw_mode()?;
+    // Querying needs raw mode already on, to read the terminal's response
+    // synchronously.
+    let supports_enhancement = keyboard_enhancement_supported();
     let mut stdout = io::stdout();
     execute!(stdout, EnterAlternateScreen, EnableMouseCapture)?;
+    if supports_enhancement {
+        execute!(
+            stdout,
+            PushKeyboardEnhancementFlags(KeyboardEnhancementFlags::DISAMBIGUATE_ESCAPE_CODES)
+        )?;
+    }
     Ok(Terminal::new(CrosstermBackend::new(stdout))?)
 }
 
 pub fn exit(mut terminal: Tui) -> Result<()> {
     disable_raw_mode()?;
+    if keyboard_enhancement_supported() {
+        execute!(terminal.backend_mut(), PopKeyboardEnhancementFlags)?;
+    }
     execute!(
         terminal.backend_mut(),
         LeaveAlternateScreen,
@@ -45,13 +81,16 @@ pub fn exit(mut terminal: Tui) -> Result<()> {
 /// is idempotent).
 ///
 /// Ops no longer use this — their output streams into
-/// [`super::tui::output::Panel`] instead. It exists for `gg` and `[B]`, which
-/// launch lazygit and bacon: a full-screen application has to own the terminal
-/// outright, and there is nothing to stream. Both reach it through
-/// `rolls::StatusApp::hand_over_terminal`, so the suspend/resume pair is
-/// bracketed in one place rather than once per tool.
+/// [`super::tui::output::Panel`] instead. It exists for `gg` (lazygit), `[B]` (bacon)
+/// and the `:` command runner's "run in the real shell" key: all are full-screen
+/// or interactive enough that the child needs the terminal outright. Lazygit and
+/// bacon reach it through `rolls::StatusApp::hand_over_terminal`, so the
+/// suspend/resume pair is bracketed in one place rather than once per tool.
 pub fn suspend(terminal: &mut Tui) -> Result<()> {
     disable_raw_mode()?;
+    if keyboard_enhancement_supported() {
+        execute!(terminal.backend_mut(), PopKeyboardEnhancementFlags)?;
+    }
     execute!(
         terminal.backend_mut(),
         LeaveAlternateScreen,
@@ -70,6 +109,12 @@ pub fn resume(terminal: &mut Tui) -> Result<()> {
         EnterAlternateScreen,
         EnableMouseCapture
     )?;
+    if keyboard_enhancement_supported() {
+        execute!(
+            terminal.backend_mut(),
+            PushKeyboardEnhancementFlags(KeyboardEnhancementFlags::DISAMBIGUATE_ESCAPE_CODES)
+        )?;
+    }
     terminal.hide_cursor()?;
     terminal.clear()?;
     Ok(())

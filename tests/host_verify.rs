@@ -100,7 +100,7 @@ fn promote_blocks_on_failing_host_and_force_bypasses() {
     sb.set_host_gates(&["test {host} != merlin"]);
     sb.git(&["checkout", "rolling"]);
 
-    let out = sb.rf(&["promote"]);
+    let out = sb.rf(&["promote", "--yes"]);
     assert!(
         !out.success,
         "promote should block on a failing active host: {}",
@@ -117,7 +117,7 @@ fn promote_blocks_on_failing_host_and_force_bypasses() {
     );
 
     // `--force --reason` bypasses the failing host gate and records it.
-    let out = sb.rf(&["promote", "--force", "--reason", "host offline"]);
+    let out = sb.rf(&["promote", "--force", "--reason", "host offline", "--yes"]);
     assert!(
         out.success,
         "forced promote should proceed: {}",

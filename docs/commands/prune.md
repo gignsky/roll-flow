@@ -4,8 +4,11 @@
 rf prune [--dry-run] [--local | --remote] [--yes] [--force] [--no-fetch]
 ```
 
-Deletes roll branches that have already been promoted to the stable branch,
-removing both the local branch and its copy on `origin`. Reachable from the TUI
+Deletes roll branches that have already been promoted to the stable branch, and
+hotfix branches that have landed on it, removing both the local branch and its
+copy on `origin`. Landing is a hotfix's promotion, so a landed hotfix goes
+through exactly the same containment check below; an open one is never touched.
+Hotfixes are listed as `h<N>`, since their numbering is independent of rolls'. Reachable from the TUI
 with `[x]` — next to `[t]`, which is [`tidy`](tidy.md) and deletes the local copy
 only.
 

@@ -3,9 +3,9 @@ use std::io::IsTerminal;
 use anyhow::Result;
 
 use crate::core::{
-    branches::{self, BranchLocation, RollInfo},
+    branches::{self, BranchLocation, HotfixInfo, RollInfo},
     config::Config,
-    git,
+    git, rebuild,
 };
 
 /// `show_deps` drives the `deps` / `dependants` columns. Unlike `rf list`, where
@@ -25,12 +25,28 @@ pub fn run(no_tui: bool, show_deps: bool) -> Result<()> {
     let current_roll = branches::get_current_roll(&config)?;
     print_header(&config, &current_branch);
     print_current_roll_line(&config, &current_roll);
+
+    let rebuild_status = rebuild::current_host_identifier(repo)
+        .and_then(|host_id| rebuild::detect(&config, repo, &rolls, &host_id));
+    if let Some(line) = rebuild_status
+        .as_ref()
+        .and_then(rebuild::format_summary_line)
+    {
+        println!("{line}");
+    }
     println!();
 
-    if rolls.is_empty() {
+    let hotfixes = branches::list_hotfixes(&config)?;
+    if rolls.is_empty() && hotfixes.is_empty() {
         println!("  (no roll branches found)");
     } else {
-        print_rolls_table(&config, &rolls, show_deps);
+        print_rolls_table(
+            &config,
+            &rolls,
+            &hotfixes,
+            show_deps,
+            rebuild_status.as_ref(),
+        );
     }
 
     Ok(())
@@ -69,11 +85,19 @@ fn print_current_roll_line(config: &Config, current_roll: &Option<String>) {
 
 // ── Roll table ────────────────────────────────────────────────────────────────
 
-fn print_rolls_table(config: &Config, rolls: &[RollInfo], show_deps: bool) {
-    // Compute column widths dynamically.
+fn print_rolls_table(
+    config: &Config,
+    rolls: &[RollInfo],
+    hotfixes: &[HotfixInfo],
+    show_deps: bool,
+    rebuild_status: Option<&rebuild::RebuildStatus>,
+) {
+    // Compute column widths dynamically — over the hotfix names too, since
+    // they share the columns.
     let name_w = rolls
         .iter()
         .map(|r| r.branch.len())
+        .chain(hotfixes.iter().map(|h| h.branch.len()))
         .max()
         .unwrap_or(4)
         .max(4);
@@ -101,9 +125,37 @@ fn print_rolls_table(config: &Config, rolls: &[RollInfo], show_deps: bool) {
         }
     };
 
+    // Present only when this machine's host is known to the config and has at
+    // least been looked at — a dotfiles-shaped repo pays for this column, a
+    // repo with no hosts modeled (like roll-flow's own) never sees it.
+    // Placed in the left gutter, right after the current-branch chevron,
+    // rather than at the far right — it's a per-row marker, not a detail
+    // like `version`/`deps`. Padded like any other non-last column, so the
+    // columns after it stay aligned.
+    let build_w = rebuild_status.map(|s| {
+        rolls
+            .iter()
+            .map(|r| rebuild::gutter_label(s, &r.branch).chars().count())
+            .max()
+            .unwrap_or(0)
+            .max("build".len())
+    });
+    let build_hdr = match build_w {
+        Some(w) => format!("{:<w$}  ", "build", w = w),
+        None => String::new(),
+    };
+    let build_col = |branch: &str| match (rebuild_status, build_w) {
+        (Some(s), Some(w)) => format!("{:<w$}  ", rebuild::gutter_label(s, branch), w = w),
+        _ => String::new(),
+    };
+    let build_sep = match build_w {
+        Some(w) => format!("{}  ", "─".repeat(w)),
+        None => String::new(),
+    };
+
     // Header
     println!(
-        "  {num:>nw$}  {name:<ew$}  {loc:<3}  {state:<sw$}{ver_hdr}{deps_hdr}",
+        "  {build_hdr}{num:>nw$}  {name:<ew$}  {loc:<3}  {state:<sw$}{ver_hdr}{deps_hdr}",
         num = "#",
         name = "roll",
         loc = "loc",
@@ -125,7 +177,7 @@ fn print_rolls_table(config: &Config, rolls: &[RollInfo], show_deps: bool) {
         sw = state_w,
     );
     println!(
-        "  {sep_n}  {sep_e}  ───  {sep_s}{sep_v}{sep_d}",
+        "  {build_sep}{sep_n}  {sep_e}  ───  {sep_s}{sep_v}{sep_d}",
         sep_n = "─".repeat(num_w),
         sep_e = "─".repeat(name_w),
         sep_s = "─".repeat(state_w),
@@ -146,15 +198,16 @@ fn print_rolls_table(config: &Config, rolls: &[RollInfo], show_deps: bool) {
         let deps_col = if show_deps {
             format!(
                 "  {:<dep_w$}  {}",
-                branches::format_deps_with_staleness(&roll.deps, &roll.stale_deps),
+                branches::format_deps(roll),
                 branches::format_roll_numbers(&roll.dependents),
             )
         } else {
             String::new()
         };
         println!(
-            "{cur} {num:>nw$}  {name:<ew$}  {loc:<3}  {state:<sw$}{ver_col}{deps_col}",
+            "{cur} {build_col}{num:>nw$}  {name:<ew$}  {loc:<3}  {state:<sw$}{ver_col}{deps_col}",
             cur = cur_marker,
+            build_col = build_col(&roll.branch),
             ver_col = version_col(&roll.branch),
             num = roll.number,
             name = roll.branch,
@@ -165,13 +218,27 @@ fn print_rolls_table(config: &Config, rolls: &[RollInfo], show_deps: bool) {
             sw = state_w,
         );
     }
+    crate::print_hotfix_rows(hotfixes, name_w, state_w, build_w);
     println!();
     println!("  loc: L=local  R=remote  B=both");
+    if rebuild_status.is_some() {
+        println!(
+            "  build: N/NT/NB=nixos switch/test/boot  H/HT=home switch/test — most recent local rebuild"
+        );
+    }
     if show_deps {
         println!("  deps: rolls this one integrated  |  dependants: rolls that integrated it");
         println!(
             "  ⚠ after a dep number: it has moved since this roll integrated it — reintegrate"
         );
+        if !branches::distinct_cycles(rolls).is_empty() {
+            println!("  ↻ after a dep number: it integrated this roll back — a dependency cycle");
+        }
+    }
+    // Printed with or without `--no-deps`: it is what explains a `⛔ blocked`
+    // that would otherwise be waiting on a roll that is waiting on it.
+    for cycle in branches::distinct_cycles(rolls) {
+        println!("  {}", cycle.advice(rolls));
     }
 }
 
