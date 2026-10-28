@@ -176,7 +176,7 @@ pub struct Config {
     /// `lazygit` on `PATH`.
     #[serde(default = "default_lazygit")]
     pub lazygit_command: String,
-    /// The command the TUI's `[B]` binding launches, run in `repo_root`.
+    /// The command the TUI's `bb` binding launches, run in the `Cargo.toml` directory.
     /// Overridable for the same reasons as [`Self::lazygit_command`] — a
     /// wrapper, a flake app, or an absolute path instead of a bare `bacon` on
     /// `PATH`.

@@ -50,7 +50,7 @@ Three notes on that layout:
   require and what kept falling out of date.
 - Handing the terminal to another full-screen TUI happens in exactly one
   function, `tui::rolls::StatusApp::hand_over_terminal` — `gg` (lazygit) and
-  `[B]` (bacon) differ only in the command and how it is pointed at the repo.
+  `bb` (bacon) differ only in the command and how it is pointed at the repo.
   It is the only thing left that calls `tui::suspend`; everything else streams
   into `tui::output`'s panel. A third tool adds a caller, not a second copy of
   the suspend/spawn/resume bracket, whose failure path (restore the screen, then
