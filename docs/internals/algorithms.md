@@ -226,6 +226,101 @@ graduated rolls whose changes are in this roll's baseline. This is a promotion o
 constraint (this roll can't go to main before those do), not a graduation blocker. The
 `--basic` flag skips Method 4.
 
+## Local rebuild markers (`core/rebuild.rs`)
+
+**Not to be confused with the "Verification" section above** — that design
+(`core/verification.rs`, `rf test-all`, `Flake-Check:`/`Host-Results:`
+commits) was never built; this module is a separate, much narrower, purely
+informational one that *is* shipped. It answers "what did *this machine*
+most recently rebuild, locally" — for `rf status`/`rf list`'s `build` gutter
+column and `--json` output — and gates nothing. `rf` never shells out to
+`nixos-rebuild`/`home-manager` or reads profile symlinks here; it only reads
+commit messages the dotfiles repo's own rebuild scripts
+(`scripts/nixos-rebuild.sh`, `scripts/home-switch.sh`) already write:
+
+- NixOS: `<host-id>: generation <N> (switch|boot|test)`, or
+  `<host-id>: unknown generation (switch|boot|test)`.
+- Home-manager switch: `<username>@<host-id>: ... id <N> -> ... (current)`.
+- Home-manager test build: `<username>@<host-id>: test build (no generation created)`
+  (home-manager has no "boot" concept).
+
+`<host-id>` is `<flake-target>@<physical-host>` on WSL, else the plain flake
+target — `core::rebuild::current_host_identifier` mirrors dotfiles' own
+`scripts/host-detection-lib.sh` to compute it (hostname, `nixos`→`wsl` under
+WSL, `cmd.exe`/`.physical-host`/`hostname` for the physical host), with a
+`RF_HOST_IDENTIFIER` env var as both a manual override and the seam
+integration tests use to fake a host deterministically.
+
+**Gating.** Invisible unless the current host's flake-target (the part
+before any `@physical-host`) is known to `config.hosts`/`config.host_active`
+at all — not `active_hosts()`: a host marked inactive (e.g. mid-reinstall)
+should still show what it last rebuilt. A repo that models no hosts at
+all — `hosts = []`, `host_active = {}`, the shape roll-flow's own
+`.roll-flow.toml` is in — always shows nothing, by construction.
+
+**Discovery.** One `git log --all` pass (already newest-first) finds the
+most recent commit matching each of five shapes: nixos switch/test/boot,
+home switch/test. Kept as its own pass, independent of attribution below: a
+commit whose owning roll has since been pruned belongs to none of the
+ownership sets attribution builds, so folding discovery into that walk would
+silently miss exactly the commit this feature is about.
+
+**Attribution.** Naming which roll (or `rolling`/`stable`) a found commit
+belongs to is *not* a plain `is_ancestor` check against each roll in turn —
+that reproduces the exact false-positive the dependency-detection methods
+above warn about: every roll forks from stable, so a commit made directly on
+stable long ago is an ancestor of nearly every roll created afterwards too,
+and checking rolls first would misreport it as belonging to whichever roll
+happens to be checked first.
+
+Instead, three plain sets — `git rev-list --first-parent <ref>` for stable,
+for rolling, and for each roll in the current list — are checked in a fixed
+order: **stable, then rolling, then rolls** (ascending by number, which is
+only ever a deterministic tie-break — see below). No exclusion is needed:
+this codebase's merges are always `--no-ff` (see
+[invariants.md](invariants.md)), which keeps the branch being merged
+*into*'s own tip as the first parent, so content merged in from elsewhere —
+a roll's own work via its graduation merge, a dependency's via `[i]`/`rf
+integrate` — sits on the *second*-parent side and never appears on another
+ref's first-parent chain, no matter how long ago or how many tiers later
+that merge happened. A roll's own commits are therefore never found on
+stable's or rolling's set, so checking those two first costs a roll nothing;
+it only catches the ancient-shared-baseline case before a roll's set ever
+gets a chance to claim it. (One non-obvious consequence, found by testing
+this against a repo with history: `^<ref>` always excludes `<ref>`'s
+*immediate* parents regardless of parent index, `--exclude-first-parent-only`
+or not — only commits *further back* on the excluded side are protected by
+that flag. An earlier version of this attribution tried to bound each roll's
+set with that flag; it does not do what it looks like it does, and that
+version silently lost a roll's own commits the moment anything downstream
+merged the roll in.)
+
+A commit matching none of the three sets falls back to a plain ancestor
+check, in the same **stable, then rolling** order: the common real case is a
+roll's own switch/test/boot commit after that roll has graduated, promoted,
+and had its branch pruned, so there is no roll set left to claim it either —
+it was only ever introduced to rolling/stable through a merge's second
+parent, which `--first-parent` never walks, and is absent from every set
+above for exactly the reason that keeps those sets sound. The plain check
+here cannot reintroduce the false-positive above — it only ever resolves to
+`rolling`/`stable`, never to a specific roll, and only runs once every
+still-existing roll's own set has already failed to claim the commit. What
+remains genuinely unattributed is narrower still: a commit still only on an
+unlanded hotfix branch (not an attribution candidate today).
+
+**Superseding.** After attribution, a `test`/`boot` marker is dropped once
+the channel's `switch` marker is at least as recent, compared by **commit
+timestamp (`%ct`), not ancestry**. Ancestry can't make this call: a `switch`
+on `main` and an earlier `test` on an active, unmerged roll have no ancestor
+relationship at all — a real case found against `~/.dotfiles` — so an
+ancestry-based check left the stale test visible indefinitely, reading as if
+that roll were still "the current story" long after an unrelated switch had
+made it not. Time is the only ordering two unrelated branches share.
+`discover` already carries each hit's timestamp alongside its hash for
+exactly this. `test` and `boot` are never compared against each other: they
+are parallel states (ran-but-not-persisted vs. staged-for-next-boot), not
+competing ones.
+
 ## Revert detection (`core/branches.rs`)
 
 A roll's graduation (or promotion) merge is a normal commit — someone can
@@ -298,7 +393,22 @@ Phases:
    graduation, graduated-but-unpromoted for promotion; anything already past that
    point is history and is not walked further. Both the CLI and the TUI drive the
    same planner and the same per-step `ops::graduate`, so a chain is exactly
-   what N hand-run graduations would be
+   what N hand-run graduations would be.
+
+   `dependency_chain` also takes a `force: bool`. When `true` and `kind` is
+   `ChainKind::Graduate`, an *unknown* dependency — a roll number nothing in
+   the list carries, typically because it graduated, promoted, and was pruned
+   — is skipped rather than refused: no step is planned for it, and it is
+   recorded on the emitted step's `ChainStep::missing` as `(dependent, dep)`,
+   so the merge that actually lands without it can say so in its own commit
+   (`ops::MissingDeps`, a `Missing-Dependency:` / `Missing-Dependency-Reason:`
+   trailer independent of `ForceOpts`, since the TUI's confirm-modal escape
+   hatch for this never sets `ForceOpts.enabled` — that stays reserved for the
+   CLI's `--force` bypassing a failing gate). Every other refusal in this list
+   — the no-carrier cycle, an origin-only dependency, promotion's own
+   dependency-state checks — is unaffected by `force`; only this one shape,
+   and only for graduation, has an escape hatch (see
+   [graduate](../commands/graduate.md#a-dependency-whose-branch-is-gone)).
 5. **Pre-merge checks** — uncommitted changes, dep graduation status, verification,
    divergence, flake check per roll
 6. **Confirmation** — show merge plan, require y/N
@@ -323,6 +433,41 @@ error carrying a `ConflictReport`, raised only after the unwind so the repo is
 clean by the time anyone acts on it; a merge that failed with no conflicted
 paths keeps the plain error. Diagnosis never errors: it runs on a failing path
 and must not hide the failure it explains.
+
+### Predicting it in `rf verify`
+
+`rf verify` finds the same conflict *before* any merge, with a trial merge in the
+object store: `git merge-tree --write-tree --name-only --no-messages -z <target>
+<source>` (`git::preview_merge`). Exit 0 is clean, 1 is conflicted, and anything
+else — git older than 2.38, which lacks `--write-tree` — is reported as a
+skipped check, never a failure, since the real merge still stops on a conflict.
+Nothing is checked out, staged, or left behind but unreachable objects for `git
+gc`, so it is safe on the tree verify is about to gate.
+
+The paths go through the same attribution as above (`attribute_conflicts`, which
+`diagnose_conflicts` also calls), so verify and graduate describe one conflict
+identically. It runs only for a diverged pair — a fast-forwardable target cannot
+conflict — and before the version gate and the configured gates, since a merge
+that will stop makes their result moot. A real run fails with a typed
+`ops::PredictedConflict`; `--dry-run` reports it as a warning. Verify prints the
+fix (`rf integrate <culprit>` on a roll, else merging the target into the
+source) but never runs it: it vouches for a merge, it does not start one.
+
+`ops::verify_many` (`rf verify --all`, the TUI's `[V]`) carries the same
+`PredictedConflict` whole in `VerifyManyResult::conflict` rather than flattening
+it to its one-line `Display` the way every other failure in the pass is
+recorded — a hit for one roll in a many-roll pass still needs the attributed
+report and the fix, not just that it failed.
+
+The TUI's fix text differs from a lone `[v]`'s, though: `[i]`/`[I]` merge into
+whatever is checked out, and `verify_many` switches through every roll in the
+set before restoring HEAD to the branch the pass started from — not the
+conflicting roll. `tui::rolls::predicted_conflict_message` takes the
+checked-out branch as a parameter for exactly this: when it equals the
+conflict's source (always true for `[v]`, since that pass never leaves HEAD),
+the advice names `[i]`/`[I]` bare; otherwise it is prefixed with `[space]`
+onto the conflicting roll first, since pressing either key as-is would
+integrate into whichever branch the batch happened to land back on.
 
 ## Merge commit message format
 
@@ -360,14 +505,55 @@ those three shapes.
 
 ## Version gate and release tags (`core/version.rs`)
 
-When the repo has a `Cargo.toml`, `rf verify` and `rf promote` require the
-`[package]` version on the source branch to be strictly greater than the
-target's, and `rf promote` creates an annotated `vX.Y.Z` tag on the promotion
-merge commit (skipping an existing tag rather than erroring); `rf graduate`
-creates the equivalent `v<X.Y.Z>-dev` tag on rolling's new tip. Repos without a
-`Cargo.toml` — including the dotfiles repo — get `VersionStatus::NotApplicable`
-and skip all of it. Configurable via `version_gate`, `tag_on_promote`,
-`tag_on_graduate`, `push_tag`, `dev_versions`.
+When the repo has a `Cargo.toml` (or, for a Node repo, a `package.json`),
+`rf verify` and `rf promote` require the manifest's version on the source
+branch to be strictly greater than the target's, and `rf promote` creates an
+annotated `vX.Y.Z` tag on the promotion merge commit (skipping an existing tag
+rather than erroring); `rf graduate` creates the equivalent `v<X.Y.Z>-dev` tag
+on rolling's new tip. A repo with neither manifest — including the dotfiles
+repo — gets `VersionStatus::NotApplicable` and skips all of it. Configurable
+via `version_gate`, `tag_on_promote`, `tag_on_graduate`, `push_tag`,
+`dev_versions`.
+
+**`ManifestKind` is the one place that knows which files.** Everything below
+this section narrates the policy against `Cargo.toml`/`Cargo.lock`, since
+that is where it was built and the narrative is clearest against one concrete
+shape — but every mention of either file name is really
+`ManifestKind::Cargo.manifest()`/`.lockfile()`, and the same rule, the same
+`Marker`/`Semver`, and the same merge driver apply verbatim to
+`ManifestKind::Npm` (`package.json`/`package-lock.json`). `ManifestKind::detect`
+(working tree) and `::detect_at` (a ref) pick Cargo when a repo carries both
+and additionally require a readable version — a `package.json` that exists
+but carries no `version` key (tooling-only: prettier, husky) reads the same
+as one that is absent, never as `Unreadable`. Every `version` free function
+that reads or compares (`read_version`, `check`, `check_against`,
+`versions_at`, `version_at`) takes a `forced: Option<ManifestKind>` that
+overrides this detection outright — `Config::forced_manifest`, driven by the
+`version_manifest` config key (`docs/config.md`), for the rare repo carrying
+both manifests that needs one kind named explicitly. Every caller already
+has a `Config` in scope and passes `config.forced_manifest()` (or, for a few
+sites that need the resolved kind itself rather than just overriding
+detection, `Config::manifest_kind`/`manifest_kind_at`). The one thing it does
+not reach is the merge-driver subprocess, which has no `Config` at all and
+keeps plain auto-detection — harmless, since the driver's job is only to
+settle a version-line conflict on whichever files a merge actually touches.
+See `docs/proposals/package-json-versioning.md` for the original design; the
+implementation above is the `forced`-threading it left as an open question,
+resolved in favour of full coverage once a first cut that stopped at the
+write paths proved inconsistent (the gate's own comparison still auto-
+detected, so a forced kind's bump was gated against the wrong file). The npm
+arm's one structural difference: its manifest/lockfile are JSON,
+hand-formatted, so reading and rewriting goes through a small byte-level
+scanner (`version::json_string_at`) instead of the `toml` crate, and a
+version-only lockfile refresh needs no toolchain invoked at all (unlike
+Cargo's best-effort `cargo update --workspace`), since an npm root version
+change implies nothing else in the lockfile. (The proposal's claim that npm
+orders a dev marker the same way `Semver`'s derived `Ord` does only holds
+for "below the bare release" — semver prerelease identifiers compare
+lexically, so npm itself would rank `-dev` below `-roll9`, the reverse of
+`Ord`'s `Roll(_) < Dev`. This never matters to `rf`: its own `Ord` is what
+every gate and comparison here actually uses, and a dev marker never reaches
+a tool that would apply npm's ordering to it.)
 
 The gate and the tag are per promotion *step*, not per invocation: a per-roll
 promotion compares each roll's graduation commit against stable as that step is
@@ -518,3 +704,42 @@ and commits only if they pass. This is why a gate that rewrites tracked files
 aborts the promotion — `git commit` would drop those changes and record a merge
 whose content the gates never saw. Graduation still uses `run_merge`, which
 merges and commits in one step.
+
+## Roll graph column (`tui/rolls.rs`)
+
+The leftmost table column (right after the current-branch chevron, left of
+`#`) shows two fixed lanes — main, then rolling — rather than a dynamic
+multi-lane `git log --graph` layout. `graph_glyphs(&RollState) -> (char,
+char)` is a pure mapping from state to the `(main_lane, rolling_lane)` glyph
+pair; `base_graph_glyphs`/`hotfix_graph_glyphs` give the same shape for the
+pinned base rows and hotfix rows:
+
+| row | main lane | rolling lane |
+|---|---|---|
+| stable (base row) | `●` | ` ` |
+| rolling (base row) | `│` | `●` |
+| `Active` | `│` | `○` |
+| `Blocked` | `│` | `◌` |
+| `Diverged` | `│` | `◐` |
+| `Reverted` | `│` | `↺` |
+| `Graduated` | `│` | `●` |
+| `Promoted` | `●` | `●` |
+| `Demoted` | `◐` | `●` |
+| hotfix, open | `│` | `○` |
+| hotfix, landed | `●` | `●` |
+
+**Deliberately not a dependency graph.** A roll that integrated another
+(`[i]`) already has a home for that fact — the `deps`/`dependants` columns and
+their `⚠` stale markers (see [Dependency detection](#dependency-detection-coredependenciesrs)
+above) — so this column does not draw crossing lines between arbitrary rows
+for it. Two reasons: the `branch` column already "has nothing to spare" for a
+wider deps column, and true lane packing needs unbounded width in the
+pathological case (a long chain of integrations), which a fixed two-column
+budget cannot offer. This column re-renders facts `RollState` already carries
+spatially — `●` closer to main reads as "more settled" — it does not add new
+ones. A future roll that wants real integration lines needs a new design, not
+an extension of this table: that would be a genuine multi-lane layout problem,
+not a glyph lookup.
+
+TUI-only: there is no plain-table or `--json` equivalent, the same scoping the
+existing columns already apply to narrow terminal real estate.

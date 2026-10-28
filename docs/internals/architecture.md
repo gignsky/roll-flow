@@ -23,6 +23,7 @@ src/
     mod.rs             terminal enter/exit, and suspend/resume for lazygit
     rolls.rs           the rolls view: state, event loop, table, modals, keymap
     output.rs          background jobs and the floating output panel
+    queue.rs           commands queued behind the running job; held on failure
   core/
     mod.rs
     config.rs          Config struct, auto-detection from flake.nix
@@ -34,6 +35,7 @@ src/
     clean.rs           stale-branch detection across all remotes
     version.rs         version gate and release tags
     merge_driver.rs    git merge driver resolving the version in Cargo.toml/.lock
+    rebuild.rs         this machine's last local nixos/home-manager rebuild
 ```
 
 Three notes on that layout:

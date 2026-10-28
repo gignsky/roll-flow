@@ -81,6 +81,19 @@ long list — that keeps two rolls adding rules in different areas from collidin
   others, nothing graduates, and every surface — the planner's refusal, both
   plain tables, the TUI detail view and `--json` — gives the same
   `DepCycle::advice`: which `rf integrate` makes a carrier. Never `--force`.
+- **An unknown dependency is forceable for graduation, but not yet for
+  promotion.** A dependency number no roll in the list carries — typically
+  one that graduated, promoted, and was pruned, so nothing is left to resolve
+  what "roll N" is — can be skipped with `rf graduate --force --reason` or
+  the TUI's own force-confirm stage on `[G]`, for `ChainKind::Graduate` only;
+  `ChainKind::Promote` keeps this refusal unconditionally for now, since
+  forcing past it there has not been built. The origin-only refusal and the
+  no-carrier cycle refusal are a different matter — each has its own remedy
+  (fetch, `rf integrate`) and is never bypassed by `force` regardless of
+  `ChainKind`. The TUI's bypass is its own second, explicit confirmation —
+  never `ForceOpts.enabled`, which stays reserved for the CLI's `--force`
+  bypassing a failing gate, so confirming past a missing dependency from a
+  keypress can never also start bypassing gates from one.
 - **Every walk over dependencies terminates.** Cycles are found once, by
   Tarjan's SCC (`branches::dependency_cycles`), and recorded on
   `RollInfo::cycle`; walks either treat a recorded cycle as one node
@@ -94,9 +107,41 @@ long list — that keeps two rolls adding rules in different areas from collidin
   commit where it landed — never left pointing at an integrate merge on a roll
   branch, which `rf promote --roll` would then advance stable to.
 
+## TUI command queue
+
+- One git command runs at a time. A mutating key pressed mid-job is queued
+  (`tui::queue`), never run concurrently and never silently refused.
+- A failed command *holds* the queue. Nothing behind a failure runs until the
+  user presses `[s]`; nothing is discarded until they press `[S]`. A command
+  pressed while held goes to the back, never ahead of the unresolved failure.
+  The one command that may jump the queue is a confirmed force push answering
+  the rejection that held it.
+- A key that captures the checked-out branch at keypress time must refuse
+  (`StatusApp::waits_on_head`) while a HEAD-moving job is running or queued
+  (`start_head_job`: switch, create). Work that only needs HEAD when it runs
+  should read it inside the job instead, as `git switch` does.
+- `gg` is refused only while a job is *running*. A held queue is exactly when
+  lazygit is needed.
+
 ## Verification
 
 - Active hosts only. Never require verification from inactive hosts.
+
+## Local rebuild markers
+
+- `core::rebuild` never shells out to `nixos-rebuild`/`home-manager` and never
+  reads `/nix/var/nix/profiles/system` or `/run/current-system`. It only reads
+  commit messages the dotfiles repo's own rebuild scripts
+  (`scripts/nixos-rebuild.sh`, `scripts/home-switch.sh`) already write — pure
+  git-log scanning, the same "core never runs nix" rule config auto-detection
+  follows.
+- Unlike [Verification](#verification) above, this one is **not**
+  active-hosts-only on purpose: it is informational, not a gate, so a host
+  marked inactive (mid-reinstall, say) still shows what it last rebuilt. It
+  gates on a different, wider question — is this host known to
+  `config.hosts`/`config.host_active` *at all* — so a repo that models no
+  hosts (`hosts = []`, `host_active = {}`, the shape roll-flow's own
+  `.roll-flow.toml` is in) always shows nothing.
 
 ## Deletion safety
 

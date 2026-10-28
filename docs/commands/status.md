@@ -96,6 +96,36 @@ dependencies and no detail overlay, but `[space]`, `[p]`/`[P]`/`[f]` and
 `[d]elete` work on them as on any other row. `--json` carries them as their own
 `hotfixes` array rather than mixed into the roll list.
 
+## Build column
+
+In a repo whose config models this machine's host (`hosts`/`host_active` —
+every dotfiles repo, never roll-flow's own), the table carries a `build`
+column: which roll (or `rolling`/`main`, when it isn't a roll) this machine
+most recently rebuilt, read from commit messages dotfiles' own rebuild
+scripts already write. It sits in the left gutter, right after the
+current-branch chevron (and, in the TUI, the graph column) — a per-row
+marker like those, not a trailing detail like `version`/`deps`. Up to five
+labels, space-joined on whichever single row each points at: `N`/`NT`/`NB`
+for the most recent NixOS switch/test/boot, `H`/`HT` for the most recent
+home-manager switch/test — home-manager has no "boot" concept. A
+`NT`/`NB`/`HT` label disappears once a later switch has caught up to or
+passed it, since it then tells you nothing the switch doesn't.
+
+`--no-tui` prints a one-line summary above the table instead of relying on
+the column alone — the common case, a plain switch directly on
+`rolling`/`main`, has no roll row to attach a column cell to at all:
+
+```text
+last rebuild (merlin): nixos switch→rolling · nixos test→roll/41-x · home switch→rolling
+```
+
+`--json` carries the same data as a top-level `local_rebuild` object
+(`host`, `nixos`/`home`, each `{switch, test, boot}` as branch-name strings
+or `null`) — see [`list`](list.md) for the per-roll echo of this in `rf list
+--json`. See
+[Local rebuild markers](../internals/algorithms.md#local-rebuild-markers-corerebuildrs)
+for how a commit is attributed to a roll vs. a branch.
+
 ## Keys
 
 The status bar carries the handful you need before you know the rest exist:
@@ -154,6 +184,7 @@ The full list:
 | `d` / `x` / `t` | delete / prune / tidy branches |
 | `esc` | close the output panel |
 | `PgUp` / `PgDn` / `End` | scroll the panel, or follow new output |
+| `s` / `S` | [resume / drop a held queue](#chaining-commands) |
 
 The sync keys follow lazygit, which is why graduate is `[G]` and promote is `[m]`
 rather than the `[g]`/`[p]` they used to be — `[p]` and `[P]` are pull and push
@@ -165,7 +196,9 @@ rows: it merges the roll under the cursor into the roll wearing the chevron — 
 [`integrate`](integrate.md#from-the-tui). The `sync` column reports each branch against
 its upstream: `✓` in sync, `↑2` ahead, `↓1` behind, `↑2↓1` diverged, `gone` once
 the upstream is deleted, and `—` when there is nothing to compare (no upstream,
-or no local copy).
+or no local copy). A `⚡` appended to any of those means that branch's worktree
+has uncommitted changes — only possible for a branch checked out somewhere,
+local or in a linked `git worktree`.
 
 ## Running commands
 
@@ -173,8 +206,41 @@ An action does not take the screen away. Its output streams into a panel in the
 bottom-right corner while the table stays drawn and navigable — `j`/`k` and
 `[enter]` keep working mid-push — and `[esc]` dismisses the panel once the
 command has finished. `PageUp`/`PageDown` scroll its scrollback and `End` returns
-to following new output. Only one command runs at a time; a second action while
-one is in flight is refused rather than queued.
+to following new output.
+
+### Chaining commands
+
+Only one git command runs at a time, but you do not have to wait for it: an
+action pressed while one is in flight is **queued** behind it and starts the
+moment the one ahead finishes. Press `[c]` mid-push and the new roll is created
+once the push lands. The queued command continues the same panel under a
+`── title ──` divider, so the whole chain reads as one log, and the status bar
+lists what is still waiting (`⏳ 2 queued: git fetch --prune → rf create`).
+
+When a command **fails**, the queue is *held*, not run and not thrown away —
+the commands behind it were chosen assuming it would succeed. The status bar
+turns red and stays that way even after `[esc]` closes the panel. Resolve the
+problem — a merge conflict is the usual one, and `gg` opens lazygit to fix it
+(lazygit is refused only while a command is actually running, never while the
+queue is merely held) — then:
+
+- `[s]` resumes the queue from the next command;
+- `[S]` drops every queued command.
+
+Anything you press while the queue is held joins the back of it rather than
+jumping ahead of a conflict you have not resolved yet. A push rejected as
+non-fast-forward holds the queue too: answering `y` to the force prompt runs the
+forced push *ahead* of the queue and releases it, `n` leaves it held.
+
+Two guards keep a chain from doing something you did not ask for:
+
+- Keys that act on the **checked-out branch** — `[i]`, `[I]`, `[b]`, `[v]`,
+  `[p]`, `[P]`, `PP` — are refused while a queued or running `space` switch or
+  `[c]` create is pending, because they capture the branch when pressed and
+  would act on a different one by the time their turn came. Press them again
+  once the switch has run.
+- `q` with commands queued only warns the first time; a second `q` quits and
+  drops them.
 
 `gg` is the exception: lazygit is full-screen and owns the terminal, so `rf`
 suspends, hands it over, and redraws when lazygit exits. Set `lazygit_command` in
@@ -255,6 +321,11 @@ failed version gate points at `[b]` instead, which is the key that already write
 that commit. A failed host or an unsatisfied gate marks the panel as failed
 rather than passing quietly.
 
+A predicted merge conflict fails the panel the same way, before any gate runs,
+with the same attributed report `rf verify` prints. The fix is pointed at this
+screen's keys instead of at commands: `[i]` on the culprit roll's row to take
+the conflict onto the checked-out roll, or `[I]` to integrate rolling itself.
+
 ### `[V]` — verify many at once
 
 `[V]` opens a picker — `all rolls`, `active`, `blocked`, `graduated`,
@@ -266,6 +337,20 @@ on, whatever any roll's gates said. A dirty tree is refused in the status bar
 before the picker even opens. One job, one panel: each roll's report under its
 own header, then `N passed, M failed, K skipped`, and the panel marks failed if
 any did — see [`verify`](verify.md#verifying-many-at-once).
+
+### Graduating past a missing dependency
+
+`[G]` on a roll whose dependency's branch no longer exists (see
+[graduate](graduate.md#a-dependency-whose-branch-is-gone)) opens the confirm
+modal as usual rather than refusing the key outright — the plan lists the
+missing roll alongside whatever else would land. Pressing `[y]` there does not
+graduate: it advances to a second, explicit stage naming the missing roll and
+asking again, the same two-stage shape `[d]elete` uses for an uncontained
+branch. Only a fresh `[y]` on *that* stage graduates, skipping the missing
+dependency; `[n]`/`[esc]` at either stage cancels. This is the TUI's only way
+to force anything — no key here bypasses a failing gate, which `rf graduate
+--force` can still do from the CLI.
+
 ## Hotfixes
 
 `[h]` opens the same slug modal as `[c]reate` and runs `rf hotfix <slug>`,

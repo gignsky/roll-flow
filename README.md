@@ -49,7 +49,7 @@ rf graduate [--dry-run] [--force --reason <text>] [--no-tag] [--yes]
 rf promote [--roll <branch>]... [--dry-run] [--force --reason <text>] [--bump <patch|minor|major>] [--no-tag] [--final] [--yes]
 rf status [--no-tui] [--no-deps] [--json]
 rf list [--no-tui] [--deps] [--json]
-rf update [--roll <branch>]... [--dry-run]
+rf update [--roll <branch>]... [--dry-run] [--state <all|active|blocked>]
 rf prune [--dry-run] [--local | --remote] [--yes] [--force] [--no-fetch]
 rf tidy [--state <active|blocked|diverged|reverted|graduated|promoted|demoted|all>,...] [--dry-run] [--yes] [--force] [--no-fetch]
 rf delete <branch> [--dry-run] [--local | --remote] [--yes] [--force] [--no-fetch]
@@ -84,20 +84,27 @@ See [docs/config.md](docs/config.md) for `.roll-flow.toml` and its gate and
 
 ## Versioning and release tags
 
-When the repository has a `Cargo.toml`, `rf` enforces the same release policy as
-this project's CI, so promoting locally and promoting through a pull request are
-equivalent:
+When the repository has a `Cargo.toml` or a `package.json`, `rf` enforces the
+same release policy as this project's CI, so promoting locally and promoting
+through a pull request are equivalent. The policy itself is not Cargo-specific
+— it reads the version from whichever manifest the repo versions through
+(`Cargo.toml` wins when both are present; see `version_manifest` in
+[docs/config.md](docs/config.md) to force the other), and repeats every
+rewrite into that kind's lockfile too:
 
-- **Version gate** — `rf verify` and `rf promote` require the `[package]`
+- **Version gate** — `rf verify` and `rf promote` require the manifest's
   version on the branch being merged to be strictly greater than the version on
   the branch it merges into. This mirrors
   `.github/workflows/version-bump-check.yml`. When the version is unchanged,
   both commands offer to bump it and commit
   `chore(release): bump version to X.Y.Z for <branch>`; a version _lower_ than
   the target is always a hard error. The bump is applied before the configured
-  gates run, because it rewrites `Cargo.lock` and the gates include
-  `cargo update --workspace --locked`. The TUI's `[b]` applies the same bump on
-  demand, ahead of needing it — see [`status`](docs/commands/status.md#bumping-the-version).
+  gates run, because it rewrites the lockfile too and the gates include
+  `cargo update --workspace --locked` (for a Cargo repo — an npm repo rewrites
+  `package-lock.json`'s own entries directly, with no toolchain invoked at
+  all, and `npm ci` in the gates is the equivalent lockfile check). The TUI's
+  `[b]` applies the same bump on demand, ahead of needing it — see
+  [`status`](docs/commands/status.md#bumping-the-version).
 - **Dev versions** — a version carries one of three markers as it moves through
   the pipeline: a roll's own `-roll<N>` (`0.2.4` → `0.2.4-roll9`, written by
   `rf start`), rolling's steady-state `-dev` (`rf graduate` swaps the roll's
@@ -131,8 +138,8 @@ reached, finalizing each graduation commit's `-dev` marker in the staged merge
 tree as it goes. Only the whole-branch route offers a bump, since only it
 merges a branch a bump commit could land on.
 
-Repos without a `Cargo.toml` — including the dotfiles repo roll-flow was built
-for — skip all of this silently. `version_gate`, `tag_on_promote`,
+A repo with neither manifest — including the dotfiles repo roll-flow was built
+for — skips all of this silently. `version_gate`, `tag_on_promote`,
 `tag_on_graduate`, and `push_tag` in [docs/config.md](docs/config.md) turn each
 piece off.
 
