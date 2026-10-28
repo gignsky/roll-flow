@@ -125,6 +125,13 @@ long list — that keeps two rolls adding rules in different areas from collidin
   refspec (`refs/heads/<branch>:…`), so neither the request nor the job reads
   HEAD. Any new push path must keep naming its branch up front; one that reads
   HEAD when it runs must go back behind `waits_on_head`.
+- `[v]` is the other exception, by the opposite route: it names no branch at
+  keypress and reads HEAD only inside the job (`run_verify`), so a verify queued
+  behind a switch judges the branch that switch leaves checked out. While HEAD
+  is about to move, its title says what it waits on instead of naming a route
+  that is about to be stale. Anything added to that job that captures the
+  branch when the key is pressed breaks this and must go back behind
+  `waits_on_head`.
 - `gg` is refused only while a job is *running*. A held queue is exactly when
   lazygit is needed.
 

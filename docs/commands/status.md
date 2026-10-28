@@ -234,11 +234,17 @@ forced push *ahead* of the queue and releases it, `n` leaves it held.
 
 Two guards keep a chain from doing something you did not ask for:
 
-- Keys that act on the **checked-out branch** — `[i]`, `[I]`, `[b]`, `[v]`,
+- Keys that act on the **checked-out branch** — `[i]`, `[I]`, `[b]`,
   `[p]` — are refused while a queued or running `space` switch or
   `[c]` create is pending, because they capture the branch when pressed and
   would act on a different one by the time their turn came. Press them again
   once the switch has run.
+- `[v]` is **not** refused: it reads the checked-out branch when it *runs*, so
+  it chains. Verify `roll/45`, queue a `space` switch to `roll/44`, then `[v]`
+  again, and the second verify judges `roll/44`. Its panel title says it waits
+  on the switch rather than naming a branch that is about to be left, and a
+  branch that is not promotable fails inside the job like any other verify
+  error. (`[V]` verifies a named set and is unaffected.)
 - `[P]` and `PP` are **not** refused: a push names its branch, so it is queued
   like any other command. The branch is fixed when you press the key (the
   selected row, or the plan `PP` showed), never read from HEAD when the push

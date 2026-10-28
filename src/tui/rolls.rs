@@ -4101,21 +4101,30 @@ impl StatusApp {
     /// inside the job so the panel title names it before the gates start — on a
     /// repo with `cargo test` gates that is the difference between a title the
     /// user can trust and several silent minutes.
+    ///
+    /// Verify may be queued behind a switch or create, which is how verifies
+    /// chain across rolls: the job reads HEAD when it *runs* (`run_verify`),
+    /// so it judges whichever branch the queued switch left checked out. The
+    /// route cannot be named at keypress then — HEAD is about to change — so
+    /// the title says what it waits on instead, and a branch that turns out not
+    /// to be promotable fails inside the job like any other verify error.
     fn start_verify(&mut self) {
-        if self.waits_on_head("[v]") {
-            return;
-        }
-        let Some((source, target)) = verify_route_for(&self.config, &self.current_branch) else {
-            self.message = Some(format!(
-                "'{}' is not promotable — check out {} or a {}branch to verify",
-                self.current_branch, self.config.rolling_branch, self.config.roll_prefix
-            ));
-            return;
+        let title = match self.head_will_move() {
+            Some(pending) => format!("rf verify (checked-out branch after '{pending}')"),
+            None => {
+                let Some((source, target)) = verify_route_for(&self.config, &self.current_branch)
+                else {
+                    self.message = Some(format!(
+                        "'{}' is not promotable — check out {} or a {}branch to verify",
+                        self.current_branch, self.config.rolling_branch, self.config.roll_prefix
+                    ));
+                    return;
+                };
+                format!("rf verify {source} → {target}")
+            }
         };
         let config = self.config.clone();
-        self.start_job(format!("rf verify {source} → {target}"), move || {
-            Ok(JobDone::lines(run_verify(&config)?))
-        });
+        self.start_job(title, move || Ok(JobDone::lines(run_verify(&config)?)));
     }
 
     /// `gg` — hand the terminal to lazygit, then take it back.
@@ -10808,6 +10817,41 @@ mod tests {
         // The push itself fails (no such repo); the queue is empty so nothing
         // is held either way.
         settle(&mut app);
+    }
+
+    #[test]
+    fn verifies_chain_behind_a_pending_switch_without_naming_a_branch_early() {
+        let mut app = idle_app();
+        app.current_branch = "feature/not-promotable".to_string();
+        let (release, gate) = std::sync::mpsc::channel::<()>();
+        app.start_job("rf verify roll/45 → rolling", move || {
+            gate.recv().ok();
+            Ok(JobDone::default())
+        });
+        app.start_head_job("git switch roll/44", says("switched"));
+
+        // HEAD is about to move, so `[v]` queues instead of refusing — and does
+        // not judge the soon-to-be-stale checked-out branch.
+        app.start_verify();
+        app.start_verify();
+        let order: Vec<&str> = app.queue.titles().collect();
+        assert_eq!(
+            order,
+            [
+                "git switch roll/44",
+                "rf verify (checked-out branch after 'git switch roll/44')",
+                "rf verify (checked-out branch after 'git switch roll/44')",
+            ]
+        );
+        assert!(
+            !app.message
+                .clone()
+                .unwrap_or_default()
+                .contains("not promotable"),
+            "{:?}",
+            app.message
+        );
+        release.send(()).unwrap();
     }
 
     #[test]
