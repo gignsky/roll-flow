@@ -11,6 +11,9 @@
 //! `gg` to hand the terminal to lazygit itself. The keymap is deliberately
 //! lazygit's rather than one of our own — `[G]raduate` and `[m] promote` moved
 //! aside to make room for it.
+//!
+//! `[B]` hands the terminal to bacon the same way. Both go through
+//! [`StatusApp::hand_over_terminal`], the one place anything suspends the TUI.
 
 use std::collections::{HashMap, HashSet};
 use std::time::{Duration, Instant};
@@ -805,6 +808,9 @@ struct StatusApp {
     /// When a bare `p` was pressed, waiting to see whether it becomes `pp`.
     /// Same shape as `pending_push`, timed by [`PULL_CHORD_WINDOW`].
     pending_pull: Option<Instant>,
+    /// When a bare `b` was pressed, waiting to see whether it becomes `bb`.
+    /// Same shape as `pending_pull`, timed by [`BUMP_CHORD_WINDOW`].
+    pending_bump: Option<Instant>,
     /// Commands run through `:`, most-recent-first. Loaded once at startup
     /// from [`history::load`] and saved back after every run.
     command_history: Vec<String>,
@@ -944,6 +950,53 @@ pub(crate) fn pull_chord_key(code: KeyCode) -> PullChord {
         KeyCode::Char('p') => PullChord::All,
         _ => PullChord::Single,
     }
+}
+
+/// Same timeout as [`PULL_CHORD_WINDOW`]. `bb` makes a lone `b` — the version
+/// bump — wait this long before it fires.
+pub(crate) const BUMP_CHORD_WINDOW: Duration = Duration::from_millis(400);
+
+/// What the key following a bare `b` makes of it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum BumpChord {
+    /// A second `b`: hand the terminal to bacon.
+    Bacon,
+    /// Anything else: the version bump the first `b` already meant.
+    Bump,
+}
+
+/// Decide a pending `b` from the key that followed it. Mirrors
+/// [`pull_chord_key`]: only a second `b` completes the chord.
+pub(crate) fn bump_chord_key(code: KeyCode) -> BumpChord {
+    match code {
+        KeyCode::Char('b') => BumpChord::Bacon,
+        _ => BumpChord::Bump,
+    }
+}
+
+/// The directory of the shallowest `Cargo.toml` in the working tree — the
+/// repo root itself when it has one, else the nearest crate below it. Asked of
+/// git, so untracked-but-not-ignored manifests count and `target/` or
+/// `node_modules/` never do.
+pub(crate) fn cargo_root(repo_root: &std::path::Path) -> Option<std::path::PathBuf> {
+    let listed = crate::core::git::capture_git(
+        repo_root,
+        &[
+            "ls-files",
+            "--cached",
+            "--others",
+            "--exclude-standard",
+            "--",
+            ":(glob)**/Cargo.toml",
+        ],
+    )
+    .ok()?;
+    let manifest = listed
+        .lines()
+        .filter(|line| !line.is_empty())
+        .min_by_key(|line| (line.matches('/').count(), *line))?;
+    let dir = std::path::Path::new(manifest).parent()?;
+    Some(repo_root.join(dir))
 }
 
 /// One branch `PP` will push.
@@ -1288,12 +1341,26 @@ pub(crate) const BINDINGS: &[Binding] = &[
         hint: None,
         replay: &[KeyCode::Char('f')],
     },
+    // lazygit and bacon are not roll operations at all — they are other
+    // people's TUIs that this one steps aside for. Their own group, so `?`
+    // lists them together and a search for "sync" or "roll" does not turn up
+    // a key that touches neither.
     Binding {
         keys: "gg",
         label: "hand the terminal to lazygit",
-        group: "sync",
+        group: "tools",
         hint: None,
         replay: &[KeyCode::Char('g'), KeyCode::Char('g')],
+    },
+    Binding {
+        keys: "bb",
+        // "watch" earns its place the way "all" does on `PP`: the search is a
+        // subsequence match, and someone looking for a background cargo check
+        // types what it does, not the name of the program that does it.
+        label: "hand the terminal to bacon (watch and recheck)",
+        group: "tools",
+        hint: None,
+        replay: &[KeyCode::Char('b'), KeyCode::Char('b')],
     },
     Binding {
         keys: "c",
@@ -2453,6 +2520,7 @@ impl StatusApp {
             pending_g: false,
             pending_push: None,
             pending_pull: None,
+            pending_bump: None,
             command_history: history::load(),
         }
     }
@@ -2466,6 +2534,7 @@ impl StatusApp {
             self.open_deferred_mode();
             self.resolve_lapsed_push();
             self.resolve_lapsed_pull();
+            self.resolve_lapsed_bump();
 
             if event::poll(Duration::from_millis(50))? {
                 let event = event::read()?;
@@ -2837,6 +2906,15 @@ impl StatusApp {
             return Ok(false);
         }
 
+        // `bb` opens bacon; any other key resolves the pending `b` as the bump.
+        if self.pending_bump.take().is_some() {
+            match bump_chord_key(code) {
+                BumpChord::Bacon => self.launch_bacon(terminal)?,
+                BumpChord::Bump => self.request_bump(),
+            }
+            return Ok(false);
+        }
+
         match code {
             KeyCode::Char('q') => return Ok(self.confirm_quit(quit_armed)),
             // `esc` dismisses the output panel when one is up, and only quits
@@ -2905,7 +2983,7 @@ impl StatusApp {
             KeyCode::Char('G') => self.request(Action::Graduate),
             KeyCode::Char('i') => self.request_integrate(),
             KeyCode::Char('I') => self.request_integrate_rolling(),
-            KeyCode::Char('b') => self.request_bump(),
+            KeyCode::Char('b') => self.arm_bump(),
             KeyCode::Char('m') => self.request(Action::Promote),
             KeyCode::Char('u') => self.request(Action::Update),
             KeyCode::Char('U') => self.request_update_many(),
@@ -3958,6 +4036,29 @@ impl StatusApp {
         }
     }
 
+    /// `[b]` — arm the bump chord. The bump itself does not start until the
+    /// chord resolves, in [`Self::handle_browsing`] or
+    /// [`Self::resolve_lapsed_bump`].
+    fn arm_bump(&mut self) {
+        if self.busy() {
+            return;
+        }
+        self.pending_bump = Some(Instant::now());
+        self.message = Some("b again to open bacon".to_string());
+    }
+
+    /// Fire a pending `b` that nothing followed.
+    fn resolve_lapsed_bump(&mut self) {
+        let lapsed = self
+            .pending_bump
+            .is_some_and(|armed| armed.elapsed() >= BUMP_CHORD_WINDOW);
+        if lapsed {
+            self.pending_bump = None;
+            self.message = None;
+            self.request_bump();
+        }
+    }
+
     /// `PP` — plan a push of every branch that needs one and open its modal.
     ///
     /// Nothing is pushed here. The plan is resolved from the tracking data the
@@ -4119,43 +4220,91 @@ impl StatusApp {
         });
     }
 
-    /// `gg` — hand the terminal to lazygit, then take it back.
+    /// Hand the terminal to an external full-screen application, then take it
+    /// back.
     ///
-    /// The one action that still suspends: lazygit is a full-screen application
-    /// and owns the terminal outright, so there is nothing to stream into a
-    /// panel. The list reloads afterwards because anything at all may have
-    /// happened inside it.
-    fn launch_lazygit(&mut self, terminal: &mut super::Tui) -> Result<()> {
+    /// These are the only actions that still suspend. Ops stream into
+    /// [`output::Panel`] instead, but lazygit and bacon draw their own
+    /// full-screen UI and own the terminal outright, so there is nothing to
+    /// stream — see [`super::suspend`]. There is one implementation rather
+    /// than one per tool because every part of this is the same for both and
+    /// easy to get subtly wrong twice: [`super::resume`] has to run on the
+    /// failure path too or a missing binary leaves the screen wrecked, a
+    /// non-zero exit is a message while a failed spawn is a panel,
+    /// and the panel has to name the config key that overrides the command.
+    /// The list reloads afterwards because anything at all may have happened
+    /// inside.
+    ///
+    /// `command` is owned rather than borrowed from `self.config`: the `&mut
+    /// self` here would otherwise conflict with it for the whole call.
+    fn hand_over_terminal(
+        &mut self,
+        terminal: &mut super::Tui,
+        command: String,
+        config_key: &str,
+        configure: impl FnOnce(&mut std::process::Command),
+    ) -> Result<()> {
         if self.busy() {
             return Ok(());
         }
+        let mut child = std::process::Command::new(&command);
+        configure(&mut child);
+
         super::suspend(terminal)?;
-        let spawned = std::process::Command::new(&self.config.lazygit_command)
-            .arg("-p")
-            .arg(&self.config.repo_root)
-            .status();
+        let spawned = child.status();
         super::resume(terminal)?;
 
         match spawned {
             Ok(status) if status.success() => self.message = None,
-            Ok(status) => {
-                self.message = Some(format!(
-                    "{} exited with {status}",
-                    self.config.lazygit_command
-                ))
-            }
+            Ok(status) => self.message = Some(format!("{command} exited with {status}")),
             // A missing binary is the common case and deserves the actionable
             // message rather than a raw io error.
             Err(err) => {
-                let mut panel = output::Panel::new(self.config.lazygit_command.clone());
+                let mut panel = output::Panel::new(command.clone());
                 panel.fail(vec![
-                    format!("could not run '{}': {err}", self.config.lazygit_command),
-                    "set lazygit_command in .roll-flow.toml to override".to_string(),
+                    format!("could not run '{command}': {err}"),
+                    format!("set {config_key} in .roll-flow.toml to override"),
                 ]);
                 self.panel = Some(panel);
             }
         }
         self.reload()
+    }
+
+    /// `gg` — hand the terminal to lazygit.
+    fn launch_lazygit(&mut self, terminal: &mut super::Tui) -> Result<()> {
+        let command = self.config.lazygit_command.clone();
+        let repo_root = self.config.repo_root.clone();
+        self.hand_over_terminal(terminal, command, "lazygit_command", |child| {
+            child.arg("-p").arg(repo_root);
+        })
+    }
+
+    /// `bb` — hand the terminal to bacon, in the directory holding the working
+    /// tree's `Cargo.toml` (see [`cargo_root`]).
+    ///
+    /// Launched by `current_dir` rather than a path flag, which is the one way
+    /// this differs from lazygit's `-p`: bacon's positional argument is a *job*
+    /// name (`check`, `clippy`, `test`), so a repo path passed there would be
+    /// read as a job that does not exist. Setting the working directory is what
+    /// running `bacon` by hand in the repo does anyway, and it needs no
+    /// agreement with bacon about which flag names a path.
+    ///
+    /// No roll-flow state is involved: bacon watches the worktree and reruns
+    /// cargo, so it is a dev-loop key that happens to live on this screen
+    /// because this screen is where the user already is. The `reload` the
+    /// hand-over does on the way out is still right — bacon can be left
+    /// running across a `git` command typed in its shell-out.
+    fn launch_bacon(&mut self, terminal: &mut super::Tui) -> Result<()> {
+        let Some(root) = cargo_root(&self.config.repo_root) else {
+            self.message =
+                Some("no Cargo.toml in the working tree — nothing for bacon to watch".to_string());
+            return Ok(());
+        };
+        let command = self.config.bacon_command.clone();
+        self.hand_over_terminal(terminal, command, "bacon_command", |child| {
+            child.current_dir(root);
+        })
     }
 
     /// Route a mouse event to the output panel. A no-op with no panel up —
@@ -6704,6 +6853,7 @@ mod tests {
             clean_protect: Vec::new(),
             pull_mode: Default::default(),
             lazygit_command: "lazygit".to_string(),
+            bacon_command: "bacon".to_string(),
             version_manifest: Default::default(),
         }
     }
@@ -6822,6 +6972,7 @@ mod tests {
             pending_g: false,
             pending_push: None,
             pending_pull: None,
+            pending_bump: None,
             command_history: Vec::new(),
         };
 
@@ -6885,6 +7036,7 @@ mod tests {
             pending_g: false,
             pending_push: None,
             pending_pull: None,
+            pending_bump: None,
             command_history: Vec::new(),
         };
 
@@ -6928,6 +7080,7 @@ mod tests {
             pending_g: false,
             pending_push: None,
             pending_pull: None,
+            pending_bump: None,
             command_history: Vec::new(),
         };
         app.toggle_maximize();
@@ -7362,19 +7515,70 @@ mod tests {
     }
 
     #[test]
+    fn only_a_second_b_completes_the_bacon_chord() {
+        assert_eq!(bump_chord_key(KeyCode::Char('b')), BumpChord::Bacon);
+        for key in [
+            KeyCode::Char('B'),
+            KeyCode::Char('v'),
+            KeyCode::Esc,
+            KeyCode::Enter,
+        ] {
+            assert_eq!(bump_chord_key(key), BumpChord::Bump, "{key:?}");
+        }
+    }
+
+    #[test]
+    fn cargo_root_finds_the_shallowest_manifest_in_the_working_tree() {
+        let dir = std::env::temp_dir().join(format!("rf-cargo-root-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(dir.join("app/sub")).unwrap();
+        let git = |args: &[&str]| {
+            assert!(std::process::Command::new("git")
+                .arg("-C")
+                .arg(&dir)
+                .args(args)
+                .output()
+                .unwrap()
+                .status
+                .success());
+        };
+        git(&["init", "-q"]);
+        assert_eq!(cargo_root(&dir), None);
+        std::fs::write(dir.join("app/sub/Cargo.toml"), "").unwrap();
+        assert_eq!(cargo_root(&dir), Some(dir.join("app/sub")));
+        std::fs::write(dir.join("app/Cargo.toml"), "").unwrap();
+        assert_eq!(cargo_root(&dir), Some(dir.join("app")));
+        std::fs::write(dir.join("Cargo.toml"), "").unwrap();
+        assert_eq!(cargo_root(&dir), Some(dir.clone()));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
     fn the_search_ranks_the_key_you_meant_first() {
         // The point of fuzzy over substring: a half-remembered word against a
         // label nobody read, with the right row at the top.
         assert_eq!(matched_keys("prune")[0], "x");
         assert_eq!(matched_keys("lazygit")[0], "gg");
         assert_eq!(matched_keys("bump")[0], "b");
+        // bacon by name, and by what it does — someone after a background
+        // cargo check does not necessarily know the program's name, and `b`
+        // sits one letter away from both queries.
+        assert_eq!(matched_keys("bacon")[0], "bb");
+        assert_eq!(matched_keys("watch")[0], "bb");
         // By the key itself, which is the other way people search.
         assert_eq!(matched_keys("gg")[0], "gg");
         // A group name lists the whole group, and nothing outside it.
         let sync = matched_keys("sync");
         assert!(sync.len() >= 4, "{sync:?}");
-        for keys in ["p", "P", "f", "gg"] {
+        for keys in ["p", "P", "PP", "f"] {
             assert!(sync.contains(&keys), "{keys} missing from {sync:?}");
+        }
+        // The two terminal hand-overs are their own group, so neither answers a
+        // search for the git keys it sits nowhere near.
+        assert!(!sync.contains(&"gg"), "gg is not a sync key: {sync:?}");
+        let tools = matched_keys("tools");
+        for keys in ["gg", "bb"] {
+            assert!(tools.contains(&keys), "{keys} missing from {tools:?}");
         }
         // An empty query is everything, in table order.
         assert_eq!(matched_keys("").len(), BINDINGS.len());
@@ -8717,6 +8921,7 @@ mod tests {
             pending_g: false,
             pending_push: None,
             pending_pull: None,
+            pending_bump: None,
             command_history: Vec::new(),
         };
         let out = draw(|f, area| app.render_table(f, area));
@@ -8810,6 +9015,7 @@ mod tests {
             clean_protect: Vec::new(),
             pull_mode: Default::default(),
             lazygit_command: "lazygit".to_string(),
+            bacon_command: "bacon".to_string(),
             version_manifest: Default::default(),
         }
     }
@@ -9114,6 +9320,7 @@ mod tests {
             pending_g: false,
             pending_push: None,
             pending_pull: None,
+            pending_bump: None,
             command_history: Vec::new(),
         };
 
@@ -9176,6 +9383,7 @@ mod tests {
             pending_g: false,
             pending_push: None,
             pending_pull: None,
+            pending_bump: None,
             command_history: Vec::new(),
         };
 
@@ -9230,6 +9438,7 @@ mod tests {
             pending_g: false,
             pending_push: None,
             pending_pull: None,
+            pending_bump: None,
             command_history: Vec::new(),
         };
         let out = draw(|f, area| app.render_table(f, area));
@@ -9300,6 +9509,7 @@ mod tests {
             pending_g: false,
             pending_push: None,
             pending_pull: None,
+            pending_bump: None,
             command_history: Vec::new(),
         };
         let out = draw(|f, area| app.render_table(f, area));
@@ -9362,6 +9572,7 @@ mod tests {
             pending_g: false,
             pending_push: None,
             pending_pull: None,
+            pending_bump: None,
             command_history: Vec::new(),
         };
         let out = draw(|f, area| app.render_table(f, area));
@@ -9417,6 +9628,7 @@ mod tests {
             pending_g: false,
             pending_push: None,
             pending_pull: None,
+            pending_bump: None,
             command_history: Vec::new(),
         };
         let out = draw(|f, area| app.render_table(f, area));
@@ -10570,6 +10782,7 @@ mod tests {
             pending_g: false,
             pending_push: None,
             pending_pull: None,
+            pending_bump: None,
             command_history: Vec::new(),
         }
     }
@@ -10901,6 +11114,7 @@ mod tests {
             pending_g: false,
             pending_push: None,
             pending_pull: None,
+            pending_bump: None,
             command_history: Vec::new(),
         };
         let out = draw(|f, area| app.render_table(f, area));
@@ -10977,6 +11191,7 @@ mod tests {
             pending_g: false,
             pending_push: None,
             pending_pull: None,
+            pending_bump: None,
             command_history: Vec::new(),
         };
 

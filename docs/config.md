@@ -26,6 +26,7 @@ host_gates = []
 clean_protect = []
 pull_mode = "ff-only"
 lazygit_command = "lazygit"
+bacon_command = "bacon"
 version_manifest = "auto"
 
 [host_active]
@@ -78,6 +79,7 @@ the layers are merged; everything else has a default.
 | `clean_protect` | `[]` | never — hand-edited | `rf clean` |
 | `pull_mode` | `"ff-only"` | fresh file | the TUI's `[p]` |
 | `lazygit_command` | `"lazygit"` | fresh file | the TUI's `gg` |
+| `bacon_command` | `"bacon"` | fresh file | the TUI's `bb` |
 | `version_manifest` | `"auto"` | fresh file | `rf start` / `rf graduate` / `rf promote`'s own version writes, in a repo carrying both a `Cargo.toml` and a `package.json` |
 
 Gate entries are shell commands run in repo root. Any failure blocks
@@ -161,6 +163,12 @@ refspec, which can only ever fast-forward. See [`status`](commands/status.md).
 `<command> -p <repo_root>`. Defaults to `lazygit` on `PATH`; point it at a
 wrapper, a flake app, or an absolute path if a bare `lazygit` is not what you
 want.
+
+`bacon_command` is the same for the TUI's `[bb]`, except that it is run with no
+arguments in the directory of the working tree's `Cargo.toml` rather than given a path flag — bacon's positional
+argument is a job name, not a path. Defaults to `bacon` on `PATH`. See
+[`status`](commands/status.md#gg-and-bb--hand-over-the-terminal).
+
 
 ## Editing by hand
 

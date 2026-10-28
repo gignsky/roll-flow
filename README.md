@@ -174,7 +174,7 @@ cargo test
   workflow (`i` integrate, `I` integrate rolling, `v` verify, `V` verify many,
   `G` graduate, `m` promote, `u` update, `x` prune, `t` tidy, `d` delete, `b`
   bump the version) and syncs the selected branch (`p` pull, `P` push, `PP` push
-  every branch that needs it, `f` fetch, `gg` lazygit). The status bar carries
+  every branch that needs it, `f` fetch, `gg` lazygit, `bb` bacon). The status bar carries
   only the basics; `?` opens a fuzzy-searchable list of every key, and enter
   runs the one under the cursor. A force *push* is available there behind a
   confirmation; every other forced operation stays CLI-only by design
