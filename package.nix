@@ -3,6 +3,7 @@
   lib,
   git,
   bacon,
+  lazygit,
   makeBinaryWrapper,
   runtimeShell,
 }:
@@ -25,10 +26,16 @@ rustPlatform.buildRustPackage {
   # it drops the `flow` word and sets argv[0] to "roll flow" so clap's help and
   # usage lines read "roll flow" instead of "rf".
   postInstall = ''
-    # `bb` in the TUI launches bacon, so it ships with rf. Suffixed, not
-    # prefixed: a bacon the user already has on PATH (or `bacon_command`)
-    # still wins, this is only the fallback that makes `bb` work out of the box.
-    wrapProgram "$out/bin/rf" --suffix PATH : ${lib.makeBinPath [ bacon ]}
+    # `bb` and `gg` in the TUI launch bacon and lazygit, so both ship with rf.
+    # Suffixed, not prefixed: one the user already has on PATH (or sets via
+    # `bacon_command`/`lazygit_command`) still wins; this is only the fallback
+    # that makes the keys work out of the box.
+    wrapProgram "$out/bin/rf" --suffix PATH : ${
+      lib.makeBinPath [
+        bacon
+        lazygit
+      ]
+    }
     ln -s rf "$out/bin/roll-flow"
     printf '#!%s\nif [ "$1" = flow ]; then shift; exec -a "roll flow" %s "$@"; fi\nexec %s "$@"\n' \
       "${runtimeShell}" "$out/bin/rf" "$out/bin/rf" > "$out/bin/roll"

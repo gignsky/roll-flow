@@ -192,9 +192,12 @@
                 if grep -q warning stderr.txt; then echo "rf warned about the generated config:"; cat stderr.txt; exit 1; fi
                 touch $out
               '';
-          # `bb` launches bacon, so the package must carry it on rf's PATH.
-          bacon-bundled = p.runCommand "roll-flow-bacon-check" { } ''
-            grep -q ${p.bacon}/bin ${rf}/bin/rf || { echo "rf's wrapper does not put bacon on PATH"; exit 1; }
+          # `bb` and `gg` launch bacon and lazygit, so the package must carry
+          # both on rf's PATH.
+          tools-bundled = p.runCommand "roll-flow-tools-check" { } ''
+            for tool in ${p.bacon} ${p.lazygit}; do
+              grep -q "$tool/bin" ${rf}/bin/rf || { echo "rf's wrapper does not put $tool on PATH"; exit 1; }
+            done
             touch $out
           '';
           nixos-module = p.writeText "roll-flow-nixos-module-check" (
