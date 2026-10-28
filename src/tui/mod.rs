@@ -81,9 +81,11 @@ pub fn exit(mut terminal: Tui) -> Result<()> {
 /// is idempotent).
 ///
 /// Ops no longer use this — their output streams into
-/// [`super::tui::output::Panel`] instead. It exists for `gg` (lazygit) and for
-/// the `:` command runner's "run in the real shell" key: both are full-screen
-/// or interactive enough that the child needs the terminal outright.
+/// [`super::tui::output::Panel`] instead. It exists for `gg` (lazygit), `bb` (bacon)
+/// and the `:` command runner's "run in the real shell" key: all are full-screen
+/// or interactive enough that the child needs the terminal outright. Lazygit and
+/// bacon reach it through `rolls::StatusApp::hand_over_terminal`, so the
+/// suspend/resume pair is bracketed in one place rather than once per tool.
 pub fn suspend(terminal: &mut Tui) -> Result<()> {
     disable_raw_mode()?;
     if keyboard_enhancement_supported() {
