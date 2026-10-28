@@ -2,6 +2,8 @@
   rustPlatform,
   lib,
   git,
+  bacon,
+  makeBinaryWrapper,
   runtimeShell,
 }:
 rustPlatform.buildRustPackage {
@@ -10,7 +12,10 @@ rustPlatform.buildRustPackage {
   src = lib.cleanSource ./.;
   cargoLock.lockFile = ./Cargo.lock;
 
-  nativeBuildInputs = [ git ];
+  nativeBuildInputs = [
+    git
+    makeBinaryWrapper
+  ];
 
   # One binary (rf), three ways to invoke it — all from this single package:
   #   rf …          the real Cargo binary
@@ -20,6 +25,10 @@ rustPlatform.buildRustPackage {
   # it drops the `flow` word and sets argv[0] to "roll flow" so clap's help and
   # usage lines read "roll flow" instead of "rf".
   postInstall = ''
+    # `bb` in the TUI launches bacon, so it ships with rf. Suffixed, not
+    # prefixed: a bacon the user already has on PATH (or `bacon_command`)
+    # still wins, this is only the fallback that makes `bb` work out of the box.
+    wrapProgram "$out/bin/rf" --suffix PATH : ${lib.makeBinPath [ bacon ]}
     ln -s rf "$out/bin/roll-flow"
     printf '#!%s\nif [ "$1" = flow ]; then shift; exec -a "roll flow" %s "$@"; fi\nexec %s "$@"\n' \
       "${runtimeShell}" "$out/bin/rf" "$out/bin/rf" > "$out/bin/roll"

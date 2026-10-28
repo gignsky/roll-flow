@@ -257,6 +257,9 @@ in the directory of the shallowest `Cargo.toml` in the working tree — the repo
 root when it has one, else the nearest crate below it — and the key says so in
 the status line when there is none.
 
+The nix package wraps `rf` with bacon on a *suffixed* `PATH`, so `bb` works with
+nothing else installed while a bacon you already have still wins.
+
 Set `lazygit_command` or `bacon_command` in `.roll-flow.toml` to point at
 something other than a bare `lazygit`/`bacon` on `PATH`. lazygit is launched as
 `<command> -p <repo_root>`; bacon is launched with no arguments in that Cargo.toml directory,

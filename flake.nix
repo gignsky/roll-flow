@@ -192,6 +192,11 @@
                 if grep -q warning stderr.txt; then echo "rf warned about the generated config:"; cat stderr.txt; exit 1; fi
                 touch $out
               '';
+          # `bb` launches bacon, so the package must carry it on rf's PATH.
+          bacon-bundled = p.runCommand "roll-flow-bacon-check" { } ''
+            grep -q ${p.bacon}/bin ${rf}/bin/rf || { echo "rf's wrapper does not put bacon on PATH"; exit 1; }
+            touch $out
+          '';
           nixos-module = p.writeText "roll-flow-nixos-module-check" (
             lib.concatStringsSep "\n" (map (pkg: pkg.name) nixos.config.environment.systemPackages)
           );
