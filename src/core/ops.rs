@@ -1716,16 +1716,29 @@ pub(crate) struct VerifyOutcome {
 
 pub(crate) fn verify(config: &Config, dry_run: bool) -> Result<VerifyOutcome> {
     let current = git::current_branch(&config.repo_root)?;
-    let route =
-        infer_route(config, &current).ok_or_else(|| not_promotable_error(config, &current))?;
+    // A hotfix is verified the way `hotfix_land` will gate it: against stable,
+    // with the stable-merge gates and no host verification or version rule.
+    // `infer_route` stays roll/rolling-only, so promote and graduate never
+    // see a hotfix.
+    let hotfix = current.starts_with(branches::HOTFIX_PREFIX);
+    let route = if hotfix {
+        None
+    } else {
+        Some(infer_route(config, &current).ok_or_else(|| not_promotable_error(config, &current))?)
+    };
 
     let (source, target, gates) = match &route {
-        Route::Graduate { roll } => (
+        None => (
+            current.clone(),
+            config.stable_branch.clone(),
+            &config.rolling_to_main_gates,
+        ),
+        Some(Route::Graduate { roll }) => (
             roll.clone(),
             config.rolling_branch.clone(),
             &config.roll_to_rolling_gates,
         ),
-        Route::Promote => (
+        Some(Route::Promote) => (
             config.rolling_branch.clone(),
             config.stable_branch.clone(),
             &config.rolling_to_main_gates,
@@ -1753,11 +1766,12 @@ pub(crate) fn verify(config: &Config, dry_run: bool) -> Result<VerifyOutcome> {
     // requirement (deliberately, matching what `rf promote` enforces) but
     // still checks the dev marker it does carry is actually this roll's own.
     let version = match route {
-        Route::Promote => version_check(config, &source, &target)?,
-        Route::Graduate { .. } => {
+        Some(Route::Promote) => version_check(config, &source, &target)?,
+        Some(Route::Graduate { .. }) => {
             check_dev_marker_ownership(config, &source)?;
             VersionCheck::not_applicable()
         }
+        None => VersionCheck::not_applicable(),
     };
 
     let report = run_gates(
@@ -1770,7 +1784,16 @@ pub(crate) fn verify(config: &Config, dry_run: bool) -> Result<VerifyOutcome> {
     // Host gates run on both routes (issue #106). `rf verify` never forces, so a
     // failed host is recorded and surfaced to the CLI, which turns it into a hard
     // error after printing the per-host summary.
-    let host_report = run_host_gates(config, dry_run, &ForceOpts::new(false, None)?)?;
+    // Hotfixes bypass host verification by design, as `hotfix_land` does.
+    let host_report = if route.is_some() {
+        run_host_gates(config, dry_run, &ForceOpts::new(false, None)?)?
+    } else {
+        HostReport {
+            results: Vec::new(),
+            notices: Vec::new(),
+            bypassed: Vec::new(),
+        }
+    };
     let failed_hosts = host_report.failed_hosts();
 
     Ok(VerifyOutcome {

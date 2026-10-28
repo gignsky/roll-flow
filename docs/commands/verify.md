@@ -9,6 +9,13 @@ Checks graduation/promotion readiness for the current branch. Reachable from the
 TUI with `[v]`, which runs the same checks minus the bump offer — see
 [`status`](status.md#verifying).
 
+## Verifying a hotfix
+
+On a `hotfix/*` branch, `rf verify` (and `[v]`) checks the hotfix against the
+stable branch exactly as [`rf hotfix --land`](hotfix.md) will gate it: the
+stable-merge gates run, and nothing else. Host verification and the version
+rule are skipped, since landing a hotfix bypasses both.
+
 ## Verifying many at once
 
 `rf verify --all` (and the TUI's `[V]`) runs the same check for every roll in

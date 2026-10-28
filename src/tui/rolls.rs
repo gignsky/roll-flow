@@ -1224,6 +1224,10 @@ pub(crate) fn handle_help_key(
 /// [`ops::infer_route`] keeps the TUI and `rf verify` agreeing on what a branch
 /// tier means — there is one definition of the route, not two.
 pub(crate) fn verify_route_for(config: &Config, current_branch: &str) -> Option<(String, String)> {
+    // A hotfix is verified against stable, as `ops::verify` does.
+    if current_branch.starts_with(branches::HOTFIX_PREFIX) {
+        return Some((current_branch.to_string(), config.stable_branch.clone()));
+    }
     match ops::infer_route(config, current_branch)? {
         ops::Route::Graduate { roll } => Some((roll, config.rolling_branch.clone())),
         ops::Route::Promote => Some((config.rolling_branch.clone(), config.stable_branch.clone())),
@@ -2975,7 +2979,7 @@ impl StatusApp {
         }
         let Some((source, target)) = verify_route_for(&self.config, &self.current_branch) else {
             self.message = Some(format!(
-                "'{}' is not promotable — check out {} or a {}branch to verify",
+                "'{}' is not promotable — check out {}, a {}branch or a hotfix to verify",
                 self.current_branch, self.config.rolling_branch, self.config.roll_prefix
             ));
             return;
