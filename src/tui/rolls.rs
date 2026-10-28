@@ -3769,8 +3769,16 @@ impl StatusApp {
                 CreateKind::Roll => ops::create(&config, &slug, None, false)?,
                 CreateKind::Hotfix => ops::hotfix_create(&config, &slug, None, false)?,
             };
+            let mut lines = vec![format!("Created {}", outcome.branch)];
+            // Same as `rf create`: mark the roll's version `-roll<N>`. Hotfixes
+            // are not versioned this way.
+            if matches!(kind, CreateKind::Roll) && config.dev_versions {
+                if let Some(dev) = ops::apply_dev_version(&config, outcome.number)? {
+                    lines.push(format!("version marked {dev}"));
+                }
+            }
             Ok(JobDone::with_next(
-                vec![format!("Created {}", outcome.branch)],
+                lines,
                 Followup::SelectBranch(outcome.branch),
             ))
         });
