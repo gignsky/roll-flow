@@ -20,9 +20,10 @@ src/
     status.rs          → tui::rolls::run, or prints the plain/JSON table
     clean.rs
   tui/
-    mod.rs             terminal enter/exit, and suspend/resume for lazygit
+    mod.rs             terminal enter/exit, and suspend/resume for lazygit/bacon
     rolls.rs           the rolls view: state, event loop, table, modals, keymap
     output.rs          background jobs and the floating output panel
+    queue.rs           commands queued behind the running job; held on failure
   core/
     mod.rs
     config.rs          Config struct, auto-detection from flake.nix
@@ -33,7 +34,8 @@ src/
     sync.rs            pull/push/fetch planning and execution
     clean.rs           stale-branch detection across all remotes
     version.rs         version gate and release tags
-    merge_driver.rs    git merge driver resolving Cargo.toml's version line
+    merge_driver.rs    git merge driver resolving the version in Cargo.toml/.lock
+    rebuild.rs         this machine's last local nixos/home-manager rebuild
 ```
 
 Three notes on that layout:
@@ -46,6 +48,15 @@ Three notes on that layout:
   A new key is a row there plus an arm in `handle_browsing` — never a hint
   string written out by hand, which is what the four-line status bar used to
   require and what kept falling out of date.
+- Handing the terminal to another full-screen TUI happens in exactly one
+  function, `tui::rolls::StatusApp::hand_over_terminal` — `gg` (lazygit) and
+  `bb` (bacon) differ only in the command and how it is pointed at the repo.
+  It is the only thing left that calls `tui::suspend`; everything else streams
+  into `tui::output`'s panel. A third tool adds a caller, not a second copy of
+  the suspend/spawn/resume bracket, whose failure path (restore the screen, then
+  name the config key that overrides the command) is the part that is easy to
+  get wrong twice.
+
 - `core` returns data and never prints. The single exception is child-process
   output, which is why `core::proc` exists: it routes a subprocess's stdio to the
   terminal for the CLI and to `tui::output`'s panel for the TUI, chosen by a

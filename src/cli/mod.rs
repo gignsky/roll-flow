@@ -1,7 +1,7 @@
 pub mod clean;
 pub mod status;
 
-use crate::core::branches::RollState;
+use crate::core::branches::{RollState, UpdateSet, VerifySet};
 use crate::core::version::BumpLevel;
 use std::io::IsTerminal;
 
@@ -19,6 +19,27 @@ pub(crate) fn prompt_yes(msg: &str) -> anyhow::Result<bool> {
     std::io::stdin().read_line(&mut line)?;
     let ans = line.trim().to_ascii_lowercase();
     Ok(ans == "y" || ans == "yes")
+}
+
+/// Prompt for one of `1..=max`, returning `default` on an empty line. Any
+/// other answer re-prompts, so a stray keypress never picks an option.
+pub(crate) fn prompt_choice(max: usize, default: usize) -> anyhow::Result<usize> {
+    use std::io::Write;
+    loop {
+        print!("Choose [1-{max}, default {default}]: ");
+        std::io::stdout().flush()?;
+        let mut line = String::new();
+        std::io::stdin().read_line(&mut line)?;
+        let ans = line.trim();
+        if ans.is_empty() {
+            return Ok(default);
+        }
+        if let Ok(n) = ans.parse::<usize>() {
+            if (1..=max).contains(&n) {
+                return Ok(n);
+            }
+        }
+    }
 }
 
 /// How a destructive command's confirmation resolved.
@@ -103,7 +124,7 @@ pub enum Cmd {
         date: Option<String>,
         #[arg(long)]
         dry_run: bool,
-        /// Skip marking the new branch's Cargo.toml version as
+        /// Skip marking the new branch's manifest version as
         /// `X.Y.Z-roll<N>`, overriding `dev_versions` in the config.
         #[arg(long)]
         no_dev_version: bool,
@@ -131,31 +152,45 @@ pub enum Cmd {
     Verify {
         #[arg(long)]
         dry_run: bool,
-        /// Bump the Cargo.toml version by this level and commit it before the
+        /// Bump the manifest version by this level and commit it before the
         /// gates run, instead of prompting. Only acts when a bump is needed.
         #[arg(long, value_name = "LEVEL")]
         bump: Option<BumpLevel>,
         /// Answer yes to prompts (non-interactive).
         #[arg(long)]
         yes: bool,
+        /// Verify every roll in `--state` (default: all) in turn instead of the
+        /// current branch, switching to each and back again. Never bumps.
+        #[arg(long, conflicts_with_all = ["bump", "yes", "dry_run"])]
+        all: bool,
+        /// Which rolls `--all` covers.
+        #[arg(long, value_enum, default_value = "all", requires = "all")]
+        state: VerifySet,
     },
 
     /// Graduate the current roll branch into rolling (--no-ff merge).
     Graduate {
         #[arg(long)]
         dry_run: bool,
-        /// Proceed past failing gates, recording the bypass in the merge commit.
-        /// Requires --reason.
+        /// Proceed past failing gates, and past a dependency whose branch no
+        /// longer exists (typically graduated, promoted, and pruned) —
+        /// either bypass is recorded in the merge commit. Requires --reason.
         #[arg(long)]
         force: bool,
-        /// Justification recorded as `Force-Reason:` in the merge commit.
+        /// Justification recorded in the merge commit as `Force-Reason:`
+        /// (a bypassed gate) and/or `Missing-Dependency-Reason:` (a
+        /// dependency whose branch is gone), whichever `--force` bypassed.
         #[arg(long)]
         reason: Option<String>,
         /// Skip creating the `v<X.Y.Z>-dev` tag on rolling's new tip.
         #[arg(long)]
         no_tag: bool,
-        /// Answer yes to prompts (non-interactive): pushes the dev tag without
-        /// asking.
+        /// Answer yes to prompts (non-interactive): graduates ungraduated
+        /// dependencies first, pushes the dev tag, and — when the merge
+        /// conflicts — takes the recommended way forward (integrating the
+        /// conflicting roll(s) into this one) without asking. Without it a
+        /// multi-roll plan is shown and confirmed; unattended, it is shown
+        /// and nothing is merged.
         #[arg(long)]
         yes: bool,
     },
@@ -177,7 +212,7 @@ pub enum Cmd {
         /// Justification recorded as `Force-Reason:` in the merge commit.
         #[arg(long)]
         reason: Option<String>,
-        /// Bump the Cargo.toml version by this level and commit it before the
+        /// Bump the manifest version by this level and commit it before the
         /// gates run, instead of prompting. Only acts when a bump is needed.
         #[arg(long, value_name = "LEVEL")]
         bump: Option<BumpLevel>,
@@ -224,10 +259,16 @@ pub enum Cmd {
     Update {
         /// Update only this roll branch. Repeatable; with no `--roll` given,
         /// every active local roll is updated.
-        #[arg(long)]
+        #[arg(long, conflicts_with = "state")]
         roll: Vec<String>,
         #[arg(long)]
         dry_run: bool,
+        /// Narrow the default "every active local roll" to one state.
+        /// Unlike `verify --all --state`, this needs no companion `--all`
+        /// flag: `rf update` with no `--roll` is already the bulk pass, so
+        /// `--state` just picks which rolls that pass covers.
+        #[arg(long, value_enum)]
+        state: Option<UpdateSet>,
     },
 
     /// Delete roll branches already promoted to the stable branch, locally and
@@ -338,9 +379,11 @@ pub enum Cmd {
     /// Print program version.
     Version,
 
-    /// Internal: git merge driver for Cargo.toml's `version` line. Invoked by
-    /// git itself (wired up by `rf init` via `.gitattributes` and git config)
-    /// — never meant to be run by hand. Hidden from `--help`.
+    /// Internal: git merge driver for the crate/package's own version — the
+    /// detected manifest (`Cargo.toml` or `package.json`) and its lockfile.
+    /// Invoked by git itself (wired up by `rf init` and before every `rf`
+    /// merge, via clone-local attributes and git config) — never meant to be
+    /// run by hand. Hidden from `--help`.
     #[command(name = "__merge-driver-version", hide = true)]
     MergeDriverVersion {
         /// Git's `%O`: the common ancestor's content.
@@ -349,6 +392,11 @@ pub enum Cmd {
         ours: std::path::PathBuf,
         /// Git's `%B`: their side.
         theirs: std::path::PathBuf,
+        /// Git's `%P`: the file's repo-relative path, which says which kind
+        /// and which of the manifest/lockfile it is. Optional so a clone
+        /// still configured with the older three-argument command keeps
+        /// resolving `Cargo.toml`.
+        path: Option<std::path::PathBuf>,
     },
 }
 

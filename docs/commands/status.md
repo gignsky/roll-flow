@@ -8,11 +8,16 @@ Shows current branch, tier, cleanliness, pending rolls, and promotion readiness.
 Runs as a full-screen TUI by default; `--no-tui` prints a plain table instead and
 `--json` emits machine-readable output.
 
-In a repo that has a `Cargo.toml`, the table carries a `version` column: the
-`[package]` version as it stands at each branch's tip — its own tip for a branch
-that exists locally, `origin/<branch>` for one that only exists on the remote.
-Repos without a manifest, which is every dotfiles repo, get no column at all,
-the same rule the header version follows. There is no flag for it.
+In a repo that versions through a manifest (see
+[`version_manifest`](../config.md)), the table carries a `version` column: the
+version as it stands at each branch's tip — its own tip for a branch that
+exists locally, `origin/<branch>` for one that only exists on the remote. A repo
+versioned through more than one manifest gets **one column per manifest**,
+headed by which file it is — its file name at the root, its directory when
+nested — so a site's `package.json` and a `keeper/Cargo.toml` read side by side
+(`package.json  keeper`), and a branch that lacks one shows a dash under it.
+Repos without a manifest, which is every dotfiles repo, get no column at all.
+There is no flag for it.
 
 The cell shows the full version, dev marker included: a roll carrying one reads
 `0.2.4-roll9`, not `0.2.4`. The `#` column says which roll a row is, but not
@@ -28,25 +33,103 @@ The table carries a `deps` column (roll numbers this roll integrated) and a
 `dependants` column (roll numbers that integrated it) — `--no-deps` hides both.
 They are shown whatever the roll's state, so a roll that has already graduated
 still reports what it depends on and what depends on it. A dep number in the
-plain table gets a trailing `⚠` when that dependency's branch has moved since
-this roll integrated it — `26⚠` — so a stale copy is visible without opening
-the detail view, which matters before reintegrating or merging a batch of
-dependent rolls against a dependency that is still gaining commits. `--json`
-carries the same signal as `stale_deps`, a subset of `deps`.
+table (TUI and plain alike) gets a trailing `⚠` when that dependency's branch
+has moved since this roll integrated it — `26⚠` — so a stale copy is visible
+without opening the detail view, which matters before reintegrating or merging
+a batch of dependent rolls against a dependency that is still gaining commits.
+`--json` carries the same signal as `stale_deps`, a subset of `deps`.
+
+A trailing `↻` marks a dependency that integrated this roll back — a
+**dependency cycle**, which is what two rows each `⛔ blocked` on the other
+means. No order of separate graduations can satisfy a cycle, so it is resolved
+by containment instead: the member whose tip contains every other member's tip
+is the cycle's *carrier*, reads `active` (unless something outside the cycle
+still blocks it), and graduating it lands the rest; the others stay `⛔ blocked`
+waiting on it. Every table prints one line per cycle beneath it saying exactly
+what to do, `--no-deps` or not:
+
+```text
+    2  roll/2-0919-add-hotfix-to-menu  L    ⛔ blocked    3⚠↻   3
+>   3  roll/3-0919-show-hotfixes       L    active       2↻    2
+
+  ↻ rolls 2 ⇄ 3 integrated each other: roll/3-0919-show-hotfixes contains the others' latest work — graduate roll/3-0919-show-hotfixes and it carries 2 to rolling
+```
+
+When no member contains the others yet — each moved on after integrating the
+other — the line instead names the member to integrate the others into, and the
+exact `rf integrate` to run on it; after that it is the carrier. `--json` gives
+each member's row the same `cycle` object (`null` outside a cycle): `members`,
+`carrier` (`null` when there is none yet), `suggested`, `lacks` (the tips
+`suggested` is missing) and the `advice` line. See
+[graduate](graduate.md#dependency-cycles).
 
 Press `[enter]` on a roll for the detail overlay, which breaks the same two
-relationships out with per-dependency markers, and the two are independent —
-a dep can be both at once: `⛔ blocker` for a dep that has not graduated yet
-(it gates this roll's graduation), and `⚠ reintegrate` for one whose branch
-has moved since this roll integrated it (the same `⚠` as the plain table),
-whatever its own state — a dependency does not need to have graduated and
-diverged to be stale; it only needs to have kept moving after it was
-integrated. See
+relationships out with per-dependency markers. Its dependency list follows the
+chain all the way down — roll 12 depends on 9, which depends on 8, which
+depends on 7 — one indented line per link; a roll reached twice (a diamond) is
+shown once more as `↑ shown above` and not expanded again. The two markers are
+independent — a dep can be both at once: `⛔ blocker` for a dep that has not
+graduated yet (it gates its parent's graduation), and `⚠ reintegrate` for one
+whose branch has moved since its parent integrated it (the same `⚠` as the
+plain table), whatever its own state — a dependency does not need to have
+graduated and diverged to be stale; it only needs to have kept moving after it
+was integrated. A cycle carrier's fellow members read `↻ carried` rather than
+`⛔ blocker`, and a roll in a cycle gets the same advice line as the tables at
+the top of its dependencies. See
 [divergence after integration](../internals/algorithms.md#dependency-detection-coredependenciesrs).
+
+The overlay is a place to dig, not just read. `j`/`k` walk the linked rolls —
+every chain link, then the dependents — and `[enter]` (or `l`) opens the one
+under the cursor as its own pane, with a breadcrumb (`#12 → #9 → #8`) showing
+the path taken. `[backspace]` (or `h`) comes back up one level, and closes when
+there is nowhere further up, so the key never dead-ends; `[esc]` closes outright
+from any depth. Each pane is the same view the table's `[enter]` would open for
+that roll, divergence included, so digging from 12 to 7 shows exactly what
+selecting 7 would have. These keys belong to the overlay, not the table, so they
+are listed in its own footer rather than in the `?` keymap below.
 
 The TUI table pins the stable and rolling branches above the rolls, so `[space]`
 switches to them the same way it switches to a roll. A base branch that exists
 neither locally nor on `origin` is not listed.
+
+Hotfix branches (`hotfix/N-MMDD-slug`, see [`hotfix`](hotfix.md)) are listed
+below the rolls, numbered `h1`, `h2`, … because they number independently of
+rolls and a bare `1` under a roll `1` would read as a duplicate. Their `state`
+column reads `hotfix` while open and `✓ landed` once the landing merge is on
+stable — detected from merge subjects exactly the way promotion is. They have no
+dependencies and no detail overlay, but `[space]`, `[p]`/`[P]`/`[f]` and
+`[d]elete` work on them as on any other row. `--json` carries them as their own
+`hotfixes` array rather than mixed into the roll list.
+
+## Build column
+
+In a repo whose config models this machine's host (`hosts`/`host_active` —
+every dotfiles repo, never roll-flow's own), the table carries a `build`
+column: which roll (or `rolling`/`main`, when it isn't a roll) this machine
+most recently rebuilt, read from commit messages dotfiles' own rebuild
+scripts already write. It sits in the left gutter, right after the
+current-branch chevron (and, in the TUI, the graph column) — a per-row
+marker like those, not a trailing detail like `version`/`deps`. Up to five
+labels, space-joined on whichever single row each points at: `N`/`NT`/`NB`
+for the most recent NixOS switch/test/boot, `H`/`HT` for the most recent
+home-manager switch/test — home-manager has no "boot" concept. A
+`NT`/`NB`/`HT` label disappears once a later switch has caught up to or
+passed it, since it then tells you nothing the switch doesn't.
+
+`--no-tui` prints a one-line summary above the table instead of relying on
+the column alone — the common case, a plain switch directly on
+`rolling`/`main`, has no roll row to attach a column cell to at all:
+
+```text
+last rebuild (merlin): nixos switch→rolling · nixos test→roll/41-x · home switch→rolling
+```
+
+`--json` carries the same data as a top-level `local_rebuild` object
+(`host`, `nixos`/`home`, each `{switch, test, boot}` as branch-name strings
+or `null`) — see [`list`](list.md) for the per-roll echo of this in `rf list
+--json`. See
+[Local rebuild markers](../internals/algorithms.md#local-rebuild-markers-corerebuildrs)
+for how a commit is attributed to a roll vs. a branch.
 
 ## Keys
 
@@ -97,13 +180,16 @@ The full list:
 | `q` | quit |
 | `p` / `P` / `f` | pull / push / fetch the selected branch |
 | `PP` | [push every branch that needs it](#pp--push-everything-that-needs-it) |
-| `gg` | lazygit |
+| `gg` / `bb` | [lazygit / bacon](#gg-and-bb--hand-over-the-terminal) |
 | `c` / `i` | create a roll / integrate one into the checked-out roll |
+| `V` | verify all rolls, or a set of them |
 | `G` / `m` / `u` | graduate / promote / update from stable |
 | `b` | bump the version |
+| `h` / `H` | create a hotfix off stable / land the checked-out hotfix |
 | `d` / `x` / `t` | delete / prune / tidy branches |
 | `esc` | close the output panel |
 | `PgUp` / `PgDn` / `End` | scroll the panel, or follow new output |
+| `s` / `S` | [resume / drop a held queue](#chaining-commands) |
 
 The sync keys follow lazygit, which is why graduate is `[G]` and promote is `[m]`
 rather than the `[g]`/`[p]` they used to be — `[p]` and `[P]` are pull and push
@@ -115,7 +201,9 @@ rows: it merges the roll under the cursor into the roll wearing the chevron — 
 [`integrate`](integrate.md#from-the-tui). The `sync` column reports each branch against
 its upstream: `✓` in sync, `↑2` ahead, `↓1` behind, `↑2↓1` diverged, `gone` once
 the upstream is deleted, and `—` when there is nothing to compare (no upstream,
-or no local copy).
+or no local copy). A `⚡` appended to any of those means that branch's worktree
+has uncommitted changes — only possible for a branch checked out somewhere,
+local or in a linked `git worktree`.
 
 ## Running commands
 
@@ -123,12 +211,81 @@ An action does not take the screen away. Its output streams into a panel in the
 bottom-right corner while the table stays drawn and navigable — `j`/`k` and
 `[enter]` keep working mid-push — and `[esc]` dismisses the panel once the
 command has finished. `PageUp`/`PageDown` scroll its scrollback and `End` returns
-to following new output. Only one command runs at a time; a second action while
-one is in flight is refused rather than queued.
+to following new output.
 
-`gg` is the exception: lazygit is full-screen and owns the terminal, so `rf`
-suspends, hands it over, and redraws when lazygit exits. Set `lazygit_command` in
-`.roll-flow.toml` to point at something other than a bare `lazygit` on `PATH`.
+### Chaining commands
+
+Only one git command runs at a time, but you do not have to wait for it: an
+action pressed while one is in flight is **queued** behind it and starts the
+moment the one ahead finishes. Press `[c]` mid-push and the new roll is created
+once the push lands. The queued command continues the same panel under a
+`── title ──` divider, so the whole chain reads as one log, and the status bar
+lists what is still waiting (`⏳ 2 queued: git fetch --prune → rf create`).
+
+When a command **fails**, the queue is *held*, not run and not thrown away —
+the commands behind it were chosen assuming it would succeed. The status bar
+turns red and stays that way even after `[esc]` closes the panel. Resolve the
+problem — a merge conflict is the usual one, and `gg` opens lazygit to fix it
+(lazygit is refused only while a command is actually running, never while the
+queue is merely held) — then:
+
+- `[s]` resumes the queue from the next command;
+- `[S]` drops every queued command.
+
+Anything you press while the queue is held joins the back of it rather than
+jumping ahead of a conflict you have not resolved yet. A push rejected as
+non-fast-forward holds the queue too: answering `y` to the force prompt runs the
+forced push *ahead* of the queue and releases it, `n` leaves it held.
+
+Two guards keep a chain from doing something you did not ask for:
+
+- Keys that act on the **checked-out branch** — `[i]`, `[I]`, `[b]`,
+  `[p]` — are refused while a queued or running `space` switch or
+  `[c]` create is pending, because they capture the branch when pressed and
+  would act on a different one by the time their turn came. Press them again
+  once the switch has run.
+- `[v]` is **not** refused: it reads the checked-out branch when it *runs*, so
+  it chains. On a roll row it queues its own switch to that roll first (see
+  [Verifying](#verifying)), and while a switch is pending it switches back even
+  to the row that is checked out now, since that is about to change. On a row
+  it cannot verify, it judges whatever the pending switch leaves checked out;
+  its panel title then says what it waits on, and a branch that is not
+  promotable fails inside the job like any other verify error.
+- `[V]` is **not** refused either: the pass restores HEAD to whatever was
+  checked out when it *starts*, so it queues behind running jobs, a held queue
+  and pending switches alike.
+- `[P]` and `PP` are **not** refused: a push names its branch, so it is queued
+  like any other command. The branch is fixed when you press the key (the
+  selected row, or the plan `PP` showed), never read from HEAD when the push
+  finally runs. Push `roll/45`, queue a `space` switch to `roll/44`, then `[P]`
+  again, and the second push goes to `roll/44`. A rejected push still holds the
+  queue and asks before forcing, exactly as above.
+- `q` with commands queued only warns the first time; a second `q` quits and
+  drops them.
+
+## `gg` and `bb` — hand over the terminal
+
+`gg` and `bb` are the exceptions to the output panel: lazygit and bacon draw
+their own full-screen UI and own the terminal outright, so there is nothing to
+stream. `rf` suspends, hands the terminal over, and redraws when the tool
+exits — then reloads the list, because anything at all may have happened
+inside. Only one of the two is a git tool, which is why they are their own
+`tools` group in `?` rather than sitting under `sync` or `roll`.
+
+`bb` is a chord on the `b` that bumps the version, like `pp` on `p`: a lone `b`
+still bumps, but only after a short window (400ms) with no second `b`. Bacon runs
+in the directory of the shallowest `Cargo.toml` in the working tree — the repo
+root when it has one, else the nearest crate below it — and the key says so in
+the status line when there is none.
+
+The nix package wraps `rf` with bacon and lazygit on a *suffixed* `PATH`, so `bb` and `gg` work
+with nothing else installed while a copy you already have still wins.
+
+Set `lazygit_command` or `bacon_command` in `.roll-flow.toml` to point at
+something other than a bare `lazygit`/`bacon` on `PATH`. lazygit is launched as
+`<command> -p <repo_root>`; bacon is launched with no arguments in that Cargo.toml directory,
+because bacon's positional argument is a job name (`check`, `clippy`, `test`)
+and a path passed there would be read as a job that does not exist.
 
 ## Pulling and pushing
 
@@ -184,19 +341,29 @@ started.
 
 ## Verifying
 
-`[v]` runs [`verify`](verify.md) on the **checked-out** branch — not the row
-under the cursor, because the gates run in the working tree, so the branch they
-judge is whichever one is checked out. The route comes from that branch's tier
-and is named in the panel title before the gates start:
+`[v]` runs [`verify`](verify.md) on the **selected** roll. The gates run in the
+working tree, so the branch they judge has to be checked out: on a roll, rolling
+or hotfix row that is not, `[v]` queues a `space` switch to it first and then the
+verify — and the switch stays, leaving that branch checked out. On the row that
+is already checked out it just verifies. Anywhere else (the stable row) it
+verifies whatever is checked out. The route comes from the branch's tier and is
+named in the panel title before the gates start:
 
-| checked out | `[v]` checks |
+| verified branch | `[v]` checks |
 |---|---|
 | a `roll/*` branch | `roll/N-… → rolling` |
 | the rolling branch | `rolling → main` |
+| a hotfix | `hotfix/N-… → main` |
 | anything else | nothing — it says to check out a roll or rolling first |
 
-It is the one action key with no confirmation modal, because it is the one that
-changes nothing: the modal is for the ops that write to the repo. It reports the
+Because the switch and the verify are two queued commands, a chain across rolls
+is just `[v]` on each row: `[v]` on roll 44, `[v]` on roll 45, and the queue runs
+switch, verify, switch, verify. A switch that fails (a dirty tree git will not
+carry) holds the queue before its verify runs, like any other failure.
+
+It is the one action key with no confirmation modal, because the verify itself
+changes nothing — the modal is for the ops that write to the repo; the switch
+`[v]` may queue first is the same one `space` makes. It reports the
 same checks as `rf verify`, in the same words — divergence note, version
 comparison, gate notices, per-host results, verdict.
 
@@ -204,6 +371,49 @@ The one thing it will not do is bump the version. `rf verify` offers one; here a
 failed version gate points at `[b]` instead, which is the key that already writes
 that commit. A failed host or an unsatisfied gate marks the panel as failed
 rather than passing quietly.
+
+A predicted merge conflict fails the panel the same way, before any gate runs,
+with the same attributed report `rf verify` prints. The fix is pointed at this
+screen's keys instead of at commands: `[i]` on the culprit roll's row to take
+the conflict onto the checked-out roll, or `[I]` to integrate rolling itself.
+
+### `[V]` — verify many at once
+
+`[V]` opens a picker — `all rolls`, `active`, `blocked`, `graduated`,
+`diverged`, `rolls with a local copy` — each with how many rolls it covers, and a
+digit runs the pass. It is `rf verify --all --state <set>` on the same core
+routine, so the rules are identical, and the one that matters is that the pass
+**checks out each roll in turn** and always returns to the branch you started
+on, whatever any roll's gates said. A dirty tree is refused in the status bar
+before the picker even opens when nothing else is pending; queued behind other
+commands, the pass checks again when it starts. It queues like any other
+command rather than waiting for the panel to go idle. One job, one panel: each roll's report under its
+own header, then `N passed, M failed, K skipped`, and the panel marks failed if
+any did — see [`verify`](verify.md#verifying-many-at-once).
+
+### Graduating past a missing dependency
+
+`[G]` on a roll whose dependency's branch no longer exists (see
+[graduate](graduate.md#a-dependency-whose-branch-is-gone)) opens the confirm
+modal as usual rather than refusing the key outright — the plan lists the
+missing roll alongside whatever else would land. Pressing `[y]` there does not
+graduate: it advances to a second, explicit stage naming the missing roll and
+asking again, the same two-stage shape `[d]elete` uses for an uncontained
+branch. Only a fresh `[y]` on *that* stage graduates, skipping the missing
+dependency; `[n]`/`[esc]` at either stage cancels. This is the TUI's only way
+to force anything — no key here bypasses a failing gate, which `rf graduate
+--force` can still do from the CLI.
+
+## Hotfixes
+
+`[h]` opens the same slug modal as `[c]reate` and runs `rf hotfix <slug>`,
+branching `hotfix/N-MMDD-slug` off stable and selecting it. `[H]` runs
+`rf hotfix --land` on the **checked-out** hotfix — the merge comes from HEAD, so
+the cursor cannot pick a different one; on a hotfix row that is not checked out
+it says to `[space]` onto it first. The confirmation names both merges, because
+landing writes to stable *and* then reintegrates stable into rolling. Gates run
+as they do from the CLI and are never forced from a keypress. `[d]elete` works
+on a hotfix row with the same shapes and the same safety rules as a roll.
 
 ## Bumping the version
 
@@ -242,7 +452,32 @@ magnitude apart by the shift key alone is a mistake waiting to happen; the digit
 also carry the ordering. Every row shows the version it would produce, so the
 choice needs no semver arithmetic in your head.
 
-It writes `Cargo.toml`, refreshes `Cargo.lock`, and commits both as
+### More than one manifest
+
+A repo versioned through both `Cargo.toml` and `package.json` (see
+[`version_manifest`](../config.md)) gets a **drill-down**: `[b]` first asks
+*which* version to raise, then by how much.
+
+```text
+┌ bump version ─────────────────────────────────────────────────┐
+│Bump which version?  (on rolling)                              │
+│                                                               │
+│[1] Cargo.toml 0.2.0-dev  — needs a bump                       │
+│[2] package.json 1.4.0  — already ahead of the stable branch   │
+│[a] all of them                                                │
+│                                                               │
+│[n] cancel                                                     │
+└───────────────────────────────────────────────────────────────┘
+```
+
+Each row says whether that manifest still owes a bump past the stable branch,
+which is what a promotion needs — it is refused until every manifest has one.
+`[1]`/`[2]` pick one, `[a]` raises them all by the same level, and the level
+step then lists each chosen manifest's resulting version. One commit carries
+every file it changed.
+
+For one manifest it writes `Cargo.toml` (or `package.json`), refreshes the
+lockfile, and commits both as
 `chore(release): bump version to <X> for <branch>` — identical to what
 `rf promote --bump` does, and the reason a clean working tree is required: the
 commit stages its two files and then commits the index, so anything else staged

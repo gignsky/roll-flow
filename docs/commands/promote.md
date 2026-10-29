@@ -8,7 +8,12 @@ Merges rolling into the stable branch with `--no-ff` and a structured subject
 (`Promote roll/N-slug to main`, or `Promote rolling to main` with the included
 rolls listed in the body when several graduated rolls ride along). Run from a
 roll branch it redirects to graduation. Conflicts abort and restore, same as
-[`graduate`](graduate.md), and `--force`/`--reason` behave the same way.
+[`graduate`](graduate.md), and are diagnosed the same way — each conflicted
+path is attributed to the merges on stable that touched it, which for a
+promotion means a hotfix landed there since. There is no integrate option on
+this route (the source is a commit on rolling, not a branch to merge into); the
+choices are the by-hand commands or leaving the merge staged on stable for
+lazygit. `--force`/`--reason` behave the same way as for graduate.
 
 ## Is this final?
 
@@ -65,6 +70,23 @@ unasked — each is promoted by its own step, so no step drags another along. A
 `--dry-run` prints the same list as `would also land:` lines instead of asking,
 and a real promotion reports what it landed as `also landed:`. The TUI's `[m]`
 on a roll row shows the same list inside its confirmation modal.
+A `--roll` that depends on rolls which have graduated but not yet promoted
+promotes those first, each as its own step, and says so before asking:
+
+```text
+  roll/7-0918-verify-button  (dependency of 8, ✓ graduated)
+(dependencies added ahead of what was named)
+
+Promote these in order? [y/N]
+```
+
+`--yes` confirms; unattended, the plan is printed and nothing is merged. Since a
+per-roll promotion advances stable to a graduation commit that already carries
+everything graduated before it, the dependency step often reports
+`already contained` once the first merge lands — that is correct, and the point
+of ordering them. A dependency that has not graduated is refused outright: there
+is nothing on rolling to advance stable to. `[m]` on a roll row in the TUI
+performs the same expansion and lists it in its confirm modal.
 
 Each `--roll` is its own merge behind its own gate run, so a two-roll promotion
 runs the gates twice and verifies both intermediate states of stable. Promoting
@@ -89,6 +111,15 @@ opened a PR — see
   rolling's version would sit *below* stable's and the next promotion would
   fail as LOWER. A graduation that already carried its own bump is not bumped
   again
+- a repo versioned through more than one manifest — `Cargo.toml` and
+  `package.json`, at the root or in a subdirectory (see
+  [`version_manifest`](../config.md)) — must clear the gate in **each**: the
+  failure names the manifest that still owes a bump
+  (<a id="more-than-one-manifest"></a>*more than one manifest*). Interactively
+  you are asked which to bump before the level; `--bump` and `--yes` raise every
+  manifest that owes one, by that level. The tag names the first manifest's
+  version: a root manifest before a nested one, `Cargo.toml` before
+  `package.json` at the same depth
 - after a `--roll` promotion, offers to merge stable into the active local rolls
   (`rf update`), since they now trail what landed; `--yes` accepts, and an
   unattended run is told the command instead
