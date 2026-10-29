@@ -521,27 +521,34 @@ that is where it was built and the narrative is clearest against one concrete
 shape — but every mention of either file name is really
 `ManifestKind::Cargo.manifest()`/`.lockfile()`, and the same rule, the same
 `Marker`/`Semver`, and the same merge driver apply verbatim to
-`ManifestKind::Npm` (`package.json`/`package-lock.json`). `ManifestKind::detect`
-(working tree) and `::detect_at` (a ref) pick Cargo when a repo carries both
-and additionally require a readable version — a `package.json` that exists
-but carries no `version` key (tooling-only: prettier, husky) reads the same
-as one that is absent, never as `Unreadable`. Every `version` free function
-that reads or compares (`read_version`, `check`, `check_against`,
-`versions_at`, `version_at`) takes a `forced: Option<ManifestKind>` that
-overrides this detection outright — `Config::forced_manifest`, driven by the
-`version_manifest` config key (`docs/config.md`), for the rare repo carrying
-both manifests that needs one kind named explicitly. Every caller already
-has a `Config` in scope and passes `config.forced_manifest()` (or, for a few
-sites that need the resolved kind itself rather than just overriding
-detection, `Config::manifest_kind`/`manifest_kind_at`). The one thing it does
-not reach is the merge-driver subprocess, which has no `Config` at all and
-keeps plain auto-detection — harmless, since the driver's job is only to
-settle a version-line conflict on whichever files a merge actually touches.
-See `docs/proposals/package-json-versioning.md` for the original design; the
-implementation above is the `forced`-threading it left as an open question,
-resolved in favour of full coverage once a first cut that stopped at the
-write paths proved inconsistent (the gate's own comparison still auto-
-detected, so a forced kind's bump was gated against the wrong file). The npm
+`ManifestKind::Npm` (`package.json`/`package-lock.json`).
+
+**`Manifest` is a kind plus a directory.** A repo's crate need not sit at the
+root — a site's root `package.json` beside a Rust service in `keeper/` is the
+real case — so what is versioned is a `version::Manifest` (`keeper/Cargo.toml`,
+locking in `keeper/Cargo.lock`), not a bare kind. `version::Selection`, which
+the `version_manifest` key resolves to (`Config::manifests`/`manifests_at`),
+finds them: `Auto` discovers every *tracked* manifest (`git ls-files` in the
+working tree, `git ls-tree` at a ref) with a readable version, `Kind` narrows
+that to one kind, and `Paths` names them outright. A manifest with no readable
+version — a tooling-only `package.json`, a member inheriting
+`version.workspace` — reads the same as one that is absent, never as
+`Unreadable`. Every list comes back in `Manifest::precedence` order —
+shallowest first, then Cargo before npm — and the first is what names the
+release tag (`tag_release` takes the worst check, which on a tie is the first)
+and what the single-version displays read (`Config::version`). That order keeps
+every Cargo-only repo's tags unchanged and makes a root site, not a nested
+service, name a release. Every `version` free function that reads, compares or
+writes (`read_version`, `version_at`, `check`, `check_all`, `check_against`,
+`write_version`) takes the `Manifest` it is about; nothing in `version` detects
+on its own any more. A comparison between two refs covers the manifests found
+at *either* (`Selection::manifests_between`), since a branch may add one. The
+one thing the selection does not reach is the merge-driver subprocess, which
+has no `Config` at all and matches `Cargo.toml`/`package.json` by file name at
+any depth — harmless, since the driver's job is only to settle a version-line
+conflict on whichever files a merge actually touches, and the attribute lines
+`wire_version_merge_driver` writes name bare file names for the same reason.
+See `docs/proposals/package-json-versioning.md` for the original design. The npm
 arm's one structural difference: its manifest/lockfile are JSON,
 hand-formatted, so reading and rewriting goes through a small byte-level
 scanner (`version::json_string_at`) instead of the `toml` crate, and a

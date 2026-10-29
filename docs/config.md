@@ -47,7 +47,7 @@ rf reads two files and lays one over the other:
    branch names; anything it leaves out comes from the global file.
 
 Merging is by top-level key: a key in the repo file replaces the global one
-*whole* — an array or the `[host_active]` table included — rather than being
+_whole_ — an array or the `[host_active]` table included — rather than being
 spliced into it, so what the repo file says is exactly what applies. `rf init`
 only ever writes the repo file. Unknown keys are warned about naming the file
 they are in.
@@ -57,30 +57,30 @@ the layers are merged; everything else has a default.
 
 ## Every key
 
-| key | default | set by `rf init` | read by |
-|---|---|---|---|
-| `config_version` | `1` | on a fresh file only; an existing value is kept | load — warned about when it differs from what this rf writes, never refused |
-| `repo_root` | `""` | always (from `git rev-parse`) | nothing: the value on disk is **ignored** and re-read from git on every run, so a checkout can move |
-| `rolling_branch` | — | always (first of `rolling`, `develop`, `integration` that exists) | everything |
-| `stable_branch` | — | always (`main` or `master`) | everything |
-| `roll_prefix` | — | fresh file, or `--roll-prefix` | everything; a value without a trailing `/` is normalized with a warning |
-| `version_gate` | `true` | fresh file | `rf verify` / `rf promote` |
-| `tag_on_promote` | `true` | fresh file | `rf promote` |
-| `tag_on_graduate` | `true` | fresh file | `rf graduate` |
-| `push_tag` | `true` | fresh file | `rf promote` / `rf graduate` (offer to push the tag they create) |
-| `dev_versions` | `true` | fresh file | `rf start` / `rf graduate` / `rf promote` (dev-version markers) |
-| `mode` | `"manage"` | `--mode`, else kept | **nothing yet** — round-tripped only; intended to let `assist` make mutating commands report instead of merge |
-| `username` | `""` | detected: `vars/default.nix` `username`, then `$USER`, then git `user.name` | **nothing yet** — reserved for attributing `user@host` rebuild commits |
-| `hosts` | `[]` | detected from `vars/hosts.nix` | ordering for `host_gates`; may be empty (see `host_active`) |
-| `host_active` | `{}` | detected from `vars/hosts.nix` | the source of truth for which hosts gate; when `hosts` is empty its keys are used |
-| `roll_to_rolling_gates` | `[]` | never — hand-edited | `rf verify` / `rf graduate` |
-| `rolling_to_main_gates` | `[]` | never — hand-edited | `rf verify` / `rf promote` |
-| `host_gates` | `[]` | never — hand-edited | per-host verification; `{host}` is substituted per active host, and an entry without it is warned about |
-| `clean_protect` | `[]` | never — hand-edited | `rf clean` |
-| `pull_mode` | `"ff-only"` | fresh file | the TUI's `[p]` |
-| `lazygit_command` | `"lazygit"` | fresh file | the TUI's `gg` |
-| `bacon_command` | `"bacon"` | fresh file | the TUI's `bb` |
-| `version_manifest` | `"auto"` | fresh file | `rf start` / `rf graduate` / `rf promote`'s own version writes, in a repo carrying both a `Cargo.toml` and a `package.json` |
+| key                     | default     | set by `rf init`                                                            | read by                                                                                                                                                              |
+| ----------------------- | ----------- | --------------------------------------------------------------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `config_version`        | `1`         | on a fresh file only; an existing value is kept                             | load — warned about when it differs from what this rf writes, never refused                                                                                          |
+| `repo_root`             | `""`        | always (from `git rev-parse`)                                               | nothing: the value on disk is **ignored** and re-read from git on every run, so a checkout can move                                                                  |
+| `rolling_branch`        | —           | always (first of `rolling`, `develop`, `integration` that exists)           | everything                                                                                                                                                           |
+| `stable_branch`         | —           | always (`main` or `master`)                                                 | everything                                                                                                                                                           |
+| `roll_prefix`           | —           | fresh file, or `--roll-prefix`                                              | everything; a value without a trailing `/` is normalized with a warning                                                                                              |
+| `version_gate`          | `true`      | fresh file                                                                  | `rf verify` / `rf promote`                                                                                                                                           |
+| `tag_on_promote`        | `true`      | fresh file                                                                  | `rf promote`                                                                                                                                                         |
+| `tag_on_graduate`       | `true`      | fresh file                                                                  | `rf graduate`                                                                                                                                                        |
+| `push_tag`              | `true`      | fresh file                                                                  | `rf promote` / `rf graduate` (offer to push the tag they create)                                                                                                     |
+| `dev_versions`          | `true`      | fresh file                                                                  | `rf start` / `rf graduate` / `rf promote` (dev-version markers)                                                                                                      |
+| `mode`                  | `"manage"`  | `--mode`, else kept                                                         | **nothing yet** — round-tripped only; intended to let `assist` make mutating commands report instead of merge                                                        |
+| `username`              | `""`        | detected: `vars/default.nix` `username`, then `$USER`, then git `user.name` | **nothing yet** — reserved for attributing `user@host` rebuild commits                                                                                               |
+| `hosts`                 | `[]`        | detected from `vars/hosts.nix`                                              | ordering for `host_gates`; may be empty (see `host_active`)                                                                                                          |
+| `host_active`           | `{}`        | detected from `vars/hosts.nix`                                              | the source of truth for which hosts gate; when `hosts` is empty its keys are used                                                                                    |
+| `roll_to_rolling_gates` | `[]`        | never — hand-edited                                                         | `rf verify` / `rf graduate`                                                                                                                                          |
+| `rolling_to_main_gates` | `[]`        | never — hand-edited                                                         | `rf verify` / `rf promote`                                                                                                                                           |
+| `host_gates`            | `[]`        | never — hand-edited                                                         | per-host verification; `{host}` is substituted per active host, and an entry without it is warned about                                                              |
+| `clean_protect`         | `[]`        | never — hand-edited                                                         | `rf clean`                                                                                                                                                           |
+| `pull_mode`             | `"ff-only"` | fresh file                                                                  | the TUI's `[p]`                                                                                                                                                      |
+| `lazygit_command`       | `"lazygit"` | fresh file                                                                  | the TUI's `gg`                                                                                                                                                       |
+| `bacon_command`         | `"bacon"`   | fresh file                                                                  | the TUI's `bb`                                                                                                                                                       |
+| `version_manifest`      | `"auto"`    | fresh file                                                                  | which manifest(s) the version gate and `rf start` / `rf graduate` / `rf promote`'s version writes use: `auto` tracks every one with a version, `cargo`/`npm` pin one |
 
 Gate entries are shell commands run in repo root. Any failure blocks
 verify/graduate/promote.
@@ -137,17 +137,40 @@ repo where `nix eval` would not.
 five default to `true` and are inert in a repo with neither a `Cargo.toml`
 nor a `package.json`.
 
-`version_manifest` matters only to a repo carrying *both* manifests — a
-Tauri app, say, with a `Cargo.toml` for the Rust side and a `package.json`
-that is the one actually released. `"auto"` (the default) prefers `Cargo`,
-matching the behavior every existing repo already had; set it to `"npm"` to
-version through `package.json` instead. It reaches every command that reads
-or writes a version through `Config` — `rf start`/`rf verify`/`rf graduate`/
-`rf promote`, status display, the TUI's version column — so the file written
-and the file compared always agree. It does not reach the merge-driver
-subprocess (which has no `Config` at all); that keeps auto-detecting, which
-is harmless since its only job is to stop a version-line conflict on
-whichever files a merge actually touches.
+`version_manifest` decides which manifests carry the release version. `"auto"`
+(the default) **discovers** them: every tracked `Cargo.toml` and
+`package.json` with a readable version, at the root or in any subdirectory — a
+site's root `package.json` beside a Rust service in `keeper/Cargo.toml`, a Tauri
+app, a Rust backend released with its JS front end. A manifest with no
+`version` (tooling-only, or a workspace member inheriting
+`version.workspace`) is not versioned. Each one found is marked `-roll<N>` on
+`rf start`, resolved on `rf graduate`, finalized on `rf promote`, and must clear
+the version gate on its own, so a promotion is refused until _each_ is ahead of
+the stable branch. Their numbers are independent — the gate never compares one
+manifest against another. Where a bump is needed, `rf promote` (and the TUI's
+`[b]`) lets you pick which manifest to raise — see
+[`promote`](commands/promote.md#more-than-one-manifest). A nested manifest's
+lockfile is the one beside it (`keeper/Cargo.lock`).
+
+The release tag, and the `version` field of `--json`, come from the **first**
+manifest: a root manifest before a nested one,
+and `Cargo.toml` before `package.json` at the same depth.
+
+Narrow it with `"cargo"` or `"npm"` (discovery, but of that kind only), or
+name the manifests outright with a list of repo-relative paths, which
+discovers nothing — the way to keep a versioned test fixture or vendored crate
+out of the gate:
+
+```toml
+version_manifest = ["package.json", "keeper/Cargo.toml"]
+```
+
+A listed path that is not a `Cargo.toml` or `package.json` is refused when the
+config loads. The setting reaches every command that reads or writes a version
+through `Config`, so the files written and the files compared always agree.
+The merge-driver subprocess has no `Config` and matches files by name at any
+depth, which is harmless since its only job is to stop a version-line conflict
+on whichever files a merge actually touches.
 
 `clean_protect` names branches [`rf clean`](commands/clean.md) must never delete,
 on top of the stable and rolling branches and each remote's default branch, which
@@ -169,10 +192,9 @@ arguments in the directory of the working tree's `Cargo.toml` rather than given 
 argument is a job name, not a path. Defaults to `bacon` on `PATH`. See
 [`status`](commands/status.md#gg-and-bb--hand-over-the-terminal).
 
-
 ## Editing by hand
 
-TOML puts every bare key *before* the first `[table]` header. A key appended to
+TOML puts every bare key _before_ the first `[table]` header. A key appended to
 the end of the file, after `[host_active]`, becomes a host name instead, and the
 error will complain about expecting a boolean. `rf init` never makes this
 mistake — keys it adds land in the root table — so the safe way to pick up a

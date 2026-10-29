@@ -176,6 +176,11 @@ pub struct Config {
     /// `lazygit` on `PATH`.
     #[serde(default = "default_lazygit")]
     pub lazygit_command: String,
+    /// Which manifest(s) this repo versions through — see
+    /// [`version::Selection`]. `"auto"` (default) discovers every tracked
+    /// `Cargo.toml`/`package.json` with a readable version, at any depth, and
+    /// each must clear the gate ([`Config::manifests`]). `"cargo"`/`"npm"`
+    /// narrow that to one kind; a list of paths names them outright.
     /// The command the TUI's `bb` binding launches, run in the `Cargo.toml` directory.
     /// Overridable for the same reasons as [`Self::lazygit_command`] — a
     /// wrapper, a flake app, or an absolute path instead of a bare `bacon` on
@@ -189,60 +194,97 @@ pub struct Config {
     /// versions through `package.json` despite also carrying a `Cargo.toml`
     /// for tooling.
     ///
-    /// Reaches every `version` free function that reads or compares — not
-    /// just the writes — via [`Config::forced_manifest`] (passed as that
-    /// function's own `forced` parameter) and [`Config::manifest_kind`]/
-    /// [`Config::manifest_kind_at`] (for the handful of call sites that
-    /// already resolve a kind for other reasons, e.g. to pick which lockfile
-    /// to refresh). What `apply_version_bump`/`apply_dev_version`/
-    /// `finalize_rolling` read as "current", what the version gate compares,
-    /// and what they then write all agree on which manifest. It does not
-    /// reach the merge-driver subprocess, which has no `Config` at all and
-    /// keeps auto-detecting — harmless, since its only job is to settle a
-    /// version-line conflict on whichever files a merge actually touches,
-    /// and attribute lines for the other kind's files are simply never
-    /// matched. A repo carrying both manifests and needing this at all is
-    /// expected to be the rare exception, not the common case this key
-    /// exists to unblock.
+    /// Reaches every read, comparison and write through [`Config::manifests`]/
+    /// [`Config::manifests_at`], so what `apply_version_bump`/
+    /// `apply_dev_version`/`finalize_rolling` read as "current", what the
+    /// version gate compares, and what they then write all agree on which
+    /// manifests. It does not reach the merge-driver subprocess, which has no
+    /// `Config` at all and matches files by name — harmless, since its only
+    /// job is to settle a version-line conflict on whichever files a merge
+    /// actually touches.
     #[serde(default)]
     pub version_manifest: VersionManifest,
 }
 
-/// Forces which of [`version::ManifestKind`]'s variants a repo versions
-/// through, for the rare repo that carries both manifests and wants the one
-/// `ManifestKind::detect`'s Cargo-first default would not pick.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
-#[serde(rename_all = "lowercase")]
+/// The `version_manifest` setting as written: `"auto"`, `"cargo"`, `"npm"`,
+/// or a list of repo-relative manifest paths. Resolved by
+/// [`selection`](Self::selection).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(try_from = "RawVersionManifest", into = "RawVersionManifest")]
 pub enum VersionManifest {
     #[default]
     Auto,
     Cargo,
     Npm,
+    Paths(Vec<String>),
+}
+
+/// `VersionManifest`'s TOML shape: a keyword, or an array of paths.
+#[derive(Serialize, Deserialize)]
+#[serde(untagged)]
+enum RawVersionManifest {
+    Keyword(VersionManifestKeyword),
+    Paths(Vec<String>),
+}
+
+#[derive(Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+enum VersionManifestKeyword {
+    Auto,
+    Cargo,
+    Npm,
+}
+
+impl TryFrom<RawVersionManifest> for VersionManifest {
+    type Error = String;
+
+    fn try_from(raw: RawVersionManifest) -> Result<Self, Self::Error> {
+        Ok(match raw {
+            RawVersionManifest::Keyword(VersionManifestKeyword::Auto) => VersionManifest::Auto,
+            RawVersionManifest::Keyword(VersionManifestKeyword::Cargo) => VersionManifest::Cargo,
+            RawVersionManifest::Keyword(VersionManifestKeyword::Npm) => VersionManifest::Npm,
+            RawVersionManifest::Paths(paths) => {
+                // Refused at load rather than skipped later: a typo here would
+                // otherwise quietly drop a manifest out of the gate.
+                if let Some(bad) = paths
+                    .iter()
+                    .find(|p| version::Manifest::from_path(p).is_none())
+                {
+                    return Err(format!(
+                        "version_manifest entry '{bad}' is not a path to a Cargo.toml or package.json"
+                    ));
+                }
+                VersionManifest::Paths(paths)
+            }
+        })
+    }
+}
+
+impl From<VersionManifest> for RawVersionManifest {
+    fn from(setting: VersionManifest) -> Self {
+        match setting {
+            VersionManifest::Auto => RawVersionManifest::Keyword(VersionManifestKeyword::Auto),
+            VersionManifest::Cargo => RawVersionManifest::Keyword(VersionManifestKeyword::Cargo),
+            VersionManifest::Npm => RawVersionManifest::Keyword(VersionManifestKeyword::Npm),
+            VersionManifest::Paths(paths) => RawVersionManifest::Paths(paths),
+        }
+    }
 }
 
 impl VersionManifest {
-    /// The kind this setting pins, or `None` for `Auto` (plain detection).
-    pub fn forced(self) -> Option<version::ManifestKind> {
+    /// What this setting selects.
+    pub fn selection(&self) -> version::Selection {
         match self {
-            VersionManifest::Auto => None,
-            VersionManifest::Cargo => Some(version::ManifestKind::Cargo),
-            VersionManifest::Npm => Some(version::ManifestKind::Npm),
+            VersionManifest::Auto => version::Selection::Auto,
+            VersionManifest::Cargo => version::Selection::Kind(version::ManifestKind::Cargo),
+            VersionManifest::Npm => version::Selection::Kind(version::ManifestKind::Npm),
+            VersionManifest::Paths(paths) => version::Selection::Paths(
+                paths
+                    .iter()
+                    .filter_map(|p| version::Manifest::from_path(p))
+                    .collect(),
+            ),
         }
-    }
-
-    /// The kind to use in the working tree, honouring a forced choice. See
-    /// [`version::ManifestKind::detect_forced`].
-    pub fn resolve(self, repo: &Path) -> Option<version::ManifestKind> {
-        version::ManifestKind::detect_forced(repo, self.forced())
-    }
-
-    /// Like [`resolve`](Self::resolve), at a ref rather than the working tree.
-    pub fn resolve_at(
-        self,
-        repo: &Path,
-        refspec: &str,
-    ) -> Result<Option<version::ManifestKind>, RfError> {
-        version::ManifestKind::detect_at_forced(repo, refspec, self.forced())
     }
 }
 
@@ -531,27 +573,27 @@ impl Config {
         repo_root.join(CONFIG_NAME)
     }
 
-    /// The manifest kind this repo's working tree versions through,
-    /// honouring `version_manifest`. See that field's doc comment for scope.
-    pub fn manifest_kind(&self) -> Option<version::ManifestKind> {
-        self.version_manifest.resolve(&self.repo_root)
+    /// Every manifest this repo's working tree versions through, honouring
+    /// `version_manifest`, in precedence order — a root manifest first, so
+    /// the first is the one that names the release tag.
+    pub fn manifests(&self) -> Vec<version::Manifest> {
+        self.version_manifest.selection().manifests(&self.repo_root)
     }
 
-    /// Like [`manifest_kind`](Self::manifest_kind), at a ref rather than the
-    /// working tree.
-    pub fn manifest_kind_at(
-        &self,
-        refspec: &str,
-    ) -> Result<Option<version::ManifestKind>, RfError> {
-        self.version_manifest.resolve_at(&self.repo_root, refspec)
+    /// [`manifests`](Self::manifests) at a ref rather than the working tree.
+    pub fn manifests_at(&self, refspec: &str) -> Result<Vec<version::Manifest>, RfError> {
+        self.version_manifest
+            .selection()
+            .manifests_at(&self.repo_root, refspec)
     }
 
-    /// The raw `version_manifest` override, if any was set — `None` for
-    /// `Auto`. Passed to the `version` free functions (`read_version`,
-    /// `check`, `check_against`, `versions_at`, `version_at`) so a repo
-    /// carrying both manifests compares and reads the same kind it writes.
-    pub fn forced_manifest(&self) -> Option<version::ManifestKind> {
-        self.version_manifest.forced()
+    /// The working tree's version as a single value: the first manifest's.
+    /// What a header or a "does this repo version at all" question reads.
+    pub fn version(&self) -> Option<version::Semver> {
+        let first = self.manifests().into_iter().next()?;
+        version::read_version(&self.repo_root, &first)
+            .ok()
+            .flatten()
     }
 
     /// True when rf is configured to assist rather than drive the workflow.

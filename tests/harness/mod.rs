@@ -321,9 +321,15 @@ impl Sandbox {
     /// Like [`set_config_flag`](Self::set_config_flag), for a string-valued
     /// key (e.g. `version_manifest = "npm"`).
     pub fn set_config_string(&self, key: &str, value: &str) {
+        self.set_config_raw(key, &format!("\"{value}\""));
+    }
+
+    /// Like [`set_config_string`](Self::set_config_string), with `raw` written
+    /// as-is as the TOML value — an array, say.
+    pub fn set_config_raw(&self, key: &str, raw: &str) {
         let path = self.path().join(".roll-flow.toml");
         let existing = fs::read_to_string(&path).expect("read config");
-        let new_line = format!("{key} = \"{value}\"");
+        let new_line = format!("{key} = {raw}");
         let mut replaced = false;
         let mut lines: Vec<String> = existing
             .lines()
