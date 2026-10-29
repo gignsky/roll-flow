@@ -980,6 +980,74 @@ impl MissingDeps {
     }
 }
 
+/// Manifests a promotion may land with their version unchanged from stable,
+/// because the user said so at a prompt — the case of a repo versioned through
+/// more than one manifest where only some of them actually changed (a site's
+/// `package.json` bumped, a nested service's `Cargo.toml` untouched).
+///
+/// Deliberately narrower than `--force`: it only ever waives
+/// [`VersionStatus::Unchanged`], never `Lower`, `DevVersion` or `Unreadable`,
+/// never a configured gate, and only while another manifest in the same step
+/// does move (see [`waivable_unchanged`]) — so it can never land a promotion
+/// with no version change at all, the thing the gate exists to stop. Like
+/// [`MissingDeps`] it is independent of [`ForceOpts`], and records itself in
+/// its own trailer.
+#[derive(Default)]
+pub(crate) struct UnchangedVersions {
+    manifests: Vec<Manifest>,
+    reason: String,
+}
+
+impl UnchangedVersions {
+    pub(crate) fn new(manifests: Vec<Manifest>, reason: impl Into<String>) -> Self {
+        Self {
+            manifests,
+            reason: reason.into(),
+        }
+    }
+
+    fn accepts(&self, manifest: &Manifest) -> bool {
+        self.manifests.contains(manifest)
+    }
+
+    /// Build the `Unchanged-Version:` / `Unchanged-Version-Reason:` trailer for
+    /// the checks a step actually waved through, or `None` when it waived none.
+    fn trailer(&self, accepted: &[VersionCheck]) -> Option<String> {
+        if accepted.is_empty() {
+            return None;
+        }
+        let mut s = String::from("Unchanged-Version:\n");
+        for check in accepted {
+            let manifest = check
+                .manifest
+                .as_ref()
+                .map(|m| m.to_string())
+                .unwrap_or_default();
+            let head = check.head.map(|v| v.to_string()).unwrap_or_default();
+            s.push_str(&format!("  {manifest} {head}\n"));
+        }
+        s.push_str(&format!("Unchanged-Version-Reason: {}", self.reason));
+        Some(s)
+    }
+}
+
+/// The unchanged checks among `checks` that [`UnchangedVersions`] may waive:
+/// every `Unchanged` one, provided at least one other manifest is `Ok` (or,
+/// via `moves`, is being bumped by the caller). Empty otherwise — a repo whose
+/// every manifest is unchanged still owes a bump, and a single-manifest repo
+/// never gets a waiver at all.
+pub(crate) fn waivable_unchanged(checks: &[VersionCheck], moves: bool) -> Vec<VersionCheck> {
+    let moves = moves || checks.iter().any(|c| c.status == VersionStatus::Ok);
+    if !moves {
+        return Vec::new();
+    }
+    checks
+        .iter()
+        .filter(|c| c.status == VersionStatus::Unchanged && c.manifest.is_some())
+        .cloned()
+        .collect()
+}
+
 // ── Slug / date helpers ─────────────────────────────────────────────────────
 
 fn normalize_slug(input: &str) -> Result<String> {
@@ -3126,6 +3194,7 @@ pub(crate) fn promote(
     force: &ForceOpts,
     tag: bool,
     bump: Option<BumpLevel>,
+    unchanged: &UnchangedVersions,
 ) -> Result<PromoteOutcome> {
     let rolling = &config.rolling_branch;
     let stable = &config.stable_branch;
@@ -3145,7 +3214,16 @@ pub(crate) fn promote(
     for (i, step) in plan.steps.into_iter().enumerate() {
         let name = step.roll.clone().unwrap_or_else(|| rolling.clone());
         let step_bump = if per_roll { bump } else { None };
-        match run_promote_step(config, &stable_ref, step, dry_run, force, tag, step_bump) {
+        match run_promote_step(
+            config,
+            &stable_ref,
+            step,
+            dry_run,
+            force,
+            tag,
+            step_bump,
+            unchanged,
+        ) {
             Ok(done) => steps.push(done),
             // Earlier steps are committed by now, so the error has to say where
             // stable stands rather than leave the user to work it out.
@@ -3399,6 +3477,54 @@ pub(crate) fn preview_roll_promotion(config: &Config, rolls: &[String]) -> Resul
     })
 }
 
+/// The unchanged manifests a promotion of `target` could waive with an
+/// [`UnchangedVersions`] — what the TUI's `[m]` asks about before it promotes.
+///
+/// Read-only, and judged the way [`run_promote_step`] will judge it: each
+/// step's source against stable, on the finalized (marker-dropped) version.
+/// Each step is compared against stable as it stands now, not as the earlier
+/// steps will have advanced it, so this can only over-offer; the step itself
+/// re-checks, and a waiver it cannot use leaves the ordinary gate error.
+pub(crate) fn preview_unchanged_versions(
+    config: &Config,
+    target: &PromoteTarget,
+) -> Result<Vec<VersionCheck>> {
+    if !config.version_gate {
+        return Ok(Vec::new());
+    }
+    let repo = &config.repo_root;
+    let Some(stable_ref) = git::resolve_branch(repo, &config.stable_branch) else {
+        return Ok(Vec::new());
+    };
+    let sources = match target {
+        PromoteTarget::Rolling => vec![config.rolling_branch.clone()],
+        PromoteTarget::Rolls(rolls) => plan_roll_steps(config, rolls, &stable_ref)?
+            .steps
+            .into_iter()
+            .map(|s| s.source)
+            .collect(),
+    };
+    let mut waivable: Vec<VersionCheck> = Vec::new();
+    for source in sources {
+        let mut checks = Vec::new();
+        for manifest in config.manifests_at(&source)? {
+            let head = version::version_at(repo, &source, &manifest)?.map(|v| v.release());
+            checks.push(version::check_against(
+                repo,
+                head,
+                &stable_ref,
+                Some(&manifest),
+            )?);
+        }
+        for check in waivable_unchanged(&checks, false) {
+            if !waivable.iter().any(|c| c.manifest == check.manifest) {
+                waivable.push(check);
+            }
+        }
+    }
+    Ok(waivable)
+}
+
 /// The merges a per-roll promotion would make, in order.
 ///
 /// Carries no `skipped` list: a roll already contained in stable simply has no
@@ -3454,6 +3580,7 @@ struct KindPlan {
     staged_write: Option<Semver>,
 }
 
+#[allow(clippy::too_many_arguments)]
 fn run_promote_step(
     config: &Config,
     stable_ref: &str,
@@ -3462,6 +3589,7 @@ fn run_promote_step(
     force: &ForceOpts,
     tag: bool,
     bump: Option<BumpLevel>,
+    unchanged: &UnchangedVersions,
 ) -> Result<PromoteStep> {
     let repo = &config.repo_root;
     let stable = &config.stable_branch;
@@ -3500,9 +3628,12 @@ fn run_promote_step(
         // An unchanged version with a bump level in hand is not a failure but
         // a plan: raise it inside the merge. Only `Unchanged` qualifies — a
         // version *lower* than stable is never one level away from right, and
-        // an unreadable one cannot be raised at all.
+        // an unreadable one cannot be raised at all. A manifest the user
+        // already agreed may stay unchanged is not raised behind their back.
         let in_merge_bump = match (version.status, version.head, bump) {
-            (VersionStatus::Unchanged, Some(head), Some(level)) if !dry_run => {
+            (VersionStatus::Unchanged, Some(head), Some(level))
+                if !dry_run && !unchanged.accepts(&manifest) =>
+            {
                 Some((head, head.bump(level)))
             }
             _ => None,
@@ -3548,8 +3679,23 @@ fn run_promote_step(
     }
     let mut version_bypass = Vec::new();
 
+    // Unchanged manifests the user agreed to leave alone, waved through only
+    // while another manifest in this step does move.
+    let moves = plans.iter().any(|p| p.in_merge_bump.is_some());
+    let accepted: Vec<VersionCheck> = waivable_unchanged(
+        &plans.iter().map(|p| p.version.clone()).collect::<Vec<_>>(),
+        moves,
+    )
+    .into_iter()
+    .filter(|c| c.manifest.as_ref().is_some_and(|m| unchanged.accepts(m)))
+    .collect();
+    let is_accepted = |plan: &KindPlan| {
+        plan.version.status == VersionStatus::Unchanged
+            && accepted.iter().any(|c| c.manifest == plan.manifest)
+    };
+
     for plan in &plans {
-        if plan.version.is_satisfied() || plan.in_merge_bump.is_some() {
+        if plan.version.is_satisfied() || plan.in_merge_bump.is_some() || is_accepted(plan) {
             continue;
         }
         // `--dry-run` previews rather than enforces, exactly as it does for the
@@ -3567,8 +3713,15 @@ fn run_promote_step(
             });
         }
     }
-    let mut version =
-        VersionCheck::worst(&plans.iter().map(|p| p.version.clone()).collect::<Vec<_>>());
+    // A waived manifest neither blocks the step nor names its release: the
+    // verdict and the tag are read from the manifests that actually moved.
+    let mut version = VersionCheck::worst(
+        &plans
+            .iter()
+            .filter(|p| !is_accepted(p))
+            .map(|p| p.version.clone())
+            .collect::<Vec<_>>(),
+    );
 
     // Gates run against the staged merge result, so `report` is produced inside
     // `merge_gated`. In dry-run nothing is staged and nothing is merged.
@@ -3608,7 +3761,12 @@ fn run_promote_step(
         // The tag names the first manifest's version, but the step reports the
         // worst verdict: a bump still owed by *any* manifest keeps the tag
         // name unknowable.
-        let primary = plans[0].version.clone();
+        let primary = plans
+            .iter()
+            .find(|p| !is_accepted(p))
+            .unwrap_or(&plans[0])
+            .version
+            .clone();
         let tag_outcome = match (tag && config.tag_on_promote, primary.head) {
             // The version still has to move, so the eventual tag name is not
             // knowable here — claiming the current one would be wrong.
@@ -3647,7 +3805,12 @@ fn run_promote_step(
     let mut bypassed = version_bypass;
     bypassed.extend(report.bypassed);
     bypassed.extend(host_report.bypassed);
-    if let Some(trailer) = force.trailer(&bypassed) {
+    let trailer = [force.trailer(&bypassed), unchanged.trailer(&accepted)]
+        .into_iter()
+        .flatten()
+        .collect::<Vec<_>>()
+        .join("\n\n");
+    if !trailer.is_empty() {
         append_commit_trailer(repo, stable_ref, &trailer)?;
     }
 
@@ -3668,8 +3831,8 @@ fn run_promote_step(
         }
     }
     let versions: Vec<VersionCheck> = plans.iter().map(|p| p.version.clone()).collect();
-    if let Some(first) = versions.first() {
-        version = first.clone();
+    if let Some(first) = plans.iter().find(|p| !is_accepted(p)).or(plans.first()) {
+        version = first.version.clone();
     }
 
     // Tag last of all, so it points at the commit the trailer amend produced

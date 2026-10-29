@@ -120,6 +120,18 @@ opened a PR — see
   manifest that owes one, by that level. The tag names the first manifest's
   version: a root manifest before a nested one, `Cargo.toml` before
   `package.json` at the same depth
+- when one manifest moved and another did not — a site's `package.json` bumped,
+  the service in `keeper/` untouched — you can promote the unmoved one as it is
+  (<a id="promoting-a-manifest-unchanged"></a>*promoting a manifest unchanged*).
+  Declining its bump asks `Promote with keeper/Cargo.toml 0.1.0 unchanged from
+  'main'? [y/N]`; the TUI's `[m]` asks the same thing as a second confirmation
+  stage. A yes lets only that manifest through and records it in the merge
+  commit (`Unchanged-Version:` / `Unchanged-Version-Reason:`). The tag is named
+  from a manifest that moved. You are never asked when *no* manifest moved, or
+  when the repo has only one manifest: that promotion still owes a bump. The
+  prompt never runs unattended, `--yes` bumps everything rather than skipping
+  anything, and nothing else (a lower version, a dev marker, a failing gate)
+  can be waived this way
 - after a `--roll` promotion, offers to merge stable into the active local rolls
   (`rf update`), since they now trail what landed; `--yes` accepts, and an
   unattended run is told the command instead
