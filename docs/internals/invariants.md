@@ -70,10 +70,98 @@ long list — that keeps two rolls adding rules in different areas from collidin
   `RollState::Diverged` alone misses every dependency that is stale while still
   active — exactly the case that matters before merging a batch of dependent
   rolls against a dependency someone keeps pushing to.
+- **A dependency cycle is never a deadlock.** Rolls that integrated each other
+  have no graduation order, so the ordering constraint is satisfied by
+  containment instead: a cycle's *carrier* — the member whose tip contains every
+  other member's tip — is not blocked by its fellow members, and graduating it
+  lands them (see [Dependency cycles](algorithms.md#dependency-cycles)). This
+  exception is scoped to cycles on purpose; outside one, a contained but
+  ungraduated dependency still blocks, because an order exists in which it
+  lands first with a graduation merge of its own. When no member contains the
+  others, nothing graduates, and every surface — the planner's refusal, both
+  plain tables, the TUI detail view and `--json` — gives the same
+  `DepCycle::advice`: which `rf integrate` makes a carrier. Never `--force`.
+- **An unknown dependency is forceable for graduation, but not yet for
+  promotion.** A dependency number no roll in the list carries — typically
+  one that graduated, promoted, and was pruned, so nothing is left to resolve
+  what "roll N" is — can be skipped with `rf graduate --force --reason` or
+  the TUI's own force-confirm stage on `[G]`, for `ChainKind::Graduate` only;
+  `ChainKind::Promote` keeps this refusal unconditionally for now, since
+  forcing past it there has not been built. The origin-only refusal and the
+  no-carrier cycle refusal are a different matter — each has its own remedy
+  (fetch, `rf integrate`) and is never bypassed by `force` regardless of
+  `ChainKind`. The TUI's bypass is its own second, explicit confirmation —
+  never `ForceOpts.enabled`, which stays reserved for the CLI's `--force`
+  bypassing a failing gate, so confirming past a missing dependency from a
+  keypress can never also start bypassing gates from one.
+- **Every walk over dependencies terminates.** Cycles are found once, by
+  Tarjan's SCC (`branches::dependency_cycles`), and recorded on
+  `RollInfo::cycle`; walks either treat a recorded cycle as one node
+  (graduation), skip an edge back into the current path (promotion, which is
+  ordered by rolling's history, not the dependency graph), or refuse it. A new
+  walk over `RollInfo::deps` must do one of the three — recursing on `deps`
+  alone loops on the first cycle a user's merges create.
+- **A graduation commit is a point on rolling's mainline.** A roll that only
+  reached rolling inside another roll's history (a cycle's carried member, or a
+  `--force` graduation) is re-anchored by `scan_graduated` to the first-parent
+  commit where it landed — never left pointing at an integrate merge on a roll
+  branch, which `rf promote --roll` would then advance stable to.
+
+## TUI command queue
+
+- One git command runs at a time. A mutating key pressed mid-job is queued
+  (`tui::queue`), never run concurrently and never silently refused.
+- A failed command *holds* the queue. Nothing behind a failure runs until the
+  user presses `[s]`; nothing is discarded until they press `[S]`. A command
+  pressed while held goes to the back, never ahead of the unresolved failure.
+  The one command that may jump the queue is a confirmed force push answering
+  the rejection that held it.
+- A key that captures the checked-out branch at keypress time must refuse
+  (`StatusApp::waits_on_head`) while a HEAD-moving job is running or queued
+  (`start_head_job`: switch, create). Work that only needs HEAD when it runs
+  should read it inside the job instead, as `git switch` does.
+- A push is not such a key: `[P]` and `PP` queue behind a pending switch. They
+  resolve their branch(es) at keypress time and `push_job` pushes by explicit
+  refspec (`refs/heads/<branch>:…`), so neither the request nor the job reads
+  HEAD. Any new push path must keep naming its branch up front; one that reads
+  HEAD when it runs must go back behind `waits_on_head`.
+- `[v]` is the other exception, by the opposite route: the verify job names no
+  branch and reads HEAD only when it runs (`run_verify`), so a verify queued
+  behind a switch judges the branch that switch leaves checked out. On a
+  verifiable row `[v]` queues that switch itself (`execute_switch`, the same
+  job `space` queues) immediately ahead of the verify — and does so even for
+  the row that is checked out now whenever HEAD is about to move, since "is
+  checked out" read at keypress is exactly what goes stale. Only on a row it
+  cannot verify does it rely on someone else's pending switch, and then its
+  title says what it waits on. Anything added to the verify job that captures
+  the branch when the key is pressed breaks this and must go back behind
+  `waits_on_head`.
+- `[V]` queues too: `ops::verify_many` restores HEAD to the branch checked out
+  when the pass *starts*, never one captured at keypress. Its up-front
+  clean-tree refusal applies only when nothing is pending; behind other
+  commands the pass's own check is the one that counts.
+- `gg` is refused only while a job is *running*. A held queue is exactly when
+  lazygit is needed.
 
 ## Verification
 
 - Active hosts only. Never require verification from inactive hosts.
+
+## Local rebuild markers
+
+- `core::rebuild` never shells out to `nixos-rebuild`/`home-manager` and never
+  reads `/nix/var/nix/profiles/system` or `/run/current-system`. It only reads
+  commit messages the dotfiles repo's own rebuild scripts
+  (`scripts/nixos-rebuild.sh`, `scripts/home-switch.sh`) already write — pure
+  git-log scanning, the same "core never runs nix" rule config auto-detection
+  follows.
+- Unlike [Verification](#verification) above, this one is **not**
+  active-hosts-only on purpose: it is informational, not a gate, so a host
+  marked inactive (mid-reinstall, say) still shows what it last rebuilt. It
+  gates on a different, wider question — is this host known to
+  `config.hosts`/`config.host_active` *at all* — so a repo that models no
+  hosts (`hosts = []`, `host_active = {}`, the shape roll-flow's own
+  `.roll-flow.toml` is in) always shows nothing.
 
 ## Deletion safety
 
@@ -194,8 +282,9 @@ long list — that keeps two rolls adding rules in different areas from collidin
   getting stale against an advanced target (via `rf update`/`[i]`/`[I]`) is
   resolved at the git level, not by `rf` committing a strip/reapply on either
   branch first. See `src/core/merge_driver.rs` and
-  `ops::ensure_version_merge_driver` (wired up by `rf init`): `Cargo.toml` is
-  attributed to a custom merge driver that resolves the `version` line by
+  `ops::ensure_version_merge_driver` (wired up by `rf init` and before every
+  `rf` merge): `Cargo.toml` and `Cargo.lock` are attributed to a custom merge
+  driver that resolves the crate's own version line by
   keeping whichever side is being merged *into*'s own marker and the higher of
   the two numbers — "ours" is just whichever branch git has checked out,
   decided by git itself rather than by which `rf` command is running. This
@@ -207,6 +296,25 @@ long list — that keeps two rolls adding rules in different areas from collidin
   itself commits. The driver's generic rule is correct as-is for `[i]`/`[I]`/
   `rf update`, where "ours" (a roll) already carries its own right marker from
   `rf start` — but not for graduation, see below.
+- **A version-only conflict never stops an `rf` merge.** The crate's own
+  version lives in two files that change in lockstep — `Cargo.toml` and
+  `Cargo.lock`'s own `[[package]]` entry — so a fix for one is no fix: both are
+  attributed to the driver, and every version rewrite syncs the lockfile entry
+  itself (`ops::sync_lockfile_own_entry`) rather than trusting a `cargo update`
+  that may not run. The driver is clone-local configuration, so `rf init`
+  cannot be the only thing that sets it: every `rf` merge path (`run_merge`,
+  `merge_gated`, `ops::integrate`) wires it first, into the clone's
+  `info/attributes` rather than the tree. And because git can still fail to
+  run it, those same paths finish a merge that stopped on *nothing but* those
+  lines by the same rule (`ops::settle_version_only_conflicts`). Any new merge
+  path must go through one of the three, not call `git merge` itself.
+- **Only the version line, and only all-or-nothing.** The driver and the
+  in-process fallback touch the crate's own entry and nothing else — never a
+  dependency's lockfile entry, never a `[[package]]` with a `source`, never an
+  ambiguous match. If any unmerged path is something else, or a version file
+  still conflicts once its version line agrees, the merge is left exactly as
+  git left it: finishing the parts `rf` understands would make the real
+  conflict look smaller than it is.
 - `ops::graduate` does not delegate to the merge driver's generic rule, because
   "keep ours's marker" is wrong on the very first graduation ever: rolling has
   never worn `-dev` before that point, so "keep ours's marker" would just carry
@@ -223,11 +331,11 @@ long list — that keeps two rolls adding rules in different areas from collidin
   side (the roll's marked value) without ever invoking any driver. `ops::graduate`
   corrects this itself, inside `merge_gated`'s staged tree, before the gates
   run (`reconcile_staged_version`): it reads both sides' version ahead of the
-  merge and rewrites `Cargo.toml` to its own computed answer (above) if the
-  merge didn't already land there. This is why the fix exists in `ops::graduate`
-  and not purely in `.gitattributes` — the driver alone covers the conflicting
-  case but not the trivial one, and both have to resolve the same way for the
-  marker to never reach rolling wrong. `rf update`'s direction doesn't need
+  merge and rewrites `Cargo.toml` (and syncs `Cargo.lock`'s own entry) to its
+  own computed answer (above) if the merge didn't already land there. This is
+  why the fix exists in `ops::graduate` and not purely in the driver — the
+  driver alone covers the conflicting case but not the trivial one, and both
+  have to resolve the same way for the marker to never reach rolling wrong. `rf update`'s direction doesn't need
   this: its trivial case (stable hasn't touched the version, only the roll's
   own marker has) already resolves correctly by git's own default of keeping
   the side that changed, since that side is the roll.

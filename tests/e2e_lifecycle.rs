@@ -255,3 +255,117 @@ fn multi_roll_promote_marks_all_promoted() {
         Some("✓ promoted")
     );
 }
+
+#[test]
+fn a_conflicting_graduation_names_the_roll_that_got_there_first() {
+    // Roll A graduates touching F. Roll B, off stable, touches F differently.
+    // Graduating B conflicts — and the diagnosis must say the other side came
+    // in with A, so the user knows which roll to integrate.
+    let sb = Sandbox::plain();
+    sb.init();
+
+    let out = sb.create_roll("first", "0611");
+    assert!(out.success, "{}", out.combined());
+    let a = sb.current_branch();
+    sb.commit_file("clash.txt", "roll A's line\n", "A edits clash");
+    let out = sb.rf(&["graduate"]);
+    assert!(out.success, "graduate A: {}", out.combined());
+
+    let out = sb.create_roll("second", "0612");
+    assert!(out.success, "{}", out.combined());
+    let b = sb.current_branch();
+    sb.commit_file("clash.txt", "roll B's line\n", "B edits clash");
+
+    // Unattended: no terminal, no --yes — must report and change nothing.
+    let out = sb.rf(&["graduate"]);
+    assert!(!out.success, "conflicting graduation should fail");
+    let text = out.combined();
+    assert!(text.contains("clash.txt"), "path not named: {text}");
+    assert!(text.contains(&a), "culprit roll not named: {text}");
+    assert!(text.contains("rf integrate"), "no by-hand commands: {text}");
+    assert_eq!(sb.current_branch(), b);
+    assert!(!sb.exists(".git/MERGE_HEAD"), "left mid-merge unattended");
+    assert!(
+        !sb.has_commit_subject("rolling", &format!("Graduate {b}")),
+        "B must not have graduated"
+    );
+
+    // --yes takes the recommended way: integrate A into B, which reproduces
+    // the conflict on B's own branch, where it is resolved and committed.
+    let out = sb.rf(&["graduate", "--yes"]);
+    assert!(
+        !out.success,
+        "integrate should stop on the conflict: {}",
+        out.combined()
+    );
+    assert!(
+        out.combined().contains("mid-merge"),
+        "should say B is mid-merge: {}",
+        out.combined()
+    );
+    assert_eq!(sb.current_branch(), b);
+    assert!(
+        sb.exists(".git/MERGE_HEAD"),
+        "the conflict should now be on B"
+    );
+
+    sb.write("clash.txt", "resolved\n");
+    sb.git(&["add", "clash.txt"]);
+    sb.git(&["commit", "--no-edit"]);
+    assert!(
+        sb.has_commit_subject(&b, &format!("Merge branch '{a}'")),
+        "B should now carry A as an integrate merge"
+    );
+
+    // With the conflict resolved on B, graduation goes through.
+    let out = sb.rf(&["graduate"]);
+    assert!(
+        out.success,
+        "graduate B after resolving: {}",
+        out.combined()
+    );
+}
+
+#[test]
+fn a_conflict_with_a_direct_edit_on_rolling_offers_nothing_to_integrate() {
+    // Not every conflict has a roll behind it. A change made on rolling
+    // directly is reported as exactly that, and --yes then falls back to the
+    // by-hand commands rather than integrating an unrelated roll.
+    let sb = Sandbox::plain();
+    sb.init();
+
+    let out = sb.create_roll("first", "0611");
+    assert!(out.success, "{}", out.combined());
+    let a = sb.current_branch();
+    sb.commit_file("clash.txt", "line 1\nline 2\nline 3\n", "A adds clash");
+    let out = sb.rf(&["graduate"]);
+    assert!(out.success, "graduate A: {}", out.combined());
+
+    // A is on rolling but never touched other.txt; B and a direct commit on
+    // rolling both add it. The attribution for other.txt must therefore name
+    // no roll at all — A is a bystander.
+    let out = sb.create_roll("second", "0612");
+    assert!(out.success, "{}", out.combined());
+    let b = sb.current_branch();
+    sb.commit_file("other.txt", "B's version\n", "B adds other");
+    sb.git(&["checkout", "rolling"]);
+    sb.commit_file(
+        "other.txt",
+        "rolling's version\n",
+        "rolling edits other directly",
+    );
+    sb.git(&["checkout", &b]);
+
+    let out = sb.rf(&["graduate", "--yes"]);
+    assert!(!out.success, "{}", out.combined());
+    let text = out.combined();
+    assert!(text.contains("other.txt"), "{text}");
+    assert!(
+        text.contains("made there directly") || text.contains("directly"),
+        "should say no roll is attributable: {text}"
+    );
+    // Nothing to integrate, so --yes falls back to reporting; A is unrelated.
+    assert!(!text.contains(&format!("integrating {a}")), "{text}");
+    assert!(!sb.exists(".git/MERGE_HEAD"));
+    assert_eq!(sb.current_branch(), b);
+}
