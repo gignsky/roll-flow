@@ -180,7 +180,7 @@ The full list:
 | `q` | quit |
 | `p` / `P` / `f` | pull / push / fetch the selected branch |
 | `PP` | [push every branch that needs it](#pp--push-everything-that-needs-it) |
-| `gg` | lazygit |
+| `gg` / `bb` | [lazygit / bacon](#gg-and-bb--hand-over-the-terminal) |
 | `c` / `i` | create a roll / integrate one into the checked-out roll |
 | `V` | verify all rolls, or a set of them |
 | `G` / `m` / `u` | graduate / promote / update from stable |
@@ -247,9 +247,26 @@ Two guards keep a chain from doing something you did not ask for:
 - `q` with commands queued only warns the first time; a second `q` quits and
   drops them.
 
-`gg` is the exception: lazygit is full-screen and owns the terminal, so `rf`
-suspends, hands it over, and redraws when lazygit exits. Set `lazygit_command` in
-`.roll-flow.toml` to point at something other than a bare `lazygit` on `PATH`.
+## `gg` and `bb` — hand over the terminal
+
+`gg` and `bb` are the exceptions to the output panel: lazygit and bacon draw
+their own full-screen UI and own the terminal outright, so there is nothing to
+stream. `rf` suspends, hands the terminal over, and redraws when the tool
+exits — then reloads the list, because anything at all may have happened
+inside. Only one of the two is a git tool, which is why they are their own
+`tools` group in `?` rather than sitting under `sync` or `roll`.
+
+`bb` is a chord on the `b` that bumps the version, like `pp` on `p`: a lone `b`
+still bumps, but only after a short window (400ms) with no second `b`. Bacon runs
+in the directory of the shallowest `Cargo.toml` in the working tree — the repo
+root when it has one, else the nearest crate below it — and the key says so in
+the status line when there is none.
+
+Set `lazygit_command` or `bacon_command` in `.roll-flow.toml` to point at
+something other than a bare `lazygit`/`bacon` on `PATH`. lazygit is launched as
+`<command> -p <repo_root>`; bacon is launched with no arguments in that Cargo.toml directory,
+because bacon's positional argument is a job name (`check`, `clippy`, `test`)
+and a path passed there would be read as a job that does not exist.
 
 ## Pulling and pushing
 
