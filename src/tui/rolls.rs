@@ -3873,13 +3873,15 @@ impl StatusApp {
 
     /// `[P]` — push the selected branch, offering a force when git refuses.
     ///
+    /// The branch is resolved here, at keypress time, from the selected row, and
+    /// the job carries that name — so a push pressed mid-job (or behind a queued
+    /// switch) pushes the branch it was pressed on, not whatever HEAD is when its
+    /// turn comes.
+    ///
     /// A branch already known to be behind skips the doomed plain attempt and
     /// goes straight to the confirmation, which is what lazygit does: there is no
     /// point spending a round-trip to be told what the tracking ref already says.
     fn start_push(&mut self) {
-        if self.waits_on_head("[P]") {
-            return;
-        }
         let Some(target) = self.sync_target() else {
             self.message = Some("no branch selected".to_string());
             return;
@@ -3909,13 +3911,10 @@ impl StatusApp {
     /// chord resolves, in [`Self::handle_browsing`] or
     /// [`Self::resolve_lapsed_push`].
     ///
-    /// The HEAD check happens here as well as at the far end so that a `P`
-    /// that cannot run is refused the instant it is pressed, instead of after
-    /// the window.
+    /// There is deliberately no [`Self::waits_on_head`] check: a push names its
+    /// branch with an explicit refspec, so it neither reads nor depends on HEAD
+    /// and may queue behind a pending switch.
     fn arm_push(&mut self) {
-        if self.waits_on_head("[P]") {
-            return;
-        }
         self.pending_push = Some(Instant::now());
         self.message = Some("P again to push every branch that needs it".to_string());
     }
@@ -3962,10 +3961,10 @@ impl StatusApp {
     ///
     /// Nothing is pushed here. The plan is resolved from the tracking data the
     /// view already loaded, so the modal states exactly what the job will do.
+    ///
+    /// Like `[P]`, it does not wait on HEAD: the plan names every branch up
+    /// front, so it can queue behind a pending switch.
     fn start_push_all(&mut self) {
-        if self.waits_on_head("PP") {
-            return;
-        }
         let rows: Vec<(String, BranchLocation)> = self
             .bases
             .iter()
@@ -4102,21 +4101,30 @@ impl StatusApp {
     /// inside the job so the panel title names it before the gates start — on a
     /// repo with `cargo test` gates that is the difference between a title the
     /// user can trust and several silent minutes.
+    ///
+    /// Verify may be queued behind a switch or create, which is how verifies
+    /// chain across rolls: the job reads HEAD when it *runs* (`run_verify`),
+    /// so it judges whichever branch the queued switch left checked out. The
+    /// route cannot be named at keypress then — HEAD is about to change — so
+    /// the title says what it waits on instead, and a branch that turns out not
+    /// to be promotable fails inside the job like any other verify error.
     fn start_verify(&mut self) {
-        if self.waits_on_head("[v]") {
-            return;
-        }
-        let Some((source, target)) = verify_route_for(&self.config, &self.current_branch) else {
-            self.message = Some(format!(
-                "'{}' is not promotable — check out {} or a {}branch to verify",
-                self.current_branch, self.config.rolling_branch, self.config.roll_prefix
-            ));
-            return;
+        let title = match self.head_will_move() {
+            Some(pending) => format!("rf verify (checked-out branch after '{pending}')"),
+            None => {
+                let Some((source, target)) = verify_route_for(&self.config, &self.current_branch)
+                else {
+                    self.message = Some(format!(
+                        "'{}' is not promotable — check out {} or a {}branch to verify",
+                        self.current_branch, self.config.rolling_branch, self.config.roll_prefix
+                    ));
+                    return;
+                };
+                format!("rf verify {source} → {target}")
+            }
         };
         let config = self.config.clone();
-        self.start_job(format!("rf verify {source} → {target}"), move || {
-            Ok(JobDone::lines(run_verify(&config)?))
-        });
+        self.start_job(title, move || Ok(JobDone::lines(run_verify(&config)?)));
     }
 
     /// `gg` — hand the terminal to lazygit, then take it back.
@@ -10770,6 +10778,80 @@ mod tests {
         settle(&mut app);
         assert_eq!(app.job_title, "rf create");
         settle(&mut app);
+    }
+
+    #[test]
+    fn pushes_queue_behind_a_pending_switch_and_keep_their_branch() {
+        let mut app = idle_app();
+        let (release, gate) = std::sync::mpsc::channel::<()>();
+        app.start_job("git push roll/45", move || {
+            gate.recv().ok();
+            Ok(JobDone::default())
+        });
+        app.start_head_job("git switch roll/44", says("switched"));
+        assert!(app.waits_on_head("[i]"), "a switch is pending");
+
+        // `[P]` is not refused for it: the chord arms, and `PP` is not refused.
+        app.arm_push();
+        assert!(app.pending_push.is_some(), "{:?}", app.message);
+        app.pending_push = None;
+        app.start_push_all();
+        assert!(
+            !app.message.clone().unwrap_or_default().contains("acts on"),
+            "{:?}",
+            app.message
+        );
+
+        // A push for a named branch queues behind the switch, titled for the
+        // branch it was requested for, not for HEAD.
+        let target = SyncTarget::resolve("roll/46", "roll/1-0101-x", BranchLocation::Local, None);
+        app.push_job(target, false, false);
+        let order: Vec<&str> = app.queue.titles().collect();
+        assert_eq!(order, ["git switch roll/44", "git push roll/46"]);
+
+        release.send(()).unwrap();
+        settle(&mut app);
+        assert_eq!(app.job_title, "git switch roll/44");
+        settle(&mut app);
+        assert_eq!(app.job_title, "git push roll/46");
+        // The push itself fails (no such repo); the queue is empty so nothing
+        // is held either way.
+        settle(&mut app);
+    }
+
+    #[test]
+    fn verifies_chain_behind_a_pending_switch_without_naming_a_branch_early() {
+        let mut app = idle_app();
+        app.current_branch = "feature/not-promotable".to_string();
+        let (release, gate) = std::sync::mpsc::channel::<()>();
+        app.start_job("rf verify roll/45 → rolling", move || {
+            gate.recv().ok();
+            Ok(JobDone::default())
+        });
+        app.start_head_job("git switch roll/44", says("switched"));
+
+        // HEAD is about to move, so `[v]` queues instead of refusing — and does
+        // not judge the soon-to-be-stale checked-out branch.
+        app.start_verify();
+        app.start_verify();
+        let order: Vec<&str> = app.queue.titles().collect();
+        assert_eq!(
+            order,
+            [
+                "git switch roll/44",
+                "rf verify (checked-out branch after 'git switch roll/44')",
+                "rf verify (checked-out branch after 'git switch roll/44')",
+            ]
+        );
+        assert!(
+            !app.message
+                .clone()
+                .unwrap_or_default()
+                .contains("not promotable"),
+            "{:?}",
+            app.message
+        );
+        release.send(()).unwrap();
     }
 
     #[test]
