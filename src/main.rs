@@ -508,7 +508,7 @@ fn cmd_verify(dry_run: bool, bump: Option<BumpLevel>, yes: bool) -> Result<()> {
 
     // Resolved before `ops::verify` so an accepted bump is already committed by
     // the time the gates (and their `--locked` cargo commands) run.
-    resolve_version_gate(&config, bump, yes, false, dry_run)?;
+    resolve_version_gate(&config, bump, yes, false, dry_run, false)?;
 
     let outcome = match ops::verify(&config, dry_run) {
         Ok(outcome) => outcome,
@@ -705,18 +705,25 @@ fn cmd_verify_all(set: branches::VerifySet) -> Result<()> {
 ///
 /// Mirrors `.github/workflows/version-bump-check.yml`, so a promotion done with
 /// `rf` and one done through a PR are held to the same standard.
+///
+/// With `waive`, a manifest left unchanged while another one moves may be
+/// promoted as-is after an explicit y/N (see [`ops::UnchangedVersions`]); the
+/// manifests the user agreed to are returned, for `ops::promote` to record.
+/// `rf verify` passes `false`: it vouches for a promotion, and has no merge to
+/// record a waiver on.
 fn resolve_version_gate(
     config: &Config,
     bump: Option<BumpLevel>,
     yes: bool,
     forced: bool,
     dry_run: bool,
-) -> Result<()> {
+    waive: bool,
+) -> Result<Vec<Manifest>> {
     let current = git::current_branch(&config.repo_root)?;
     let route = match ops::infer_route(config, &current) {
         Some(route) => route,
         // Not a promotable branch: the caller raises its own clearer error.
-        None => return Ok(()),
+        None => return Ok(Vec::new()),
     };
     let (source, target) = match &route {
         ops::Route::Graduate { roll } => (roll.clone(), config.rolling_branch.clone()),
@@ -726,7 +733,7 @@ fn resolve_version_gate(
     // Graduation into rolling is deliberately out of scope: only the promotion
     // route carries the bump requirement here.
     if !matches!(route, ops::Route::Promote) {
-        return Ok(());
+        return Ok(Vec::new());
     }
     // Resolve the target the same way the merge will: local branch first, then
     // `origin/<target>`. A repo that has never checked stable out locally still
@@ -735,7 +742,7 @@ fn resolve_version_gate(
     let Some(target_ref) = git::resolve_branch(&config.repo_root, &target) else {
         // Genuinely missing on both sides — `ops::promote` raises the clearer
         // "branch not found" error for this.
-        return Ok(());
+        return Ok(Vec::new());
     };
 
     // A *final* promotion must land a bare version on stable, never `-dev` —
@@ -800,7 +807,7 @@ fn resolve_version_gate(
 
     if check.is_satisfied() {
         finalize_now(dry_run)?;
-        return Ok(());
+        return Ok(Vec::new());
     }
 
     // A version *below* the target is never fixable by bumping one level, and
@@ -835,7 +842,7 @@ fn resolve_version_gate(
             println!("Dry-run: would also finalize the release before bumping");
         }
         println!("Dry-run: not bumping the version");
-        return Ok(());
+        return Ok(Vec::new());
     }
 
     // The bump commit must land on the branch being merged from. `run_merge`
@@ -872,12 +879,37 @@ fn resolve_version_gate(
         }
     };
 
+    // Whatever still owes a bump once this answer lands. At a terminal, with
+    // another manifest moving, the user may promote it unchanged instead —
+    // asked before anything is written, so a "no" leaves rolling untouched.
+    let bumping: &[Manifest] = if level.is_some() { &chosen } else { &[] };
+    let unbumped: Vec<Manifest> = owing
+        .iter()
+        .filter(|m| !bumping.contains(m))
+        .cloned()
+        .collect();
+    let mut waived = Vec::new();
+    if waive && !forced && !unbumped.is_empty() && std::io::stdin().is_terminal() {
+        waived = confirm_unchanged_versions(&checks, &unbumped, !bumping.is_empty(), &target)?;
+        if waived.len() < unbumped.len() {
+            let still = checks
+                .iter()
+                .find(|c| {
+                    c.manifest
+                        .as_ref()
+                        .is_some_and(|m| unbumped.contains(m) && !waived.contains(m))
+                })
+                .unwrap_or(&check);
+            return Err(ops::version_gate_error(still, &source, &target));
+        }
+    }
+
     let Some(level) = level else {
         if forced {
             eprintln!("warning: version not bumped, continuing under --force");
         }
         finalize_now(false)?;
-        return Ok(());
+        return Ok(waived);
     };
 
     finalize_now(false)?;
@@ -888,7 +920,48 @@ fn resolve_version_gate(
         ops::describe_versions(&from),
         ops::describe_versions(&to)
     );
-    Ok(())
+    Ok(waived)
+}
+
+/// Ask whether to promote with `unbumped` left at the target's version. Only
+/// offered when another manifest moves — already ahead of the target, or
+/// `bumping` — since a promotion that changes no version at all still owes a
+/// bump (see [`ops::waivable_unchanged`]). An empty answer is no.
+fn confirm_unchanged_versions(
+    checks: &[VersionCheck],
+    unbumped: &[Manifest],
+    bumping: bool,
+    target: &str,
+) -> Result<Vec<Manifest>> {
+    let waivable: Vec<VersionCheck> = ops::waivable_unchanged(checks, bumping)
+        .into_iter()
+        .filter(|c| c.manifest.as_ref().is_some_and(|m| unbumped.contains(m)))
+        .collect();
+    if waivable.is_empty() {
+        return Ok(Vec::new());
+    }
+    let names: Vec<String> = waivable
+        .iter()
+        .map(|c| {
+            let head = c.head.map(|v| v.to_string()).unwrap_or_default();
+            format!(
+                "{} {head}",
+                c.manifest
+                    .as_ref()
+                    .map(|m| m.to_string())
+                    .unwrap_or_default()
+            )
+        })
+        .collect();
+    let ok = cli::prompt_yes(&format!(
+        "Promote with {} unchanged from '{target}'? [y/N]: ",
+        names.join(", ")
+    ))?;
+    Ok(if ok {
+        waivable.into_iter().filter_map(|c| c.manifest).collect()
+    } else {
+        Vec::new()
+    })
 }
 
 /// A set of `(manifest, from, to)` version changes as its two sides, ready
@@ -1247,7 +1320,15 @@ fn cmd_promote(
         };
         let target = ops::PromoteTarget::Rolls(rolls);
         let outcome = with_conflict_handling(&config, yes, None, || {
-            ops::promote(&config, &target, dry_run, &force, tag, level)
+            ops::promote(
+                &config,
+                &target,
+                dry_run,
+                &force,
+                tag,
+                level,
+                &ops::UnchangedVersions::default(),
+            )
         })?;
         print_promote(&outcome);
         offer_step_tag_pushes(&config, &outcome, yes)?;
@@ -1272,7 +1353,8 @@ fn cmd_promote(
             }
             // Resolved before `ops::promote` so the bump commit is part of what
             // gets merged, and so it precedes the `--locked` cargo gates.
-            resolve_version_gate(&config, bump, yes, forced, dry_run)?;
+            let waived = resolve_version_gate(&config, bump, yes, forced, dry_run, true)?;
+            let unchanged = ops::UnchangedVersions::new(waived, "confirmed at the prompt");
 
             let outcome = with_conflict_handling(&config, yes, None, || {
                 ops::promote(
@@ -1282,6 +1364,7 @@ fn cmd_promote(
                     &force,
                     tag,
                     None,
+                    &unchanged,
                 )
             })?;
             print_promote(&outcome);

@@ -416,7 +416,17 @@ enum Mode {
         /// This is the modal's own second, separate confirmation; nothing
         /// here ever sets `ForceOpts.enabled`, which stays reserved for
         /// bypassing gate failures under the CLI's `--force`.
+        ///
+        /// `unchanged` opens the same second stage for `[m]`, and the same
+        /// flip is what lets `run_op` waive it.
         force_confirmed: bool,
+        /// For `Action::Promote`: manifests whose version is unchanged from
+        /// stable while another manifest moves (`ops::preview_unchanged_versions`),
+        /// read once when the modal opens. Non-empty opens a second stage
+        /// asking to promote them unchanged; only that stage's `[y]` carries
+        /// them into the job as an `ops::UnchangedVersions`. Empty for every
+        /// other action, and for a promotion whose versions all moved.
+        unchanged: Vec<VersionCheck>,
     },
     /// Read-only drill-down for a single roll: its identity plus its dependency
     /// rows (issue #61). A snapshot of the selected roll is captured on open so
@@ -3175,17 +3185,19 @@ impl StatusApp {
     /// open, the same two-stage shape `DeletePrompt::ForceConfirm` uses for
     /// an uncontained delete. Only the *second*, fresh `[y]` that follows
     /// executes, and only then is `missing` carried into the job — the one
-    /// thing that lets `run_op` plan with `force: true`.
+    /// thing that lets `run_op` plan with `force: true`. A promotion's
+    /// `unchanged` manifests take the same two stages.
     fn handle_confirm(&mut self, code: KeyCode) {
         match code {
             KeyCode::Char('y') | KeyCode::Char('Y') => {
                 if let Mode::Confirm {
                     missing,
+                    unchanged,
                     force_confirmed,
                     ..
                 } = &self.mode
                 {
-                    if !missing.is_empty() && !force_confirmed {
+                    if (!missing.is_empty() || !unchanged.is_empty()) && !force_confirmed {
                         if let Mode::Confirm {
                             force_confirmed, ..
                         } = &mut self.mode
@@ -3199,10 +3211,12 @@ impl StatusApp {
                     action,
                     target,
                     missing,
+                    unchanged,
                     ..
                 } = std::mem::replace(&mut self.mode, Mode::Browsing)
                 {
-                    self.execute(action, target, missing);
+                    let unchanged = unchanged.into_iter().filter_map(|c| c.manifest).collect();
+                    self.execute(action, target, missing, unchanged);
                 }
             }
             KeyCode::Char('n') | KeyCode::Char('N') | KeyCode::Esc => {
@@ -3433,6 +3447,14 @@ impl StatusApp {
             }
             _ => Vec::new(),
         };
+        // Read once, the same way again: a version left unchanged beside one
+        // that moved is a question to ask here, not an error to hit in the job.
+        let unchanged = match (action, &validation) {
+            (Action::Promote, Ok(())) => promote_target(&self.rolls, target.as_deref())
+                .and_then(|t| ops::preview_unchanged_versions(&self.config, &t))
+                .unwrap_or_default(),
+            _ => Vec::new(),
+        };
         match validation {
             Ok(()) => {
                 self.mode = Mode::Confirm {
@@ -3441,6 +3463,7 @@ impl StatusApp {
                     carried,
                     missing,
                     force_confirmed: false,
+                    unchanged,
                 }
             }
             Err(msg) => self.message = Some(msg),
@@ -3486,6 +3509,7 @@ impl StatusApp {
                     carried: Vec::new(),
                     missing: Vec::new(),
                     force_confirmed: false,
+                    unchanged: Vec::new(),
                 }
             }
             Err(msg) => self.message = Some(msg),
@@ -3512,6 +3536,7 @@ impl StatusApp {
                     carried: Vec::new(),
                     missing: Vec::new(),
                     force_confirmed: false,
+                    unchanged: Vec::new(),
                 }
             }
             Err(msg) => self.message = Some(msg),
@@ -3935,12 +3960,19 @@ impl StatusApp {
     /// chain's missing pairs the confirm modal's force-confirm stage
     /// accepted, empty for every action but a force-confirmed `Graduate`; see
     /// [`run_op`] for how it is re-checked rather than trusted blindly.
-    fn execute(&mut self, action: Action, target: Option<String>, missing: Vec<(u32, u32)>) {
+    /// `unchanged` is likewise what a `Promote`'s second stage accepted.
+    fn execute(
+        &mut self,
+        action: Action,
+        target: Option<String>,
+        missing: Vec<(u32, u32)>,
+        unchanged: Vec<Manifest>,
+    ) {
         let config = self.config.clone();
         let title = action.job_title(target.as_deref());
         let current = self.current_branch.clone();
         self.start_job(title, move || {
-            match run_op(&config, action, target.as_deref(), &missing) {
+            match run_op(&config, action, target.as_deref(), &missing, &unchanged) {
                 Ok(lines) => Ok(JobDone::lines(lines)),
                 // A conflict is an expected answer to act on, not an error to
                 // stop at — the same treatment a rejected push gets. The repo is
@@ -4706,6 +4738,7 @@ impl StatusApp {
                 carried,
                 missing,
                 force_confirmed,
+                unchanged,
             } => {
                 render_modal(
                     f,
@@ -4717,6 +4750,7 @@ impl StatusApp {
                         carried,
                         missing,
                         force_confirmed: *force_confirmed,
+                        unchanged,
                         rolls: &self.rolls,
                         hotfixes: &self.hotfixes,
                         current_branch: &self.current_branch,
@@ -5304,6 +5338,19 @@ fn run_verify(config: &Config) -> Result<Vec<String>> {
     Ok(lines)
 }
 
+/// What `[m]` promotes: the whole rolling branch with no roll selected, else
+/// the selected roll after its graduated-but-unpromoted dependencies, each its
+/// own step — the same expansion `rf promote --roll` performs.
+fn promote_target(rolls: &[RollInfo], target: Option<&str>) -> Result<ops::PromoteTarget> {
+    Ok(match target {
+        Some(roll) => {
+            let chain = ops::dependency_chain(rolls, roll, ops::ChainKind::Promote, false)?;
+            ops::PromoteTarget::Rolls(chain.into_iter().map(|s| s.branch).collect())
+        }
+        None => ops::PromoteTarget::Rolling,
+    })
+}
+
 /// Drive a workflow operation through `core::ops`, rendering its structured
 /// outcome into printable lines. Never runs dry and never forces a gate —
 /// `ForceOpts.enabled` stays `false` unconditionally, even for a
@@ -5318,11 +5365,16 @@ fn run_verify(config: &Config) -> Result<Vec<String>> {
 /// modal opening and this executing and change what is actually missing —
 /// deleting the one dependency that made graduating safe, say — so a
 /// mismatch refuses rather than silently acting on a plan the user never saw.
+///
+/// `confirmed_unchanged` is what a `Promote`'s second stage accepted. It needs
+/// no such re-check: `ops::promote` only ever waives an unchanged manifest
+/// while another one moves, and judges that itself, step by step.
 fn run_op(
     config: &Config,
     action: Action,
     target: Option<&str>,
     confirmed_missing: &[(u32, u32)],
+    confirmed_unchanged: &[Manifest],
 ) -> Result<Vec<String>> {
     let force = ops::ForceOpts::new(false, None)?;
     let mut lines = Vec::new();
@@ -5400,21 +5452,26 @@ fn run_op(
         }
         Action::Promote => {
             ops::ensure_clean_state(config)?;
-            let promote_target = match target {
-                // Graduated-but-unpromoted dependencies first, each its own
-                // step — the same expansion `rf promote --roll` performs.
-                Some(roll) => {
-                    let rolls = branches::list_rolls(config)?;
-                    let chain =
-                        ops::dependency_chain(&rolls, roll, ops::ChainKind::Promote, false)?;
-                    ops::PromoteTarget::Rolls(chain.into_iter().map(|s| s.branch).collect())
-                }
-                None => ops::PromoteTarget::Rolling,
-            };
+            let rolls = branches::list_rolls(config)?;
+            let promote_target = promote_target(&rolls, target)?;
             // Tagging is on; the version gate hard-fails here rather than
             // prompting, since the TUI has no place to offer a bump — the
-            // error names the `rf promote --bump` fix.
-            let o = ops::promote(config, &promote_target, false, &force, true, None)?;
+            // error names the `rf promote --bump` fix. The one exception is a
+            // manifest the modal's second stage agreed may stay unchanged.
+            let unchanged =
+                ops::UnchangedVersions::new(confirmed_unchanged.to_vec(), "confirmed in the TUI");
+            let o = ops::promote(
+                config,
+                &promote_target,
+                false,
+                &force,
+                true,
+                None,
+                &unchanged,
+            )?;
+            for manifest in confirmed_unchanged {
+                lines.push(format!("note: promoted with {manifest} unchanged"));
+            }
             for step in &o.steps {
                 push_gate_notices(&mut lines, &step.gate_notices);
                 push_gate_notices(&mut lines, &step.host_notices);
@@ -6187,6 +6244,8 @@ struct ConfirmModal<'a> {
     missing: &'a [(u32, u32)],
     /// See [`Mode::Confirm::force_confirmed`].
     force_confirmed: bool,
+    /// See [`Mode::Confirm::unchanged`]. Empty for every action but `Promote`.
+    unchanged: &'a [VersionCheck],
     rolls: &'a [RollInfo],
     /// Counted alongside `rolls` by `[x]` and `[t]`, which reach landed hotfixes.
     hotfixes: &'a [HotfixInfo],
@@ -6227,6 +6286,7 @@ fn render_modal(f: &mut Frame, area: Rect, config: &Config, modal: &ConfirmModal
         carried,
         missing,
         force_confirmed,
+        unchanged,
         rolls,
         hotfixes,
         current_branch,
@@ -6277,6 +6337,27 @@ fn render_modal(f: &mut Frame, area: Rect, config: &Config, modal: &ConfirmModal
         // `target` is the selected roll when `[p]` was pressed on one, and
         // `None` for a whole-branch promotion — the prompt must say which,
         // because the two differ enormously in what they land on stable.
+        // The second stage `unchanged` opens names each manifest and the
+        // version it would keep, since that is what lands on stable untouched.
+        Action::Promote if force_confirmed => {
+            let names = unchanged
+                .iter()
+                .map(|c| {
+                    let manifest = c
+                        .manifest
+                        .as_ref()
+                        .map(|m| m.to_string())
+                        .unwrap_or_default();
+                    let head = c.head.map(|v| v.to_string()).unwrap_or_default();
+                    format!("{manifest} {head}")
+                })
+                .collect::<Vec<_>>()
+                .join(", ");
+            format!(
+                "Promote with {names} unchanged from {}? Its version was not bumped.",
+                config.stable_branch
+            )
+        }
         Action::Promote => match target {
             Some(roll) => match chain_lines(rolls, roll, ops::ChainKind::Promote, false) {
                 Some((n, lines)) => {
@@ -6332,9 +6413,14 @@ fn render_modal(f: &mut Frame, area: Rect, config: &Config, modal: &ConfirmModal
     // only ever advances to the escalated stage above, which then needs its
     // own fresh `[y]` (see invariants.md's deletion-safety rule: a second,
     // separate confirmation is the only thing that sets force).
-    let hint = match (action, missing.is_empty(), force_confirmed) {
-        (Action::Graduate, false, false) => "[y] continue    [n] cancel",
+    let hint = match (
+        action,
+        missing.is_empty() && unchanged.is_empty(),
+        force_confirmed,
+    ) {
+        (Action::Graduate | Action::Promote, false, false) => "[y] continue    [n] cancel",
         (Action::Graduate, false, true) => "[y] force graduate    [n] cancel",
+        (Action::Promote, false, true) => "[y] promote unchanged    [n] cancel",
         _ => "[y] confirm    [n] cancel",
     };
 
@@ -7470,6 +7556,112 @@ mod tests {
             lock.contains("0.0.1-roll1"),
             "lockfile not refreshed: {lock}"
         );
+    }
+
+    /// A site's root `package.json` beside a Rust service in `keeper/`, with
+    /// rolling ahead of main and only the site's version bumped — the shape
+    /// that used to leave `[m]` no way through but `rf promote --force`.
+    fn sandbox_site_with_unbumped_keeper() -> tempfile::TempDir {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let repo = dir.path();
+        let git = |args: &[&str]| {
+            let status = std::process::Command::new("git")
+                .args(args)
+                .current_dir(repo)
+                .status()
+                .expect("run git");
+            assert!(status.success(), "git {args:?} failed");
+        };
+        let site = |version: &str| {
+            std::fs::write(
+                repo.join("package.json"),
+                format!("{{\n  \"name\": \"site\",\n  \"version\": \"{version}\"\n}}\n"),
+            )
+            .expect("write package.json");
+        };
+        git(&["init", "-q", "-b", "main"]);
+        git(&["config", "user.email", "t@t.com"]);
+        git(&["config", "user.name", "tester"]);
+        site("0.0.1");
+        std::fs::create_dir(repo.join("keeper")).expect("mkdir keeper");
+        std::fs::write(
+            repo.join("keeper/Cargo.toml"),
+            "[package]\nname = \"keeper\"\nversion = \"0.1.0\"\nedition = \"2021\"\n",
+        )
+        .expect("write keeper/Cargo.toml");
+        git(&["add", "."]);
+        git(&["commit", "-q", "-m", "site and keeper"]);
+        git(&["checkout", "-q", "-b", "rolling"]);
+        site("0.0.2");
+        git(&["commit", "-q", "-am", "site work, bumped"]);
+        dir
+    }
+
+    #[test]
+    fn promote_offers_to_waive_an_unbumped_manifest_beside_a_bumped_one() {
+        let dir = sandbox_site_with_unbumped_keeper();
+        let mut cfg = config("main", "rolling");
+        cfg.repo_root = dir.path().to_path_buf();
+        let keeper = Manifest::from_path("keeper/Cargo.toml").expect("a manifest path");
+
+        let offered =
+            ops::preview_unchanged_versions(&cfg, &ops::PromoteTarget::Rolling).expect("preview");
+        let offered: Vec<_> = offered.into_iter().filter_map(|c| c.manifest).collect();
+        assert_eq!(offered, vec![keeper.clone()]);
+
+        // Unconfirmed, the gate still refuses — and names keeper.
+        let err = run_op(&cfg, Action::Promote, None, &[], &[]).expect_err("gate must refuse");
+        assert!(err.to_string().contains("keeper/Cargo.toml"), "{err:#}");
+
+        let lines = run_op(&cfg, Action::Promote, None, &[], &[keeper]).expect("promote");
+        assert!(lines.iter().any(|l| l.contains("unchanged")), "{lines:?}");
+        let body = std::process::Command::new("git")
+            .args(["log", "-1", "--format=%B", "main"])
+            .current_dir(dir.path())
+            .output()
+            .expect("git log");
+        let body = String::from_utf8_lossy(&body.stdout);
+        assert!(
+            body.contains("Unchanged-Version:\n  keeper/Cargo.toml 0.1.0"),
+            "{body}"
+        );
+        assert!(
+            body.contains("Unchanged-Version-Reason: confirmed in the TUI"),
+            "{body}"
+        );
+        // The site, which moved, names the release — not the waived keeper.
+        let tags = std::process::Command::new("git")
+            .args(["tag", "--list"])
+            .current_dir(dir.path())
+            .output()
+            .expect("git tag");
+        assert_eq!(String::from_utf8_lossy(&tags.stdout).trim(), "v0.0.2");
+    }
+
+    #[test]
+    fn no_waiver_is_offered_when_no_manifest_moved() {
+        let dir = sandbox_site_with_unbumped_keeper();
+        let run = |args: &[&str]| {
+            assert!(std::process::Command::new("git")
+                .args(args)
+                .current_dir(dir.path())
+                .status()
+                .expect("git")
+                .success());
+        };
+        // Put the site back to main's version, so nothing moves at all.
+        run(&["revert", "--no-edit", "HEAD"]);
+        run(&["commit", "-q", "--allow-empty", "-m", "still ahead of main"]);
+        let mut cfg = config("main", "rolling");
+        cfg.repo_root = dir.path().to_path_buf();
+        let keeper = Manifest::from_path("keeper/Cargo.toml").expect("a manifest path");
+
+        let offered =
+            ops::preview_unchanged_versions(&cfg, &ops::PromoteTarget::Rolling).expect("preview");
+        assert!(offered.is_empty(), "{offered:?}");
+        // A waiver handed in anyway changes nothing: the gate still refuses.
+        let err = run_op(&cfg, Action::Promote, None, &[], &[keeper]).expect_err("must refuse");
+        assert!(err.to_string().contains("unchanged"), "{err:#}");
     }
 
     #[test]
@@ -9558,6 +9750,7 @@ mod tests {
                     carried: &[],
                     missing: &[],
                     force_confirmed: false,
+                    unchanged: &[],
                     rolls: &[],
                     hotfixes: &[],
                     current_branch: "hotfix/1-0720-urgent",
@@ -11090,6 +11283,7 @@ mod tests {
                     carried: &[],
                     missing: &[],
                     force_confirmed: false,
+                    unchanged: &[],
                     rolls: &rolls,
                     hotfixes: &[],
                     current_branch: "roll/9-0102-target",
@@ -11131,6 +11325,7 @@ mod tests {
                     carried: &[],
                     missing: &[],
                     force_confirmed: false,
+                    unchanged: &[],
                     rolls: &[],
                     hotfixes: &[],
                     current_branch: "roll/2-0102-beta",
@@ -11164,6 +11359,7 @@ mod tests {
                     carried: &carried,
                     missing: &[],
                     force_confirmed: false,
+                    unchanged: &[],
                     rolls: &[],
                     hotfixes: &[],
                     current_branch: "rolling",
@@ -11201,6 +11397,7 @@ mod tests {
                     carried: &[],
                     missing: &[],
                     force_confirmed: false,
+                    unchanged: &[],
                     rolls: &rolls,
                     hotfixes: &[],
                     current_branch: "main",
@@ -11223,6 +11420,7 @@ mod tests {
                     carried: &[],
                     missing: &[],
                     force_confirmed: false,
+                    unchanged: &[],
                     rolls: &rolls,
                     hotfixes: &[],
                     current_branch: "main",
@@ -11943,6 +12141,7 @@ mod tests {
             carried: Vec::new(),
             missing: vec![(9, 4)],
             force_confirmed: false,
+            unchanged: Vec::new(),
         }
     }
 
@@ -11990,6 +12189,69 @@ mod tests {
         }
     }
 
+    fn keeper_unchanged() -> VersionCheck {
+        VersionCheck {
+            manifest: Manifest::from_path("keeper/Cargo.toml"),
+            head: Some(v(0, 1, 0)),
+            base: Some(v(0, 1, 0)),
+            status: VersionStatus::Unchanged,
+        }
+    }
+
+    #[test]
+    fn an_ordinary_y_on_an_unchanged_version_only_advances_to_the_second_stage() {
+        let mut app = StatusApp::new(test_config(), "rolling".to_string(), Vec::new(), false);
+        app.mode = Mode::Confirm {
+            action: Action::Promote,
+            target: None,
+            carried: Vec::new(),
+            missing: Vec::new(),
+            force_confirmed: false,
+            unchanged: vec![keeper_unchanged()],
+        };
+
+        app.handle_confirm(KeyCode::Char('y'));
+
+        match &app.mode {
+            Mode::Confirm {
+                force_confirmed, ..
+            } => assert!(*force_confirmed, "the first [y] must flip the stage"),
+            _ => panic!("expected the modal to stay open"),
+        }
+        assert!(app.job.is_none(), "a single [y] must not start a job");
+    }
+
+    #[test]
+    fn the_unchanged_version_modal_names_the_manifest_on_the_second_stage() {
+        let cfg = test_config();
+        let unchanged = [keeper_unchanged()];
+        let modal = |force_confirmed| ConfirmModal {
+            action: Action::Promote,
+            target: None,
+            carried: &[],
+            missing: &[],
+            force_confirmed,
+            unchanged: &unchanged,
+            rolls: &[],
+            hotfixes: &[],
+            current_branch: "rolling",
+        };
+
+        let first = draw(|f, area| render_modal(f, area, &cfg, &modal(false)));
+        assert!(
+            first.contains("Promote all of rolling into main?"),
+            "{first}"
+        );
+        assert!(first.contains("[y] continue"), "{first}");
+
+        let second = draw(|f, area| render_modal(f, area, &cfg, &modal(true)));
+        assert!(
+            second.contains("Promote with keeper/Cargo.toml 0.1.0 unchanged from main?"),
+            "{second}"
+        );
+        assert!(second.contains("[y] promote unchanged"), "{second}");
+    }
+
     #[test]
     fn the_missing_dependency_modal_escalates_its_prompt_and_hint_on_the_second_stage() {
         let cfg = test_config();
@@ -12006,6 +12268,7 @@ mod tests {
                     carried: &[],
                     missing: &[(9, 4)],
                     force_confirmed: false,
+                    unchanged: &[],
                     rolls: &rolls,
                     hotfixes: &[],
                     current_branch: "roll/9-0101-x",
@@ -12027,6 +12290,7 @@ mod tests {
                     carried: &[],
                     missing: &[(9, 4)],
                     force_confirmed: true,
+                    unchanged: &[],
                     rolls: &rolls,
                     hotfixes: &[],
                     current_branch: "roll/9-0101-x",

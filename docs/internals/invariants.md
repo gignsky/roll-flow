@@ -350,6 +350,19 @@ long list — that keeps two rolls adding rules in different areas from collidin
   `rf promote`/`rf verify` hits this directly (`VersionStatus::DevVersion`); a
   *final* `rf promote` avoids it by finalizing (stripping the marker) before
   the gate runs at all — see "Finalizing" below.
+- **An unchanged manifest can be waived only beside one that moved.** A repo
+  versioned through more than one manifest may promote one of them unchanged
+  after an explicit y/N (the CLI prompt, or `[m]`'s second stage), carried
+  into `ops::promote` as an `ops::UnchangedVersions` and recorded in its own
+  `Unchanged-Version:` trailer. The CLI prompt runs only at a terminal, and
+  `--yes` never answers it. It waives `Unchanged` and nothing else. It holds
+  only while another manifest in the same step is `Ok` or being bumped
+  (`ops::waivable_unchanged`, re-judged per step inside `run_promote_step`,
+  never just trusted from the prompt). So a promotion that moves no version at
+  all still fails the gate, and a single-manifest repo, roll-flow's own
+  included, behaves exactly as the CI workflow does. It never touches
+  `ForceOpts`. A waived manifest neither names the release tag nor sets the
+  step's verdict.
 - The dev marker is a `Marker` — a roll *number*, rolling's `-dev`, or none —
   not a free-form pre-release string. It keeps `Semver` `Copy`, and any other
   suffix still fails to parse rather than being silently dropped — dropping one
