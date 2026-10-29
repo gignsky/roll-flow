@@ -869,20 +869,193 @@ fn npm_lockfile_markers_from_two_rolls_merge_through_the_driver() {
     assert_eq!(sb.package_lock_version_at("rolling"), "0.0.2-dev");
 }
 
-#[test]
-fn a_repo_with_both_manifests_versions_through_cargo_by_default() {
+/// A Cargo project that also carries a versioned `package.json` (Tauri-style
+/// apps, a Rust backend released together with its JS front end).
+fn dual() -> Sandbox {
     let sb = Sandbox::cargo();
     sb.write_package_version("0.0.1");
     sb.git(&["add", "package.json"]);
     sb.git(&["commit", "-m", "add package.json too"]);
     sb.init();
+    sb
+}
+
+#[test]
+fn a_repo_with_both_manifests_marks_both() {
+    let sb = dual();
 
     let out = sb.create_roll("both", "0611");
     assert!(out.success, "create failed: {}", out.combined());
-    // Cargo wins by default: the roll marker lands in Cargo.toml, and
-    // package.json is untouched.
+    assert_eq!(sb.cargo_version_at("HEAD"), "0.0.1-roll1");
+    assert_eq!(sb.package_version_at("HEAD"), "0.0.1-roll1");
+}
+
+#[test]
+fn pinning_version_manifest_keeps_the_other_manifest_out_of_it() {
+    let sb = dual();
+    sb.set_config_string("version_manifest", "cargo");
+
+    let out = sb.create_roll("pinned", "0611");
+    assert!(out.success, "create failed: {}", out.combined());
     assert_eq!(sb.cargo_version_at("HEAD"), "0.0.1-roll1");
     assert_eq!(sb.package_version_at("HEAD"), "0.0.1");
+}
+
+#[test]
+fn both_manifests_are_graduated_bumped_and_promoted_together() {
+    let sb = dual();
+    graduate_one(&sb, "feature", "0611");
+    assert_eq!(sb.cargo_version_at("rolling"), "0.0.1-dev");
+    assert_eq!(sb.package_version_at("rolling"), "0.0.1-dev");
+
+    let out = sb.rf(&["promote", "--bump", "patch", "--yes"]);
+    assert!(out.success, "promote failed: {}", out.combined());
+
+    assert_eq!(sb.cargo_version_at("main"), "0.0.2");
+    assert_eq!(sb.package_version_at("main"), "0.0.2");
+    assert!(sb.tag_exists("v0.0.2"), "tags: {:?}", sb.tags());
+}
+
+/// A site versioned through a root `package.json`, with a Rust service in
+/// `keeper/` that carries its own, unrelated version and its own lockfile —
+/// the shape of a repo whose crate is not at the root.
+fn nested() -> Sandbox {
+    let sb = Sandbox::npm();
+    sb.write(
+        "keeper/Cargo.toml",
+        "[package]\nname = \"keeper\"\nversion = \"0.1.0\"\nedition = \"2021\"\n",
+    );
+    sb.write(
+        "keeper/Cargo.lock",
+        "version = 4\n\n[[package]]\nname = \"keeper\"\nversion = \"0.1.0\"\n",
+    );
+    // A tooling-only manifest with no version: never versioned.
+    sb.write("scripts/tool/package.json", "{\n  \"private\": true\n}\n");
+    sb.git(&["add", "."]);
+    sb.git(&["commit", "-m", "add keeper"]);
+    sb.init();
+    sb
+}
+
+/// The version `keeper/Cargo.toml` (or, with `lock`, `keeper/Cargo.lock`'s own
+/// entry) carries at `refspec`.
+fn keeper_version_at(sb: &Sandbox, refspec: &str, lock: bool) -> String {
+    let file = if lock { "Cargo.lock" } else { "Cargo.toml" };
+    let text = sb.git(&["show", &format!("{refspec}:keeper/{file}")]);
+    text.lines()
+        .map(str::trim)
+        .find(|l| l.starts_with("version = \""))
+        .and_then(|l| l.split('"').nth(1))
+        .unwrap_or_else(|| panic!("no version in keeper/{file} at {refspec}: {text}"))
+        .to_string()
+}
+
+#[test]
+fn a_crate_in_a_subdirectory_is_versioned_beside_the_root_manifest() {
+    let sb = nested();
+
+    let out = sb.create_roll("both", "0611");
+    assert!(out.success, "create failed: {}", out.combined());
+    assert_eq!(sb.package_version_at("HEAD"), "0.0.1-roll1");
+    assert_eq!(keeper_version_at(&sb, "HEAD", false), "0.1.0-roll1");
+    assert_eq!(keeper_version_at(&sb, "HEAD", true), "0.1.0-roll1");
+    assert!(
+        !sb.git(&["show", "HEAD:scripts/tool/package.json"])
+            .contains("version"),
+        "a manifest with no version is left alone"
+    );
+}
+
+#[test]
+fn a_nested_crate_is_graduated_bumped_and_promoted_but_the_root_names_the_tag() {
+    let sb = nested();
+    graduate_one(&sb, "feature", "0611");
+    assert_eq!(sb.package_version_at("rolling"), "0.0.1-dev");
+    assert_eq!(keeper_version_at(&sb, "rolling", false), "0.1.0-dev");
+
+    let out = sb.rf(&["promote", "--bump", "patch", "--yes"]);
+    assert!(out.success, "promote failed: {}", out.combined());
+
+    assert_eq!(sb.package_version_at("main"), "0.0.2");
+    assert_eq!(keeper_version_at(&sb, "main", false), "0.1.1");
+    assert_eq!(keeper_version_at(&sb, "main", true), "0.1.1");
+    // The root manifest outranks the nested crate, Cargo or not.
+    assert!(sb.tag_exists("v0.0.2"), "tags: {:?}", sb.tags());
+    assert!(!sb.tag_exists("v0.1.1"), "tags: {:?}", sb.tags());
+}
+
+#[test]
+fn the_tables_and_json_show_every_manifests_version() {
+    let sb = nested();
+    let out = sb.create_roll("both", "0611");
+    assert!(out.success, "create failed: {}", out.combined());
+
+    let list = sb.rf(&["list", "--no-tui"]);
+    assert!(list.success, "list failed: {}", list.combined());
+    let text = list.combined();
+    assert!(
+        text.contains("package.json") && text.contains("keeper"),
+        "{text}"
+    );
+    let row = text.lines().find(|l| l.contains("roll/1-")).unwrap();
+    assert!(
+        row.contains("0.0.1-roll1") && row.contains("0.1.0-roll1"),
+        "{row}"
+    );
+
+    let json = sb.rf(&["list", "--json"]);
+    assert!(json.success, "json failed: {}", json.combined());
+    let text = json.combined();
+    assert!(text.contains("\"version\": \"0.0.1-roll1\""), "{text}");
+    assert!(
+        text.contains("\"keeper/Cargo.toml\": \"0.1.0-roll1\""),
+        "{text}"
+    );
+}
+
+#[test]
+fn listing_version_manifest_paths_keeps_a_nested_crate_out() {
+    let sb = nested();
+    sb.set_config_raw("version_manifest", "[\"package.json\"]");
+
+    let out = sb.create_roll("listed", "0611");
+    assert!(out.success, "create failed: {}", out.combined());
+    assert_eq!(sb.package_version_at("HEAD"), "0.0.1-roll1");
+    assert_eq!(keeper_version_at(&sb, "HEAD", false), "0.1.0");
+}
+
+#[test]
+fn a_version_manifest_path_that_is_not_a_manifest_is_refused() {
+    let sb = nested();
+    sb.set_config_raw("version_manifest", "[\"keeper/Cargo.lock\"]");
+
+    let out = sb.rf(&["status", "--json"]);
+    assert!(!out.success, "a bad path must not load: {}", out.combined());
+    assert!(
+        out.combined().contains("keeper/Cargo.lock"),
+        "{}",
+        out.combined()
+    );
+}
+
+#[test]
+fn promote_names_the_manifest_that_still_owes_a_bump() {
+    let sb = dual();
+    graduate_one(&sb, "feature", "0611");
+
+    // Rolling already moved Cargo.toml past main by hand; package.json has not.
+    sb.commit_cargo_version("0.0.2");
+    let out = sb.rf(&["promote", "--final"]);
+    assert!(
+        !out.success,
+        "promote should demand a bump: {}",
+        out.combined()
+    );
+    assert!(
+        out.combined().contains("package.json"),
+        "the failure should name the manifest that owes the bump: {}",
+        out.combined()
+    );
 }
 
 #[test]

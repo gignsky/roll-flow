@@ -120,6 +120,26 @@ long list — that keeps two rolls adding rules in different areas from collidin
   (`StatusApp::waits_on_head`) while a HEAD-moving job is running or queued
   (`start_head_job`: switch, create). Work that only needs HEAD when it runs
   should read it inside the job instead, as `git switch` does.
+- A push is not such a key: `[P]` and `PP` queue behind a pending switch. They
+  resolve their branch(es) at keypress time and `push_job` pushes by explicit
+  refspec (`refs/heads/<branch>:…`), so neither the request nor the job reads
+  HEAD. Any new push path must keep naming its branch up front; one that reads
+  HEAD when it runs must go back behind `waits_on_head`.
+- `[v]` is the other exception, by the opposite route: the verify job names no
+  branch and reads HEAD only when it runs (`run_verify`), so a verify queued
+  behind a switch judges the branch that switch leaves checked out. On a
+  verifiable row `[v]` queues that switch itself (`execute_switch`, the same
+  job `space` queues) immediately ahead of the verify — and does so even for
+  the row that is checked out now whenever HEAD is about to move, since "is
+  checked out" read at keypress is exactly what goes stale. Only on a row it
+  cannot verify does it rely on someone else's pending switch, and then its
+  title says what it waits on. Anything added to the verify job that captures
+  the branch when the key is pressed breaks this and must go back behind
+  `waits_on_head`.
+- `[V]` queues too: `ops::verify_many` restores HEAD to the branch checked out
+  when the pass *starts*, never one captured at keypress. Its up-front
+  clean-tree refusal applies only when nothing is pending; behind other
+  commands the pass's own check is the one that counts.
 - `gg` is refused only while a job is *running*. A held queue is exactly when
   lazygit is needed.
 

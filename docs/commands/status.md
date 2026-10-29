@@ -8,11 +8,16 @@ Shows current branch, tier, cleanliness, pending rolls, and promotion readiness.
 Runs as a full-screen TUI by default; `--no-tui` prints a plain table instead and
 `--json` emits machine-readable output.
 
-In a repo that has a `Cargo.toml`, the table carries a `version` column: the
-`[package]` version as it stands at each branch's tip — its own tip for a branch
-that exists locally, `origin/<branch>` for one that only exists on the remote.
-Repos without a manifest, which is every dotfiles repo, get no column at all,
-the same rule the header version follows. There is no flag for it.
+In a repo that versions through a manifest (see
+[`version_manifest`](../config.md)), the table carries a `version` column: the
+version as it stands at each branch's tip — its own tip for a branch that
+exists locally, `origin/<branch>` for one that only exists on the remote. A repo
+versioned through more than one manifest gets **one column per manifest**,
+headed by which file it is — its file name at the root, its directory when
+nested — so a site's `package.json` and a `keeper/Cargo.toml` read side by side
+(`package.json  keeper`), and a branch that lacks one shows a dash under it.
+Repos without a manifest, which is every dotfiles repo, get no column at all.
+There is no flag for it.
 
 The cell shows the full version, dev marker included: a roll carrying one reads
 `0.2.4-roll9`, not `0.2.4`. The `#` column says which roll a row is, but not
@@ -175,7 +180,7 @@ The full list:
 | `q` | quit |
 | `p` / `P` / `f` | pull / push / fetch the selected branch |
 | `PP` | [push every branch that needs it](#pp--push-everything-that-needs-it) |
-| `gg` | lazygit |
+| `gg` / `bb` | [lazygit / bacon](#gg-and-bb--hand-over-the-terminal) |
 | `c` / `i` | create a roll / integrate one into the checked-out roll |
 | `V` | verify all rolls, or a set of them |
 | `G` / `m` / `u` | graduate / promote / update from stable |
@@ -234,17 +239,53 @@ forced push *ahead* of the queue and releases it, `n` leaves it held.
 
 Two guards keep a chain from doing something you did not ask for:
 
-- Keys that act on the **checked-out branch** — `[i]`, `[I]`, `[b]`, `[v]`,
-  `[p]`, `[P]`, `PP` — are refused while a queued or running `space` switch or
+- Keys that act on the **checked-out branch** — `[i]`, `[I]`, `[b]`,
+  `[p]` — are refused while a queued or running `space` switch or
   `[c]` create is pending, because they capture the branch when pressed and
   would act on a different one by the time their turn came. Press them again
   once the switch has run.
+- `[v]` is **not** refused: it reads the checked-out branch when it *runs*, so
+  it chains. On a roll row it queues its own switch to that roll first (see
+  [Verifying](#verifying)), and while a switch is pending it switches back even
+  to the row that is checked out now, since that is about to change. On a row
+  it cannot verify, it judges whatever the pending switch leaves checked out;
+  its panel title then says what it waits on, and a branch that is not
+  promotable fails inside the job like any other verify error.
+- `[V]` is **not** refused either: the pass restores HEAD to whatever was
+  checked out when it *starts*, so it queues behind running jobs, a held queue
+  and pending switches alike.
+- `[P]` and `PP` are **not** refused: a push names its branch, so it is queued
+  like any other command. The branch is fixed when you press the key (the
+  selected row, or the plan `PP` showed), never read from HEAD when the push
+  finally runs. Push `roll/45`, queue a `space` switch to `roll/44`, then `[P]`
+  again, and the second push goes to `roll/44`. A rejected push still holds the
+  queue and asks before forcing, exactly as above.
 - `q` with commands queued only warns the first time; a second `q` quits and
   drops them.
 
-`gg` is the exception: lazygit is full-screen and owns the terminal, so `rf`
-suspends, hands it over, and redraws when lazygit exits. Set `lazygit_command` in
-`.roll-flow.toml` to point at something other than a bare `lazygit` on `PATH`.
+## `gg` and `bb` — hand over the terminal
+
+`gg` and `bb` are the exceptions to the output panel: lazygit and bacon draw
+their own full-screen UI and own the terminal outright, so there is nothing to
+stream. `rf` suspends, hands the terminal over, and redraws when the tool
+exits — then reloads the list, because anything at all may have happened
+inside. Only one of the two is a git tool, which is why they are their own
+`tools` group in `?` rather than sitting under `sync` or `roll`.
+
+`bb` is a chord on the `b` that bumps the version, like `pp` on `p`: a lone `b`
+still bumps, but only after a short window (400ms) with no second `b`. Bacon runs
+in the directory of the shallowest `Cargo.toml` in the working tree — the repo
+root when it has one, else the nearest crate below it — and the key says so in
+the status line when there is none.
+
+The nix package wraps `rf` with bacon and lazygit on a *suffixed* `PATH`, so `bb` and `gg` work
+with nothing else installed while a copy you already have still wins.
+
+Set `lazygit_command` or `bacon_command` in `.roll-flow.toml` to point at
+something other than a bare `lazygit`/`bacon` on `PATH`. lazygit is launched as
+`<command> -p <repo_root>`; bacon is launched with no arguments in that Cargo.toml directory,
+because bacon's positional argument is a job name (`check`, `clippy`, `test`)
+and a path passed there would be read as a job that does not exist.
 
 ## Pulling and pushing
 
@@ -300,19 +341,29 @@ started.
 
 ## Verifying
 
-`[v]` runs [`verify`](verify.md) on the **checked-out** branch — not the row
-under the cursor, because the gates run in the working tree, so the branch they
-judge is whichever one is checked out. The route comes from that branch's tier
-and is named in the panel title before the gates start:
+`[v]` runs [`verify`](verify.md) on the **selected** roll. The gates run in the
+working tree, so the branch they judge has to be checked out: on a roll, rolling
+or hotfix row that is not, `[v]` queues a `space` switch to it first and then the
+verify — and the switch stays, leaving that branch checked out. On the row that
+is already checked out it just verifies. Anywhere else (the stable row) it
+verifies whatever is checked out. The route comes from the branch's tier and is
+named in the panel title before the gates start:
 
-| checked out | `[v]` checks |
+| verified branch | `[v]` checks |
 |---|---|
 | a `roll/*` branch | `roll/N-… → rolling` |
 | the rolling branch | `rolling → main` |
+| a hotfix | `hotfix/N-… → main` |
 | anything else | nothing — it says to check out a roll or rolling first |
 
-It is the one action key with no confirmation modal, because it is the one that
-changes nothing: the modal is for the ops that write to the repo. It reports the
+Because the switch and the verify are two queued commands, a chain across rolls
+is just `[v]` on each row: `[v]` on roll 44, `[v]` on roll 45, and the queue runs
+switch, verify, switch, verify. A switch that fails (a dirty tree git will not
+carry) holds the queue before its verify runs, like any other failure.
+
+It is the one action key with no confirmation modal, because the verify itself
+changes nothing — the modal is for the ops that write to the repo; the switch
+`[v]` may queue first is the same one `space` makes. It reports the
 same checks as `rf verify`, in the same words — divergence note, version
 comparison, gate notices, per-host results, verdict.
 
@@ -334,7 +385,9 @@ digit runs the pass. It is `rf verify --all --state <set>` on the same core
 routine, so the rules are identical, and the one that matters is that the pass
 **checks out each roll in turn** and always returns to the branch you started
 on, whatever any roll's gates said. A dirty tree is refused in the status bar
-before the picker even opens. One job, one panel: each roll's report under its
+before the picker even opens when nothing else is pending; queued behind other
+commands, the pass checks again when it starts. It queues like any other
+command rather than waiting for the panel to go idle. One job, one panel: each roll's report under its
 own header, then `N passed, M failed, K skipped`, and the panel marks failed if
 any did — see [`verify`](verify.md#verifying-many-at-once).
 
@@ -399,7 +452,32 @@ magnitude apart by the shift key alone is a mistake waiting to happen; the digit
 also carry the ordering. Every row shows the version it would produce, so the
 choice needs no semver arithmetic in your head.
 
-It writes `Cargo.toml`, refreshes `Cargo.lock`, and commits both as
+### More than one manifest
+
+A repo versioned through both `Cargo.toml` and `package.json` (see
+[`version_manifest`](../config.md)) gets a **drill-down**: `[b]` first asks
+*which* version to raise, then by how much.
+
+```text
+┌ bump version ─────────────────────────────────────────────────┐
+│Bump which version?  (on rolling)                              │
+│                                                               │
+│[1] Cargo.toml 0.2.0-dev  — needs a bump                       │
+│[2] package.json 1.4.0  — already ahead of the stable branch   │
+│[a] all of them                                                │
+│                                                               │
+│[n] cancel                                                     │
+└───────────────────────────────────────────────────────────────┘
+```
+
+Each row says whether that manifest still owes a bump past the stable branch,
+which is what a promotion needs — it is refused until every manifest has one.
+`[1]`/`[2]` pick one, `[a]` raises them all by the same level, and the level
+step then lists each chosen manifest's resulting version. One commit carries
+every file it changed.
+
+For one manifest it writes `Cargo.toml` (or `package.json`), refreshes the
+lockfile, and commits both as
 `chore(release): bump version to <X> for <branch>` — identical to what
 `rf promote --bump` does, and the reason a clean working tree is required: the
 commit stages its two files and then commits the index, so anything else staged

@@ -11,7 +11,7 @@ use clap::Parser;
 use serde::Serialize;
 
 use cli::{Cli, Cmd};
-use core::version::{self, BumpLevel, VersionCheck, VersionStatus};
+use core::version::{self, BumpLevel, Manifest, VersionCheck, VersionStatus};
 use core::{branches, config::Config, git, ops, rebuild};
 
 fn main() -> Result<()> {
@@ -208,11 +208,15 @@ fn cmd_init(
     // `ops::ensure_version_merge_driver`), so a repo whose config is already
     // up to date on a fresh clone still needs this wired up here.
     if ops::ensure_version_merge_driver(&overridden)? {
-        if let Some(kind) = overridden.manifest_kind() {
+        let files: Vec<String> = overridden
+            .manifests()
+            .iter()
+            .flat_map(|m| m.paths())
+            .collect();
+        if !files.is_empty() {
             println!(
-                "Configured the version merge driver for {} and {}",
-                kind.manifest(),
-                kind.lockfile()
+                "Configured the version merge driver for {}",
+                files.join(", ")
             );
         }
     }
@@ -414,8 +418,9 @@ fn cmd_create(slug: &str, date: Option<String>, dry_run: bool, no_dev_version: b
     // a dry run must not leave one behind. A repo with no `Cargo.toml` reports
     // `None` and nothing is said.
     if !dry_run && config.dev_versions && !no_dev_version {
-        if let Some(dev) = ops::apply_dev_version(&config, outcome.number)? {
-            println!("version marked {dev}");
+        let marked = ops::apply_dev_version(&config, outcome.number)?;
+        if !marked.is_empty() {
+            println!("version marked {}", ops::describe_versions(&marked));
         }
     }
     Ok(())
@@ -495,8 +500,9 @@ fn cmd_verify(dry_run: bool, bump: Option<BumpLevel>, yes: bool) -> Result<()> {
     // so it has to land before the `--locked` gates run. A dry run leaves it.
     let current = git::current_branch(&config.repo_root)?;
     if !dry_run {
-        if let Some(dev) = ops::apply_dev_version_for_branch(&config, &current)? {
-            println!("version marked {dev}");
+        let marked = ops::apply_dev_version_for_branch(&config, &current)?;
+        if !marked.is_empty() {
+            println!("version marked {}", ops::describe_versions(&marked));
         }
     }
 
@@ -539,7 +545,7 @@ fn cmd_verify(dry_run: bool, bump: Option<BumpLevel>, yes: bool) -> Result<()> {
             outcome.source, outcome.target
         );
     }
-    render_version_check(&outcome.version, &outcome.source, &outcome.target);
+    render_version_checks(&outcome.versions, &outcome.source, &outcome.target);
     render_gate_notices(&outcome.gate_notices);
     render_gate_notices(&outcome.host_notices);
     render_host_results(&outcome.host_results);
@@ -638,7 +644,7 @@ fn cmd_verify_all(set: branches::VerifySet) -> Result<()> {
     let mut skipped = 0;
     for result in &results {
         println!("\n── {} ──", result.branch);
-        if let Some(dev) = result.marked {
+        if let Some(dev) = &result.marked {
             println!("version marked {dev}");
         }
         if let Some(outcome) = &result.outcome {
@@ -654,7 +660,7 @@ fn cmd_verify_all(set: branches::VerifySet) -> Result<()> {
                     outcome.source, outcome.target
                 );
             }
-            render_version_check(&outcome.version, &outcome.source, &outcome.target);
+            render_version_checks(&outcome.versions, &outcome.source, &outcome.target);
             render_gate_notices(&outcome.gate_notices);
             render_gate_notices(&outcome.host_notices);
             render_host_results(&outcome.host_results);
@@ -742,25 +748,52 @@ fn resolve_version_gate(
     // the finalized value alone already satisfies the gate, or immediately
     // before the bump below, so a promotion that ultimately fails (no bump
     // resolved) doesn't leave rolling finalized with nothing to show for it.
-    let forced_kind = config.forced_manifest();
-    let needs_finalize = config.dev_versions
-        && version::read_version(&config.repo_root, forced_kind)?.is_some_and(|v| v.has_marker());
-    let check = if !config.version_gate {
-        VersionCheck::not_applicable()
+    let manifests = config.manifests();
+    let mut needs_finalize = false;
+    if config.dev_versions {
+        for manifest in &manifests {
+            if version::read_version(&config.repo_root, manifest)?.is_some_and(|v| v.has_marker()) {
+                needs_finalize = true;
+            }
+        }
+    }
+    // One check per manifest the repo versions through: a repo carrying more
+    // than one has to clear the gate in each.
+    let checks: Vec<VersionCheck> = if !config.version_gate {
+        Vec::new()
     } else if config.dev_versions {
-        let finalized_head =
-            version::read_version(&config.repo_root, forced_kind)?.map(|v| v.release());
-        version::check_against(&config.repo_root, finalized_head, &target_ref, forced_kind)?
+        let mut checks = Vec::new();
+        for manifest in &manifests {
+            let finalized_head =
+                version::read_version(&config.repo_root, manifest)?.map(|v| v.release());
+            let check = version::check_against(
+                &config.repo_root,
+                finalized_head,
+                &target_ref,
+                Some(manifest),
+            )?;
+            if check.status != VersionStatus::NotApplicable {
+                checks.push(check);
+            }
+        }
+        checks
     } else {
-        ops::version_check(config, &source, &target_ref)?
+        ops::version_checks(config, &source, &target_ref)?
     };
+    let check = VersionCheck::worst(&checks);
 
     let finalize_now = |dry_run: bool| -> Result<()> {
         if !needs_finalize || dry_run {
             return Ok(());
         }
-        if let Some((from, to)) = ops::finalize_rolling(config)? {
-            println!("Finalized {from} -> {to} (chore(release) commit on '{source}')");
+        let finalized = ops::finalize_rolling(config)?;
+        if !finalized.is_empty() {
+            let (from, to) = split_changes(&finalized);
+            println!(
+                "Finalized {} -> {} (chore(release) commit on '{source}')",
+                ops::describe_versions(&from),
+                ops::describe_versions(&to)
+            );
         }
         Ok(())
     };
@@ -772,15 +805,30 @@ fn resolve_version_gate(
 
     // A version *below* the target is never fixable by bumping one level, and
     // silently jumping it would hide a bad merge. Always a hard error.
-    if check.status == VersionStatus::Lower {
-        return Err(ops::version_gate_error(&check, &source, &target));
+    if let Some(lower) = checks.iter().find(|c| c.status == VersionStatus::Lower) {
+        return Err(ops::version_gate_error(lower, &source, &target));
     }
 
-    let head = check
-        .head
-        .map(|v| v.to_string())
-        .unwrap_or_else(|| "<unreadable>".to_string());
-    println!("Version: {head} on '{source}' is unchanged from '{target}'; a bump is required");
+    // The manifests that actually owe a bump: unchanged from the target. A
+    // manifest already ahead of it needs nothing, whatever its neighbour does.
+    let owing: Vec<Manifest> = checks
+        .iter()
+        .filter(|c| c.status == VersionStatus::Unchanged)
+        .filter_map(|c| c.manifest.clone())
+        .collect();
+    for c in checks.iter().filter(|c| !c.is_satisfied()) {
+        let head = c
+            .head
+            .map(|v| v.to_string())
+            .unwrap_or_else(|| "<unreadable>".to_string());
+        let file = match (checks.len() > 1, &c.manifest) {
+            (true, Some(manifest)) => format!(" ({manifest})"),
+            _ => String::new(),
+        };
+        println!(
+            "Version{file}: {head} on '{source}' is unchanged from '{target}'; a bump is required"
+        );
+    }
 
     if dry_run {
         if needs_finalize {
@@ -799,10 +847,22 @@ fn resolve_version_gate(
         );
     }
 
+    // Which manifests to bump: all that owe one, unless the user is at a
+    // terminal with more than one to choose from — then they pick.
+    let mut chosen = owing.clone();
     let level = match bump {
         Some(level) => Some(level),
         None if yes => Some(BumpLevel::Patch),
-        None if std::io::stdin().is_terminal() => prompt_bump_level()?,
+        None if std::io::stdin().is_terminal() => {
+            if owing.len() > 1 {
+                chosen = prompt_bump_manifests(&owing)?;
+            }
+            if chosen.is_empty() {
+                None
+            } else {
+                prompt_bump_level()?
+            }
+        }
         None => {
             if forced {
                 None
@@ -821,9 +881,52 @@ fn resolve_version_gate(
     };
 
     finalize_now(false)?;
-    let (from, to) = ops::apply_version_bump(config, level, &source)?;
-    println!("Bumped version {from} -> {to} (chore(release) commit on '{current}')");
+    let bumped = ops::apply_version_bump(config, level, &source, &chosen)?;
+    let (from, to) = split_changes(&bumped);
+    println!(
+        "Bumped version {} -> {} (chore(release) commit on '{current}')",
+        ops::describe_versions(&from),
+        ops::describe_versions(&to)
+    );
     Ok(())
+}
+
+/// A set of `(manifest, from, to)` version changes as its two sides, ready
+/// for [`ops::describe_versions`].
+type VersionSide = Vec<(Manifest, version::Semver)>;
+pub(crate) fn split_changes(
+    changes: &[(Manifest, version::Semver, version::Semver)],
+) -> (VersionSide, VersionSide) {
+    changes
+        .iter()
+        .map(|(m, from, to)| ((m.clone(), *from), (m.clone(), *to)))
+        .unzip()
+}
+
+/// Ask which manifests to bump when more than one owes a bump. An empty answer
+/// is "all"; `n` declines every one.
+fn prompt_bump_manifests(owing: &[Manifest]) -> Result<Vec<Manifest>> {
+    use std::io::Write;
+    println!("These manifests are unchanged from the target:");
+    for (i, manifest) in owing.iter().enumerate() {
+        println!("  [{}] {manifest}", i + 1);
+    }
+    print!("Bump which? [a]ll / number / [n]one: ");
+    std::io::stdout().flush()?;
+    let mut line = String::new();
+    std::io::stdin().read_line(&mut line)?;
+    Ok(match line.trim() {
+        "" | "a" | "all" => owing.to_vec(),
+        "n" | "none" => Vec::new(),
+        n => match n
+            .parse::<usize>()
+            .ok()
+            .and_then(|i| owing.get(i.wrapping_sub(1)))
+        {
+            Some(manifest) => vec![manifest.clone()],
+            None => Vec::new(),
+        },
+    })
 }
 
 /// Ask which field to raise. `None` means the user declined.
@@ -845,7 +948,15 @@ fn prompt_bump_level() -> Result<Option<BumpLevel>> {
 
 /// Render the version comparison line. Silent when the repo does not version
 /// through `Cargo.toml`, so unaffected repos see no new output.
-fn render_version_check(check: &VersionCheck, source: &str, target: &str) {
+fn render_version_checks(checks: &[VersionCheck], source: &str, target: &str) {
+    for check in checks {
+        render_version_check(check, source, target, checks.len() > 1);
+    }
+}
+
+/// `named` adds the manifest's file name, for a repo versioned through more
+/// than one — a single-manifest repo's output is unchanged.
+fn render_version_check(check: &VersionCheck, source: &str, target: &str, named: bool) {
     if check.status == VersionStatus::NotApplicable {
         return;
     }
@@ -865,7 +976,11 @@ fn render_version_check(check: &VersionCheck, source: &str, target: &str) {
         VersionStatus::DevVersion => "DEV",
         VersionStatus::NotApplicable => return,
     };
-    println!("Version: {head} on '{source}' (base '{target}' {base}) {verdict}");
+    let file = match (named, &check.manifest) {
+        (true, Some(manifest)) => format!(" ({manifest})"),
+        _ => String::new(),
+    };
+    println!("Version{file}: {head} on '{source}' (base '{target}' {base}) {verdict}");
 }
 
 /// Offer to push a freshly created release tag.
@@ -1398,7 +1513,7 @@ fn confirm_final_promotion(
     finalize: bool,
     yes: bool,
 ) -> Result<bool> {
-    let has_version = version::read_version(&config.repo_root, config.forced_manifest())?.is_some();
+    let has_version = config.version().is_some();
     if dry_run || !config.dev_versions || !has_version || finalize {
         return Ok(true);
     }
@@ -1525,7 +1640,7 @@ fn offer_update(config: &Config, yes: bool) -> Result<()> {
 /// prints exactly what it always did for that case.
 fn print_promote(outcome: &ops::PromoteOutcome) {
     for step in &outcome.steps {
-        render_version_check(&step.version, &step.source, &outcome.stable);
+        render_version_checks(&step.versions, &step.source, &outcome.stable);
         render_gate_notices(&step.gate_notices);
         render_gate_notices(&step.host_notices);
         render_host_results(&step.host_results);
@@ -2091,7 +2206,8 @@ fn cmd_list_text(no_tui: bool, deps: bool) -> Result<()> {
 
     let (dep_w, dependant_w) = dep_column_widths(&rolls);
     // Empty in a repo with no `Cargo.toml`, which drops the column entirely.
-    let (versions, ver_w) = version_column(&config, &rolls);
+    let versions = version_column(&config, &rolls);
+    let ver_w = versions.width;
     // Placed in the left gutter, right after the current-branch chevron,
     // rather than at the far right — it's a per-row marker, not a detail
     // like `version`/`deps`. Padded like any other non-last column, so the
@@ -2126,9 +2242,9 @@ fn cmd_list_text(no_tui: bool, deps: bool) -> Result<()> {
         ver_hdr = if versions.is_empty() {
             String::new()
         } else if deps {
-            format!("  {VERSION_HDR:<ver_w$}")
+            format!("  {:<ver_w$}", versions.header)
         } else {
-            format!("  {VERSION_HDR}")
+            format!("  {}", versions.header)
         },
         deps_hdr = if deps {
             format!("  {DEPS_HDR:<dep_w$}  {DEPENDANTS_HDR}")
@@ -2170,10 +2286,7 @@ fn cmd_list_text(no_tui: bool, deps: bool) -> Result<()> {
         let ver_col = if versions.is_empty() {
             String::new()
         } else {
-            let v = versions
-                .get(&roll.branch)
-                .map(String::as_str)
-                .unwrap_or("—");
+            let v = versions.cell(&roll.branch);
             if deps {
                 format!("  {v:<ver_w$}")
             } else {
@@ -2247,45 +2360,108 @@ pub(crate) fn print_hotfix_rows(
     }
 }
 
-/// Header for the per-branch crate version, shared by both plain tables.
-pub(crate) const VERSION_HDR: &str = "version";
-
-/// The version string to print per roll, keyed by branch, plus the column width.
+/// The version column of the plain tables: one sub-column per manifest the
+/// repo versions through, laid out as a single padded column so both tables
+/// can keep treating it as one.
 ///
-/// An empty map means "no column": either the repo has no `Cargo.toml` at all —
-/// every dotfiles repo — or nothing readable was found, and in both cases the
-/// table is better off without a column of dashes. The same rule the TUI table
-/// and the header version follow.
+/// An empty `header` means "no column": either the repo has no manifest at
+/// all — every dotfiles repo — or nothing readable was found, and in both
+/// cases the table is better off without a column of dashes. The same rule
+/// the TUI table follows.
+pub(crate) struct VersionColumn {
+    pub header: String,
+    pub width: usize,
+    cells: HashMap<String, String>,
+    blank: String,
+    /// The versions themselves, by branch, for `--json`.
+    pub table: version::VersionTable,
+}
+
+impl VersionColumn {
+    pub fn is_empty(&self) -> bool {
+        self.header.is_empty()
+    }
+
+    /// The printed cell for `branch`: each manifest's version, or a dash
+    /// where it has none.
+    pub fn cell(&self, branch: &str) -> &str {
+        self.cells.get(branch).unwrap_or(&self.blank)
+    }
+}
+
+/// The version columns to print per roll — see [`VersionColumn`].
 ///
 /// Versions are read at [`branches::content_ref`] per roll, so the plain tables
 /// and the TUI report the same commit's manifest.
-pub(crate) fn version_column(
-    config: &Config,
-    rolls: &[branches::RollInfo],
-) -> (HashMap<String, String>, usize) {
+pub(crate) fn version_column(config: &Config, rolls: &[branches::RollInfo]) -> VersionColumn {
     let refs: Vec<String> = rolls
         .iter()
         .map(|r| branches::content_ref(&r.branch, &r.location))
         .collect();
-    let by_ref = version::versions_at(&config.repo_root, &refs, config.forced_manifest());
+    let candidates = config
+        .version_manifest
+        .selection()
+        .candidates(&config.repo_root);
+    let table = version::versions_at(&config.repo_root, &refs, &candidates).keyed_by(
+        rolls
+            .iter()
+            .zip(refs.iter())
+            .map(|(r, refspec)| (r.branch.as_str(), refspec.as_str())),
+    );
 
-    let by_branch: HashMap<String, String> = rolls
+    // Through `Display`, dev marker included — see `tui::rolls::version_cell`.
+    let text = |row: &[Option<version::Semver>]| -> Vec<String> {
+        row.iter().map(|v| tui::rolls::version_cell(*v)).collect()
+    };
+    let headers: Vec<String> = (0..table.manifests.len())
+        .map(|i| table.header(i))
+        .collect();
+    let widths: Vec<usize> = headers
         .iter()
-        .zip(refs.iter())
-        .filter_map(|(roll, refspec)| {
-            let v = by_ref.get(refspec)?;
-            // Through `Display`, dev marker included — see `tui::rolls::version_cell`.
-            Some((roll.branch.clone(), v.to_string()))
+        .enumerate()
+        .map(|(i, h)| {
+            table
+                .rows
+                .values()
+                .map(|row| tui::rolls::version_cell(row[i]).chars().count())
+                .chain([h.chars().count()])
+                .max()
+                .unwrap_or(0)
         })
         .collect();
+    // Sub-columns two spaces apart; the last is left unpadded, and the caller
+    // pads the whole column when another follows it.
+    let join = |parts: &[String]| -> String {
+        let last = parts.len().saturating_sub(1);
+        parts
+            .iter()
+            .enumerate()
+            .map(|(i, p)| {
+                if i == last {
+                    p.clone()
+                } else {
+                    format!("{p:<w$}", w = widths[i])
+                }
+            })
+            .collect::<Vec<_>>()
+            .join("  ")
+    };
 
-    let width = by_branch
-        .values()
-        .map(|v| v.chars().count())
-        .max()
-        .unwrap_or(0)
-        .max(VERSION_HDR.chars().count());
-    (by_branch, width)
+    let header = join(&headers);
+    let cells: HashMap<String, String> = table
+        .rows
+        .iter()
+        .map(|(branch, row)| (branch.clone(), join(&text(row))))
+        .collect();
+    let blank = join(&vec![tui::rolls::version_cell(None); headers.len()]);
+    let width = widths.iter().sum::<usize>() + 2 * widths.len().saturating_sub(1);
+    VersionColumn {
+        header,
+        width,
+        cells,
+        blank,
+        table,
+    }
 }
 
 /// Column headers for the dependency pair, shared by `rf list --no-tui --deps`
@@ -2418,9 +2594,13 @@ struct JsonRoll {
     /// consumers see the same dependency graph the TUI draws.
     deps: Vec<u32>,
     dependants: Vec<u32>,
-    /// The `[package]` version at this roll's tip. `null` in repos with no
-    /// `Cargo.toml`, which is the same absence the tables render as a dash.
+    /// The version at this roll's tip — its first manifest's, the one that
+    /// names the release tag. `null` in repos with no manifest, which is the
+    /// same absence the tables render as a dash.
     version: Option<String>,
+    /// Every manifest's version at this roll's tip, keyed by its path
+    /// (`package.json`, `keeper/Cargo.toml`). Empty where `version` is `null`.
+    versions: std::collections::BTreeMap<String, String>,
     /// Subset of `deps` whose current tip this roll has not integrated — the
     /// ancestry check behind the TUI's `⚠ reintegrate` marker, exposed so a
     /// script deciding whether to merge a batch of dependent rolls can check
@@ -2461,7 +2641,7 @@ fn rolls_for_json(
     rolls: Vec<branches::RollInfo>,
     rebuild_status: Option<&rebuild::RebuildStatus>,
 ) -> Vec<JsonRoll> {
-    let (versions, _) = version_column(config, &rolls);
+    let versions = version_column(config, &rolls).table;
     let cycles: Vec<Option<JsonCycle>> = rolls
         .iter()
         .map(|r| {
@@ -2479,7 +2659,18 @@ fn rolls_for_json(
         .zip(cycles)
         .map(|(r, cycle)| JsonRoll {
             cycle,
-            version: versions.get(&r.branch).cloned(),
+            version: versions
+                .row(&r.branch)
+                .into_iter()
+                .flatten()
+                .next()
+                .map(|v| v.to_string()),
+            versions: versions
+                .manifests
+                .iter()
+                .zip(versions.row(&r.branch))
+                .filter_map(|(m, v)| Some((m.manifest(), v?.to_string())))
+                .collect(),
             recent_rebuilds: recent_rebuild_labels(rebuild_status, &r.branch),
             branch: r.branch,
             number: r.number,
