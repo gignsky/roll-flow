@@ -135,22 +135,40 @@ repo where `nix eval` would not.
 five default to `true` and are inert in a repo with neither a `Cargo.toml`
 nor a `package.json`.
 
-`version_manifest` matters only to a repo carrying *both* manifests — a
-Tauri app, say, or a Rust backend released together with its JS front end.
-`"auto"` (the default) versions through **both**: every manifest with a
-readable version is marked `-roll<N>` on `rf start`, resolved on `rf graduate`,
-finalized on `rf promote`, and must clear the version gate on its own, so a
-promotion is refused until *each* is ahead of the stable branch. Where a bump is
-needed, `rf promote` (and the TUI's `[b]`) lets you pick which manifest to
-raise — see [`promote`](commands/promote.md#more-than-one-manifest). The release
-tag names `Cargo.toml`'s version when there are two. Pin `"cargo"` or `"npm"` to
-version through that file alone — the right setting when the other one only
-exists for tooling and its `version` is not meant to track releases. It reaches
-every command that reads or writes a version through `Config`, so the files
-written and the files compared always agree. Only manifests at the repo root are
-read. The merge-driver subprocess has no `Config` and keeps auto-detecting,
-which is harmless since its only job is to stop a version-line conflict on
-whichever files a merge actually touches.
+`version_manifest` decides which manifests carry the release version. `"auto"`
+(the default) **discovers** them: every tracked `Cargo.toml` and
+`package.json` with a readable version, at the root or in any subdirectory — a
+site's root `package.json` beside a Rust service in `keeper/Cargo.toml`, a Tauri
+app, a Rust backend released with its JS front end. A manifest with no
+`version` (tooling-only, or a workspace member inheriting
+`version.workspace`) is not versioned. Each one found is marked `-roll<N>` on
+`rf start`, resolved on `rf graduate`, finalized on `rf promote`, and must clear
+the version gate on its own, so a promotion is refused until *each* is ahead of
+the stable branch. Their numbers are independent — the gate never compares one
+manifest against another. Where a bump is needed, `rf promote` (and the TUI's
+`[b]`) lets you pick which manifest to raise — see
+[`promote`](commands/promote.md#more-than-one-manifest). A nested manifest's
+lockfile is the one beside it (`keeper/Cargo.lock`).
+
+The release tag, and the single version the TUI header and version column
+show, come from the **first** manifest: a root manifest before a nested one,
+and `Cargo.toml` before `package.json` at the same depth.
+
+Narrow it with `"cargo"` or `"npm"` (discovery, but of that kind only), or
+name the manifests outright with a list of repo-relative paths, which
+discovers nothing — the way to keep a versioned test fixture or vendored crate
+out of the gate:
+
+```toml
+version_manifest = ["package.json", "keeper/Cargo.toml"]
+```
+
+A listed path that is not a `Cargo.toml` or `package.json` is refused when the
+config loads. The setting reaches every command that reads or writes a version
+through `Config`, so the files written and the files compared always agree.
+The merge-driver subprocess has no `Config` and matches files by name at any
+depth, which is harmless since its only job is to stop a version-line conflict
+on whichever files a merge actually touches.
 
 `clean_protect` names branches [`rf clean`](commands/clean.md) must never delete,
 on top of the stable and rolling branches and each remote's default branch, which

@@ -39,7 +39,7 @@ use crate::core::{
     git::{self, TrackState},
     history, ops, proc, rebuild,
     sync::{self, PullPlan, PushOutcome, SyncTarget},
-    version::{self, BumpLevel, ManifestKind, Semver, VersionCheck, VersionStatus},
+    version::{self, BumpLevel, Manifest, Semver, VersionCheck, VersionStatus},
 };
 
 /// A workflow operation reachable from the view. Navigation, quit and refresh
@@ -271,9 +271,9 @@ pub(crate) fn bump_previews(current: Semver) -> [(BumpLevel, Semver); 3] {
 /// One manifest the bump modal can raise: which file, what it says now, and
 /// whether it still owes a bump to get past the stable branch (`None` when
 /// that could not be told — no stable to compare against).
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct BumpManifest {
-    pub kind: ManifestKind,
+    pub manifest: Manifest,
     pub current: Semver,
     pub owes: Option<bool>,
 }
@@ -313,8 +313,8 @@ pub(crate) fn bump_pick_key(code: KeyCode, count: usize) -> BumpPick {
 /// (`VersionStatus::NotApplicable`), so refusing here keeps the key honest
 /// rather than opening a modal over nothing.
 pub(crate) fn bump_gate(
-    manifests: Vec<(ManifestKind, Semver)>,
-) -> Result<Vec<(ManifestKind, Semver)>, String> {
+    manifests: Vec<(Manifest, Semver)>,
+) -> Result<Vec<(Manifest, Semver)>, String> {
     if manifests.is_empty() {
         return Err("no readable version — nothing to bump".to_string());
     }
@@ -1786,8 +1786,8 @@ fn push_version_check(
         .base
         .map(|v| v.to_string())
         .unwrap_or_else(|| "none".to_string());
-    let file = match (named, check.kind) {
-        (true, Some(kind)) => format!(" ({})", kind.manifest()),
+    let file = match (named, &check.manifest) {
+        (true, Some(manifest)) => format!(" ({manifest})"),
         _ => String::new(),
     };
     lines.push(format!(
@@ -2476,8 +2476,7 @@ impl StatusApp {
         let tracking = load_tracking(&config);
         let dirty = load_dirty(&tracking);
         let versions = load_versions(&config, &bases, &rolls, &hotfixes);
-        let version =
-            version::read_version(&config.repo_root, config.forced_manifest()).unwrap_or(None);
+        let version = config.version();
         let host_id = rebuild::current_host_identifier(&config.repo_root);
         let rebuild_status = host_id
             .as_deref()
@@ -3444,15 +3443,15 @@ impl StatusApp {
         if self.waits_on_head("[b]") {
             return;
         }
-        let read: Vec<(ManifestKind, Semver)> = self
+        let read: Vec<(Manifest, Semver)> = self
             .config
-            .manifest_kinds()
+            .manifests()
             .into_iter()
-            .filter_map(|kind| {
-                version::read_version_for(&self.config.repo_root, kind)
+            .filter_map(|manifest| {
+                let v = version::read_version(&self.config.repo_root, &manifest)
                     .ok()
-                    .flatten()
-                    .map(|v| (kind, v))
+                    .flatten()?;
+                Some((manifest, v))
             })
             .collect();
         match bump_gate(read) {
@@ -3461,16 +3460,16 @@ impl StatusApp {
                     git::resolve_branch(&self.config.repo_root, &self.config.stable_branch);
                 let manifests: Vec<BumpManifest> = read
                     .into_iter()
-                    .map(|(kind, current)| BumpManifest {
-                        kind,
-                        current,
+                    .map(|(manifest, current)| BumpManifest {
                         owes: stable.as_deref().and_then(|stable| {
-                            let (_, base) =
-                                version::version_at(&self.config.repo_root, stable, Some(kind))
+                            let base =
+                                version::version_at(&self.config.repo_root, stable, &manifest)
                                     .ok()
                                     .flatten()?;
                             Some(current.release() <= base.release())
                         }),
+                        manifest,
+                        current,
                     })
                     .collect();
                 // One manifest: nothing to drill into.
@@ -3710,19 +3709,22 @@ impl StatusApp {
             }
             return;
         };
-        let kinds: Vec<ManifestKind> = chosen.iter().map(|&i| manifests[i].kind).collect();
+        let chosen: Vec<Manifest> = chosen
+            .iter()
+            .map(|&i| manifests[i].manifest.clone())
+            .collect();
         match bump_key(code) {
             BumpOutcome::Ignore => {}
             BumpOutcome::Cancel => self.mode = Mode::Browsing,
             BumpOutcome::Level(level) => {
                 self.mode = Mode::Browsing;
-                self.execute_bump(level, kinds);
+                self.execute_bump(level, chosen);
             }
         }
     }
 
     /// Write the bumped version, refresh the lockfile and commit, as a job.
-    fn execute_bump(&mut self, level: BumpLevel, kinds: Vec<ManifestKind>) {
+    fn execute_bump(&mut self, level: BumpLevel, manifests: Vec<Manifest>) {
         let config = self.config.clone();
         let branch = self.current_branch.clone();
         self.start_job(format!("rf bump {level}"), move || {
@@ -3730,15 +3732,12 @@ impl StatusApp {
             // `git::commit_paths` stages its two files and then commits the whole
             // index. Graduate and promote take the same precaution.
             ops::ensure_clean_state(&config)?;
-            let bumped = ops::apply_version_bump(&config, level, &branch, &kinds)?;
-            let (from, to): (Vec<_>, Vec<_>) = bumped
-                .iter()
-                .map(|&(kind, from, to)| ((kind, from), (kind, to)))
-                .unzip();
+            let bumped = ops::apply_version_bump(&config, level, &branch, &manifests)?;
+            let (from, to) = crate::split_changes(&bumped);
             Ok(JobDone::lines(vec![format!(
                 "Bumped {} → {} ({level}) on '{branch}'",
-                ops::describe_versions(from),
-                ops::describe_versions(to)
+                ops::describe_versions(&from),
+                ops::describe_versions(&to)
             )]))
         });
     }
@@ -4441,8 +4440,7 @@ impl StatusApp {
         self.versions = load_versions(&self.config, &self.bases, &self.rolls, &self.hotfixes);
         // Read from the worktree, so a bump — or a branch switch that changes it —
         // shows in the header straight away.
-        self.version = version::read_version(&self.config.repo_root, self.config.forced_manifest())
-            .unwrap_or(None);
+        self.version = self.config.version();
         self.rebuild_status = self
             .host_id
             .as_deref()
@@ -4525,7 +4523,8 @@ impl StatusApp {
             Mode::Bump { manifests, picked } => match picked {
                 None => render_bump_pick_modal(f, area, manifests, &self.current_branch),
                 Some(indices) => {
-                    let chosen: Vec<BumpManifest> = indices.iter().map(|&i| manifests[i]).collect();
+                    let chosen: Vec<BumpManifest> =
+                        indices.iter().map(|&i| manifests[i].clone()).collect();
                     render_bump_levels_modal(f, area, &chosen, &self.current_branch)
                 }
             },
@@ -5039,7 +5038,10 @@ fn run_verify(config: &Config) -> Result<Vec<String>> {
     let current = git::current_branch(&config.repo_root)?;
     let marked = ops::apply_dev_version_for_branch(config, &current)?;
     if !marked.is_empty() {
-        lines.push(format!("version marked {}", ops::describe_versions(marked)));
+        lines.push(format!(
+            "version marked {}",
+            ops::describe_versions(&marked)
+        ));
     }
 
     let outcome = match ops::verify(config, false) {
@@ -5358,7 +5360,11 @@ fn load_versions(
         .map(|(branch, location)| branches::content_ref(branch, location))
         .collect();
 
-    let by_ref = version::versions_at(&config.repo_root, &refs, config.forced_manifest());
+    let candidates = config
+        .version_manifest
+        .selection()
+        .candidates(&config.repo_root);
+    let by_ref = version::versions_at(&config.repo_root, &refs, &candidates);
     rows.iter()
         .map(|(branch, _)| *branch)
         .zip(refs.iter())
@@ -5609,7 +5615,7 @@ fn render_bump_pick_modal(f: &mut Frame, area: Rect, manifests: &[BumpManifest],
         };
         lines.push(Line::from(vec![
             Span::styled(format!("[{}] ", i + 1), Style::default().fg(Color::Yellow)),
-            Span::raw(format!("{} ", m.kind.manifest())),
+            Span::raw(format!("{} ", m.manifest)),
             Span::styled(
                 m.current.to_string(),
                 Style::default().add_modifier(Modifier::BOLD),
@@ -5654,7 +5660,7 @@ fn render_bump_levels_modal(f: &mut Frame, area: Rect, chosen: &[BumpManifest], 
         Line::from(""),
     ];
     for m in chosen {
-        lines.push(Line::from(format!("{}: {}", m.kind.manifest(), m.current)));
+        lines.push(Line::from(format!("{}: {}", m.manifest, m.current)));
     }
     lines.push(Line::from(""));
     for (i, level) in [BumpLevel::Patch, BumpLevel::Minor, BumpLevel::Major]
@@ -5663,7 +5669,7 @@ fn render_bump_levels_modal(f: &mut Frame, area: Rect, chosen: &[BumpManifest], 
     {
         let results = chosen
             .iter()
-            .map(|m| format!("{} {}", m.kind.manifest(), m.current.bump(level)))
+            .map(|m| format!("{} {}", m.manifest, m.current.bump(level)))
             .collect::<Vec<_>>()
             .join(", ");
         lines.push(Line::from(vec![
@@ -7982,7 +7988,7 @@ mod tests {
             push_version_check(
                 &mut lines,
                 &VersionCheck {
-                    kind: None,
+                    manifest: None,
                     head,
                     base,
                     status,
@@ -10228,7 +10234,7 @@ mod tests {
         let err =
             bump_gate(Vec::new()).expect_err("a repo with no readable version has nothing to bump");
         assert!(err.contains("nothing to bump"), "{err}");
-        let one = vec![(ManifestKind::Cargo, v(0, 1, 0))];
+        let one = vec![(Manifest::root(version::ManifestKind::Cargo), v(0, 1, 0))];
         assert_eq!(bump_gate(one.clone()), Ok(one));
     }
 
@@ -10273,12 +10279,12 @@ mod tests {
     fn the_bump_picker_names_each_manifest_and_what_it_still_owes() {
         let manifests = [
             BumpManifest {
-                kind: ManifestKind::Cargo,
+                manifest: Manifest::root(version::ManifestKind::Cargo),
                 current: v(0, 2, 0),
                 owes: Some(true),
             },
             BumpManifest {
-                kind: ManifestKind::Npm,
+                manifest: Manifest::root(version::ManifestKind::Npm),
                 current: v(1, 4, 0),
                 owes: Some(false),
             },

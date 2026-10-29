@@ -11,7 +11,7 @@ use clap::Parser;
 use serde::Serialize;
 
 use cli::{Cli, Cmd};
-use core::version::{self, BumpLevel, ManifestKind, VersionCheck, VersionStatus};
+use core::version::{self, BumpLevel, Manifest, VersionCheck, VersionStatus};
 use core::{branches, config::Config, git, ops, rebuild};
 
 fn main() -> Result<()> {
@@ -208,11 +208,15 @@ fn cmd_init(
     // `ops::ensure_version_merge_driver`), so a repo whose config is already
     // up to date on a fresh clone still needs this wired up here.
     if ops::ensure_version_merge_driver(&overridden)? {
-        if let Some(kind) = overridden.manifest_kind() {
+        let files: Vec<String> = overridden
+            .manifests()
+            .iter()
+            .flat_map(|m| m.paths())
+            .collect();
+        if !files.is_empty() {
             println!(
-                "Configured the version merge driver for {} and {}",
-                kind.manifest(),
-                kind.lockfile()
+                "Configured the version merge driver for {}",
+                files.join(", ")
             );
         }
     }
@@ -416,7 +420,7 @@ fn cmd_create(slug: &str, date: Option<String>, dry_run: bool, no_dev_version: b
     if !dry_run && config.dev_versions && !no_dev_version {
         let marked = ops::apply_dev_version(&config, outcome.number)?;
         if !marked.is_empty() {
-            println!("version marked {}", ops::describe_versions(marked));
+            println!("version marked {}", ops::describe_versions(&marked));
         }
     }
     Ok(())
@@ -498,7 +502,7 @@ fn cmd_verify(dry_run: bool, bump: Option<BumpLevel>, yes: bool) -> Result<()> {
     if !dry_run {
         let marked = ops::apply_dev_version_for_branch(&config, &current)?;
         if !marked.is_empty() {
-            println!("version marked {}", ops::describe_versions(marked));
+            println!("version marked {}", ops::describe_versions(&marked));
         }
     }
 
@@ -744,26 +748,30 @@ fn resolve_version_gate(
     // the finalized value alone already satisfies the gate, or immediately
     // before the bump below, so a promotion that ultimately fails (no bump
     // resolved) doesn't leave rolling finalized with nothing to show for it.
-    let kinds = config.manifest_kinds();
+    let manifests = config.manifests();
     let mut needs_finalize = false;
     if config.dev_versions {
-        for &kind in &kinds {
-            if version::read_version_for(&config.repo_root, kind)?.is_some_and(|v| v.has_marker()) {
+        for manifest in &manifests {
+            if version::read_version(&config.repo_root, manifest)?.is_some_and(|v| v.has_marker()) {
                 needs_finalize = true;
             }
         }
     }
-    // One check per manifest the repo versions through: a repo carrying both
-    // `Cargo.toml` and `package.json` has to clear the gate in each.
+    // One check per manifest the repo versions through: a repo carrying more
+    // than one has to clear the gate in each.
     let checks: Vec<VersionCheck> = if !config.version_gate {
         Vec::new()
     } else if config.dev_versions {
         let mut checks = Vec::new();
-        for &kind in &kinds {
+        for manifest in &manifests {
             let finalized_head =
-                version::read_version_for(&config.repo_root, kind)?.map(|v| v.release());
-            let check =
-                version::check_against(&config.repo_root, finalized_head, &target_ref, Some(kind))?;
+                version::read_version(&config.repo_root, manifest)?.map(|v| v.release());
+            let check = version::check_against(
+                &config.repo_root,
+                finalized_head,
+                &target_ref,
+                Some(manifest),
+            )?;
             if check.status != VersionStatus::NotApplicable {
                 checks.push(check);
             }
@@ -780,14 +788,11 @@ fn resolve_version_gate(
         }
         let finalized = ops::finalize_rolling(config)?;
         if !finalized.is_empty() {
-            let (from, to): (Vec<_>, Vec<_>) = finalized
-                .iter()
-                .map(|&(kind, from, to)| ((kind, from), (kind, to)))
-                .unzip();
+            let (from, to) = split_changes(&finalized);
             println!(
                 "Finalized {} -> {} (chore(release) commit on '{source}')",
-                ops::describe_versions(from),
-                ops::describe_versions(to)
+                ops::describe_versions(&from),
+                ops::describe_versions(&to)
             );
         }
         Ok(())
@@ -806,18 +811,18 @@ fn resolve_version_gate(
 
     // The manifests that actually owe a bump: unchanged from the target. A
     // manifest already ahead of it needs nothing, whatever its neighbour does.
-    let owing: Vec<ManifestKind> = checks
+    let owing: Vec<Manifest> = checks
         .iter()
         .filter(|c| c.status == VersionStatus::Unchanged)
-        .filter_map(|c| c.kind)
+        .filter_map(|c| c.manifest.clone())
         .collect();
     for c in checks.iter().filter(|c| !c.is_satisfied()) {
         let head = c
             .head
             .map(|v| v.to_string())
             .unwrap_or_else(|| "<unreadable>".to_string());
-        let file = match (checks.len() > 1, c.kind) {
-            (true, Some(kind)) => format!(" ({})", kind.manifest()),
+        let file = match (checks.len() > 1, &c.manifest) {
+            (true, Some(manifest)) => format!(" ({manifest})"),
             _ => String::new(),
         };
         println!(
@@ -850,7 +855,7 @@ fn resolve_version_gate(
         None if yes => Some(BumpLevel::Patch),
         None if std::io::stdin().is_terminal() => {
             if owing.len() > 1 {
-                chosen = prompt_bump_kinds(&owing)?;
+                chosen = prompt_bump_manifests(&owing)?;
             }
             if chosen.is_empty() {
                 None
@@ -877,25 +882,34 @@ fn resolve_version_gate(
 
     finalize_now(false)?;
     let bumped = ops::apply_version_bump(config, level, &source, &chosen)?;
-    let (from, to): (Vec<_>, Vec<_>) = bumped
-        .iter()
-        .map(|&(kind, from, to)| ((kind, from), (kind, to)))
-        .unzip();
+    let (from, to) = split_changes(&bumped);
     println!(
         "Bumped version {} -> {} (chore(release) commit on '{current}')",
-        ops::describe_versions(from),
-        ops::describe_versions(to)
+        ops::describe_versions(&from),
+        ops::describe_versions(&to)
     );
     Ok(())
 }
 
+/// A set of `(manifest, from, to)` version changes as its two sides, ready
+/// for [`ops::describe_versions`].
+type VersionSide = Vec<(Manifest, version::Semver)>;
+pub(crate) fn split_changes(
+    changes: &[(Manifest, version::Semver, version::Semver)],
+) -> (VersionSide, VersionSide) {
+    changes
+        .iter()
+        .map(|(m, from, to)| ((m.clone(), *from), (m.clone(), *to)))
+        .unzip()
+}
+
 /// Ask which manifests to bump when more than one owes a bump. An empty answer
 /// is "all"; `n` declines every one.
-fn prompt_bump_kinds(owing: &[ManifestKind]) -> Result<Vec<ManifestKind>> {
+fn prompt_bump_manifests(owing: &[Manifest]) -> Result<Vec<Manifest>> {
     use std::io::Write;
     println!("These manifests are unchanged from the target:");
-    for (i, kind) in owing.iter().enumerate() {
-        println!("  [{}] {}", i + 1, kind.manifest());
+    for (i, manifest) in owing.iter().enumerate() {
+        println!("  [{}] {manifest}", i + 1);
     }
     print!("Bump which? [a]ll / number / [n]one: ");
     std::io::stdout().flush()?;
@@ -909,7 +923,7 @@ fn prompt_bump_kinds(owing: &[ManifestKind]) -> Result<Vec<ManifestKind>> {
             .ok()
             .and_then(|i| owing.get(i.wrapping_sub(1)))
         {
-            Some(kind) => vec![*kind],
+            Some(manifest) => vec![manifest.clone()],
             None => Vec::new(),
         },
     })
@@ -962,8 +976,8 @@ fn render_version_check(check: &VersionCheck, source: &str, target: &str, named:
         VersionStatus::DevVersion => "DEV",
         VersionStatus::NotApplicable => return,
     };
-    let file = match (named, check.kind) {
-        (true, Some(kind)) => format!(" ({})", kind.manifest()),
+    let file = match (named, &check.manifest) {
+        (true, Some(manifest)) => format!(" ({manifest})"),
         _ => String::new(),
     };
     println!("Version{file}: {head} on '{source}' (base '{target}' {base}) {verdict}");
@@ -1499,7 +1513,7 @@ fn confirm_final_promotion(
     finalize: bool,
     yes: bool,
 ) -> Result<bool> {
-    let has_version = version::read_version(&config.repo_root, config.forced_manifest())?.is_some();
+    let has_version = config.version().is_some();
     if dry_run || !config.dev_versions || !has_version || finalize {
         return Ok(true);
     }
@@ -2368,7 +2382,11 @@ pub(crate) fn version_column(
         .iter()
         .map(|r| branches::content_ref(&r.branch, &r.location))
         .collect();
-    let by_ref = version::versions_at(&config.repo_root, &refs, config.forced_manifest());
+    let candidates = config
+        .version_manifest
+        .selection()
+        .candidates(&config.repo_root);
+    let by_ref = version::versions_at(&config.repo_root, &refs, &candidates);
 
     let by_branch: HashMap<String, String> = rolls
         .iter()

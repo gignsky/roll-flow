@@ -111,11 +111,15 @@ opened a PR — see
   rolling's version would sit *below* stable's and the next promotion would
   fail as LOWER. A graduation that already carried its own bump is not bumped
   again
-- a repo versioned through both `Cargo.toml` and `package.json` must clear the
-  gate in **each**: the failure names the manifest that still owes a bump
+- a repo versioned through more than one manifest — `Cargo.toml` and
+  `package.json`, at the root or in a subdirectory (see
+  [`version_manifest`](../config.md)) — must clear the gate in **each**: the
+  failure names the manifest that still owes a bump
   (<a id="more-than-one-manifest"></a>*more than one manifest*). Interactively
   you are asked which to bump before the level; `--bump` and `--yes` raise every
-  manifest that owes one, by that level. The tag names `Cargo.toml`'s version
+  manifest that owes one, by that level. The tag names the first manifest's
+  version: a root manifest before a nested one, `Cargo.toml` before
+  `package.json` at the same depth
 - after a `--roll` promotion, offers to merge stable into the active local rolls
   (`rf update`), since they now trail what landed; `--yes` accepts, and an
   unattended run is told the command instead
