@@ -795,10 +795,11 @@ struct StatusApp {
     /// Branches whose worktree has uncommitted changes, refreshed on reload.
     /// Drawn as a ⚡ in the `sync` column. See [`load_dirty`].
     dirty: HashSet<String>,
-    /// The `[package]` version at each visible branch's tip, refreshed on
-    /// reload. Sourced in one `cat-file --batch` rather than a `git show` per
-    /// row, the same reason `tracking` is one `for-each-ref`.
-    versions: HashMap<String, Semver>,
+    /// Every manifest's version at each visible branch's tip, refreshed on
+    /// reload — one column per manifest. Sourced in one `cat-file --batch`
+    /// rather than a `git show` per row, the same reason `tracking` is one
+    /// `for-each-ref`.
+    versions: version::VersionTable,
     /// The `[package]` version on the checked-out branch, refreshed on reload.
     /// `None` in repos with no `Cargo.toml`, where the header omits it and `[b]`
     /// refuses.
@@ -4639,21 +4640,25 @@ impl StatusApp {
             Constraint::Length(7),
             Constraint::Length(13),
         ]);
-        // Present only in repos that have a `Cargo.toml`, the same rule the
-        // header version follows — so a dotfiles repo pays nothing for it.
+        // Present only in repos that version through a manifest — so a
+        // dotfiles repo pays nothing for it.
         // Sized to the longest cell on screen (a dev marker like `-roll10`
         // makes this wider than a bare `12.34.5`), the same way `main.rs`'s
         // `version_column` sizes the plain tables; `branch` is the Fill
         // column that pays for it.
-        let show_versions = !self.versions.is_empty();
-        if show_versions {
+        //
+        // One column per manifest: a repo versioned through `package.json` and
+        // `keeper/Cargo.toml` shows both, headed by which file each is.
+        let version_columns = self.versions.manifests.len();
+        for i in 0..version_columns {
             let width = self
                 .versions
+                .rows
                 .values()
-                .map(|v| v.to_string().chars().count())
+                .map(|row| version_cell(row[i]).chars().count())
                 .max()
                 .unwrap_or(0)
-                .max("version".len());
+                .max(self.versions.header(i).chars().count());
             col_constraints.push(Constraint::Length(width as u16));
         }
         if self.show_deps {
@@ -4675,8 +4680,8 @@ impl StatusApp {
             Cell::from("sync").style(bold),
             Cell::from("state").style(bold),
         ]);
-        if show_versions {
-            header_cells.push(Cell::from("version").style(bold));
+        for i in 0..version_columns {
+            header_cells.push(Cell::from(self.versions.header(i)).style(bold));
         }
         if self.show_deps {
             header_cells
@@ -4693,6 +4698,12 @@ impl StatusApp {
         let tracking = &self.tracking;
         let dirty = &self.dirty;
         let versions = &self.versions;
+        let version_cells = |branch: &str, style: Style| {
+            versions
+                .row(branch)
+                .into_iter()
+                .map(move |v| Cell::from(version_cell(v)).style(style))
+        };
         let rebuild_status = &self.rebuild_status;
         let build_cell = |branch: &str| {
             Cell::from(
@@ -4735,12 +4746,7 @@ impl StatusApp {
                     Cell::from(sync_text).style(Style::default().fg(sync_color)),
                     Cell::from(base.role.label()).style(Style::default().fg(base.role.color())),
                 ]);
-                if show_versions {
-                    cells.push(
-                        Cell::from(version_cell(versions.get(&base.branch).copied()))
-                            .style(base_style),
-                    );
-                }
+                cells.extend(version_cells(&base.branch, base_style));
                 if show_deps {
                     cells.push(Cell::from(""));
                     cells.push(Cell::from(""));
@@ -4777,11 +4783,7 @@ impl StatusApp {
                 Cell::from(sync_text).style(Style::default().fg(sync_color)),
                 Cell::from(roll.state.label()).style(Style::default().fg(row_state_color)),
             ]);
-            if show_versions {
-                cells.push(
-                    Cell::from(version_cell(versions.get(&roll.branch).copied())).style(base_style),
-                );
-            }
+            cells.extend(version_cells(&roll.branch, base_style));
             if show_deps {
                 cells.push(Cell::from(branches::format_deps(roll)));
                 cells.push(Cell::from(branches::format_roll_numbers(&roll.dependents)));
@@ -4820,12 +4822,7 @@ impl StatusApp {
                 Cell::from(sync_text).style(Style::default().fg(sync_color)),
                 Cell::from(hotfix.state.label()).style(Style::default().fg(color)),
             ]);
-            if show_versions {
-                cells.push(
-                    Cell::from(version_cell(versions.get(&hotfix.branch).copied()))
-                        .style(base_style),
-                );
-            }
+            cells.extend(version_cells(&hotfix.branch, base_style));
             if show_deps {
                 cells.push(Cell::from(""));
                 cells.push(Cell::from(""));
@@ -5333,7 +5330,8 @@ fn load_dirty(tracking: &HashMap<String, git::LocalBranch>) -> HashSet<String> {
     dirty
 }
 
-/// Read the crate version at every branch on screen, keyed by branch name.
+/// Read every manifest's version at every branch on screen, keyed by branch
+/// name.
 ///
 /// The refspec per row follows the same local-first order as
 /// `git::resolve_branch`: a branch with a local copy is read at its own tip, a
@@ -5341,14 +5339,14 @@ fn load_dirty(tracking: &HashMap<String, git::LocalBranch>) -> HashSet<String> {
 ///
 /// Degrades to an empty map rather than failing the reload — a missing version
 /// renders as a dash, and no repo should lose its table over a decoration. That
-/// also covers the ordinary case of a repo with no `Cargo.toml` at all, where
-/// the column simply never appears.
+/// also covers the ordinary case of a repo with no manifest at all, where no
+/// column appears.
 fn load_versions(
     config: &Config,
     bases: &[BaseBranch],
     rolls: &[RollInfo],
     hotfixes: &[HotfixInfo],
-) -> HashMap<String, Semver> {
+) -> version::VersionTable {
     let rows: Vec<(&String, &BranchLocation)> = bases
         .iter()
         .map(|b| (&b.branch, &b.location))
@@ -5364,12 +5362,11 @@ fn load_versions(
         .version_manifest
         .selection()
         .candidates(&config.repo_root);
-    let by_ref = version::versions_at(&config.repo_root, &refs, &candidates);
-    rows.iter()
-        .map(|(branch, _)| *branch)
-        .zip(refs.iter())
-        .filter_map(|(branch, refspec)| Some((branch.clone(), *by_ref.get(refspec)?)))
-        .collect()
+    version::versions_at(&config.repo_root, &refs, &candidates).keyed_by(
+        rows.iter()
+            .map(|(branch, _)| branch.as_str())
+            .zip(refs.iter().map(String::as_str)),
+    )
 }
 
 /// The version cell for `branch`: the full version through `Semver`'s
@@ -7031,7 +7028,7 @@ mod tests {
             show_deps: false,
             tracking: HashMap::new(),
             dirty: HashSet::new(),
-            versions: HashMap::new(),
+            versions: version::VersionTable::default(),
             host_id: None,
             rebuild_status: None,
             version: None,
@@ -7099,7 +7096,7 @@ mod tests {
             show_deps: false,
             tracking: HashMap::new(),
             dirty: HashSet::new(),
-            versions: HashMap::new(),
+            versions: version::VersionTable::default(),
             host_id: None,
             rebuild_status: None,
             version: None,
@@ -7142,7 +7139,7 @@ mod tests {
             show_deps: false,
             tracking: HashMap::new(),
             dirty: HashSet::new(),
-            versions: HashMap::new(),
+            versions: version::VersionTable::default(),
             host_id: None,
             rebuild_status: None,
             version: None,
@@ -8937,7 +8934,7 @@ mod tests {
             show_deps: false,
             tracking: HashMap::new(),
             dirty: HashSet::new(),
-            versions: HashMap::new(),
+            versions: version::VersionTable::default(),
             host_id: None,
             rebuild_status: None,
             version: None,
@@ -9334,7 +9331,7 @@ mod tests {
             show_deps: false,
             tracking,
             dirty: HashSet::new(),
-            versions: HashMap::new(),
+            versions: version::VersionTable::default(),
             host_id: None,
             rebuild_status: None,
             version: None,
@@ -9396,7 +9393,7 @@ mod tests {
             show_deps: false,
             tracking: HashMap::new(),
             dirty,
-            versions: HashMap::new(),
+            versions: version::VersionTable::default(),
             version: None,
             host_id: None,
             rebuild_status: None,
@@ -9438,8 +9435,13 @@ mod tests {
         rolls[0].branch = "roll/1-0101-versioned".to_string();
         rolls[1].branch = "roll/2-0102-bare".to_string();
 
-        let mut versions = HashMap::new();
-        versions.insert("roll/1-0101-versioned".to_string(), v(0, 12, 34));
+        let versions = version::VersionTable {
+            manifests: vec![version::Manifest::root(version::ManifestKind::Cargo)],
+            rows: HashMap::from([(
+                "roll/1-0101-versioned".to_string(),
+                vec![Some(v(0, 12, 34))],
+            )]),
+        };
 
         let mut app = StatusApp {
             config: test_config(),
@@ -9520,7 +9522,7 @@ mod tests {
             show_deps: true,
             tracking: HashMap::new(),
             dirty: HashSet::new(),
-            versions: HashMap::new(),
+            versions: version::VersionTable::default(),
             version: None,
             host_id: Some("merlin".to_string()),
             rebuild_status,
@@ -9570,6 +9572,77 @@ mod tests {
     }
 
     #[test]
+    fn every_manifest_gets_its_own_version_column() {
+        // A site's root `package.json` beside a crate in `keeper/`: both
+        // versions on every row, each column headed by which file it is.
+        let mut rolls = vec![roll_n(1, RollState::Active), roll_n(2, RollState::Active)];
+        rolls[0].branch = "roll/1-0101-both".to_string();
+        rolls[1].branch = "roll/2-0102-site-only".to_string();
+
+        let versions = version::VersionTable {
+            manifests: vec![
+                version::Manifest::root(version::ManifestKind::Npm),
+                version::Manifest::from_path("keeper/Cargo.toml").unwrap(),
+            ],
+            rows: HashMap::from([
+                (
+                    "roll/1-0101-both".to_string(),
+                    vec![Some(v(0, 2, 8)), Some(v(0, 1, 2))],
+                ),
+                (
+                    "roll/2-0102-site-only".to_string(),
+                    vec![Some(v(0, 2, 9)), None],
+                ),
+            ]),
+        };
+
+        let mut app = StatusApp {
+            config: test_config(),
+            current_branch: "main".to_string(),
+            bases: Vec::new(),
+            rolls,
+            hotfixes: Vec::new(),
+            show_deps: false,
+            tracking: HashMap::new(),
+            dirty: HashSet::new(),
+            versions,
+            version: None,
+            host_id: None,
+            rebuild_status: None,
+            table: TableState::default(),
+            mode: Mode::Browsing,
+            message: None,
+            job: None,
+            job_title: String::new(),
+            job_moves_head: false,
+            queue: Queue::default(),
+            quit_armed: false,
+            deferred_mode: None,
+            panel: None,
+            panel_maximized: false,
+            panel_rect: None,
+            pending_g: false,
+            pending_push: None,
+            pending_pull: None,
+            command_history: Vec::new(),
+        };
+        let out = draw(|f, area| app.render_table(f, area));
+
+        assert!(out.contains("package.json"), "no root header:\n{out}");
+        assert!(out.contains("keeper"), "no nested header:\n{out}");
+        let both = out
+            .lines()
+            .find(|l| l.contains("roll/1-0101-both"))
+            .unwrap();
+        assert!(both.contains("0.2.8") && both.contains("0.1.2"), "{both}");
+        let site = out
+            .lines()
+            .find(|l| l.contains("roll/2-0102-site"))
+            .unwrap();
+        assert!(site.contains("0.2.9") && site.contains("—"), "{site}");
+    }
+
+    #[test]
     fn the_version_column_is_absent_in_a_repo_with_no_manifest() {
         // The whole opt-in rule: no `Cargo.toml` anywhere, no column, no cost to
         // the `branch` column. This is every dotfiles repo.
@@ -9582,7 +9655,7 @@ mod tests {
             show_deps: false,
             tracking: HashMap::new(),
             dirty: HashSet::new(),
-            versions: HashMap::new(),
+            versions: version::VersionTable::default(),
             host_id: None,
             rebuild_status: None,
             version: None,
@@ -9637,7 +9710,7 @@ mod tests {
             show_deps: false,
             tracking: HashMap::new(),
             dirty: HashSet::new(),
-            versions: HashMap::new(),
+            versions: version::VersionTable::default(),
             host_id: None,
             rebuild_status: None,
             version: None,
@@ -10840,7 +10913,7 @@ mod tests {
             show_deps: false,
             tracking: HashMap::new(),
             dirty: HashSet::new(),
-            versions: HashMap::new(),
+            versions: version::VersionTable::default(),
             host_id: None,
             rebuild_status: None,
             version: None,
@@ -11171,7 +11244,7 @@ mod tests {
             show_deps: false,
             tracking: HashMap::new(),
             dirty: HashSet::new(),
-            versions: HashMap::new(),
+            versions: version::VersionTable::default(),
             host_id: None,
             rebuild_status: None,
             version: None,
@@ -11247,7 +11320,7 @@ mod tests {
             show_deps: false,
             tracking: HashMap::new(),
             dirty: HashSet::new(),
-            versions: HashMap::new(),
+            versions: version::VersionTable::default(),
             host_id: None,
             rebuild_status: None,
             version: None,

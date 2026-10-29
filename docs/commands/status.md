@@ -8,11 +8,16 @@ Shows current branch, tier, cleanliness, pending rolls, and promotion readiness.
 Runs as a full-screen TUI by default; `--no-tui` prints a plain table instead and
 `--json` emits machine-readable output.
 
-In a repo that has a `Cargo.toml`, the table carries a `version` column: the
-`[package]` version as it stands at each branch's tip — its own tip for a branch
-that exists locally, `origin/<branch>` for one that only exists on the remote.
-Repos without a manifest, which is every dotfiles repo, get no column at all,
-the same rule the header version follows. There is no flag for it.
+In a repo that versions through a manifest (see
+[`version_manifest`](../config.md)), the table carries a `version` column: the
+version as it stands at each branch's tip — its own tip for a branch that
+exists locally, `origin/<branch>` for one that only exists on the remote. A repo
+versioned through more than one manifest gets **one column per manifest**,
+headed by which file it is — its file name at the root, its directory when
+nested — so a site's `package.json` and a `keeper/Cargo.toml` read side by side
+(`package.json  keeper`), and a branch that lacks one shows a dash under it.
+Repos without a manifest, which is every dotfiles repo, get no column at all.
+There is no flag for it.
 
 The cell shows the full version, dev marker included: a roll carrying one reads
 `0.2.4-roll9`, not `0.2.4`. The `#` column says which roll a row is, but not

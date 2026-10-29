@@ -110,14 +110,15 @@ fn print_rolls_table(
     let state_w = "✓ graduated".len(); // longest label
     let (dep_w, dependant_w) = crate::dep_column_widths(rolls);
     // Empty in a repo with no `Cargo.toml`, which drops the column entirely.
-    let (versions, ver_w) = crate::version_column(config, rolls);
+    let versions = crate::version_column(config, rolls);
+    let ver_w = versions.width;
     // Padded only when the deps columns follow it. Like `dependants`, a last
     // column is left unpadded so rows carry no trailing whitespace.
     let version_col = |branch: &str| {
         if versions.is_empty() {
             return String::new();
         }
-        let v = versions.get(branch).map(String::as_str).unwrap_or("—");
+        let v = versions.cell(branch);
         if show_deps {
             format!("  {v:<ver_w$}")
         } else {
@@ -163,9 +164,9 @@ fn print_rolls_table(
         ver_hdr = if versions.is_empty() {
             String::new()
         } else if show_deps {
-            format!("  {:<ver_w$}", crate::VERSION_HDR)
+            format!("  {:<ver_w$}", versions.header)
         } else {
-            format!("  {}", crate::VERSION_HDR)
+            format!("  {}", versions.header)
         },
         deps_hdr = if show_deps {
             format!("  {:<dep_w$}  {}", crate::DEPS_HDR, crate::DEPENDANTS_HDR)

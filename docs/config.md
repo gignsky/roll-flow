@@ -150,8 +150,8 @@ manifest against another. Where a bump is needed, `rf promote` (and the TUI's
 [`promote`](commands/promote.md#more-than-one-manifest). A nested manifest's
 lockfile is the one beside it (`keeper/Cargo.lock`).
 
-The release tag, and the single version the TUI header and version column
-show, come from the **first** manifest: a root manifest before a nested one,
+The release tag, and the `version` field of `--json`, come from the **first**
+manifest: a root manifest before a nested one,
 and `Cargo.toml` before `package.json` at the same depth.
 
 Narrow it with `"cargo"` or `"npm"` (discovery, but of that kind only), or

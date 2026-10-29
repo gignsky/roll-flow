@@ -706,47 +706,101 @@ pub fn read_version(repo: &Path, manifest: &Manifest) -> Result<Option<Semver>, 
     Ok(manifest.kind.parse_version(&text))
 }
 
-/// Read the version at each of `refs`, keyed by ref: the first of
-/// `candidates` (see [`Selection::candidates`], already in precedence order)
-/// that carries one there.
-///
-/// One `git cat-file --batch` for the whole set, because the caller is a
-/// table that wants a version per row on every reload. Refs with no manifest,
-/// or whose manifest carries a version this crate will not parse, are simply
-/// absent from the map — the column renders those as a dash, and a repo with
-/// no manifest at all yields an empty map rather than an error. Losing a
-/// version is never worth failing a reload over.
-pub fn versions_at(
-    repo: &Path,
-    refs: &[String],
-    candidates: &[Manifest],
-) -> HashMap<String, Semver> {
-    let mut specs = Vec::with_capacity(refs.len() * candidates.len());
-    for r in refs {
-        for manifest in candidates {
-            specs.push(format!("{r}:{}", manifest.manifest()));
-        }
+/// Every manifest's version at a set of refs: one column per manifest, one
+/// row per ref. What the version columns of `rf list`/`rf status` and the TUI
+/// draw, so a repo versioned through `package.json` *and*
+/// `keeper/Cargo.toml` shows both side by side.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct VersionTable {
+    /// The manifests with a version at one or more of the refs, in precedence
+    /// order — one column each. Empty in a repo that versions through none.
+    pub manifests: Vec<Manifest>,
+    /// Per key (a ref, or whatever the caller re-keyed it by), one entry per
+    /// column of [`manifests`](Self::manifests).
+    pub rows: HashMap<String, Vec<Option<Semver>>>,
+}
+
+impl VersionTable {
+    /// The row for `key`: one cell per column, `None` where that manifest has
+    /// no readable version there. Every column is `None` for an unknown key.
+    pub fn row(&self, key: &str) -> Vec<Option<Semver>> {
+        self.rows
+            .get(key)
+            .cloned()
+            .unwrap_or_else(|| vec![None; self.manifests.len()])
     }
-    if specs.is_empty() {
-        return HashMap::new();
-    }
-    let Ok(blobs) = git::show_files_at_refs(repo, &specs) else {
-        return HashMap::new();
-    };
-    let mut out = HashMap::new();
-    for r in refs {
-        for manifest in candidates {
-            let spec = format!("{r}:{}", manifest.manifest());
-            if let Some(version) = blobs
-                .get(&spec)
-                .and_then(|text| manifest.kind.parse_version(text))
-            {
-                out.insert(r.clone(), version);
-                break;
+
+    /// The header for column `i`: `version` when there is only one, so a
+    /// single-manifest repo reads as it always has; otherwise which manifest —
+    /// its directory when nested (`keeper`), its file name at the root.
+    pub fn header(&self, i: usize) -> String {
+        match self.manifests.as_slice() {
+            [_] => "version".to_string(),
+            many => {
+                let manifest = &many[i];
+                if manifest.dir().is_empty() {
+                    manifest.kind.manifest().to_string()
+                } else {
+                    manifest.dir().to_string()
+                }
             }
         }
     }
-    out
+
+    /// The same table keyed by name instead of by ref: each `(name, ref)`
+    /// pair takes the row read at `ref` — a branch, say, read at the ref
+    /// [`branches::content_ref`](crate::core::branches::content_ref) picked.
+    pub fn keyed_by<'a>(
+        &self,
+        pairs: impl IntoIterator<Item = (&'a str, &'a str)>,
+    ) -> VersionTable {
+        VersionTable {
+            manifests: self.manifests.clone(),
+            rows: pairs
+                .into_iter()
+                .map(|(name, r)| (name.to_string(), self.row(r)))
+                .collect(),
+        }
+    }
+}
+
+/// Read every candidate's version at each of `refs` (see
+/// [`Selection::candidates`]), as a [`VersionTable`] keyed by ref. Candidates
+/// with no version at any of the refs get no column.
+///
+/// One `git cat-file --batch` for the whole set, because the caller is a
+/// table that wants its versions on every reload. A ref where a manifest is
+/// absent, or carries a version this crate will not parse, gets `None` in
+/// that column — rendered as a dash — and a repo with no manifest at all
+/// yields an empty table rather than an error. Losing a version is never
+/// worth failing a reload over.
+pub fn versions_at(repo: &Path, refs: &[String], candidates: &[Manifest]) -> VersionTable {
+    let spec = |r: &str, manifest: &Manifest| format!("{r}:{}", manifest.manifest());
+    let specs: Vec<String> = refs
+        .iter()
+        .flat_map(|r| candidates.iter().map(move |m| spec(r, m)))
+        .collect();
+    if specs.is_empty() {
+        return VersionTable::default();
+    }
+    let Ok(blobs) = git::show_files_at_refs(repo, &specs) else {
+        return VersionTable::default();
+    };
+    let read = |r: &str, manifest: &Manifest| {
+        blobs
+            .get(&spec(r, manifest))
+            .and_then(|text| manifest.kind.parse_version(text))
+    };
+    let manifests: Vec<Manifest> = candidates
+        .iter()
+        .filter(|m| refs.iter().any(|r| read(r, m).is_some()))
+        .cloned()
+        .collect();
+    let rows = refs
+        .iter()
+        .map(|r| (r.clone(), manifests.iter().map(|m| read(r, m)).collect()))
+        .collect();
+    VersionTable { manifests, rows }
 }
 
 // ── Write ───────────────────────────────────────────────────────────────────

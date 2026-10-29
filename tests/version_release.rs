@@ -985,6 +985,35 @@ fn a_nested_crate_is_graduated_bumped_and_promoted_but_the_root_names_the_tag() 
 }
 
 #[test]
+fn the_tables_and_json_show_every_manifests_version() {
+    let sb = nested();
+    let out = sb.create_roll("both", "0611");
+    assert!(out.success, "create failed: {}", out.combined());
+
+    let list = sb.rf(&["list", "--no-tui"]);
+    assert!(list.success, "list failed: {}", list.combined());
+    let text = list.combined();
+    assert!(
+        text.contains("package.json") && text.contains("keeper"),
+        "{text}"
+    );
+    let row = text.lines().find(|l| l.contains("roll/1-")).unwrap();
+    assert!(
+        row.contains("0.0.1-roll1") && row.contains("0.1.0-roll1"),
+        "{row}"
+    );
+
+    let json = sb.rf(&["list", "--json"]);
+    assert!(json.success, "json failed: {}", json.combined());
+    let text = json.combined();
+    assert!(text.contains("\"version\": \"0.0.1-roll1\""), "{text}");
+    assert!(
+        text.contains("\"keeper/Cargo.toml\": \"0.1.0-roll1\""),
+        "{text}"
+    );
+}
+
+#[test]
 fn listing_version_manifest_paths_keeps_a_nested_crate_out() {
     let sb = nested();
     sb.set_config_raw("version_manifest", "[\"package.json\"]");

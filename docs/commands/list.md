@@ -9,8 +9,11 @@ Lists roll branches and states, with the same `--no-tui`/`--json` options as
 leaves off by default.
 
 The `version` column appears here too, on the same terms: shown whenever the repo
-has a `Cargo.toml`, absent otherwise, and never flagged. `--json` adds the same
-value as a `version` field per roll, `null` where there is none.
+versions through a manifest, one per manifest when there are several, absent
+otherwise, and never flagged. `--json` adds a `version` field per roll — the
+first manifest's, the one that names the release tag, `null` where there is
+none — and a `versions` object holding every manifest's, keyed by path
+(`{"package.json": "0.2.8-roll3", "keeper/Cargo.toml": "0.1.2-roll3"}`).
 
 The `build` column — this machine's most recent local rebuild — appears here
 too, on the same terms as `status`; see

@@ -2206,7 +2206,8 @@ fn cmd_list_text(no_tui: bool, deps: bool) -> Result<()> {
 
     let (dep_w, dependant_w) = dep_column_widths(&rolls);
     // Empty in a repo with no `Cargo.toml`, which drops the column entirely.
-    let (versions, ver_w) = version_column(&config, &rolls);
+    let versions = version_column(&config, &rolls);
+    let ver_w = versions.width;
     // Placed in the left gutter, right after the current-branch chevron,
     // rather than at the far right — it's a per-row marker, not a detail
     // like `version`/`deps`. Padded like any other non-last column, so the
@@ -2241,9 +2242,9 @@ fn cmd_list_text(no_tui: bool, deps: bool) -> Result<()> {
         ver_hdr = if versions.is_empty() {
             String::new()
         } else if deps {
-            format!("  {VERSION_HDR:<ver_w$}")
+            format!("  {:<ver_w$}", versions.header)
         } else {
-            format!("  {VERSION_HDR}")
+            format!("  {}", versions.header)
         },
         deps_hdr = if deps {
             format!("  {DEPS_HDR:<dep_w$}  {DEPENDANTS_HDR}")
@@ -2285,10 +2286,7 @@ fn cmd_list_text(no_tui: bool, deps: bool) -> Result<()> {
         let ver_col = if versions.is_empty() {
             String::new()
         } else {
-            let v = versions
-                .get(&roll.branch)
-                .map(String::as_str)
-                .unwrap_or("—");
+            let v = versions.cell(&roll.branch);
             if deps {
                 format!("  {v:<ver_w$}")
             } else {
@@ -2362,22 +2360,40 @@ pub(crate) fn print_hotfix_rows(
     }
 }
 
-/// Header for the per-branch crate version, shared by both plain tables.
-pub(crate) const VERSION_HDR: &str = "version";
-
-/// The version string to print per roll, keyed by branch, plus the column width.
+/// The version column of the plain tables: one sub-column per manifest the
+/// repo versions through, laid out as a single padded column so both tables
+/// can keep treating it as one.
 ///
-/// An empty map means "no column": either the repo has no `Cargo.toml` at all —
-/// every dotfiles repo — or nothing readable was found, and in both cases the
-/// table is better off without a column of dashes. The same rule the TUI table
-/// and the header version follow.
+/// An empty `header` means "no column": either the repo has no manifest at
+/// all — every dotfiles repo — or nothing readable was found, and in both
+/// cases the table is better off without a column of dashes. The same rule
+/// the TUI table follows.
+pub(crate) struct VersionColumn {
+    pub header: String,
+    pub width: usize,
+    cells: HashMap<String, String>,
+    blank: String,
+    /// The versions themselves, by branch, for `--json`.
+    pub table: version::VersionTable,
+}
+
+impl VersionColumn {
+    pub fn is_empty(&self) -> bool {
+        self.header.is_empty()
+    }
+
+    /// The printed cell for `branch`: each manifest's version, or a dash
+    /// where it has none.
+    pub fn cell(&self, branch: &str) -> &str {
+        self.cells.get(branch).unwrap_or(&self.blank)
+    }
+}
+
+/// The version columns to print per roll — see [`VersionColumn`].
 ///
 /// Versions are read at [`branches::content_ref`] per roll, so the plain tables
 /// and the TUI report the same commit's manifest.
-pub(crate) fn version_column(
-    config: &Config,
-    rolls: &[branches::RollInfo],
-) -> (HashMap<String, String>, usize) {
+pub(crate) fn version_column(config: &Config, rolls: &[branches::RollInfo]) -> VersionColumn {
     let refs: Vec<String> = rolls
         .iter()
         .map(|r| branches::content_ref(&r.branch, &r.location))
@@ -2386,25 +2402,66 @@ pub(crate) fn version_column(
         .version_manifest
         .selection()
         .candidates(&config.repo_root);
-    let by_ref = version::versions_at(&config.repo_root, &refs, &candidates);
+    let table = version::versions_at(&config.repo_root, &refs, &candidates).keyed_by(
+        rolls
+            .iter()
+            .zip(refs.iter())
+            .map(|(r, refspec)| (r.branch.as_str(), refspec.as_str())),
+    );
 
-    let by_branch: HashMap<String, String> = rolls
+    // Through `Display`, dev marker included — see `tui::rolls::version_cell`.
+    let text = |row: &[Option<version::Semver>]| -> Vec<String> {
+        row.iter().map(|v| tui::rolls::version_cell(*v)).collect()
+    };
+    let headers: Vec<String> = (0..table.manifests.len())
+        .map(|i| table.header(i))
+        .collect();
+    let widths: Vec<usize> = headers
         .iter()
-        .zip(refs.iter())
-        .filter_map(|(roll, refspec)| {
-            let v = by_ref.get(refspec)?;
-            // Through `Display`, dev marker included — see `tui::rolls::version_cell`.
-            Some((roll.branch.clone(), v.to_string()))
+        .enumerate()
+        .map(|(i, h)| {
+            table
+                .rows
+                .values()
+                .map(|row| tui::rolls::version_cell(row[i]).chars().count())
+                .chain([h.chars().count()])
+                .max()
+                .unwrap_or(0)
         })
         .collect();
+    // Sub-columns two spaces apart; the last is left unpadded, and the caller
+    // pads the whole column when another follows it.
+    let join = |parts: &[String]| -> String {
+        let last = parts.len().saturating_sub(1);
+        parts
+            .iter()
+            .enumerate()
+            .map(|(i, p)| {
+                if i == last {
+                    p.clone()
+                } else {
+                    format!("{p:<w$}", w = widths[i])
+                }
+            })
+            .collect::<Vec<_>>()
+            .join("  ")
+    };
 
-    let width = by_branch
-        .values()
-        .map(|v| v.chars().count())
-        .max()
-        .unwrap_or(0)
-        .max(VERSION_HDR.chars().count());
-    (by_branch, width)
+    let header = join(&headers);
+    let cells: HashMap<String, String> = table
+        .rows
+        .iter()
+        .map(|(branch, row)| (branch.clone(), join(&text(row))))
+        .collect();
+    let blank = join(&vec![tui::rolls::version_cell(None); headers.len()]);
+    let width = widths.iter().sum::<usize>() + 2 * widths.len().saturating_sub(1);
+    VersionColumn {
+        header,
+        width,
+        cells,
+        blank,
+        table,
+    }
 }
 
 /// Column headers for the dependency pair, shared by `rf list --no-tui --deps`
@@ -2537,9 +2594,13 @@ struct JsonRoll {
     /// consumers see the same dependency graph the TUI draws.
     deps: Vec<u32>,
     dependants: Vec<u32>,
-    /// The `[package]` version at this roll's tip. `null` in repos with no
-    /// `Cargo.toml`, which is the same absence the tables render as a dash.
+    /// The version at this roll's tip — its first manifest's, the one that
+    /// names the release tag. `null` in repos with no manifest, which is the
+    /// same absence the tables render as a dash.
     version: Option<String>,
+    /// Every manifest's version at this roll's tip, keyed by its path
+    /// (`package.json`, `keeper/Cargo.toml`). Empty where `version` is `null`.
+    versions: std::collections::BTreeMap<String, String>,
     /// Subset of `deps` whose current tip this roll has not integrated — the
     /// ancestry check behind the TUI's `⚠ reintegrate` marker, exposed so a
     /// script deciding whether to merge a batch of dependent rolls can check
@@ -2580,7 +2641,7 @@ fn rolls_for_json(
     rolls: Vec<branches::RollInfo>,
     rebuild_status: Option<&rebuild::RebuildStatus>,
 ) -> Vec<JsonRoll> {
-    let (versions, _) = version_column(config, &rolls);
+    let versions = version_column(config, &rolls).table;
     let cycles: Vec<Option<JsonCycle>> = rolls
         .iter()
         .map(|r| {
@@ -2598,7 +2659,18 @@ fn rolls_for_json(
         .zip(cycles)
         .map(|(r, cycle)| JsonRoll {
             cycle,
-            version: versions.get(&r.branch).cloned(),
+            version: versions
+                .row(&r.branch)
+                .into_iter()
+                .flatten()
+                .next()
+                .map(|v| v.to_string()),
+            versions: versions
+                .manifests
+                .iter()
+                .zip(versions.row(&r.branch))
+                .filter_map(|(m, v)| Some((m.manifest(), v?.to_string())))
+                .collect(),
             recent_rebuilds: recent_rebuild_labels(rebuild_status, &r.branch),
             branch: r.branch,
             number: r.number,
