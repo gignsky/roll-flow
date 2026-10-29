@@ -162,19 +162,40 @@ cargo test
 
 ## Caveats
 
-- no _automatic_ fetch or push — every one is a keypress or an explicit command.
-  The remote is touched by: `rf prune` and `rf delete` (and the TUI's `[x]` and
-  `[d]`), which fetch and delete branches on `origin`; `rf clean`, which fetches
-  from every remote and deletes there only with `--with-remote`; `rf tidy` (and
-  the TUI's `[t]`), which fetches but only ever deletes locally; the confirmed
-  release-tag push at the end of `rf promote`; and the TUI's `[p]`/`[P]`/`[f]`,
-  which pull, push and fetch the selected branch, plus `PP`, which pushes every
-  branch that can be fast-forwarded
-- no daemon; `rf` only ever runs when invoked. The `status`/`list` TUI drives the
-  workflow (`i` integrate, `I` integrate rolling, `v` verify, `V` verify many,
-  `G` graduate, `m` promote, `u` update, `x` prune, `t` tidy, `d` delete, `b`
-  bump the version) and syncs the selected branch (`p` pull, `P` push, `PP` push
-  every branch that needs it, `f` fetch, `gg` lazygit, `bb` bacon). The status bar carries
-  only the basics; `?` opens a fuzzy-searchable list of every key, and enter
-  runs the one under the cursor. A force *push* is available there behind a
-  confirmation; every other forced operation stays CLI-only by design
+- no _automatic_ fetch or push — every one is a keypress or an explicit
+  command. The remote is touched by:
+  - `rf prune` and `rf delete` (and the TUI's `[x]`/`[d]`) — fetch and delete
+    branches on `origin`
+  - `rf clean` — fetches from every remote, deletes there only with
+    `--with-remote`
+  - `rf tidy` (and the TUI's `[t]`) — fetches, but only ever deletes locally
+  - `rf promote` — a confirmed release-tag push at the end
+  - the TUI's `[p]`/`[P]`/`[f]` — pull, push and fetch the selected branch
+  - the TUI's `PP` — pushes every branch that can be fast-forwarded
+- no daemon; `rf` only ever runs when invoked. The `status`/`list` TUI drives
+  the workflow, one key per line so a new one is a new line, not a reflowed
+  paragraph:
+  - `i` integrate
+  - `I` integrate rolling
+  - `v` verify
+  - `V` verify many
+  - `G` graduate
+  - `m` promote
+  - `u` update
+  - `x` prune
+  - `t` tidy
+  - `d` delete
+  - `b` bump the version
+
+  and syncs the selected branch:
+  - `p` pull
+  - `P` push
+  - `PP` push every branch that needs it
+  - `f` fetch
+  - `gg` lazygit
+  - `bb` bacon
+
+  The status bar carries only the basics; `?` opens a fuzzy-searchable list of
+  every key, and enter runs the one under the cursor. A force _push_ is
+  available there behind a confirmation; every other forced operation stays
+  CLI-only by design

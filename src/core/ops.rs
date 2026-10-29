@@ -1814,6 +1814,13 @@ fn commit_settled_merge(repo: &Path) -> Result<()> {
 /// ([`sync_lockfile_own_entry`]), so it is right even when no toolchain runs.
 /// Only Cargo has a toolchain step at all: an npm root-version change implies
 /// nothing else in the lockfile, so the direct rewrite is the whole refresh.
+///
+/// Cargo runs through [`proc::run`] like the gates do, because cargo always
+/// talks: a dev marker sorts *below* the bare version, so marking a roll prints
+/// `Downgrading <pkg> v0.2.7 -> v0.2.7-roll34`. Under the TUI that line used to
+/// land on the alternate screen itself, scribbling over cells ratatui then
+/// never repainted — the table looked out of date until something forced a
+/// full redraw.
 fn refresh_lockfile(repo: &Path, manifest: &Manifest) {
     if !repo.join(manifest.lockfile()).exists() {
         return;
@@ -1825,17 +1832,19 @@ fn refresh_lockfile(repo: &Path, manifest: &Manifest) {
     // Run from the manifest's own directory, so a crate in a subdirectory
     // refreshes its own lockfile rather than the root's.
     let dir = repo.join(manifest.dir());
-    let offline = Command::new("cargo")
-        .args(["update", "--workspace", "--offline"])
-        .current_dir(&dir)
-        .status();
+    let offline = proc::run(
+        Command::new("cargo")
+            .args(["update", "--workspace", "--offline"])
+            .current_dir(&dir),
+    );
     if matches!(&offline, Ok(s) if s.success()) {
         return;
     }
-    let _ = Command::new("cargo")
-        .args(["update", "--workspace"])
-        .current_dir(&dir)
-        .status();
+    let _ = proc::run(
+        Command::new("cargo")
+            .args(["update", "--workspace"])
+            .current_dir(&dir),
+    );
 }
 
 /// Make the lockfile's own entry carry the manifest's version, touching
