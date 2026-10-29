@@ -1426,7 +1426,7 @@ pub(crate) const BINDINGS: &[Binding] = &[
     },
     Binding {
         keys: "v",
-        label: "verify the checked-out branch",
+        label: "verify the selected roll, switching to it first",
         group: "roll",
         hint: None,
         replay: &[KeyCode::Char('v')],
@@ -3565,16 +3565,23 @@ impl StatusApp {
 
     /// `[V]` — open the verify-many picker, or say why it cannot run.
     ///
+    /// Queues like `[v]`: behind a running job, a held queue or a pending
+    /// switch. `ops::verify_many` switches through the set and restores HEAD
+    /// to whatever was checked out when it *starts*, so it captures nothing at
+    /// keypress that a queued command could make stale.
+    ///
     /// The clean-tree check happens here as well as inside `ops::verify_many`,
     /// so the refusal is a status-bar message before the modal opens rather
-    /// than a failed job after the user has already chosen a set.
+    /// than a failed job after the user has already chosen a set — but only
+    /// when nothing is pending. Behind other commands the tree is theirs to
+    /// change first, and `ops::verify_many` checks again when it runs.
     fn request_verify_many(&mut self) {
-        if self.busy() {
-            return;
-        }
-        if let Err(err) = ops::ensure_clean_state(&self.config) {
-            self.message = Some(format!("{err} — verifying many rolls switches branches"));
-            return;
+        let idle = self.job.is_none() && self.queue.is_empty();
+        if idle {
+            if let Err(err) = ops::ensure_clean_state(&self.config) {
+                self.message = Some(format!("{err} — verifying many rolls switches branches"));
+                return;
+            }
         }
         self.mode = Mode::VerifyMany {
             counts: verify_set_counts(&self.rolls),
@@ -4331,11 +4338,34 @@ impl StatusApp {
     ///
     /// Verify may be queued behind a switch or create, which is how verifies
     /// chain across rolls: the job reads HEAD when it *runs* (`run_verify`),
-    /// so it judges whichever branch the queued switch left checked out. The
-    /// route cannot be named at keypress then — HEAD is about to change — so
-    /// the title says what it waits on instead, and a branch that turns out not
-    /// to be promotable fails inside the job like any other verify error.
+    /// so it judges whichever branch the queued switch left checked out.
+    ///
+    /// The cursor picks what is verified. On a verifiable row (a roll, the
+    /// rolling branch, a hotfix) that is not already checked out — or while
+    /// HEAD is about to move, so "already checked out" cannot be trusted — the
+    /// key queues a switch to that row and then the verify, so a chain across
+    /// rolls is just `[v]` on each. The switch is a real one and stays: a
+    /// verify judges the working tree, and there is no other way to put the
+    /// row's tree there. Anywhere else (the stable row, no selection) it
+    /// verifies the checked-out branch as it always has; when HEAD is about to
+    /// change, that route cannot be named at keypress, so the title says what
+    /// it waits on, and a branch that turns out not to be promotable fails
+    /// inside the job like any other verify error.
     fn start_verify(&mut self) {
+        if let Some((branch, location)) = self.selected_verify_target() {
+            let moving = self.head_will_move().is_some();
+            if moving || branch != self.current_branch {
+                let route = verify_route_for(&self.config, &branch);
+                let title = match route {
+                    Some((source, target)) => format!("rf verify {source} → {target}"),
+                    None => format!("rf verify {branch}"),
+                };
+                self.execute_switch(branch, location);
+                let config = self.config.clone();
+                self.start_job(title, move || Ok(JobDone::lines(run_verify(&config)?)));
+                return;
+            }
+        }
         let title = match self.head_will_move() {
             Some(pending) => format!("rf verify (checked-out branch after '{pending}')"),
             None => {
@@ -4352,6 +4382,18 @@ impl StatusApp {
         };
         let config = self.config.clone();
         self.start_job(title, move || Ok(JobDone::lines(run_verify(&config)?)));
+    }
+
+    /// The selected row's branch, when it is one `[v]` can verify — a roll,
+    /// the rolling branch or a hotfix — and where it lives.
+    fn selected_verify_target(&self) -> Option<(String, BranchLocation)> {
+        let (branch, location) = match self.selected_row()? {
+            RowKind::Roll(i) => (&self.rolls[i].branch, &self.rolls[i].location),
+            RowKind::Base(i) => (&self.bases[i].branch, &self.bases[i].location),
+            RowKind::Hotfix(i) => (&self.hotfixes[i].branch, &self.hotfixes[i].location),
+        };
+        verify_route_for(&self.config, branch)?;
+        Some((branch.clone(), location.clone()))
     }
 
     /// Hand the terminal to an external full-screen application, then take it
@@ -11409,6 +11451,73 @@ mod tests {
         // The push itself fails (no such repo); the queue is empty so nothing
         // is held either way.
         settle(&mut app);
+    }
+
+    #[test]
+    fn v_on_another_roll_queues_a_switch_to_it_then_the_verify() {
+        let mut app = idle_app();
+        app.rolls = vec![roll_n(1, RollState::Active), roll_n(2, RollState::Active)];
+        app.rolls[0].is_current = true;
+        let (release, gate) = std::sync::mpsc::channel::<()>();
+        app.start_job("rf fetch", move || {
+            gate.recv().ok();
+            Ok(JobDone::default())
+        });
+
+        // A chain across rolls is `[v]` on each row — no `[space]` first.
+        app.table.select(Some(1));
+        app.start_verify();
+        app.table.select(Some(0));
+        app.start_verify();
+        let order: Vec<&str> = app.queue.titles().collect();
+        assert_eq!(
+            order,
+            [
+                "git switch roll/2-0101-x",
+                "rf verify roll/2-0101-x → rolling",
+                // Checked out now, but the switch ahead is about to move HEAD
+                // off it, so it is switched back to rather than trusted.
+                "git switch roll/1-0101-x",
+                "rf verify roll/1-0101-x → rolling",
+            ]
+        );
+        release.send(()).unwrap();
+    }
+
+    #[test]
+    fn v_on_the_checked_out_roll_verifies_without_switching() {
+        let mut app = idle_app();
+        app.rolls = vec![roll_n(1, RollState::Active)];
+        app.rolls[0].is_current = true;
+        let (release, gate) = std::sync::mpsc::channel::<()>();
+        app.start_job("rf fetch", move || {
+            gate.recv().ok();
+            Ok(JobDone::default())
+        });
+
+        app.table.select(Some(0));
+        app.start_verify();
+        let order: Vec<&str> = app.queue.titles().collect();
+        assert_eq!(order, ["rf verify roll/1-0101-x → rolling"]);
+        release.send(()).unwrap();
+    }
+
+    #[test]
+    fn verify_many_queues_instead_of_refusing_while_a_job_runs() {
+        let mut app = idle_app();
+        let (release, gate) = std::sync::mpsc::channel::<()>();
+        app.start_head_job("git switch roll/44", move || {
+            gate.recv().ok();
+            Ok(JobDone::default())
+        });
+
+        app.request_verify_many();
+        assert!(
+            matches!(app.mode, Mode::VerifyMany { .. }),
+            "picker should open: {:?}",
+            app.message
+        );
+        release.send(()).unwrap();
     }
 
     #[test]

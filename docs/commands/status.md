@@ -245,11 +245,15 @@ Two guards keep a chain from doing something you did not ask for:
   would act on a different one by the time their turn came. Press them again
   once the switch has run.
 - `[v]` is **not** refused: it reads the checked-out branch when it *runs*, so
-  it chains. Verify `roll/45`, queue a `space` switch to `roll/44`, then `[v]`
-  again, and the second verify judges `roll/44`. Its panel title says it waits
-  on the switch rather than naming a branch that is about to be left, and a
-  branch that is not promotable fails inside the job like any other verify
-  error. (`[V]` verifies a named set and is unaffected.)
+  it chains. On a roll row it queues its own switch to that roll first (see
+  [Verifying](#verifying)), and while a switch is pending it switches back even
+  to the row that is checked out now, since that is about to change. On a row
+  it cannot verify, it judges whatever the pending switch leaves checked out;
+  its panel title then says what it waits on, and a branch that is not
+  promotable fails inside the job like any other verify error.
+- `[V]` is **not** refused either: the pass restores HEAD to whatever was
+  checked out when it *starts*, so it queues behind running jobs, a held queue
+  and pending switches alike.
 - `[P]` and `PP` are **not** refused: a push names its branch, so it is queued
   like any other command. The branch is fixed when you press the key (the
   selected row, or the plan `PP` showed), never read from HEAD when the push
@@ -337,19 +341,29 @@ started.
 
 ## Verifying
 
-`[v]` runs [`verify`](verify.md) on the **checked-out** branch — not the row
-under the cursor, because the gates run in the working tree, so the branch they
-judge is whichever one is checked out. The route comes from that branch's tier
-and is named in the panel title before the gates start:
+`[v]` runs [`verify`](verify.md) on the **selected** roll. The gates run in the
+working tree, so the branch they judge has to be checked out: on a roll, rolling
+or hotfix row that is not, `[v]` queues a `space` switch to it first and then the
+verify — and the switch stays, leaving that branch checked out. On the row that
+is already checked out it just verifies. Anywhere else (the stable row) it
+verifies whatever is checked out. The route comes from the branch's tier and is
+named in the panel title before the gates start:
 
-| checked out | `[v]` checks |
+| verified branch | `[v]` checks |
 |---|---|
 | a `roll/*` branch | `roll/N-… → rolling` |
 | the rolling branch | `rolling → main` |
+| a hotfix | `hotfix/N-… → main` |
 | anything else | nothing — it says to check out a roll or rolling first |
 
-It is the one action key with no confirmation modal, because it is the one that
-changes nothing: the modal is for the ops that write to the repo. It reports the
+Because the switch and the verify are two queued commands, a chain across rolls
+is just `[v]` on each row: `[v]` on roll 44, `[v]` on roll 45, and the queue runs
+switch, verify, switch, verify. A switch that fails (a dirty tree git will not
+carry) holds the queue before its verify runs, like any other failure.
+
+It is the one action key with no confirmation modal, because the verify itself
+changes nothing — the modal is for the ops that write to the repo; the switch
+`[v]` may queue first is the same one `space` makes. It reports the
 same checks as `rf verify`, in the same words — divergence note, version
 comparison, gate notices, per-host results, verdict.
 
@@ -371,7 +385,9 @@ digit runs the pass. It is `rf verify --all --state <set>` on the same core
 routine, so the rules are identical, and the one that matters is that the pass
 **checks out each roll in turn** and always returns to the branch you started
 on, whatever any roll's gates said. A dirty tree is refused in the status bar
-before the picker even opens. One job, one panel: each roll's report under its
+before the picker even opens when nothing else is pending; queued behind other
+commands, the pass checks again when it starts. It queues like any other
+command rather than waiting for the panel to go idle. One job, one panel: each roll's report under its
 own header, then `N passed, M failed, K skipped`, and the panel marks failed if
 any did — see [`verify`](verify.md#verifying-many-at-once).
 
