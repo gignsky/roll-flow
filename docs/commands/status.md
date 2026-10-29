@@ -8,11 +8,16 @@ Shows current branch, tier, cleanliness, pending rolls, and promotion readiness.
 Runs as a full-screen TUI by default; `--no-tui` prints a plain table instead and
 `--json` emits machine-readable output.
 
-In a repo that has a `Cargo.toml`, the table carries a `version` column: the
-`[package]` version as it stands at each branch's tip — its own tip for a branch
-that exists locally, `origin/<branch>` for one that only exists on the remote.
-Repos without a manifest, which is every dotfiles repo, get no column at all,
-the same rule the header version follows. There is no flag for it.
+In a repo that versions through a manifest (see
+[`version_manifest`](../config.md)), the table carries a `version` column: the
+version as it stands at each branch's tip — its own tip for a branch that
+exists locally, `origin/<branch>` for one that only exists on the remote. A repo
+versioned through more than one manifest gets **one column per manifest**,
+headed by which file it is — its file name at the root, its directory when
+nested — so a site's `package.json` and a `keeper/Cargo.toml` read side by side
+(`package.json  keeper`), and a branch that lacks one shows a dash under it.
+Repos without a manifest, which is every dotfiles repo, get no column at all.
+There is no flag for it.
 
 The cell shows the full version, dev marker included: a roll carrying one reads
 `0.2.4-roll9`, not `0.2.4`. The `#` column says which roll a row is, but not
@@ -175,7 +180,7 @@ The full list:
 | `q` | quit |
 | `p` / `P` / `f` | pull / push / fetch the selected branch |
 | `PP` | [push every branch that needs it](#pp--push-everything-that-needs-it) |
-| `gg` | lazygit |
+| `gg` / `bb` | [lazygit / bacon](#gg-and-bb--hand-over-the-terminal) |
 | `c` / `i` | create a roll / integrate one into the checked-out roll |
 | `V` | verify all rolls, or a set of them |
 | `G` / `m` / `u` | graduate / promote / update from stable |
@@ -254,9 +259,29 @@ Two guards keep a chain from doing something you did not ask for:
 - `q` with commands queued only warns the first time; a second `q` quits and
   drops them.
 
-`gg` is the exception: lazygit is full-screen and owns the terminal, so `rf`
-suspends, hands it over, and redraws when lazygit exits. Set `lazygit_command` in
-`.roll-flow.toml` to point at something other than a bare `lazygit` on `PATH`.
+## `gg` and `bb` — hand over the terminal
+
+`gg` and `bb` are the exceptions to the output panel: lazygit and bacon draw
+their own full-screen UI and own the terminal outright, so there is nothing to
+stream. `rf` suspends, hands the terminal over, and redraws when the tool
+exits — then reloads the list, because anything at all may have happened
+inside. Only one of the two is a git tool, which is why they are their own
+`tools` group in `?` rather than sitting under `sync` or `roll`.
+
+`bb` is a chord on the `b` that bumps the version, like `pp` on `p`: a lone `b`
+still bumps, but only after a short window (400ms) with no second `b`. Bacon runs
+in the directory of the shallowest `Cargo.toml` in the working tree — the repo
+root when it has one, else the nearest crate below it — and the key says so in
+the status line when there is none.
+
+The nix package wraps `rf` with bacon and lazygit on a *suffixed* `PATH`, so `bb` and `gg` work
+with nothing else installed while a copy you already have still wins.
+
+Set `lazygit_command` or `bacon_command` in `.roll-flow.toml` to point at
+something other than a bare `lazygit`/`bacon` on `PATH`. lazygit is launched as
+`<command> -p <repo_root>`; bacon is launched with no arguments in that Cargo.toml directory,
+because bacon's positional argument is a job name (`check`, `clippy`, `test`)
+and a path passed there would be read as a job that does not exist.
 
 ## Pulling and pushing
 
@@ -411,7 +436,32 @@ magnitude apart by the shift key alone is a mistake waiting to happen; the digit
 also carry the ordering. Every row shows the version it would produce, so the
 choice needs no semver arithmetic in your head.
 
-It writes `Cargo.toml`, refreshes `Cargo.lock`, and commits both as
+### More than one manifest
+
+A repo versioned through both `Cargo.toml` and `package.json` (see
+[`version_manifest`](../config.md)) gets a **drill-down**: `[b]` first asks
+*which* version to raise, then by how much.
+
+```text
+┌ bump version ─────────────────────────────────────────────────┐
+│Bump which version?  (on rolling)                              │
+│                                                               │
+│[1] Cargo.toml 0.2.0-dev  — needs a bump                       │
+│[2] package.json 1.4.0  — already ahead of the stable branch   │
+│[a] all of them                                                │
+│                                                               │
+│[n] cancel                                                     │
+└───────────────────────────────────────────────────────────────┘
+```
+
+Each row says whether that manifest still owes a bump past the stable branch,
+which is what a promotion needs — it is refused until every manifest has one.
+`[1]`/`[2]` pick one, `[a]` raises them all by the same level, and the level
+step then lists each chosen manifest's resulting version. One commit carries
+every file it changed.
+
+For one manifest it writes `Cargo.toml` (or `package.json`), refreshes the
+lockfile, and commits both as
 `chore(release): bump version to <X> for <branch>` — identical to what
 `rf promote --bump` does, and the reason a clean working tree is required: the
 commit stages its two files and then commits the index, so anything else staged

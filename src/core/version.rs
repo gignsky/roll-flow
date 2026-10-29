@@ -31,14 +31,12 @@ use crate::error::RfError;
 
 // ── Manifest kind ────────────────────────────────────────────────────────────
 
-/// Which manifest a repo carries its version in. Declared in precedence
-/// order: [`ManifestKind::detect_forced`] (with `forced: None`, plain
-/// detection) returns the first kind with a readable version, so a repo
-/// carrying both is read as `Cargo` — the conservative default, since it
-/// keeps every existing repo byte-for-byte on its prior behaviour (a Rust
-/// project with a `package.json` for tooling only is more common than the
-/// reverse).
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+/// Which kind of manifest carries a version. Declared in precedence order:
+/// among manifests at the same depth, a `Cargo.toml` is listed ahead of a
+/// `package.json` (see [`Manifest::precedence`]), so it names the release tag
+/// — every repo that versioned through Cargo alone before npm support existed
+/// keeps its tags.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum ManifestKind {
     Cargo,
     Npm,
@@ -55,7 +53,8 @@ pub enum Role {
 impl ManifestKind {
     pub const ALL: [ManifestKind; 2] = [ManifestKind::Cargo, ManifestKind::Npm];
 
-    /// The manifest file name: `Cargo.toml` or `package.json`.
+    /// The manifest's file name: `Cargo.toml` or `package.json`. A
+    /// [`Manifest`] joins it to the directory it sits in.
     pub fn manifest(self) -> &'static str {
         match self {
             ManifestKind::Cargo => "Cargo.toml",
@@ -63,66 +62,12 @@ impl ManifestKind {
         }
     }
 
-    /// The lockfile name: `Cargo.lock` or `package-lock.json`.
+    /// The lockfile's file name: `Cargo.lock` or `package-lock.json`.
     pub fn lockfile(self) -> &'static str {
         match self {
             ManifestKind::Cargo => "Cargo.lock",
             ManifestKind::Npm => "package-lock.json",
         }
-    }
-
-    /// Both names, manifest first — what every commit and `git add` lists.
-    pub fn paths(self) -> [&'static str; 2] {
-        [self.manifest(), self.lockfile()]
-    }
-
-    /// The kind this working tree versions through, or `None` for a repo that
-    /// does not version this way (the dotfiles repo). `forced` (`None` for
-    /// plain detection — see [`Config::forced_manifest`](crate::core::config::Config::forced_manifest))
-    /// restricts the search to one kind rather than trying both, but it
-    /// still must carry a readable version: forcing a kind says "compare and
-    /// write through this file when it has something to version", not a
-    /// promise that the file already does.
-    ///
-    /// A manifest that exists but carries no readable version — a tooling-only
-    /// `package.json` with no `version` key is the common case; an npm
-    /// manifest without one is unremarkable in a way a Rust crate without one
-    /// never is — counts the same as a manifest that is absent: there is
-    /// nothing here for `rf` to version, and the gate must read as
-    /// `NotApplicable` rather than `Unreadable`, exactly as a repo that never
-    /// had the file at all.
-    pub fn detect_forced(repo: &Path, forced: Option<ManifestKind>) -> Option<ManifestKind> {
-        let candidates: &[ManifestKind] = match &forced {
-            Some(kind) => std::slice::from_ref(kind),
-            None => &Self::ALL,
-        };
-        candidates.iter().copied().find(|kind| {
-            std::fs::read_to_string(repo.join(kind.manifest()))
-                .ok()
-                .is_some_and(|text| kind.parse_version(&text).is_some())
-        })
-    }
-
-    /// Like [`detect_forced`](Self::detect_forced), at `refspec` rather than
-    /// the working tree, for callers reasoning about a branch that need not
-    /// be checked out (`check`, `check_against`, `versions_at` and friends).
-    pub fn detect_at_forced(
-        repo: &Path,
-        refspec: &str,
-        forced: Option<ManifestKind>,
-    ) -> Result<Option<ManifestKind>, RfError> {
-        let candidates: &[ManifestKind] = match &forced {
-            Some(kind) => std::slice::from_ref(kind),
-            None => &Self::ALL,
-        };
-        for kind in candidates {
-            if let Some(text) = git::show_file_at_ref(repo, refspec, kind.manifest())? {
-                if kind.parse_version(&text).is_some() {
-                    return Ok(Some(*kind));
-                }
-            }
-        }
-        Ok(None)
     }
 
     /// Which kind `path` belongs to, and whether it is the manifest or the
@@ -202,22 +147,208 @@ impl ManifestKind {
     }
 }
 
-/// Read and parse the version at `refspec`, detecting which manifest kind the
-/// ref carries (or honouring `forced` — see [`Config::forced_manifest`](crate::core::config::Config::forced_manifest)).
-/// `Ok(None)` when neither manifest exists there, or the one that does has
-/// no readable version.
+// ── Manifest ─────────────────────────────────────────────────────────────────
+
+/// One versioned manifest: its kind and the repo-relative directory it sits in
+/// (`""` at the root). Its lockfile is the kind's lockfile in that same
+/// directory — `keeper/Cargo.toml` locks in `keeper/Cargo.lock`.
+///
+/// A repo can carry several, at different depths: a site's root `package.json`
+/// beside a Rust service in `keeper/`. Each is versioned on its own, and
+/// [`Manifest::precedence`] orders them so the first is the one that names the
+/// release tag and the one a single-version display shows.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct Manifest {
+    pub kind: ManifestKind,
+    dir: String,
+}
+
+impl Manifest {
+    /// `kind`'s manifest at the repo root.
+    pub fn root(kind: ManifestKind) -> Manifest {
+        Manifest {
+            kind,
+            dir: String::new(),
+        }
+    }
+
+    /// The manifest at repo-relative `path`, or `None` when its file name is
+    /// neither `Cargo.toml` nor `package.json`.
+    pub fn from_path(path: &str) -> Option<Manifest> {
+        let path = path.trim_start_matches("./");
+        let (kind, Role::Manifest) = ManifestKind::for_path(Path::new(path))? else {
+            return None;
+        };
+        let dir = path.rsplit_once('/').map_or("", |(dir, _)| dir);
+        Some(Manifest {
+            kind,
+            dir: dir.trim_end_matches('/').to_string(),
+        })
+    }
+
+    /// The directory it sits in, repo-relative; `""` at the root.
+    pub fn dir(&self) -> &str {
+        &self.dir
+    }
+
+    fn join(&self, name: &str) -> String {
+        if self.dir.is_empty() {
+            name.to_string()
+        } else {
+            format!("{}/{name}", self.dir)
+        }
+    }
+
+    /// The manifest's repo-relative path: `Cargo.toml`, `keeper/Cargo.toml`.
+    pub fn manifest(&self) -> String {
+        self.join(self.kind.manifest())
+    }
+
+    /// The lockfile's repo-relative path, beside the manifest.
+    pub fn lockfile(&self) -> String {
+        self.join(self.kind.lockfile())
+    }
+
+    /// Both paths, manifest first — what every commit and `git add` lists.
+    pub fn paths(&self) -> [String; 2] {
+        [self.manifest(), self.lockfile()]
+    }
+
+    /// The order a repo's manifests are listed in: shallowest first, then
+    /// [`ManifestKind::ALL`] order (Cargo before npm), then path. A root
+    /// manifest therefore always outranks a nested one, which is what makes it
+    /// the release tag's source in a repo with a site at the root and a crate
+    /// in a subdirectory.
+    fn precedence(&self) -> (usize, usize, String) {
+        let depth = if self.dir.is_empty() {
+            0
+        } else {
+            self.dir.split('/').count()
+        };
+        let kind = ManifestKind::ALL
+            .iter()
+            .position(|k| *k == self.kind)
+            .unwrap_or(usize::MAX);
+        (depth, kind, self.manifest())
+    }
+}
+
+impl fmt::Display for Manifest {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(&self.manifest())
+    }
+}
+
+/// Sort into [`Manifest::precedence`] order and drop duplicates.
+fn ordered(mut manifests: Vec<Manifest>) -> Vec<Manifest> {
+    manifests.sort_by_key(Manifest::precedence);
+    manifests.dedup();
+    manifests
+}
+
+/// Which manifests a repo versions through — what `version_manifest` in
+/// `.roll-flow.toml` resolves to.
+///
+/// - `Auto` discovers every tracked `Cargo.toml`/`package.json` carrying a
+///   readable version, at any depth: a tooling-only `package.json` with no
+///   `version` key, or a workspace member inheriting `version.workspace`,
+///   is not versioned and is left out.
+/// - `Kind` narrows that discovery to one kind.
+/// - `Paths` names the manifests outright and discovers nothing — the way to
+///   keep a versioned fixture or vendored crate out of the gate.
+///
+/// Every list it yields is in [`Manifest::precedence`] order.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub enum Selection {
+    #[default]
+    Auto,
+    Kind(ManifestKind),
+    Paths(Vec<Manifest>),
+}
+
+impl Selection {
+    fn admits(&self, manifest: &Manifest) -> bool {
+        match self {
+            Selection::Auto | Selection::Paths(_) => true,
+            Selection::Kind(kind) => manifest.kind == *kind,
+        }
+    }
+
+    /// Every manifest this selection could mean in the working tree, whether
+    /// or not it carries a version — what a lookup across many refs tries
+    /// (see [`versions_at`]). Discovery reads tracked files (`git ls-files`),
+    /// so nothing under an ignored `node_modules` or `target` is ever a
+    /// candidate; the two root names are always included so a manifest not
+    /// yet committed is still seen.
+    pub fn candidates(&self, repo: &Path) -> Vec<Manifest> {
+        if let Selection::Paths(list) = self {
+            return ordered(list.clone());
+        }
+        let mut found: Vec<Manifest> = ManifestKind::ALL.into_iter().map(Manifest::root).collect();
+        let tracked = git::capture_git(repo, &["ls-files", "--", "*Cargo.toml", "*package.json"])
+            .unwrap_or_default();
+        found.extend(tracked.lines().filter_map(Manifest::from_path));
+        ordered(found.into_iter().filter(|m| self.admits(m)).collect())
+    }
+
+    /// The manifests the working tree versions through: each candidate whose
+    /// file is present and carries a readable version.
+    pub fn manifests(&self, repo: &Path) -> Vec<Manifest> {
+        self.candidates(repo)
+            .into_iter()
+            .filter(|m| read_version(repo, m).ok().flatten().is_some())
+            .collect()
+    }
+
+    /// [`manifests`](Self::manifests) at `refspec` rather than the working
+    /// tree, for a branch that need not be checked out.
+    pub fn manifests_at(&self, repo: &Path, refspec: &str) -> Result<Vec<Manifest>, RfError> {
+        let candidates = match self {
+            Selection::Paths(list) => list.clone(),
+            _ => {
+                // `ls-tree` takes no glob pathspecs, so the whole tree is
+                // listed and filtered here — one call, names only.
+                let tree = git::capture_git(repo, &["ls-tree", "-r", "--name-only", refspec])
+                    .unwrap_or_default();
+                tree.lines()
+                    .filter_map(Manifest::from_path)
+                    .filter(|m| self.admits(m))
+                    .collect()
+            }
+        };
+        let mut found = Vec::new();
+        for manifest in ordered(candidates) {
+            if version_at(repo, refspec, &manifest)?.is_some() {
+                found.push(manifest);
+            }
+        }
+        Ok(found)
+    }
+
+    /// [`manifests_at`](Self::manifests_at) for each ref, merged: what a
+    /// comparison between two refs has to cover, since either side may carry
+    /// a manifest the other does not have yet.
+    pub fn manifests_between(
+        &self,
+        repo: &Path,
+        a: &str,
+        b: &str,
+    ) -> Result<Vec<Manifest>, RfError> {
+        let mut all = self.manifests_at(repo, a)?;
+        all.extend(self.manifests_at(repo, b)?);
+        Ok(ordered(all))
+    }
+}
+
+/// The version `manifest` carries at `refspec`. `Ok(None)` when the file does
+/// not exist there or carries no readable version.
 pub fn version_at(
     repo: &Path,
     refspec: &str,
-    forced: Option<ManifestKind>,
-) -> Result<Option<(ManifestKind, Semver)>, RfError> {
-    let Some(kind) = ManifestKind::detect_at_forced(repo, refspec, forced)? else {
-        return Ok(None);
-    };
-    let Some(text) = git::show_file_at_ref(repo, refspec, kind.manifest())? else {
-        return Ok(None);
-    };
-    Ok(kind.parse_version(&text).map(|v| (kind, v)))
+    manifest: &Manifest,
+) -> Result<Option<Semver>, RfError> {
+    Ok(git::show_file_at_ref(repo, refspec, &manifest.manifest())?
+        .and_then(|text| manifest.kind.parse_version(&text)))
 }
 
 // ── Semver ──────────────────────────────────────────────────────────────────
@@ -418,6 +549,8 @@ pub enum VersionStatus {
 /// The two versions being compared plus the verdict.
 #[derive(Debug, Clone)]
 pub struct VersionCheck {
+    /// Which manifest this compared. `None` when nothing was applicable.
+    pub manifest: Option<Manifest>,
     pub head: Option<Semver>,
     pub base: Option<Semver>,
     pub status: VersionStatus,
@@ -426,10 +559,31 @@ pub struct VersionCheck {
 impl VersionCheck {
     pub fn not_applicable() -> VersionCheck {
         VersionCheck {
+            manifest: None,
             head: None,
             base: None,
             status: VersionStatus::NotApplicable,
         }
+    }
+
+    /// The one verdict a set of per-manifest checks amounts to: the most
+    /// serious unsatisfied check (`Lower`, then `Unreadable`, `DevVersion`,
+    /// `Unchanged`), else the first that passed, else `NotApplicable`. A repo
+    /// with one manifest gets that manifest's own check back unchanged.
+    pub fn worst(checks: &[VersionCheck]) -> VersionCheck {
+        let rank = |status: VersionStatus| match status {
+            VersionStatus::Lower => 0,
+            VersionStatus::Unreadable => 1,
+            VersionStatus::DevVersion => 2,
+            VersionStatus::Unchanged => 3,
+            VersionStatus::Ok => 4,
+            VersionStatus::NotApplicable => 5,
+        };
+        checks
+            .iter()
+            .min_by_key(|c| rank(c.status))
+            .cloned()
+            .unwrap_or_else(VersionCheck::not_applicable)
     }
 
     /// True when the check neither blocks nor has anything to report.
@@ -441,54 +595,39 @@ impl VersionCheck {
     }
 }
 
-/// Compare the version at `source_ref` to the one at `target_ref` — the same
-/// comparison `version-bump-check.yml` makes between a PR head and its base.
+/// Compare `manifest`'s version at `source_ref` to its version at
+/// `target_ref` — the same comparison `version-bump-check.yml` makes between a
+/// PR head and its base.
 ///
-/// The manifest kind is detected independently at each ref (a side that added
-/// the manifest this very branch has none to detect on the other), and
-/// whichever is found is used to read *both* sides, so a repo that versions
-/// through one kind is never compared against a stray file of the other.
-/// `forced` overrides detection outright — see
-/// [`Config::forced_manifest`](crate::core::config::Config::forced_manifest).
+/// A side where the file is absent, or carries no readable version (a
+/// tooling-only `package.json`), reads as having none: a manifest that gains
+/// its first version on this very branch is a bump from nothing, not
+/// `Unreadable`.
 pub fn check(
     repo: &Path,
     source_ref: &str,
     target_ref: &str,
-    forced: Option<ManifestKind>,
+    manifest: &Manifest,
 ) -> Result<VersionCheck, RfError> {
-    let head_kind = ManifestKind::detect_at_forced(repo, source_ref, forced)?;
-    let base_kind = ManifestKind::detect_at_forced(repo, target_ref, forced)?;
-    let Some(kind) = head_kind.or(base_kind) else {
-        return Ok(VersionCheck::not_applicable());
-    };
-
-    // Read a side's text only when its *own* detection succeeded — not just
-    // "the chosen `kind`'s file is present" — so a side whose manifest exists
-    // but carries no readable version (a tooling-only `package.json`, most
-    // commonly) reads as absent here too, same as `detect_at_forced` already
-    // treats it. Without this, `base_text` below would come back `Some` for
-    // that file's raw content, `base` would still be `None` once parsed, and
-    // the "added by this branch" arm — which tests `base_text.is_none()` —
-    // would miss, reporting `Unreadable` for the ordinary case of a roll
-    // introducing the first version a tooling-only manifest never had.
-    let head_text = match head_kind {
-        Some(_) => git::show_file_at_ref(repo, source_ref, kind.manifest())?,
-        None => None,
-    };
-    let base_text = match base_kind {
-        Some(_) => git::show_file_at_ref(repo, target_ref, kind.manifest())?,
-        None => None,
-    };
-
-    // No manifest on either side: this repo doesn't version this way. Skip.
-    if head_text.is_none() && base_text.is_none() {
+    let head = version_at(repo, source_ref, manifest)?;
+    let base = version_at(repo, target_ref, manifest)?;
+    // Neither side versions through this manifest: nothing to compare.
+    if head.is_none() && base.is_none() {
         return Ok(VersionCheck::not_applicable());
     }
+    Ok(VersionCheck {
+        manifest: Some(manifest.clone()),
+        head,
+        base,
+        status: verdict(head, base),
+    })
+}
 
-    let head = head_text.as_deref().and_then(|t| kind.parse_version(t));
-    let base = base_text.as_deref().and_then(|t| kind.parse_version(t));
-
-    let status = match (head, base) {
+/// The gate's verdict on a head version against its base. `base` is `None`
+/// only when the target has no version in this manifest at all, which makes
+/// any readable head a bump from nothing.
+fn verdict(head: Option<Semver>, base: Option<Semver>) -> VersionStatus {
+    match (head, base) {
         // Checked ahead of the comparison: a dev version can be numerically
         // above its target and still must not promote — `0.2.5-roll9 > 0.2.4`
         // is true, and shipping a `-roll9` (or un-finalized `-dev`) version to
@@ -496,14 +635,30 @@ pub fn check(
         // exists to stop.
         (Some(h), _) if h.has_marker() => VersionStatus::DevVersion,
         // A manifest added by this very branch is a bump from nothing.
-        (Some(_), None) if base_text.is_none() => VersionStatus::Ok,
+        (Some(_), None) => VersionStatus::Ok,
         (Some(h), Some(b)) if h > b => VersionStatus::Ok,
         (Some(h), Some(b)) if h == b => VersionStatus::Unchanged,
         (Some(_), Some(_)) => VersionStatus::Lower,
-        _ => VersionStatus::Unreadable,
-    };
+        (None, _) => VersionStatus::Unreadable,
+    }
+}
 
-    Ok(VersionCheck { head, base, status })
+/// [`check`] once per manifest in `manifests`, dropping those neither ref
+/// versions through. Empty when the repo versions through none.
+pub fn check_all(
+    repo: &Path,
+    source_ref: &str,
+    target_ref: &str,
+    manifests: &[Manifest],
+) -> Result<Vec<VersionCheck>, RfError> {
+    let mut checks = Vec::new();
+    for manifest in manifests {
+        let check = check(repo, source_ref, target_ref, manifest)?;
+        if check.status != VersionStatus::NotApplicable {
+            checks.push(check);
+        }
+    }
+    Ok(checks)
 }
 
 /// Like [`check`], but against an already-resolved `head` rather than reading
@@ -516,120 +671,148 @@ pub fn check(
 /// promotion step otherwise, since the raw value never actually reaches
 /// stable; finalizing is exactly what landing it does.
 ///
-/// Kept as its own small function rather than `check` delegating to it: the
-/// two differ in exactly when `NotApplicable` fires (`check`'s source-missing
-/// case is about the raw file being absent, not a parse failure), and
-/// collapsing that distinction to save a few lines is not worth risking here.
+/// `manifest` is `None` when the source versions through nothing; the
+/// verdict is then `NotApplicable`, or `Unreadable` against a target that
+/// does carry a version (passed as the manifest found there).
 pub fn check_against(
     repo: &Path,
     head: Option<Semver>,
     target_ref: &str,
-    forced: Option<ManifestKind>,
+    manifest: Option<&Manifest>,
 ) -> Result<VersionCheck, RfError> {
-    let kind = ManifestKind::detect_at_forced(repo, target_ref, forced)?;
-    let base_text = match kind {
-        Some(k) => git::show_file_at_ref(repo, target_ref, k.manifest())?,
-        None => None,
+    let Some(manifest) = manifest else {
+        return Ok(VersionCheck::not_applicable());
     };
-    if head.is_none() && base_text.is_none() {
+    let base = version_at(repo, target_ref, manifest)?;
+    if head.is_none() && base.is_none() {
         return Ok(VersionCheck::not_applicable());
     }
-    let base = match (kind, base_text.as_deref()) {
-        (Some(k), Some(t)) => k.parse_version(t),
-        _ => None,
-    };
-    let status = match (head, base) {
-        (Some(h), _) if h.has_marker() => VersionStatus::DevVersion,
-        (Some(_), None) if base_text.is_none() => VersionStatus::Ok,
-        (Some(h), Some(b)) if h > b => VersionStatus::Ok,
-        (Some(h), Some(b)) if h == b => VersionStatus::Unchanged,
-        (Some(_), Some(_)) => VersionStatus::Lower,
-        _ => VersionStatus::Unreadable,
-    };
-    Ok(VersionCheck { head, base, status })
+    Ok(VersionCheck {
+        manifest: Some(manifest.clone()),
+        head,
+        base,
+        status: verdict(head, base),
+    })
 }
 
-/// Read the crate version from the working tree, honouring `forced` — see
-/// [`Config::forced_manifest`](crate::core::config::Config::forced_manifest).
-pub fn read_version(repo: &Path, forced: Option<ManifestKind>) -> Result<Option<Semver>, RfError> {
-    let Some(kind) = ManifestKind::detect_forced(repo, forced) else {
-        return Ok(None);
-    };
-    read_version_for(repo, kind)
-}
-
-/// Like [`read_version`], but from an already-resolved kind rather than
-/// auto-detecting — what a `Config::manifest_kind`-aware write path uses so
-/// the value it bumps and the file it then writes
-/// ([`write_version`]) agree on which kind, even in a repo carrying both
-/// manifests. `Ok(None)` when that kind's manifest doesn't exist here.
-pub fn read_version_for(repo: &Path, kind: ManifestKind) -> Result<Option<Semver>, RfError> {
-    let path = repo.join(kind.manifest());
+/// Read `manifest`'s version from the working tree. `Ok(None)` when the file
+/// does not exist here or carries no readable version.
+pub fn read_version(repo: &Path, manifest: &Manifest) -> Result<Option<Semver>, RfError> {
+    let path = repo.join(manifest.manifest());
     if !path.exists() {
         return Ok(None);
     }
     let text = std::fs::read_to_string(&path)?;
-    Ok(kind.parse_version(&text))
+    Ok(manifest.kind.parse_version(&text))
 }
 
-/// Read the crate version at each of `refs`, keyed by ref. `forced` restricts
-/// every ref to that one kind instead of trying both — see
-/// [`Config::forced_manifest`](crate::core::config::Config::forced_manifest).
-///
-/// One `git cat-file --batch` for the whole set (both manifest names per ref,
-/// so a repo of either kind is covered in the same round trip), because the
-/// caller is a table that wants a version per row on every reload. Refs with
-/// neither manifest, or whose manifest carries a version this crate will not
-/// parse, are simply absent from the map — the column renders those as a
-/// dash, and a repo with no manifest at all yields an empty map rather than
-/// an error. Losing a version is never worth failing a reload over.
-pub fn versions_at(
-    repo: &Path,
-    refs: &[String],
-    forced: Option<ManifestKind>,
-) -> HashMap<String, Semver> {
-    let kinds: &[ManifestKind] = match &forced {
-        Some(kind) => std::slice::from_ref(kind),
-        None => &ManifestKind::ALL,
-    };
-    let mut specs = Vec::with_capacity(refs.len() * kinds.len());
-    for r in refs {
-        for kind in kinds {
-            specs.push(format!("{r}:{}", kind.manifest()));
-        }
+/// Every manifest's version at a set of refs: one column per manifest, one
+/// row per ref. What the version columns of `rf list`/`rf status` and the TUI
+/// draw, so a repo versioned through `package.json` *and*
+/// `keeper/Cargo.toml` shows both side by side.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct VersionTable {
+    /// The manifests with a version at one or more of the refs, in precedence
+    /// order — one column each. Empty in a repo that versions through none.
+    pub manifests: Vec<Manifest>,
+    /// Per key (a ref, or whatever the caller re-keyed it by), one entry per
+    /// column of [`manifests`](Self::manifests).
+    pub rows: HashMap<String, Vec<Option<Semver>>>,
+}
+
+impl VersionTable {
+    /// The row for `key`: one cell per column, `None` where that manifest has
+    /// no readable version there. Every column is `None` for an unknown key.
+    pub fn row(&self, key: &str) -> Vec<Option<Semver>> {
+        self.rows
+            .get(key)
+            .cloned()
+            .unwrap_or_else(|| vec![None; self.manifests.len()])
     }
-    let Ok(blobs) = git::show_files_at_refs(repo, &specs) else {
-        return HashMap::new();
-    };
-    let mut out = HashMap::new();
-    for r in refs {
-        for kind in kinds {
-            let spec = format!("{r}:{}", kind.manifest());
-            if let Some(version) = blobs.get(&spec).and_then(|text| kind.parse_version(text)) {
-                out.insert(r.clone(), version);
-                break;
+
+    /// The header for column `i`: `version` when there is only one, so a
+    /// single-manifest repo reads as it always has; otherwise which manifest —
+    /// its directory when nested (`keeper`), its file name at the root.
+    pub fn header(&self, i: usize) -> String {
+        match self.manifests.as_slice() {
+            [_] => "version".to_string(),
+            many => {
+                let manifest = &many[i];
+                if manifest.dir().is_empty() {
+                    manifest.kind.manifest().to_string()
+                } else {
+                    manifest.dir().to_string()
+                }
             }
         }
     }
-    out
+
+    /// The same table keyed by name instead of by ref: each `(name, ref)`
+    /// pair takes the row read at `ref` — a branch, say, read at the ref
+    /// [`branches::content_ref`](crate::core::branches::content_ref) picked.
+    pub fn keyed_by<'a>(
+        &self,
+        pairs: impl IntoIterator<Item = (&'a str, &'a str)>,
+    ) -> VersionTable {
+        VersionTable {
+            manifests: self.manifests.clone(),
+            rows: pairs
+                .into_iter()
+                .map(|(name, r)| (name.to_string(), self.row(r)))
+                .collect(),
+        }
+    }
+}
+
+/// Read every candidate's version at each of `refs` (see
+/// [`Selection::candidates`]), as a [`VersionTable`] keyed by ref. Candidates
+/// with no version at any of the refs get no column.
+///
+/// One `git cat-file --batch` for the whole set, because the caller is a
+/// table that wants its versions on every reload. A ref where a manifest is
+/// absent, or carries a version this crate will not parse, gets `None` in
+/// that column — rendered as a dash — and a repo with no manifest at all
+/// yields an empty table rather than an error. Losing a version is never
+/// worth failing a reload over.
+pub fn versions_at(repo: &Path, refs: &[String], candidates: &[Manifest]) -> VersionTable {
+    let spec = |r: &str, manifest: &Manifest| format!("{r}:{}", manifest.manifest());
+    let specs: Vec<String> = refs
+        .iter()
+        .flat_map(|r| candidates.iter().map(move |m| spec(r, m)))
+        .collect();
+    if specs.is_empty() {
+        return VersionTable::default();
+    }
+    let Ok(blobs) = git::show_files_at_refs(repo, &specs) else {
+        return VersionTable::default();
+    };
+    let read = |r: &str, manifest: &Manifest| {
+        blobs
+            .get(&spec(r, manifest))
+            .and_then(|text| manifest.kind.parse_version(text))
+    };
+    let manifests: Vec<Manifest> = candidates
+        .iter()
+        .filter(|m| refs.iter().any(|r| read(r, m).is_some()))
+        .cloned()
+        .collect();
+    let rows = refs
+        .iter()
+        .map(|r| (r.clone(), manifests.iter().map(|m| read(r, m)).collect()))
+        .collect();
+    VersionTable { manifests, rows }
 }
 
 // ── Write ───────────────────────────────────────────────────────────────────
 
-/// Rewrite the package version in the working tree's manifest.
+/// Rewrite the package version in the working tree's copy of `manifest`.
 ///
 /// Deliberately line/byte-based rather than a serialize round-trip: that
 /// would reorder keys and strip comments (TOML) or reformat whitespace
 /// (JSON). We locate the version key directly and replace only its value.
-///
-/// `kind` is the caller's already-resolved manifest kind rather than
-/// something this function detects itself: a caller honouring
-/// `Config::manifest_kind`'s override must write to *that* kind's file, not
-/// whatever plain [`ManifestKind::detect`] would pick in a repo carrying
-/// both — so the resolution happens once, at the caller, and this just
-/// writes.
-pub fn write_version(repo: &Path, kind: ManifestKind, new: Semver) -> Result<(), RfError> {
-    let path = repo.join(kind.manifest());
+pub fn write_version(repo: &Path, manifest: &Manifest, new: Semver) -> Result<(), RfError> {
+    let path = repo.join(manifest.manifest());
+    let kind = manifest.kind;
     let text = std::fs::read_to_string(&path)?;
     let rewritten = kind.replace_version(&text, new).ok_or_else(|| {
         RfError::Git(format!(
@@ -1257,6 +1440,50 @@ version = "1.0.228"
             Some((ManifestKind::Npm, Role::Lockfile))
         );
         assert_eq!(ManifestKind::for_path(Path::new("README.md")), None);
+    }
+
+    #[test]
+    fn a_manifest_knows_its_paths_from_where_it_sits() {
+        let keeper = Manifest::from_path("keeper/Cargo.toml").unwrap();
+        assert_eq!(keeper.kind, ManifestKind::Cargo);
+        assert_eq!(keeper.dir(), "keeper");
+        assert_eq!(keeper.manifest(), "keeper/Cargo.toml");
+        assert_eq!(keeper.lockfile(), "keeper/Cargo.lock");
+        assert_eq!(
+            Manifest::from_path("./package.json"),
+            Some(Manifest::root(ManifestKind::Npm))
+        );
+        assert_eq!(
+            Manifest::root(ManifestKind::Npm).lockfile(),
+            "package-lock.json"
+        );
+        // A lockfile, or anything else, is not a manifest.
+        assert_eq!(Manifest::from_path("keeper/Cargo.lock"), None);
+        assert_eq!(Manifest::from_path("README.md"), None);
+    }
+
+    #[test]
+    fn manifests_order_root_first_then_cargo_before_npm() {
+        let at = |p: &str| Manifest::from_path(p).unwrap();
+        let sorted = ordered(vec![
+            at("keeper/Cargo.toml"),
+            at("a/b/package.json"),
+            at("package.json"),
+            at("Cargo.toml"),
+            at("keeper/Cargo.toml"),
+            at("app/package.json"),
+        ]);
+        let paths: Vec<String> = sorted.iter().map(Manifest::manifest).collect();
+        assert_eq!(
+            paths,
+            [
+                "Cargo.toml",
+                "package.json",
+                "keeper/Cargo.toml",
+                "app/package.json",
+                "a/b/package.json",
+            ]
+        );
     }
 
     #[test]

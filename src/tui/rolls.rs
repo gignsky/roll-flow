@@ -11,6 +11,9 @@
 //! `gg` to hand the terminal to lazygit itself. The keymap is deliberately
 //! lazygit's rather than one of our own — `[G]raduate` and `[m] promote` moved
 //! aside to make room for it.
+//!
+//! `[B]` hands the terminal to bacon the same way. Both go through
+//! [`StatusApp::hand_over_terminal`], the one place anything suspends the TUI.
 
 use std::collections::{HashMap, HashSet};
 use std::time::{Duration, Instant};
@@ -39,7 +42,7 @@ use crate::core::{
     git::{self, TrackState},
     history, ops, proc, rebuild,
     sync::{self, PullPlan, PushOutcome, SyncTarget},
-    version::{self, BumpLevel, Semver, VersionCheck, VersionStatus},
+    version::{self, BumpLevel, Manifest, Semver, VersionCheck, VersionStatus},
 };
 
 /// A workflow operation reachable from the view. Navigation, quit and refresh
@@ -268,14 +271,57 @@ pub(crate) fn bump_previews(current: Semver) -> [(BumpLevel, Semver); 3] {
     ]
 }
 
+/// One manifest the bump modal can raise: which file, what it says now, and
+/// whether it still owes a bump to get past the stable branch (`None` when
+/// that could not be told — no stable to compare against).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct BumpManifest {
+    pub manifest: Manifest,
+    pub current: Semver,
+    pub owes: Option<bool>,
+}
+
+/// What a keystroke in the manifest picker (the first step of the bump modal,
+/// shown only when a repo is versioned through more than one manifest) asks for.
+#[derive(Clone, PartialEq, Eq, Debug)]
+pub(crate) enum BumpPick {
+    Ignore,
+    Cancel,
+    /// Indices into the modal's manifests.
+    Chosen(Vec<usize>),
+}
+
+/// Decide a keystroke in the manifest picker over `count` manifests: a digit
+/// picks that one, `a` picks them all.
+pub(crate) fn bump_pick_key(code: KeyCode, count: usize) -> BumpPick {
+    match code {
+        KeyCode::Char('a') | KeyCode::Char('A') => BumpPick::Chosen((0..count).collect()),
+        KeyCode::Char(c @ '1'..='9') => {
+            let index = c as usize - '1' as usize;
+            if index < count {
+                BumpPick::Chosen(vec![index])
+            } else {
+                BumpPick::Ignore
+            }
+        }
+        KeyCode::Char('n') | KeyCode::Char('N') | KeyCode::Esc => BumpPick::Cancel,
+        _ => BumpPick::Ignore,
+    }
+}
+
 /// Whether `[b]` can do anything here, or why not.
 ///
 /// A repo with no readable manifest version has nothing to raise — the same
 /// condition that makes the whole release path a no-op
 /// (`VersionStatus::NotApplicable`), so refusing here keeps the key honest
 /// rather than opening a modal over nothing.
-pub(crate) fn bump_gate(current: Option<Semver>) -> Result<Semver, String> {
-    current.ok_or_else(|| "no readable version — nothing to bump".to_string())
+pub(crate) fn bump_gate(
+    manifests: Vec<(Manifest, Semver)>,
+) -> Result<Vec<(Manifest, Semver)>, String> {
+    if manifests.is_empty() {
+        return Err("no readable version — nothing to bump".to_string());
+    }
+    Ok(manifests)
 }
 
 /// Decide a keystroke in the force-push confirmation.
@@ -405,7 +451,11 @@ enum Mode {
     /// Pick a semver level to raise. Holds the version read when the modal
     /// opened, so the previews it shows and the bump it applies agree.
     Bump {
-        current: Semver,
+        manifests: Vec<BumpManifest>,
+        /// Which of `manifests` the level will apply to. `None` while the
+        /// picker step is still showing — a repo with a single manifest skips
+        /// it and opens with that one already picked.
+        picked: Option<Vec<usize>>,
     },
     /// `[V]`: pick which set of rolls to verify in one pass. Holds the counts
     /// read when the modal opened, so the numbers it shows and the set it
@@ -748,10 +798,11 @@ struct StatusApp {
     /// Branches whose worktree has uncommitted changes, refreshed on reload.
     /// Drawn as a ⚡ in the `sync` column. See [`load_dirty`].
     dirty: HashSet<String>,
-    /// The `[package]` version at each visible branch's tip, refreshed on
-    /// reload. Sourced in one `cat-file --batch` rather than a `git show` per
-    /// row, the same reason `tracking` is one `for-each-ref`.
-    versions: HashMap<String, Semver>,
+    /// Every manifest's version at each visible branch's tip, refreshed on
+    /// reload — one column per manifest. Sourced in one `cat-file --batch`
+    /// rather than a `git show` per row, the same reason `tracking` is one
+    /// `for-each-ref`.
+    versions: version::VersionTable,
     /// The `[package]` version on the checked-out branch, refreshed on reload.
     /// `None` in repos with no `Cargo.toml`, where the header omits it and `[b]`
     /// refuses.
@@ -805,6 +856,9 @@ struct StatusApp {
     /// When a bare `p` was pressed, waiting to see whether it becomes `pp`.
     /// Same shape as `pending_push`, timed by [`PULL_CHORD_WINDOW`].
     pending_pull: Option<Instant>,
+    /// When a bare `b` was pressed, waiting to see whether it becomes `bb`.
+    /// Same shape as `pending_pull`, timed by [`BUMP_CHORD_WINDOW`].
+    pending_bump: Option<Instant>,
     /// Commands run through `:`, most-recent-first. Loaded once at startup
     /// from [`history::load`] and saved back after every run.
     command_history: Vec<String>,
@@ -944,6 +998,53 @@ pub(crate) fn pull_chord_key(code: KeyCode) -> PullChord {
         KeyCode::Char('p') => PullChord::All,
         _ => PullChord::Single,
     }
+}
+
+/// Same timeout as [`PULL_CHORD_WINDOW`]. `bb` makes a lone `b` — the version
+/// bump — wait this long before it fires.
+pub(crate) const BUMP_CHORD_WINDOW: Duration = Duration::from_millis(400);
+
+/// What the key following a bare `b` makes of it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum BumpChord {
+    /// A second `b`: hand the terminal to bacon.
+    Bacon,
+    /// Anything else: the version bump the first `b` already meant.
+    Bump,
+}
+
+/// Decide a pending `b` from the key that followed it. Mirrors
+/// [`pull_chord_key`]: only a second `b` completes the chord.
+pub(crate) fn bump_chord_key(code: KeyCode) -> BumpChord {
+    match code {
+        KeyCode::Char('b') => BumpChord::Bacon,
+        _ => BumpChord::Bump,
+    }
+}
+
+/// The directory of the shallowest `Cargo.toml` in the working tree — the
+/// repo root itself when it has one, else the nearest crate below it. Asked of
+/// git, so untracked-but-not-ignored manifests count and `target/` or
+/// `node_modules/` never do.
+pub(crate) fn cargo_root(repo_root: &std::path::Path) -> Option<std::path::PathBuf> {
+    let listed = crate::core::git::capture_git(
+        repo_root,
+        &[
+            "ls-files",
+            "--cached",
+            "--others",
+            "--exclude-standard",
+            "--",
+            ":(glob)**/Cargo.toml",
+        ],
+    )
+    .ok()?;
+    let manifest = listed
+        .lines()
+        .filter(|line| !line.is_empty())
+        .min_by_key(|line| (line.matches('/').count(), *line))?;
+    let dir = std::path::Path::new(manifest).parent()?;
+    Some(repo_root.join(dir))
 }
 
 /// One branch `PP` will push.
@@ -1288,12 +1389,26 @@ pub(crate) const BINDINGS: &[Binding] = &[
         hint: None,
         replay: &[KeyCode::Char('f')],
     },
+    // lazygit and bacon are not roll operations at all — they are other
+    // people's TUIs that this one steps aside for. Their own group, so `?`
+    // lists them together and a search for "sync" or "roll" does not turn up
+    // a key that touches neither.
     Binding {
         keys: "gg",
         label: "hand the terminal to lazygit",
-        group: "sync",
+        group: "tools",
         hint: None,
         replay: &[KeyCode::Char('g'), KeyCode::Char('g')],
+    },
+    Binding {
+        keys: "bb",
+        // "watch" earns its place the way "all" does on `PP`: the search is a
+        // subsequence match, and someone looking for a background cargo check
+        // types what it does, not the name of the program that does it.
+        label: "hand the terminal to bacon (watch and recheck)",
+        group: "tools",
+        hint: None,
+        replay: &[KeyCode::Char('b'), KeyCode::Char('b')],
     },
     Binding {
         keys: "c",
@@ -1706,6 +1821,10 @@ fn shell_command(shell: &str, input: &str) -> std::process::Command {
 /// [`ops::infer_route`] keeps the TUI and `rf verify` agreeing on what a branch
 /// tier means — there is one definition of the route, not two.
 pub(crate) fn verify_route_for(config: &Config, current_branch: &str) -> Option<(String, String)> {
+    // A hotfix is verified against stable, as `ops::verify` does.
+    if current_branch.starts_with(branches::HOTFIX_PREFIX) {
+        return Some((current_branch.to_string(), config.stable_branch.clone()));
+    }
     match ops::infer_route(config, current_branch)? {
         ops::Route::Graduate { roll } => Some((roll, config.rolling_branch.clone())),
         ops::Route::Promote => Some((config.rolling_branch.clone(), config.stable_branch.clone())),
@@ -1714,7 +1833,13 @@ pub(crate) fn verify_route_for(config: &Config, current_branch: &str) -> Option<
 
 /// Render a version check the way `main.rs` prints it, so the TUI and the CLI
 /// report the same comparison in the same words.
-fn push_version_check(lines: &mut Vec<String>, check: &VersionCheck, source: &str, target: &str) {
+fn push_version_check(
+    lines: &mut Vec<String>,
+    check: &VersionCheck,
+    source: &str,
+    target: &str,
+    named: bool,
+) {
     let verdict = match check.status {
         VersionStatus::Ok => "OK",
         VersionStatus::Unchanged => "UNCHANGED",
@@ -1733,8 +1858,12 @@ fn push_version_check(lines: &mut Vec<String>, check: &VersionCheck, source: &st
         .base
         .map(|v| v.to_string())
         .unwrap_or_else(|| "none".to_string());
+    let file = match (named, &check.manifest) {
+        (true, Some(manifest)) => format!(" ({manifest})"),
+        _ => String::new(),
+    };
     lines.push(format!(
-        "Version: {head} on '{source}' (base '{target}' {base}) {verdict}"
+        "Version{file}: {head} on '{source}' (base '{target}' {base}) {verdict}"
     ));
 }
 
@@ -2419,8 +2548,7 @@ impl StatusApp {
         let tracking = load_tracking(&config);
         let dirty = load_dirty(&tracking);
         let versions = load_versions(&config, &bases, &rolls, &hotfixes);
-        let version =
-            version::read_version(&config.repo_root, config.forced_manifest()).unwrap_or(None);
+        let version = config.version();
         let host_id = rebuild::current_host_identifier(&config.repo_root);
         let rebuild_status = host_id
             .as_deref()
@@ -2453,6 +2581,7 @@ impl StatusApp {
             pending_g: false,
             pending_push: None,
             pending_pull: None,
+            pending_bump: None,
             command_history: history::load(),
         }
     }
@@ -2466,6 +2595,7 @@ impl StatusApp {
             self.open_deferred_mode();
             self.resolve_lapsed_push();
             self.resolve_lapsed_pull();
+            self.resolve_lapsed_bump();
 
             if event::poll(Duration::from_millis(50))? {
                 let event = event::read()?;
@@ -2837,6 +2967,15 @@ impl StatusApp {
             return Ok(false);
         }
 
+        // `bb` opens bacon; any other key resolves the pending `b` as the bump.
+        if self.pending_bump.take().is_some() {
+            match bump_chord_key(code) {
+                BumpChord::Bacon => self.launch_bacon(terminal)?,
+                BumpChord::Bump => self.request_bump(),
+            }
+            return Ok(false);
+        }
+
         match code {
             KeyCode::Char('q') => return Ok(self.confirm_quit(quit_armed)),
             // `esc` dismisses the output panel when one is up, and only quits
@@ -2905,7 +3044,7 @@ impl StatusApp {
             KeyCode::Char('G') => self.request(Action::Graduate),
             KeyCode::Char('i') => self.request_integrate(),
             KeyCode::Char('I') => self.request_integrate_rolling(),
-            KeyCode::Char('b') => self.request_bump(),
+            KeyCode::Char('b') => self.arm_bump(),
             KeyCode::Char('m') => self.request(Action::Promote),
             KeyCode::Char('u') => self.request(Action::Update),
             KeyCode::Char('U') => self.request_update_many(),
@@ -3387,8 +3526,39 @@ impl StatusApp {
         if self.waits_on_head("[b]") {
             return;
         }
-        match bump_gate(self.version) {
-            Ok(current) => self.mode = Mode::Bump { current },
+        let read: Vec<(Manifest, Semver)> = self
+            .config
+            .manifests()
+            .into_iter()
+            .filter_map(|manifest| {
+                let v = version::read_version(&self.config.repo_root, &manifest)
+                    .ok()
+                    .flatten()?;
+                Some((manifest, v))
+            })
+            .collect();
+        match bump_gate(read) {
+            Ok(read) => {
+                let stable =
+                    git::resolve_branch(&self.config.repo_root, &self.config.stable_branch);
+                let manifests: Vec<BumpManifest> = read
+                    .into_iter()
+                    .map(|(manifest, current)| BumpManifest {
+                        owes: stable.as_deref().and_then(|stable| {
+                            let base =
+                                version::version_at(&self.config.repo_root, stable, &manifest)
+                                    .ok()
+                                    .flatten()?;
+                            Some(current.release() <= base.release())
+                        }),
+                        manifest,
+                        current,
+                    })
+                    .collect();
+                // One manifest: nothing to drill into.
+                let picked = (manifests.len() == 1).then(|| vec![0]);
+                self.mode = Mode::Bump { manifests, picked };
+            }
             Err(msg) => self.message = Some(msg),
         }
     }
@@ -3606,19 +3776,38 @@ impl StatusApp {
     }
 
     /// Handle a keypress while the bump picker is open.
+    ///
+    /// Two steps when the repo is versioned through more than one manifest:
+    /// first which of them to raise, then by how much. With one, only the
+    /// second.
     fn handle_bump(&mut self, code: KeyCode) {
+        let Mode::Bump { manifests, picked } = &mut self.mode else {
+            return;
+        };
+        let Some(chosen) = picked.clone() else {
+            match bump_pick_key(code, manifests.len()) {
+                BumpPick::Ignore => {}
+                BumpPick::Cancel => self.mode = Mode::Browsing,
+                BumpPick::Chosen(indices) => *picked = Some(indices),
+            }
+            return;
+        };
+        let chosen: Vec<Manifest> = chosen
+            .iter()
+            .map(|&i| manifests[i].manifest.clone())
+            .collect();
         match bump_key(code) {
             BumpOutcome::Ignore => {}
             BumpOutcome::Cancel => self.mode = Mode::Browsing,
             BumpOutcome::Level(level) => {
                 self.mode = Mode::Browsing;
-                self.execute_bump(level);
+                self.execute_bump(level, chosen);
             }
         }
     }
 
     /// Write the bumped version, refresh the lockfile and commit, as a job.
-    fn execute_bump(&mut self, level: BumpLevel) {
+    fn execute_bump(&mut self, level: BumpLevel, manifests: Vec<Manifest>) {
         let config = self.config.clone();
         let branch = self.current_branch.clone();
         self.start_job(format!("rf bump {level}"), move || {
@@ -3626,9 +3815,12 @@ impl StatusApp {
             // `git::commit_paths` stages its two files and then commits the whole
             // index. Graduate and promote take the same precaution.
             ops::ensure_clean_state(&config)?;
-            let (from, to) = ops::apply_version_bump(&config, level, &branch)?;
+            let bumped = ops::apply_version_bump(&config, level, &branch, &manifests)?;
+            let (from, to) = crate::split_changes(&bumped);
             Ok(JobDone::lines(vec![format!(
-                "Bumped {from} → {to} ({level}) on '{branch}'"
+                "Bumped {} → {} ({level}) on '{branch}'",
+                ops::describe_versions(&from),
+                ops::describe_versions(&to)
             )]))
         });
     }
@@ -3769,8 +3961,20 @@ impl StatusApp {
                 CreateKind::Roll => ops::create(&config, &slug, None, false)?,
                 CreateKind::Hotfix => ops::hotfix_create(&config, &slug, None, false)?,
             };
+            let mut lines = vec![format!("Created {}", outcome.branch)];
+            // Same as `rf create`: mark the roll's version `-roll<N>`. Hotfixes
+            // are not versioned this way.
+            if matches!(kind, CreateKind::Roll) && config.dev_versions {
+                let marked = ops::apply_dev_version(&config, outcome.number)?;
+                if !marked.is_empty() {
+                    lines.push(format!(
+                        "version marked {}",
+                        ops::describe_versions(&marked)
+                    ));
+                }
+            }
             Ok(JobDone::with_next(
-                vec![format!("Created {}", outcome.branch)],
+                lines,
                 Followup::SelectBranch(outcome.branch),
             ))
         });
@@ -3957,6 +4161,29 @@ impl StatusApp {
         }
     }
 
+    /// `[b]` — arm the bump chord. The bump itself does not start until the
+    /// chord resolves, in [`Self::handle_browsing`] or
+    /// [`Self::resolve_lapsed_bump`].
+    fn arm_bump(&mut self) {
+        if self.busy() {
+            return;
+        }
+        self.pending_bump = Some(Instant::now());
+        self.message = Some("b again to open bacon".to_string());
+    }
+
+    /// Fire a pending `b` that nothing followed.
+    fn resolve_lapsed_bump(&mut self) {
+        let lapsed = self
+            .pending_bump
+            .is_some_and(|armed| armed.elapsed() >= BUMP_CHORD_WINDOW);
+        if lapsed {
+            self.pending_bump = None;
+            self.message = None;
+            self.request_bump();
+        }
+    }
+
     /// `PP` — plan a push of every branch that needs one and open its modal.
     ///
     /// Nothing is pushed here. The plan is resolved from the tracking data the
@@ -4115,7 +4342,7 @@ impl StatusApp {
                 let Some((source, target)) = verify_route_for(&self.config, &self.current_branch)
                 else {
                     self.message = Some(format!(
-                        "'{}' is not promotable — check out {} or a {}branch to verify",
+                        "'{}' is not promotable — check out {}, a {}branch or a hotfix to verify",
                         self.current_branch, self.config.rolling_branch, self.config.roll_prefix
                     ));
                     return;
@@ -4127,43 +4354,91 @@ impl StatusApp {
         self.start_job(title, move || Ok(JobDone::lines(run_verify(&config)?)));
     }
 
-    /// `gg` — hand the terminal to lazygit, then take it back.
+    /// Hand the terminal to an external full-screen application, then take it
+    /// back.
     ///
-    /// The one action that still suspends: lazygit is a full-screen application
-    /// and owns the terminal outright, so there is nothing to stream into a
-    /// panel. The list reloads afterwards because anything at all may have
-    /// happened inside it.
-    fn launch_lazygit(&mut self, terminal: &mut super::Tui) -> Result<()> {
+    /// These are the only actions that still suspend. Ops stream into
+    /// [`output::Panel`] instead, but lazygit and bacon draw their own
+    /// full-screen UI and own the terminal outright, so there is nothing to
+    /// stream — see [`super::suspend`]. There is one implementation rather
+    /// than one per tool because every part of this is the same for both and
+    /// easy to get subtly wrong twice: [`super::resume`] has to run on the
+    /// failure path too or a missing binary leaves the screen wrecked, a
+    /// non-zero exit is a message while a failed spawn is a panel,
+    /// and the panel has to name the config key that overrides the command.
+    /// The list reloads afterwards because anything at all may have happened
+    /// inside.
+    ///
+    /// `command` is owned rather than borrowed from `self.config`: the `&mut
+    /// self` here would otherwise conflict with it for the whole call.
+    fn hand_over_terminal(
+        &mut self,
+        terminal: &mut super::Tui,
+        command: String,
+        config_key: &str,
+        configure: impl FnOnce(&mut std::process::Command),
+    ) -> Result<()> {
         if self.busy() {
             return Ok(());
         }
+        let mut child = std::process::Command::new(&command);
+        configure(&mut child);
+
         super::suspend(terminal)?;
-        let spawned = std::process::Command::new(&self.config.lazygit_command)
-            .arg("-p")
-            .arg(&self.config.repo_root)
-            .status();
+        let spawned = child.status();
         super::resume(terminal)?;
 
         match spawned {
             Ok(status) if status.success() => self.message = None,
-            Ok(status) => {
-                self.message = Some(format!(
-                    "{} exited with {status}",
-                    self.config.lazygit_command
-                ))
-            }
+            Ok(status) => self.message = Some(format!("{command} exited with {status}")),
             // A missing binary is the common case and deserves the actionable
             // message rather than a raw io error.
             Err(err) => {
-                let mut panel = output::Panel::new(self.config.lazygit_command.clone());
+                let mut panel = output::Panel::new(command.clone());
                 panel.fail(vec![
-                    format!("could not run '{}': {err}", self.config.lazygit_command),
-                    "set lazygit_command in .roll-flow.toml to override".to_string(),
+                    format!("could not run '{command}': {err}"),
+                    format!("set {config_key} in .roll-flow.toml to override"),
                 ]);
                 self.panel = Some(panel);
             }
         }
         self.reload()
+    }
+
+    /// `gg` — hand the terminal to lazygit.
+    fn launch_lazygit(&mut self, terminal: &mut super::Tui) -> Result<()> {
+        let command = self.config.lazygit_command.clone();
+        let repo_root = self.config.repo_root.clone();
+        self.hand_over_terminal(terminal, command, "lazygit_command", |child| {
+            child.arg("-p").arg(repo_root);
+        })
+    }
+
+    /// `bb` — hand the terminal to bacon, in the directory holding the working
+    /// tree's `Cargo.toml` (see [`cargo_root`]).
+    ///
+    /// Launched by `current_dir` rather than a path flag, which is the one way
+    /// this differs from lazygit's `-p`: bacon's positional argument is a *job*
+    /// name (`check`, `clippy`, `test`), so a repo path passed there would be
+    /// read as a job that does not exist. Setting the working directory is what
+    /// running `bacon` by hand in the repo does anyway, and it needs no
+    /// agreement with bacon about which flag names a path.
+    ///
+    /// No roll-flow state is involved: bacon watches the worktree and reruns
+    /// cargo, so it is a dev-loop key that happens to live on this screen
+    /// because this screen is where the user already is. The `reload` the
+    /// hand-over does on the way out is still right — bacon can be left
+    /// running across a `git` command typed in its shell-out.
+    fn launch_bacon(&mut self, terminal: &mut super::Tui) -> Result<()> {
+        let Some(root) = cargo_root(&self.config.repo_root) else {
+            self.message =
+                Some("no Cargo.toml in the working tree — nothing for bacon to watch".to_string());
+            return Ok(());
+        };
+        let command = self.config.bacon_command.clone();
+        self.hand_over_terminal(terminal, command, "bacon_command", |child| {
+            child.current_dir(root);
+        })
     }
 
     /// Route a mouse event to the output panel. A no-op with no panel up —
@@ -4339,8 +4614,7 @@ impl StatusApp {
         self.versions = load_versions(&self.config, &self.bases, &self.rolls, &self.hotfixes);
         // Read from the worktree, so a bump — or a branch switch that changes it —
         // shows in the header straight away.
-        self.version = version::read_version(&self.config.repo_root, self.config.forced_manifest())
-            .unwrap_or(None);
+        self.version = self.config.version();
         self.rebuild_status = self
             .host_id
             .as_deref()
@@ -4420,7 +4694,14 @@ impl StatusApp {
                 render_create_input(f, area, &self.config, slug, *kind)
             }
             Mode::Delete { preview } => render_delete_modal(f, area, &self.config, preview),
-            Mode::Bump { current } => render_bump_modal(f, area, *current, &self.current_branch),
+            Mode::Bump { manifests, picked } => match picked {
+                None => render_bump_pick_modal(f, area, manifests, &self.current_branch),
+                Some(indices) => {
+                    let chosen: Vec<BumpManifest> =
+                        indices.iter().map(|&i| manifests[i].clone()).collect();
+                    render_bump_levels_modal(f, area, &chosen, &self.current_branch)
+                }
+            },
             Mode::VerifyMany { counts } => render_verify_many_modal(f, area, counts),
             Mode::PullMany { counts } => render_pull_many_modal(f, area, counts),
             Mode::UpdateMany { counts } => render_update_many_modal(f, area, counts),
@@ -4532,21 +4813,25 @@ impl StatusApp {
             Constraint::Length(7),
             Constraint::Length(13),
         ]);
-        // Present only in repos that have a `Cargo.toml`, the same rule the
-        // header version follows — so a dotfiles repo pays nothing for it.
+        // Present only in repos that version through a manifest — so a
+        // dotfiles repo pays nothing for it.
         // Sized to the longest cell on screen (a dev marker like `-roll10`
         // makes this wider than a bare `12.34.5`), the same way `main.rs`'s
         // `version_column` sizes the plain tables; `branch` is the Fill
         // column that pays for it.
-        let show_versions = !self.versions.is_empty();
-        if show_versions {
+        //
+        // One column per manifest: a repo versioned through `package.json` and
+        // `keeper/Cargo.toml` shows both, headed by which file each is.
+        let version_columns = self.versions.manifests.len();
+        for i in 0..version_columns {
             let width = self
                 .versions
+                .rows
                 .values()
-                .map(|v| v.to_string().chars().count())
+                .map(|row| version_cell(row[i]).chars().count())
                 .max()
                 .unwrap_or(0)
-                .max("version".len());
+                .max(self.versions.header(i).chars().count());
             col_constraints.push(Constraint::Length(width as u16));
         }
         if self.show_deps {
@@ -4568,8 +4853,8 @@ impl StatusApp {
             Cell::from("sync").style(bold),
             Cell::from("state").style(bold),
         ]);
-        if show_versions {
-            header_cells.push(Cell::from("version").style(bold));
+        for i in 0..version_columns {
+            header_cells.push(Cell::from(self.versions.header(i)).style(bold));
         }
         if self.show_deps {
             header_cells
@@ -4586,6 +4871,12 @@ impl StatusApp {
         let tracking = &self.tracking;
         let dirty = &self.dirty;
         let versions = &self.versions;
+        let version_cells = |branch: &str, style: Style| {
+            versions
+                .row(branch)
+                .into_iter()
+                .map(move |v| Cell::from(version_cell(v)).style(style))
+        };
         let rebuild_status = &self.rebuild_status;
         let build_cell = |branch: &str| {
             Cell::from(
@@ -4628,12 +4919,7 @@ impl StatusApp {
                     Cell::from(sync_text).style(Style::default().fg(sync_color)),
                     Cell::from(base.role.label()).style(Style::default().fg(base.role.color())),
                 ]);
-                if show_versions {
-                    cells.push(
-                        Cell::from(version_cell(versions.get(&base.branch).copied()))
-                            .style(base_style),
-                    );
-                }
+                cells.extend(version_cells(&base.branch, base_style));
                 if show_deps {
                     cells.push(Cell::from(""));
                     cells.push(Cell::from(""));
@@ -4670,11 +4956,7 @@ impl StatusApp {
                 Cell::from(sync_text).style(Style::default().fg(sync_color)),
                 Cell::from(roll.state.label()).style(Style::default().fg(row_state_color)),
             ]);
-            if show_versions {
-                cells.push(
-                    Cell::from(version_cell(versions.get(&roll.branch).copied())).style(base_style),
-                );
-            }
+            cells.extend(version_cells(&roll.branch, base_style));
             if show_deps {
                 cells.push(Cell::from(branches::format_deps(roll)));
                 cells.push(Cell::from(branches::format_roll_numbers(&roll.dependents)));
@@ -4713,12 +4995,7 @@ impl StatusApp {
                 Cell::from(sync_text).style(Style::default().fg(sync_color)),
                 Cell::from(hotfix.state.label()).style(Style::default().fg(color)),
             ]);
-            if show_versions {
-                cells.push(
-                    Cell::from(version_cell(versions.get(&hotfix.branch).copied()))
-                        .style(base_style),
-                );
-            }
+            cells.extend(version_cells(&hotfix.branch, base_style));
             if show_deps {
                 cells.push(Cell::from(""));
                 cells.push(Cell::from(""));
@@ -4929,8 +5206,12 @@ fn run_verify(config: &Config) -> Result<Vec<String>> {
 
     let mut lines = Vec::new();
     let current = git::current_branch(&config.repo_root)?;
-    if let Some(dev) = ops::apply_dev_version_for_branch(config, &current)? {
-        lines.push(format!("version marked {dev}"));
+    let marked = ops::apply_dev_version_for_branch(config, &current)?;
+    if !marked.is_empty() {
+        lines.push(format!(
+            "version marked {}",
+            ops::describe_versions(&marked)
+        ));
     }
 
     let outcome = match ops::verify(config, false) {
@@ -4948,12 +5229,15 @@ fn run_verify(config: &Config) -> Result<Vec<String>> {
             outcome.target, outcome.source
         ));
     }
-    push_version_check(
-        &mut lines,
-        &outcome.version,
-        &outcome.source,
-        &outcome.target,
-    );
+    for check in &outcome.versions {
+        push_version_check(
+            &mut lines,
+            check,
+            &outcome.source,
+            &outcome.target,
+            outcome.versions.len() > 1,
+        );
+    }
     push_gate_notices(&mut lines, &outcome.gate_notices);
     push_gate_notices(&mut lines, &outcome.host_notices);
     push_host_results(&mut lines, &outcome.host_results);
@@ -5219,7 +5503,8 @@ fn load_dirty(tracking: &HashMap<String, git::LocalBranch>) -> HashSet<String> {
     dirty
 }
 
-/// Read the crate version at every branch on screen, keyed by branch name.
+/// Read every manifest's version at every branch on screen, keyed by branch
+/// name.
 ///
 /// The refspec per row follows the same local-first order as
 /// `git::resolve_branch`: a branch with a local copy is read at its own tip, a
@@ -5227,14 +5512,14 @@ fn load_dirty(tracking: &HashMap<String, git::LocalBranch>) -> HashSet<String> {
 ///
 /// Degrades to an empty map rather than failing the reload — a missing version
 /// renders as a dash, and no repo should lose its table over a decoration. That
-/// also covers the ordinary case of a repo with no `Cargo.toml` at all, where
-/// the column simply never appears.
+/// also covers the ordinary case of a repo with no manifest at all, where no
+/// column appears.
 fn load_versions(
     config: &Config,
     bases: &[BaseBranch],
     rolls: &[RollInfo],
     hotfixes: &[HotfixInfo],
-) -> HashMap<String, Semver> {
+) -> version::VersionTable {
     let rows: Vec<(&String, &BranchLocation)> = bases
         .iter()
         .map(|b| (&b.branch, &b.location))
@@ -5246,12 +5531,15 @@ fn load_versions(
         .map(|(branch, location)| branches::content_ref(branch, location))
         .collect();
 
-    let by_ref = version::versions_at(&config.repo_root, &refs, config.forced_manifest());
-    rows.iter()
-        .map(|(branch, _)| *branch)
-        .zip(refs.iter())
-        .filter_map(|(branch, refspec)| Some((branch.clone(), *by_ref.get(refspec)?)))
-        .collect()
+    let candidates = config
+        .version_manifest
+        .selection()
+        .candidates(&config.repo_root);
+    version::versions_at(&config.repo_root, &refs, &candidates).keyed_by(
+        rows.iter()
+            .map(|(branch, _)| branch.as_str())
+            .zip(refs.iter().map(String::as_str)),
+    )
 }
 
 /// The version cell for `branch`: the full version through `Semver`'s
@@ -5296,7 +5584,7 @@ fn render_verify_many(
     let mut skipped = 0;
     for result in results {
         lines.push(format!("── {} ──", result.branch));
-        if let Some(dev) = result.marked {
+        if let Some(dev) = &result.marked {
             lines.push(format!("version marked {dev}"));
         }
         if let Some(o) = &result.outcome {
@@ -5312,7 +5600,15 @@ fn render_verify_many(
                     o.source, o.target
                 ));
             }
-            push_version_check(&mut lines, &o.version, &o.source, &o.target);
+            for check in &o.versions {
+                push_version_check(
+                    &mut lines,
+                    check,
+                    &o.source,
+                    &o.target,
+                    o.versions.len() > 1,
+                );
+            }
             push_gate_notices(&mut lines, &o.gate_notices);
             push_gate_notices(&mut lines, &o.host_notices);
             push_host_results(&mut lines, &o.host_results);
@@ -5474,6 +5770,105 @@ fn render_update_many_modal(f: &mut Frame, area: Rect, counts: &[(UpdateSet, usi
 
 /// abstract, `0.2.0 → 0.3.0` is not, and seeing all three at once is what makes
 /// picking the right one obvious.
+/// The manifest picker: one row per manifest with what it says now and
+/// whether it still owes a bump past stable, plus `[a]` for all of them.
+fn render_bump_pick_modal(f: &mut Frame, area: Rect, manifests: &[BumpManifest], branch: &str) {
+    let mut lines = vec![
+        Line::from(format!("Bump which version?  (on {branch})")),
+        Line::from(""),
+    ];
+    for (i, m) in manifests.iter().enumerate() {
+        let status = match m.owes {
+            Some(true) => "  — needs a bump",
+            Some(false) => "  — already ahead of the stable branch",
+            None => "",
+        };
+        lines.push(Line::from(vec![
+            Span::styled(format!("[{}] ", i + 1), Style::default().fg(Color::Yellow)),
+            Span::raw(format!("{} ", m.manifest)),
+            Span::styled(
+                m.current.to_string(),
+                Style::default().add_modifier(Modifier::BOLD),
+            ),
+            Span::raw(status),
+        ]));
+    }
+    lines.push(Line::from(vec![
+        Span::styled("[a] ", Style::default().fg(Color::Yellow)),
+        Span::raw("all of them"),
+    ]));
+    lines.push(Line::from(""));
+    lines.push(Line::from(Span::styled(
+        "[n] cancel",
+        Style::default().fg(Color::Yellow),
+    )));
+    let width = lines
+        .iter()
+        .map(|l| l.width())
+        .max()
+        .unwrap_or(32)
+        .clamp(28, 90) as u16;
+    let modal = centered_rect(area, width + 4, lines.len() as u16 + 2);
+    f.render_widget(Clear, modal);
+    f.render_widget(
+        Paragraph::new(lines).block(Block::bordered().title(Span::styled(
+            " bump version ",
+            Style::default().add_modifier(Modifier::BOLD),
+        ))),
+        modal,
+    );
+}
+
+/// The level step. A single manifest renders exactly as it always has; several
+/// list every manifest's resulting version on each row.
+fn render_bump_levels_modal(f: &mut Frame, area: Rect, chosen: &[BumpManifest], branch: &str) {
+    if let [only] = chosen {
+        return render_bump_modal(f, area, only.current, branch);
+    }
+    let mut lines = vec![
+        Line::from(format!("Bumping {} manifests  (on {branch})", chosen.len())),
+        Line::from(""),
+    ];
+    for m in chosen {
+        lines.push(Line::from(format!("{}: {}", m.manifest, m.current)));
+    }
+    lines.push(Line::from(""));
+    for (i, level) in [BumpLevel::Patch, BumpLevel::Minor, BumpLevel::Major]
+        .into_iter()
+        .enumerate()
+    {
+        let results = chosen
+            .iter()
+            .map(|m| format!("{} {}", m.manifest, m.current.bump(level)))
+            .collect::<Vec<_>>()
+            .join(", ");
+        lines.push(Line::from(vec![
+            Span::styled(format!("[{}] ", i + 1), Style::default().fg(Color::Yellow)),
+            Span::raw(format!("{level} → {results}")),
+        ]));
+    }
+    lines.push(Line::from(""));
+    lines.push(Line::from(Span::styled(
+        "[n] cancel",
+        Style::default().fg(Color::Yellow),
+    )));
+    let width = lines
+        .iter()
+        .map(|l| l.width())
+        .max()
+        .unwrap_or(32)
+        .clamp(28, 100) as u16;
+    let modal = centered_rect(area, width + 4, lines.len() as u16 + 2);
+    f.render_widget(Clear, modal);
+    f.render_widget(
+        Paragraph::new(lines).block(Block::bordered().title(Span::styled(
+            " bump version ",
+            Style::default().add_modifier(Modifier::BOLD),
+        ))),
+        modal,
+    );
+}
+
 fn render_bump_modal(f: &mut Frame, area: Rect, current: Semver, branch: &str) {
     let mut lines = vec![
         Line::from(vec![
@@ -6712,6 +7107,7 @@ mod tests {
             clean_protect: Vec::new(),
             pull_mode: Default::default(),
             lazygit_command: "lazygit".to_string(),
+            bacon_command: "bacon".to_string(),
             version_manifest: Default::default(),
         }
     }
@@ -6806,7 +7202,7 @@ mod tests {
             show_deps: false,
             tracking: HashMap::new(),
             dirty: HashSet::new(),
-            versions: HashMap::new(),
+            versions: version::VersionTable::default(),
             host_id: None,
             rebuild_status: None,
             version: None,
@@ -6830,6 +7226,7 @@ mod tests {
             pending_g: false,
             pending_push: None,
             pending_pull: None,
+            pending_bump: None,
             command_history: Vec::new(),
         };
 
@@ -6874,7 +7271,7 @@ mod tests {
             show_deps: false,
             tracking: HashMap::new(),
             dirty: HashSet::new(),
-            versions: HashMap::new(),
+            versions: version::VersionTable::default(),
             host_id: None,
             rebuild_status: None,
             version: None,
@@ -6893,6 +7290,7 @@ mod tests {
             pending_g: false,
             pending_push: None,
             pending_pull: None,
+            pending_bump: None,
             command_history: Vec::new(),
         };
 
@@ -6917,7 +7315,7 @@ mod tests {
             show_deps: false,
             tracking: HashMap::new(),
             dirty: HashSet::new(),
-            versions: HashMap::new(),
+            versions: version::VersionTable::default(),
             host_id: None,
             rebuild_status: None,
             version: None,
@@ -6936,6 +7334,7 @@ mod tests {
             pending_g: false,
             pending_push: None,
             pending_pull: None,
+            pending_bump: None,
             command_history: Vec::new(),
         };
         app.toggle_maximize();
@@ -7370,19 +7769,70 @@ mod tests {
     }
 
     #[test]
+    fn only_a_second_b_completes_the_bacon_chord() {
+        assert_eq!(bump_chord_key(KeyCode::Char('b')), BumpChord::Bacon);
+        for key in [
+            KeyCode::Char('B'),
+            KeyCode::Char('v'),
+            KeyCode::Esc,
+            KeyCode::Enter,
+        ] {
+            assert_eq!(bump_chord_key(key), BumpChord::Bump, "{key:?}");
+        }
+    }
+
+    #[test]
+    fn cargo_root_finds_the_shallowest_manifest_in_the_working_tree() {
+        let dir = std::env::temp_dir().join(format!("rf-cargo-root-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(dir.join("app/sub")).unwrap();
+        let git = |args: &[&str]| {
+            assert!(std::process::Command::new("git")
+                .arg("-C")
+                .arg(&dir)
+                .args(args)
+                .output()
+                .unwrap()
+                .status
+                .success());
+        };
+        git(&["init", "-q"]);
+        assert_eq!(cargo_root(&dir), None);
+        std::fs::write(dir.join("app/sub/Cargo.toml"), "").unwrap();
+        assert_eq!(cargo_root(&dir), Some(dir.join("app/sub")));
+        std::fs::write(dir.join("app/Cargo.toml"), "").unwrap();
+        assert_eq!(cargo_root(&dir), Some(dir.join("app")));
+        std::fs::write(dir.join("Cargo.toml"), "").unwrap();
+        assert_eq!(cargo_root(&dir), Some(dir.clone()));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
     fn the_search_ranks_the_key_you_meant_first() {
         // The point of fuzzy over substring: a half-remembered word against a
         // label nobody read, with the right row at the top.
         assert_eq!(matched_keys("prune")[0], "x");
         assert_eq!(matched_keys("lazygit")[0], "gg");
         assert_eq!(matched_keys("bump")[0], "b");
+        // bacon by name, and by what it does — someone after a background
+        // cargo check does not necessarily know the program's name, and `b`
+        // sits one letter away from both queries.
+        assert_eq!(matched_keys("bacon")[0], "bb");
+        assert_eq!(matched_keys("watch")[0], "bb");
         // By the key itself, which is the other way people search.
         assert_eq!(matched_keys("gg")[0], "gg");
         // A group name lists the whole group, and nothing outside it.
         let sync = matched_keys("sync");
         assert!(sync.len() >= 4, "{sync:?}");
-        for keys in ["p", "P", "f", "gg"] {
+        for keys in ["p", "P", "PP", "f"] {
             assert!(sync.contains(&keys), "{keys} missing from {sync:?}");
+        }
+        // The two terminal hand-overs are their own group, so neither answers a
+        // search for the git keys it sits nowhere near.
+        assert!(!sync.contains(&"gg"), "gg is not a sync key: {sync:?}");
+        let tools = matched_keys("tools");
+        for keys in ["gg", "bb"] {
+            assert!(tools.contains(&keys), "{keys} missing from {tools:?}");
         }
         // An empty query is everything, in table order.
         assert_eq!(matched_keys("").len(), BINDINGS.len());
@@ -7762,9 +8212,15 @@ mod tests {
             let mut lines = Vec::new();
             push_version_check(
                 &mut lines,
-                &VersionCheck { head, base, status },
+                &VersionCheck {
+                    manifest: None,
+                    head,
+                    base,
+                    status,
+                },
                 "rolling",
                 "main",
+                false,
             );
             lines
         };
@@ -8706,7 +9162,7 @@ mod tests {
             show_deps: false,
             tracking: HashMap::new(),
             dirty: HashSet::new(),
-            versions: HashMap::new(),
+            versions: version::VersionTable::default(),
             host_id: None,
             rebuild_status: None,
             version: None,
@@ -8725,6 +9181,7 @@ mod tests {
             pending_g: false,
             pending_push: None,
             pending_pull: None,
+            pending_bump: None,
             command_history: Vec::new(),
         };
         let out = draw(|f, area| app.render_table(f, area));
@@ -8818,6 +9275,7 @@ mod tests {
             clean_protect: Vec::new(),
             pull_mode: Default::default(),
             lazygit_command: "lazygit".to_string(),
+            bacon_command: "bacon".to_string(),
             version_manifest: Default::default(),
         }
     }
@@ -9103,7 +9561,7 @@ mod tests {
             show_deps: false,
             tracking,
             dirty: HashSet::new(),
-            versions: HashMap::new(),
+            versions: version::VersionTable::default(),
             host_id: None,
             rebuild_status: None,
             version: None,
@@ -9122,6 +9580,7 @@ mod tests {
             pending_g: false,
             pending_push: None,
             pending_pull: None,
+            pending_bump: None,
             command_history: Vec::new(),
         };
 
@@ -9165,7 +9624,7 @@ mod tests {
             show_deps: false,
             tracking: HashMap::new(),
             dirty,
-            versions: HashMap::new(),
+            versions: version::VersionTable::default(),
             version: None,
             host_id: None,
             rebuild_status: None,
@@ -9184,6 +9643,7 @@ mod tests {
             pending_g: false,
             pending_push: None,
             pending_pull: None,
+            pending_bump: None,
             command_history: Vec::new(),
         };
 
@@ -9207,8 +9667,13 @@ mod tests {
         rolls[0].branch = "roll/1-0101-versioned".to_string();
         rolls[1].branch = "roll/2-0102-bare".to_string();
 
-        let mut versions = HashMap::new();
-        versions.insert("roll/1-0101-versioned".to_string(), v(0, 12, 34));
+        let versions = version::VersionTable {
+            manifests: vec![version::Manifest::root(version::ManifestKind::Cargo)],
+            rows: HashMap::from([(
+                "roll/1-0101-versioned".to_string(),
+                vec![Some(v(0, 12, 34))],
+            )]),
+        };
 
         let mut app = StatusApp {
             config: test_config(),
@@ -9238,6 +9703,7 @@ mod tests {
             pending_g: false,
             pending_push: None,
             pending_pull: None,
+            pending_bump: None,
             command_history: Vec::new(),
         };
         let out = draw(|f, area| app.render_table(f, area));
@@ -9289,7 +9755,7 @@ mod tests {
             show_deps: true,
             tracking: HashMap::new(),
             dirty: HashSet::new(),
-            versions: HashMap::new(),
+            versions: version::VersionTable::default(),
             version: None,
             host_id: Some("merlin".to_string()),
             rebuild_status,
@@ -9308,6 +9774,7 @@ mod tests {
             pending_g: false,
             pending_push: None,
             pending_pull: None,
+            pending_bump: None,
             command_history: Vec::new(),
         };
         let out = draw(|f, area| app.render_table(f, area));
@@ -9339,6 +9806,78 @@ mod tests {
     }
 
     #[test]
+    fn every_manifest_gets_its_own_version_column() {
+        // A site's root `package.json` beside a crate in `keeper/`: both
+        // versions on every row, each column headed by which file it is.
+        let mut rolls = vec![roll_n(1, RollState::Active), roll_n(2, RollState::Active)];
+        rolls[0].branch = "roll/1-0101-both".to_string();
+        rolls[1].branch = "roll/2-0102-site-only".to_string();
+
+        let versions = version::VersionTable {
+            manifests: vec![
+                version::Manifest::root(version::ManifestKind::Npm),
+                version::Manifest::from_path("keeper/Cargo.toml").unwrap(),
+            ],
+            rows: HashMap::from([
+                (
+                    "roll/1-0101-both".to_string(),
+                    vec![Some(v(0, 2, 8)), Some(v(0, 1, 2))],
+                ),
+                (
+                    "roll/2-0102-site-only".to_string(),
+                    vec![Some(v(0, 2, 9)), None],
+                ),
+            ]),
+        };
+
+        let mut app = StatusApp {
+            config: test_config(),
+            current_branch: "main".to_string(),
+            bases: Vec::new(),
+            rolls,
+            hotfixes: Vec::new(),
+            show_deps: false,
+            tracking: HashMap::new(),
+            dirty: HashSet::new(),
+            versions,
+            version: None,
+            host_id: None,
+            rebuild_status: None,
+            table: TableState::default(),
+            mode: Mode::Browsing,
+            message: None,
+            job: None,
+            job_title: String::new(),
+            job_moves_head: false,
+            queue: Queue::default(),
+            quit_armed: false,
+            deferred_mode: None,
+            panel: None,
+            panel_maximized: false,
+            panel_rect: None,
+            pending_g: false,
+            pending_push: None,
+            pending_pull: None,
+            pending_bump: None,
+            command_history: Vec::new(),
+        };
+        let out = draw(|f, area| app.render_table(f, area));
+
+        assert!(out.contains("package.json"), "no root header:\n{out}");
+        assert!(out.contains("keeper"), "no nested header:\n{out}");
+        let both = out
+            .lines()
+            .find(|l| l.contains("roll/1-0101-both"))
+            .unwrap();
+        assert!(both.contains("0.2.8") && both.contains("0.1.2"), "{both}");
+        let site = out
+            .lines()
+            .find(|l| l.contains("roll/2-0102-site"))
+            .unwrap();
+        assert!(site.contains("0.2.9") && site.contains("—"), "{site}");
+    }
+
+    #[test]
     fn the_version_column_is_absent_in_a_repo_with_no_manifest() {
         // The whole opt-in rule: no `Cargo.toml` anywhere, no column, no cost to
         // the `branch` column. This is every dotfiles repo.
@@ -9351,7 +9890,7 @@ mod tests {
             show_deps: false,
             tracking: HashMap::new(),
             dirty: HashSet::new(),
-            versions: HashMap::new(),
+            versions: version::VersionTable::default(),
             host_id: None,
             rebuild_status: None,
             version: None,
@@ -9370,6 +9909,7 @@ mod tests {
             pending_g: false,
             pending_push: None,
             pending_pull: None,
+            pending_bump: None,
             command_history: Vec::new(),
         };
         let out = draw(|f, area| app.render_table(f, area));
@@ -9406,7 +9946,7 @@ mod tests {
             show_deps: false,
             tracking: HashMap::new(),
             dirty: HashSet::new(),
-            versions: HashMap::new(),
+            versions: version::VersionTable::default(),
             host_id: None,
             rebuild_status: None,
             version: None,
@@ -9425,6 +9965,7 @@ mod tests {
             pending_g: false,
             pending_push: None,
             pending_pull: None,
+            pending_bump: None,
             command_history: Vec::new(),
         };
         let out = draw(|f, area| app.render_table(f, area));
@@ -9879,7 +10420,7 @@ mod tests {
             ops::VerifyManyResult {
                 branch: "roll/1-x".to_string(),
                 outcome: None,
-                marked: Some(crate::core::version::Semver::parse("0.0.1-roll1").unwrap()),
+                marked: Some("0.0.1-roll1".to_string()),
                 verdict: ops::VerifyVerdict::Passed,
                 conflict: None,
             },
@@ -10000,9 +10541,11 @@ mod tests {
 
     #[test]
     fn bump_is_refused_in_a_repo_with_no_version() {
-        let err = bump_gate(None).expect_err("a repo with no readable version has nothing to bump");
+        let err =
+            bump_gate(Vec::new()).expect_err("a repo with no readable version has nothing to bump");
         assert!(err.contains("nothing to bump"), "{err}");
-        assert_eq!(bump_gate(Some(v(0, 1, 0))), Ok(v(0, 1, 0)));
+        let one = vec![(Manifest::root(version::ManifestKind::Cargo), v(0, 1, 0))];
+        assert_eq!(bump_gate(one.clone()), Ok(one));
     }
 
     #[test]
@@ -10020,6 +10563,54 @@ mod tests {
         assert!(out.contains("[2] minor → 0.3.0"), "{out}");
         assert!(out.contains("[3] major → 1.0.0"), "{out}");
         assert!(out.contains("[n] cancel"), "{out}");
+    }
+
+    #[test]
+    fn the_manifest_picker_chooses_one_or_all_and_rejects_what_is_not_listed() {
+        assert_eq!(
+            bump_pick_key(KeyCode::Char('1'), 2),
+            BumpPick::Chosen(vec![0])
+        );
+        assert_eq!(
+            bump_pick_key(KeyCode::Char('2'), 2),
+            BumpPick::Chosen(vec![1])
+        );
+        assert_eq!(bump_pick_key(KeyCode::Char('3'), 2), BumpPick::Ignore);
+        assert_eq!(
+            bump_pick_key(KeyCode::Char('a'), 2),
+            BumpPick::Chosen(vec![0, 1])
+        );
+        assert_eq!(bump_pick_key(KeyCode::Esc, 2), BumpPick::Cancel);
+        assert_eq!(bump_pick_key(KeyCode::Char('n'), 2), BumpPick::Cancel);
+        assert_eq!(bump_pick_key(KeyCode::Char('x'), 2), BumpPick::Ignore);
+    }
+
+    #[test]
+    fn the_bump_picker_names_each_manifest_and_what_it_still_owes() {
+        let manifests = [
+            BumpManifest {
+                manifest: Manifest::root(version::ManifestKind::Cargo),
+                current: v(0, 2, 0),
+                owes: Some(true),
+            },
+            BumpManifest {
+                manifest: Manifest::root(version::ManifestKind::Npm),
+                current: v(1, 4, 0),
+                owes: Some(false),
+            },
+        ];
+        let out = draw(|f, area| render_bump_pick_modal(f, area, &manifests, "rolling"));
+        assert!(out.contains("[1] Cargo.toml 0.2.0"), "{out}");
+        assert!(out.contains("needs a bump"), "{out}");
+        assert!(out.contains("[2] package.json 1.4.0"), "{out}");
+        assert!(out.contains("already ahead"), "{out}");
+        assert!(out.contains("[a] all of them"), "{out}");
+
+        let out = draw(|f, area| render_bump_levels_modal(f, area, &manifests, "rolling"));
+        assert!(
+            out.contains("[1] patch → Cargo.toml 0.2.1, package.json 1.4.1"),
+            "{out}"
+        );
     }
 
     #[test]
@@ -10559,7 +11150,7 @@ mod tests {
             show_deps: false,
             tracking: HashMap::new(),
             dirty: HashSet::new(),
-            versions: HashMap::new(),
+            versions: version::VersionTable::default(),
             host_id: None,
             rebuild_status: None,
             version: None,
@@ -10578,6 +11169,7 @@ mod tests {
             pending_g: false,
             pending_push: None,
             pending_pull: None,
+            pending_bump: None,
             command_history: Vec::new(),
         }
     }
@@ -10964,7 +11556,7 @@ mod tests {
             show_deps: false,
             tracking: HashMap::new(),
             dirty: HashSet::new(),
-            versions: HashMap::new(),
+            versions: version::VersionTable::default(),
             host_id: None,
             rebuild_status: None,
             version: None,
@@ -10983,6 +11575,7 @@ mod tests {
             pending_g: false,
             pending_push: None,
             pending_pull: None,
+            pending_bump: None,
             command_history: Vec::new(),
         };
         let out = draw(|f, area| app.render_table(f, area));
@@ -11040,7 +11633,7 @@ mod tests {
             show_deps: false,
             tracking: HashMap::new(),
             dirty: HashSet::new(),
-            versions: HashMap::new(),
+            versions: version::VersionTable::default(),
             host_id: None,
             rebuild_status: None,
             version: None,
@@ -11059,6 +11652,7 @@ mod tests {
             pending_g: false,
             pending_push: None,
             pending_pull: None,
+            pending_bump: None,
             command_history: Vec::new(),
         };
 
