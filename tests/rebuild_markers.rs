@@ -343,3 +343,43 @@ fn legacy_generation_bump_without_a_mode_suffix_is_not_treated_as_a_marker() {
     assert!(status["local_rebuild"]["nixos"]["test"].is_null());
     assert!(status["local_rebuild"]["nixos"]["boot"].is_null());
 }
+
+#[test]
+fn a_rebuild_is_current_until_its_branch_changes_something_a_rebuild_would_pick_up() {
+    let sb = Sandbox::nixos();
+    sb.init();
+    sb.create_roll("feature", "0611");
+    sb.add_nixos_rebuild("roll/1-0611-feature", "merlin", 10, "switch");
+    let env = [("RF_HOST_IDENTIFIER", "merlin")];
+    let freshness = |sb: &Sandbox| {
+        sb.status_json_with_env(&env)["local_rebuild"]["nixos"]["freshness"]["switch"].clone()
+    };
+
+    assert_eq!(freshness(&sb), "current");
+
+    // An empty commit on top (say, another host's rebuild marker) changes
+    // nothing that was built.
+    sb.commit_empty("spacedock: generation 3 (switch)");
+    assert_eq!(freshness(&sb), "current");
+
+    sb.commit_file("docs/notes.md", "n\n", "docs: notes");
+    assert_eq!(freshness(&sb), "docs_only");
+
+    sb.commit_file("hosts/merlin/extra.nix", "{ }\n", "merlin: extra module");
+    assert_eq!(freshness(&sb), "changed");
+}
+
+#[test]
+fn testing_another_branch_marks_the_older_switch_displaced() {
+    let sb = Sandbox::nixos();
+    sb.init();
+    sb.add_nixos_rebuild_at("main", "merlin", 1, "switch", 1_000);
+    sb.create_roll("feature", "0611");
+    sb.add_nixos_rebuild_at("roll/1-0611-feature", "merlin", 2, "test", 2_000);
+
+    let status = sb.status_json_with_env(&[("RF_HOST_IDENTIFIER", "merlin")]);
+    let nixos = &status["local_rebuild"]["nixos"];
+    assert_eq!(nixos["switch"], "main");
+    assert_eq!(nixos["freshness"]["switch"], "displaced", "{status}");
+    assert_eq!(nixos["freshness"]["test"], "current", "{status}");
+}

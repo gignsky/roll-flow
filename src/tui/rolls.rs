@@ -2132,6 +2132,20 @@ fn hotfix_color(state: HotfixState) -> Color {
     }
 }
 
+/// The `build` column's colour for one label: green when the branch's tip is
+/// still exactly what was rebuilt, yellow when only docs moved since, red when
+/// a rebuild would pick something up, blue when a newer test from another
+/// branch has replaced what this switch built. See `core::rebuild::Freshness`.
+fn freshness_style(freshness: rebuild::Freshness) -> Style {
+    match freshness {
+        rebuild::Freshness::Current => Style::default().fg(Color::Green),
+        rebuild::Freshness::DocsOnly => Style::default().fg(Color::Yellow),
+        rebuild::Freshness::Changed => Style::default().fg(Color::Red),
+        rebuild::Freshness::Displaced => Style::default().fg(Color::Blue),
+        rebuild::Freshness::Unknown => Style::default(),
+    }
+}
+
 /// The two-lane glyph pair (`main_lane`, `rolling_lane`) for a roll's graph
 /// column cell, read left-to-right in the same order the pinned base rows are
 /// listed (stable, then rolling).
@@ -4955,12 +4969,18 @@ impl StatusApp {
         };
         let rebuild_status = &self.rebuild_status;
         let build_cell = |branch: &str| {
-            Cell::from(
-                rebuild_status
-                    .as_ref()
-                    .map(|s| rebuild::gutter_label(s, branch))
-                    .unwrap_or_default(),
-            )
+            let labels = rebuild_status
+                .as_ref()
+                .map(|s| rebuild::gutter_labels(s, branch))
+                .unwrap_or_default();
+            let mut spans = Vec::new();
+            for (i, (label, freshness)) in labels.into_iter().enumerate() {
+                if i > 0 {
+                    spans.push(Span::raw(" "));
+                }
+                spans.push(Span::styled(label, freshness_style(freshness)));
+            }
+            Cell::from(Line::from(spans))
         };
         // Base branches are pinned above the rolls: no number and no state, the
         // `state` column carrying their role instead.
@@ -10031,6 +10051,7 @@ mod tests {
                     branch: "rolling".to_string(),
                     commit: "deadbeef".to_string(),
                     committed_at: 0,
+                    freshness: rebuild::Freshness::Current,
                 }),
                 test: None,
                 boot: None,
