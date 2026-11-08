@@ -36,6 +36,26 @@ pub struct RebuildMarker {
     /// [`supersede`], since ancestry can't order two commits on unrelated
     /// branches (see that function's doc comment).
     pub committed_at: i64,
+    /// Whether `branch` still says what was built — see [`Freshness`].
+    pub freshness: Freshness,
+}
+
+/// How `branch`'s tip compares to the rebuild commit, judged by the *net*
+/// tree diff between the two rather than by counting commits: an empty
+/// rebuild commit on top, a merge that brought nothing new, or a change
+/// later reverted all leave the build exactly as current as it was.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum Freshness {
+    /// The tip's tree is the one that was built.
+    Current,
+    /// Only docs changed since (`docs/**`, `operations/**`, `*.md` — the
+    /// Docs scope), so a rebuild would produce the same result.
+    DocsOnly,
+    /// Something a rebuild would pick up changed since.
+    Changed,
+    /// The branch's tip could not be resolved or diffed.
+    #[default]
+    Unknown,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -309,6 +329,7 @@ fn attribute_hash(
             branch: stable.0.clone(),
             commit: hash.clone(),
             committed_at: *committed_at,
+            freshness: Freshness::Unknown,
         });
     }
     if rolling.1.contains(hash.as_str()) {
@@ -316,6 +337,7 @@ fn attribute_hash(
             branch: rolling.0.clone(),
             commit: hash.clone(),
             committed_at: *committed_at,
+            freshness: Freshness::Unknown,
         });
     }
     for (_, (branch, set)) in roll_buckets {
@@ -324,6 +346,7 @@ fn attribute_hash(
                 branch: branch.clone(),
                 commit: hash.clone(),
                 committed_at: *committed_at,
+                freshness: Freshness::Unknown,
             });
         }
     }
@@ -361,6 +384,7 @@ fn attribute_fallback(
                 branch: stable_branch.to_string(),
                 commit: hash.clone(),
                 committed_at: *committed_at,
+                freshness: Freshness::Unknown,
             });
         }
     }
@@ -370,6 +394,7 @@ fn attribute_fallback(
                 branch: rolling_branch.to_string(),
                 commit: hash.clone(),
                 committed_at: *committed_at,
+                freshness: Freshness::Unknown,
             });
         }
     }
@@ -489,11 +514,58 @@ pub fn detect(
     supersede(&mut nixos.boot, &nixos.switch);
     supersede(&mut home.test, &home.switch);
 
+    for marker in [
+        &mut nixos.switch,
+        &mut nixos.test,
+        &mut nixos.boot,
+        &mut home.switch,
+        &mut home.test,
+    ]
+    .into_iter()
+    .flatten()
+    {
+        marker.freshness = freshness(repo, marker);
+    }
+
     Some(RebuildStatus {
         host_id: host_id.to_string(),
         nixos,
         home,
     })
+}
+
+/// Compare the rebuild commit's tree to its branch's current tip. The
+/// rebuild scripts commit whatever was pending *as* the rebuild commit, so
+/// that commit is the built state, and any path differing from it at the tip
+/// is a change the running system has not seen.
+fn freshness(repo: &Path, marker: &RebuildMarker) -> Freshness {
+    let Some(tip) = git::resolve_branch(repo, &marker.branch) else {
+        return Freshness::Unknown;
+    };
+    let Ok(out) = git::capture_git(repo, &["diff", "--name-only", &marker.commit, &tip]) else {
+        return Freshness::Unknown;
+    };
+    classify_changed_paths(out.lines())
+}
+
+fn classify_changed_paths<'a>(paths: impl Iterator<Item = &'a str>) -> Freshness {
+    let mut any = false;
+    for path in paths.filter(|p| !p.is_empty()) {
+        any = true;
+        if !is_docs_path(path) {
+            return Freshness::Changed;
+        }
+    }
+    if any {
+        Freshness::DocsOnly
+    } else {
+        Freshness::Current
+    }
+}
+
+/// The Docs scope from `docs/internals/algorithms.md`'s scope table.
+fn is_docs_path(path: &str) -> bool {
+    path.starts_with("docs/") || path.starts_with("operations/") || path.ends_with(".md")
 }
 
 // ── Display ───────────────────────────────────────────────────────────────────
@@ -544,10 +616,20 @@ fn push_channel_parts(
 /// 0 or 1); callers that need a column width measure this across every row,
 /// the same way `version`/`deps` size themselves to their content.
 pub fn gutter_label(status: &RebuildStatus, branch: &str) -> String {
-    let mut labels: Vec<&str> = Vec::new();
+    gutter_labels(status, branch)
+        .into_iter()
+        .map(|(label, _)| label)
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+/// [`gutter_label`]'s labels kept apart, each with its marker's
+/// [`Freshness`], for a renderer that colours them individually (the TUI).
+pub fn gutter_labels(status: &RebuildStatus, branch: &str) -> Vec<(&'static str, Freshness)> {
+    let mut labels = Vec::new();
     let mut push = |marker: &Option<RebuildMarker>, label: &'static str| {
-        if marker.as_ref().is_some_and(|m| m.branch == branch) {
-            labels.push(label);
+        if let Some(m) = marker.as_ref().filter(|m| m.branch == branch) {
+            labels.push((label, m.freshness));
         }
     };
     push(&status.nixos.switch, "N");
@@ -555,7 +637,7 @@ pub fn gutter_label(status: &RebuildStatus, branch: &str) -> String {
     push(&status.nixos.boot, "NB");
     push(&status.home.switch, "H");
     push(&status.home.test, "HT");
-    labels.join(" ")
+    labels
 }
 
 #[cfg(test)]
@@ -642,7 +724,48 @@ mod tests {
             branch: branch.to_string(),
             commit: "deadbeef".to_string(),
             committed_at,
+            freshness: Freshness::Current,
         })
+    }
+
+    #[test]
+    fn freshness_reads_the_net_change_since_the_rebuild() {
+        assert_eq!(
+            classify_changed_paths(std::iter::empty()),
+            Freshness::Current
+        );
+        assert_eq!(classify_changed_paths([""].into_iter()), Freshness::Current);
+        assert_eq!(
+            classify_changed_paths(["docs/x.md", "README.md", "operations/runbook"].into_iter()),
+            Freshness::DocsOnly
+        );
+        assert_eq!(
+            classify_changed_paths(["README.md", "hosts/merlin/default.nix"].into_iter()),
+            Freshness::Changed
+        );
+    }
+
+    #[test]
+    fn gutter_labels_carry_each_markers_own_freshness() {
+        let mut stale = marker("rolling");
+        stale.as_mut().unwrap().freshness = Freshness::Changed;
+        let status = RebuildStatus {
+            host_id: "merlin".to_string(),
+            nixos: ChannelStatus {
+                switch: stale,
+                test: None,
+                boot: None,
+            },
+            home: ChannelStatus {
+                switch: marker("rolling"),
+                test: None,
+                boot: None,
+            },
+        };
+        assert_eq!(
+            gutter_labels(&status, "rolling"),
+            vec![("N", Freshness::Changed), ("H", Freshness::Current)]
+        );
     }
 
     #[test]

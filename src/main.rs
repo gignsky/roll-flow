@@ -2603,17 +2603,43 @@ struct JsonLocalRebuild {
 /// `switch`/`test`/`boot` are branch names (a roll's, or `rolling`/`stable`
 /// when the commit landed directly there) — `null` when nothing was found or
 /// a newer switch has already superseded it. `home.boot` is always `null`.
+///
+/// `freshness` mirrors those three slots: `"current"` when the branch's tip
+/// is still exactly what was rebuilt, `"docs_only"` when only docs changed
+/// since, `"changed"` when a rebuild would pick something up, `"unknown"`
+/// when the tip could not be read — `null` wherever the slot itself is.
 #[derive(Serialize)]
 struct JsonChannelRebuild {
     switch: Option<String>,
     test: Option<String>,
     boot: Option<String>,
+    freshness: JsonChannelFreshness,
+}
+
+#[derive(Serialize)]
+struct JsonChannelFreshness {
+    switch: Option<&'static str>,
+    test: Option<&'static str>,
+    boot: Option<&'static str>,
 }
 
 impl From<rebuild::RebuildStatus> for JsonLocalRebuild {
     fn from(status: rebuild::RebuildStatus) -> Self {
+        fn freshness(m: &Option<rebuild::RebuildMarker>) -> Option<&'static str> {
+            m.as_ref().map(|m| match m.freshness {
+                rebuild::Freshness::Current => "current",
+                rebuild::Freshness::DocsOnly => "docs_only",
+                rebuild::Freshness::Changed => "changed",
+                rebuild::Freshness::Unknown => "unknown",
+            })
+        }
         fn channel(c: rebuild::ChannelStatus) -> JsonChannelRebuild {
             JsonChannelRebuild {
+                freshness: JsonChannelFreshness {
+                    switch: freshness(&c.switch),
+                    test: freshness(&c.test),
+                    boot: freshness(&c.boot),
+                },
                 switch: c.switch.map(|m| m.branch),
                 test: c.test.map(|m| m.branch),
                 boot: c.boot.map(|m| m.branch),

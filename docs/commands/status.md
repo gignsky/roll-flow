@@ -116,6 +116,20 @@ home-manager switch/test — home-manager has no "boot" concept. A
 `NT`/`NB`/`HT` label disappears once a later switch has caught up to or
 passed it, since it then tells you nothing the switch doesn't.
 
+In the TUI each label is coloured by whether its branch has moved since that
+rebuild, judged by the net diff between the rebuild commit and the branch's
+tip:
+
+| colour | meaning |
+|---|---|
+| green | the tip is exactly what was rebuilt |
+| yellow | only docs changed since (`docs/**`, `operations/**`, `*.md`) |
+| red | something a rebuild would pick up changed since |
+
+An empty commit on top — another host's rebuild marker, a merge that brought
+nothing new — leaves a label green; a change later reverted turns it green
+again.
+
 `--no-tui` prints a one-line summary above the table instead of relying on
 the column alone — the common case, a plain switch directly on
 `rolling`/`main`, has no roll row to attach a column cell to at all:
@@ -126,7 +140,8 @@ last rebuild (merlin): nixos switch→rolling · nixos test→roll/41-x · home 
 
 `--json` carries the same data as a top-level `local_rebuild` object
 (`host`, `nixos`/`home`, each `{switch, test, boot}` as branch-name strings
-or `null`) — see [`list`](list.md) for the per-roll echo of this in `rf list
+or `null`, plus a `freshness` object with the same three slots as
+`"current"`/`"docs_only"`/`"changed"`/`"unknown"`) — see [`list`](list.md) for the per-roll echo of this in `rf list
 --json`. See
 [Local rebuild markers](../internals/algorithms.md#local-rebuild-markers-corerebuildrs)
 for how a commit is attributed to a roll vs. a branch.
