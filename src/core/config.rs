@@ -187,6 +187,12 @@ pub struct Config {
     /// `PATH`.
     #[serde(default = "default_bacon")]
     pub bacon_command: String,
+    /// The editor the TUI's `vv` binding opens on the repo. Empty (the
+    /// default) means `$VISUAL`, then `$EDITOR`, then `vi` — the usual Unix
+    /// order — so this is only needed to pick something other than the
+    /// editor every other tool already opens.
+    #[serde(default)]
+    pub editor_command: String,
     /// Which manifest this repo versions through, when it carries both a
     /// `Cargo.toml` and a `package.json`. `Auto` (default) prefers `Cargo` —
     /// the same choice [`version::ManifestKind::detect`] makes with no
@@ -314,6 +320,7 @@ impl Config {
         "pull_mode",
         "lazygit_command",
         "bacon_command",
+        "editor_command",
         "version_manifest",
     ];
 
@@ -530,6 +537,7 @@ impl Config {
             pull_mode: PullMode::default(),
             lazygit_command: default_lazygit(),
             bacon_command: default_bacon(),
+            editor_command: String::new(),
             version_manifest: VersionManifest::default(),
         })
     }
@@ -824,6 +832,7 @@ mod tests {
             pull_mode: PullMode::default(),
             lazygit_command: default_lazygit(),
             bacon_command: default_bacon(),
+            editor_command: String::new(),
             version_manifest: super::VersionManifest::default(),
         };
         let updated = cfg.with_overrides(
@@ -863,6 +872,7 @@ mod tests {
             pull_mode: PullMode::default(),
             lazygit_command: default_lazygit(),
             bacon_command: default_bacon(),
+            editor_command: String::new(),
             version_manifest: super::VersionManifest::default(),
         };
         let rendered = cfg.to_toml_string().expect("render");

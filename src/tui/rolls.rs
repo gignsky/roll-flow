@@ -869,6 +869,9 @@ struct StatusApp {
     /// When a bare `b` was pressed, waiting to see whether it becomes `bb`.
     /// Same shape as `pending_pull`, timed by [`BUMP_CHORD_WINDOW`].
     pending_bump: Option<Instant>,
+    /// When a bare `v` was pressed, waiting to see whether it becomes `vv`.
+    /// Same shape as `pending_bump`, timed by [`VERIFY_CHORD_WINDOW`].
+    pending_verify: Option<Instant>,
     /// Commands run through `:`, most-recent-first. Loaded once at startup
     /// from [`history::load`] and saved back after every run.
     command_history: Vec<String>,
@@ -1030,6 +1033,46 @@ pub(crate) fn bump_chord_key(code: KeyCode) -> BumpChord {
         KeyCode::Char('b') => BumpChord::Bacon,
         _ => BumpChord::Bump,
     }
+}
+
+/// Same timeout as [`BUMP_CHORD_WINDOW`]. `vv` makes a lone `v` — verify —
+/// wait this long before it fires.
+pub(crate) const VERIFY_CHORD_WINDOW: Duration = Duration::from_millis(400);
+
+/// What the key following a bare `v` makes of it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum VerifyChord {
+    /// A second `v`: hand the terminal to the editor.
+    Editor,
+    /// Anything else: the verify the first `v` already meant.
+    Verify,
+}
+
+/// Decide a pending `v` from the key that followed it. Mirrors
+/// [`bump_chord_key`]: only a second `v` completes the chord.
+pub(crate) fn verify_chord_key(code: KeyCode) -> VerifyChord {
+    match code {
+        KeyCode::Char('v') => VerifyChord::Editor,
+        _ => VerifyChord::Verify,
+    }
+}
+
+/// The editor `vv` runs, as a command line: `editor_command` when set, then
+/// `$VISUAL`, then `$EDITOR`, then `vi`. A blank value at any step counts as
+/// unset, so an exported-but-empty `EDITOR` does not leave nothing to run.
+/// `env` is the environment lookup, a parameter so tests need not mutate the
+/// real process environment.
+pub(crate) fn editor_command_line(
+    configured: Option<&str>,
+    env: impl Fn(&str) -> Option<String>,
+) -> String {
+    configured
+        .map(str::to_string)
+        .into_iter()
+        .chain(env("VISUAL"))
+        .chain(env("EDITOR"))
+        .find(|c| !c.trim().is_empty())
+        .unwrap_or_else(|| "vi".to_string())
 }
 
 /// The directory of the shallowest `Cargo.toml` in the working tree — the
@@ -1419,6 +1462,16 @@ pub(crate) const BINDINGS: &[Binding] = &[
         group: "tools",
         hint: None,
         replay: &[KeyCode::Char('b'), KeyCode::Char('b')],
+    },
+    Binding {
+        keys: "vv",
+        // "vim" and "edit" for the same reason "watch" is on `bb`: the search
+        // is a subsequence match, and people type what they want, not the
+        // environment variable that picks it.
+        label: "hand the terminal to your editor (edit / vim, $EDITOR)",
+        group: "tools",
+        hint: None,
+        replay: &[KeyCode::Char('v'), KeyCode::Char('v')],
     },
     Binding {
         keys: "c",
@@ -2606,6 +2659,7 @@ impl StatusApp {
             pending_push: None,
             pending_pull: None,
             pending_bump: None,
+            pending_verify: None,
             command_history: history::load(),
         }
     }
@@ -2620,6 +2674,7 @@ impl StatusApp {
             self.resolve_lapsed_push();
             self.resolve_lapsed_pull();
             self.resolve_lapsed_bump();
+            self.resolve_lapsed_verify();
 
             if event::poll(Duration::from_millis(50))? {
                 let event = event::read()?;
@@ -3000,6 +3055,16 @@ impl StatusApp {
             return Ok(false);
         }
 
+        // `vv` opens the editor; any other key resolves the pending `v` as
+        // the verify.
+        if self.pending_verify.take().is_some() {
+            match verify_chord_key(code) {
+                VerifyChord::Editor => self.launch_editor(terminal)?,
+                VerifyChord::Verify => self.start_verify(),
+            }
+            return Ok(false);
+        }
+
         match code {
             KeyCode::Char('q') => return Ok(self.confirm_quit(quit_armed)),
             // `esc` dismisses the output panel when one is up, and only quits
@@ -3063,7 +3128,7 @@ impl StatusApp {
             KeyCode::Char('p') => self.arm_pull(),
             KeyCode::Char('P') => self.arm_push(),
             KeyCode::Char('f') => self.start_fetch(),
-            KeyCode::Char('v') => self.start_verify(),
+            KeyCode::Char('v') => self.arm_verify(),
             KeyCode::Char('V') => self.request_verify_many(),
             KeyCode::Char('G') => self.request(Action::Graduate),
             KeyCode::Char('i') => self.request_integrate(),
@@ -4237,6 +4302,31 @@ impl StatusApp {
         }
     }
 
+    /// `[v]` — arm the editor chord. The verify itself does not start until
+    /// the chord resolves, in [`Self::handle_browsing`] or
+    /// [`Self::resolve_lapsed_verify`].
+    ///
+    /// Unlike [`Self::arm_bump`] this does not refuse while a job runs: `[v]`
+    /// queues behind one (see [`Self::start_verify`]), and arming must not
+    /// take that away. The editor half refuses on its own, inside
+    /// [`Self::hand_over_terminal`].
+    fn arm_verify(&mut self) {
+        self.pending_verify = Some(Instant::now());
+        self.message = Some("v again to open your editor".to_string());
+    }
+
+    /// Fire a pending `v` that nothing followed.
+    fn resolve_lapsed_verify(&mut self) {
+        let lapsed = self
+            .pending_verify
+            .is_some_and(|armed| armed.elapsed() >= VERIFY_CHORD_WINDOW);
+        if lapsed {
+            self.pending_verify = None;
+            self.message = None;
+            self.start_verify();
+        }
+    }
+
     /// `PP` — plan a push of every branch that needs one and open its modal.
     ///
     /// Nothing is pushed here. The plan is resolved from the tracking data the
@@ -4526,6 +4616,28 @@ impl StatusApp {
         let command = self.config.bacon_command.clone();
         self.hand_over_terminal(terminal, command, "bacon_command", |child| {
             child.current_dir(root);
+        })
+    }
+
+    /// `vv` — hand the terminal to the editor (see [`editor_command_line`]),
+    /// opened on `.` with the repo root as its working directory, so the
+    /// editor starts on a listing of the repo and relative paths inside it
+    /// resolve there.
+    ///
+    /// The command line is split on whitespace, the way `$EDITOR` is
+    /// conventionally read, so `EDITOR="code --wait"` works. No shell, so
+    /// quoting is not interpreted — a wrapper script is the answer for
+    /// anything fancier.
+    fn launch_editor(&mut self, terminal: &mut super::Tui) -> Result<()> {
+        let line = editor_command_line(Some(&self.config.editor_command), |key| {
+            std::env::var(key).ok()
+        });
+        let mut words = line.split_whitespace().map(str::to_string);
+        let program = words.next().unwrap_or_else(|| "vi".to_string());
+        let args: Vec<String> = words.collect();
+        let root = self.config.repo_root.clone();
+        self.hand_over_terminal(terminal, program, "editor_command", |child| {
+            child.args(args).arg(".").current_dir(root);
         })
     }
 
@@ -7256,6 +7368,7 @@ mod tests {
             pull_mode: Default::default(),
             lazygit_command: "lazygit".to_string(),
             bacon_command: "bacon".to_string(),
+            editor_command: String::new(),
             version_manifest: Default::default(),
         }
     }
@@ -7375,6 +7488,7 @@ mod tests {
             pending_push: None,
             pending_pull: None,
             pending_bump: None,
+            pending_verify: None,
             command_history: Vec::new(),
         };
 
@@ -7439,6 +7553,7 @@ mod tests {
             pending_push: None,
             pending_pull: None,
             pending_bump: None,
+            pending_verify: None,
             command_history: Vec::new(),
         };
 
@@ -7483,6 +7598,7 @@ mod tests {
             pending_push: None,
             pending_pull: None,
             pending_bump: None,
+            pending_verify: None,
             command_history: Vec::new(),
         };
         app.toggle_maximize();
@@ -8093,6 +8209,40 @@ mod tests {
     }
 
     #[test]
+    fn only_a_second_v_completes_the_editor_chord() {
+        assert_eq!(verify_chord_key(KeyCode::Char('v')), VerifyChord::Editor);
+        for key in [
+            KeyCode::Char('V'),
+            KeyCode::Char('b'),
+            KeyCode::Esc,
+            KeyCode::Enter,
+        ] {
+            assert_eq!(verify_chord_key(key), VerifyChord::Verify, "{key:?}");
+        }
+    }
+
+    #[test]
+    fn the_editor_is_config_then_visual_then_editor_then_vi() {
+        let env = |vars: &'static [(&'static str, &'static str)]| {
+            move |key: &str| {
+                vars.iter()
+                    .find(|(k, _)| *k == key)
+                    .map(|(_, v)| v.to_string())
+            }
+        };
+        let both: &[(&str, &str)] = &[("VISUAL", "nvim"), ("EDITOR", "vim")];
+        assert_eq!(editor_command_line(Some("hx"), env(both)), "hx");
+        assert_eq!(editor_command_line(None, env(both)), "nvim");
+        assert_eq!(editor_command_line(None, env(&[("EDITOR", "vim")])), "vim");
+        assert_eq!(editor_command_line(None, env(&[])), "vi");
+        // Blank anywhere is unset, not "run nothing".
+        assert_eq!(
+            editor_command_line(Some(" "), env(&[("VISUAL", ""), ("EDITOR", "vim")])),
+            "vim"
+        );
+    }
+
+    #[test]
     fn cargo_root_finds_the_shallowest_manifest_in_the_working_tree() {
         let dir = std::env::temp_dir().join(format!("rf-cargo-root-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
@@ -8130,6 +8280,8 @@ mod tests {
         // sits one letter away from both queries.
         assert_eq!(matched_keys("bacon")[0], "bb");
         assert_eq!(matched_keys("watch")[0], "bb");
+        assert_eq!(matched_keys("vim")[0], "vv");
+        assert_eq!(matched_keys("editor")[0], "vv");
         // By the key itself, which is the other way people search.
         assert_eq!(matched_keys("gg")[0], "gg");
         // A group name lists the whole group, and nothing outside it.
@@ -8142,7 +8294,7 @@ mod tests {
         // search for the git keys it sits nowhere near.
         assert!(!sync.contains(&"gg"), "gg is not a sync key: {sync:?}");
         let tools = matched_keys("tools");
-        for keys in ["gg", "bb"] {
+        for keys in ["gg", "bb", "vv"] {
             assert!(tools.contains(&keys), "{keys} missing from {tools:?}");
         }
         // An empty query is everything, in table order.
@@ -9493,6 +9645,7 @@ mod tests {
             pending_push: None,
             pending_pull: None,
             pending_bump: None,
+            pending_verify: None,
             command_history: Vec::new(),
         };
         let out = draw(|f, area| app.render_table(f, area));
@@ -9587,6 +9740,7 @@ mod tests {
             pull_mode: Default::default(),
             lazygit_command: "lazygit".to_string(),
             bacon_command: "bacon".to_string(),
+            editor_command: String::new(),
             version_manifest: Default::default(),
         }
     }
@@ -9893,6 +10047,7 @@ mod tests {
             pending_push: None,
             pending_pull: None,
             pending_bump: None,
+            pending_verify: None,
             command_history: Vec::new(),
         };
 
@@ -9956,6 +10111,7 @@ mod tests {
             pending_push: None,
             pending_pull: None,
             pending_bump: None,
+            pending_verify: None,
             command_history: Vec::new(),
         };
 
@@ -10016,6 +10172,7 @@ mod tests {
             pending_push: None,
             pending_pull: None,
             pending_bump: None,
+            pending_verify: None,
             command_history: Vec::new(),
         };
         let out = draw(|f, area| app.render_table(f, area));
@@ -10088,6 +10245,7 @@ mod tests {
             pending_push: None,
             pending_pull: None,
             pending_bump: None,
+            pending_verify: None,
             command_history: Vec::new(),
         };
         let out = draw(|f, area| app.render_table(f, area));
@@ -10172,6 +10330,7 @@ mod tests {
             pending_push: None,
             pending_pull: None,
             pending_bump: None,
+            pending_verify: None,
             command_history: Vec::new(),
         };
         let out = draw(|f, area| app.render_table(f, area));
@@ -10223,6 +10382,7 @@ mod tests {
             pending_push: None,
             pending_pull: None,
             pending_bump: None,
+            pending_verify: None,
             command_history: Vec::new(),
         };
         let out = draw(|f, area| app.render_table(f, area));
@@ -10279,6 +10439,7 @@ mod tests {
             pending_push: None,
             pending_pull: None,
             pending_bump: None,
+            pending_verify: None,
             command_history: Vec::new(),
         };
         let out = draw(|f, area| app.render_table(f, area));
@@ -11488,6 +11649,7 @@ mod tests {
             pending_push: None,
             pending_pull: None,
             pending_bump: None,
+            pending_verify: None,
             command_history: Vec::new(),
         }
     }
@@ -11961,6 +12123,7 @@ mod tests {
             pending_push: None,
             pending_pull: None,
             pending_bump: None,
+            pending_verify: None,
             command_history: Vec::new(),
         };
         let out = draw(|f, area| app.render_table(f, area));
@@ -12038,6 +12201,7 @@ mod tests {
             pending_push: None,
             pending_pull: None,
             pending_bump: None,
+            pending_verify: None,
             command_history: Vec::new(),
         };
 
