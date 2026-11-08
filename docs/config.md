@@ -27,6 +27,7 @@ clean_protect = []
 pull_mode = "ff-only"
 lazygit_command = "lazygit"
 bacon_command = "bacon"
+editor_command = ""
 version_manifest = "auto"
 
 [host_active]
@@ -80,6 +81,7 @@ the layers are merged; everything else has a default.
 | `pull_mode`             | `"ff-only"` | fresh file                                                                  | the TUI's `[p]`                                                                                                                                                      |
 | `lazygit_command`       | `"lazygit"` | fresh file                                                                  | the TUI's `gg`                                                                                                                                                       |
 | `bacon_command`         | `"bacon"`   | fresh file                                                                  | the TUI's `bb`                                                                                                                                                       |
+| `editor_command`        | `""`        | fresh file                                                                  | the TUI's `vv`; empty means `$VISUAL`, then `$EDITOR`, then `vi`                                                                                                     |
 | `version_manifest`      | `"auto"`    | fresh file                                                                  | which manifest(s) the version gate and `rf start` / `rf graduate` / `rf promote`'s version writes use: `auto` tracks every one with a version, `cargo`/`npm` pin one |
 
 Gate entries are shell commands run in repo root. Any failure blocks
@@ -190,7 +192,14 @@ want.
 `bacon_command` is the same for the TUI's `[bb]`, except that it is run with no
 arguments in the directory of the working tree's `Cargo.toml` rather than given a path flag — bacon's positional
 argument is a job name, not a path. Defaults to `bacon` on `PATH`. See
-[`status`](commands/status.md#gg-and-bb--hand-over-the-terminal).
+[`status`](commands/status.md#gg-bb-and-vv--hand-over-the-terminal).
+
+`editor_command` is what the TUI's `[vv]` opens, run as `<command> .` in the
+repo root. Left empty — the default — it falls back to `$VISUAL`, then
+`$EDITOR`, then `vi`, so it only needs setting to pick a different editor for
+`rf` than for everything else. Split on whitespace like `$EDITOR`
+(`"code --wait"` works); no shell, so use a wrapper script for anything that
+needs quoting.
 
 ## Editing by hand
 
