@@ -125,10 +125,14 @@ tip:
 | green | the tip is exactly what was rebuilt |
 | yellow | only docs changed since (`docs/**`, `operations/**`, `*.md`) |
 | red | something a rebuild would pick up changed since |
+| blue | a switch you have since moved off: a newer `NT`/`HT` was built from a different branch, so what is running is that test, not this switch |
 
 An empty commit on top — another host's rebuild marker, a merge that brought
 nothing new — leaves a label green; a change later reverted turns it green
-again.
+again. Blue wins over the others — `N` on `main` turns blue once you switch
+to a roll and run a test there, whatever `main` has done since. A newer
+`NB` does not do this, since the running system is still the switch's until
+you reboot.
 
 `--no-tui` prints a one-line summary above the table instead of relying on
 the column alone — the common case, a plain switch directly on
@@ -141,7 +145,7 @@ last rebuild (merlin): nixos switch→rolling · nixos test→roll/41-x · home 
 `--json` carries the same data as a top-level `local_rebuild` object
 (`host`, `nixos`/`home`, each `{switch, test, boot}` as branch-name strings
 or `null`, plus a `freshness` object with the same three slots as
-`"current"`/`"docs_only"`/`"changed"`/`"unknown"`) — see [`list`](list.md) for the per-roll echo of this in `rf list
+`"current"`/`"docs_only"`/`"changed"`/`"displaced"`/`"unknown"`) — see [`list`](list.md) for the per-roll echo of this in `rf list
 --json`. See
 [Local rebuild markers](../internals/algorithms.md#local-rebuild-markers-corerebuildrs)
 for how a commit is attributed to a roll vs. a branch.

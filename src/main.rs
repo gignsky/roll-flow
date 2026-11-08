@@ -2606,7 +2606,8 @@ struct JsonLocalRebuild {
 ///
 /// `freshness` mirrors those three slots: `"current"` when the branch's tip
 /// is still exactly what was rebuilt, `"docs_only"` when only docs changed
-/// since, `"changed"` when a rebuild would pick something up, `"unknown"`
+/// since, `"changed"` when a rebuild would pick something up, `"displaced"`
+/// when a newer test from another branch replaced a switch, `"unknown"`
 /// when the tip could not be read — `null` wherever the slot itself is.
 #[derive(Serialize)]
 struct JsonChannelRebuild {
@@ -2630,6 +2631,7 @@ impl From<rebuild::RebuildStatus> for JsonLocalRebuild {
                 rebuild::Freshness::Current => "current",
                 rebuild::Freshness::DocsOnly => "docs_only",
                 rebuild::Freshness::Changed => "changed",
+                rebuild::Freshness::Displaced => "displaced",
                 rebuild::Freshness::Unknown => "unknown",
             })
         }

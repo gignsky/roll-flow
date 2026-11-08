@@ -322,7 +322,7 @@ are parallel states (ran-but-not-persisted vs. staged-for-next-boot), not
 competing ones.
 
 **Freshness.** Each surviving marker then gets a `rebuild::Freshness` —
-`Current`, `DocsOnly`, `Changed` or `Unknown` — from `git diff --name-only
+`Current`, `DocsOnly`, `Changed`, `Displaced` or `Unknown` — from `git diff --name-only
 <rebuild-commit> <branch-tip>`, which the TUI colours the label by and
 `--json` carries as `freshness`. The net tree diff, not a commit count, on
 purpose: the rebuild scripts commit what was pending *as* the rebuild commit,
@@ -330,6 +330,13 @@ so that commit's tree is the built state, and an empty marker commit from
 another host, a merge that brought nothing, or a change since reverted all
 leave the build exactly as current. `DocsOnly` is the Docs scope from the
 table at the top of this file.
+
+That diff only looks at the marker's own branch, so it cannot see the
+running system move *away* from it. `displace` covers that afterwards: a
+switch is `Displaced` when the channel's surviving `test` (which, past
+`supersede`, is newer) was built from a different branch. Only `test` — a
+`boot` changes the next boot, not what is running — and never a same-branch
+test, which the diff already accounts for.
 
 ## Revert detection (`core/branches.rs`)
 

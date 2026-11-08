@@ -2134,12 +2134,14 @@ fn hotfix_color(state: HotfixState) -> Color {
 
 /// The `build` column's colour for one label: green when the branch's tip is
 /// still exactly what was rebuilt, yellow when only docs moved since, red when
-/// a rebuild would pick something up. See `core::rebuild::Freshness`.
+/// a rebuild would pick something up, blue when a newer test from another
+/// branch has replaced what this switch built. See `core::rebuild::Freshness`.
 fn freshness_style(freshness: rebuild::Freshness) -> Style {
     match freshness {
         rebuild::Freshness::Current => Style::default().fg(Color::Green),
         rebuild::Freshness::DocsOnly => Style::default().fg(Color::Yellow),
         rebuild::Freshness::Changed => Style::default().fg(Color::Red),
+        rebuild::Freshness::Displaced => Style::default().fg(Color::Blue),
         rebuild::Freshness::Unknown => Style::default(),
     }
 }

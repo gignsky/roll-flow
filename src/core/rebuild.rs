@@ -53,6 +53,11 @@ pub enum Freshness {
     DocsOnly,
     /// Something a rebuild would pick up changed since.
     Changed,
+    /// A switch whose result is no longer what is running: a newer `test`
+    /// of the same channel was built from a *different* branch since (see
+    /// [`displace`]). Takes precedence over the diff-based states, which
+    /// only say whether the branch moved, not whether this build is live.
+    Displaced,
     /// The branch's tip could not be resolved or diffed.
     #[default]
     Unknown,
@@ -526,12 +531,30 @@ pub fn detect(
     {
         marker.freshness = freshness(repo, marker);
     }
+    displace(&mut nixos.switch, &nixos.test);
+    displace(&mut home.switch, &home.test);
 
     Some(RebuildStatus {
         host_id: host_id.to_string(),
         nixos,
         home,
     })
+}
+
+/// Mark `switch` [`Freshness::Displaced`] when a newer `test` was built from
+/// another branch — switching branches and testing there replaced the
+/// running system without touching the switch's own branch, so the diff
+/// against that branch alone would still read it as current.
+///
+/// Only `test`: a `boot` stages the next boot and leaves the running system
+/// as the switch built it. A newer test on the *same* branch is left to the
+/// diff, which already sees whatever that test committed.
+fn displace(switch: &mut Option<RebuildMarker>, test: &Option<RebuildMarker>) {
+    if let (Some(s), Some(t)) = (switch.as_mut(), test.as_ref()) {
+        if t.branch != s.branch && t.committed_at > s.committed_at {
+            s.freshness = Freshness::Displaced;
+        }
+    }
 }
 
 /// Compare the rebuild commit's tree to its branch's current tip. The
@@ -743,6 +766,24 @@ mod tests {
             classify_changed_paths(["README.md", "hosts/merlin/default.nix"].into_iter()),
             Freshness::Changed
         );
+    }
+
+    #[test]
+    fn a_newer_test_on_another_branch_displaces_the_switch() {
+        let mut switch = marker_at("main", 10);
+        displace(&mut switch, &marker_at("roll/41-x", 20));
+        assert_eq!(switch.unwrap().freshness, Freshness::Displaced);
+    }
+
+    #[test]
+    fn a_test_on_the_same_branch_or_an_older_one_does_not_displace() {
+        let mut switch = marker_at("main", 10);
+        displace(&mut switch, &marker_at("main", 20));
+        assert_eq!(switch.as_ref().unwrap().freshness, Freshness::Current);
+        displace(&mut switch, &marker_at("roll/41-x", 5));
+        assert_eq!(switch.as_ref().unwrap().freshness, Freshness::Current);
+        displace(&mut switch, &None);
+        assert_eq!(switch.unwrap().freshness, Freshness::Current);
     }
 
     #[test]
