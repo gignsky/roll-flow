@@ -2916,14 +2916,15 @@ impl StatusApp {
         true
     }
 
-    /// Refuse `gg` while a job is running: lazygit takes the terminal and the
-    /// repo, and a git command racing it is exactly what the queue avoids. A
-    /// *held* queue is fine — that is when lazygit is most needed. Returns
-    /// true when the caller should stop.
+    /// Refuse a key while a job is running — `gg` above all: lazygit takes the
+    /// terminal and the repo, and a git command racing it is exactly what the
+    /// queue avoids. A *held* queue is fine — that is when lazygit is most
+    /// needed. Shared by every key that refuses rather than queues, so the
+    /// message names none of them. Returns true when the caller should stop.
     fn busy(&mut self) -> bool {
         if self.job.is_some() {
             self.message = Some(format!(
-                "'{}' is still running — gg once it finishes",
+                "'{}' is still running — try again once it finishes",
                 self.job_title
             ));
             return true;
