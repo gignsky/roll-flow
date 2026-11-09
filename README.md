@@ -186,6 +186,7 @@ cargo test
   - `t` tidy
   - `d` delete
   - `b` bump the version
+  - `n` rebuild NixOS / home-manager
 
   and syncs the selected branch:
   - `p` pull

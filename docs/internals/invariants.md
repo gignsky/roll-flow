@@ -142,6 +142,11 @@ long list — that keeps two rolls adding rules in different areas from collidin
   commands the pass's own check is the one that counts.
 - `gg` is refused only while a job is *running*. A held queue is exactly when
   lazygit is needed.
+- `n` is stricter: refused while anything is running *or queued*, because a
+  rebuild commits onto the checked-out branch. Its own switch is the one job
+  it queues, and the rebuild starts only once the queue is empty again and
+  the branch it was picked for is checked out (`rebuild_menu::readiness`) —
+  otherwise it is dropped, never run on whatever HEAD became.
 
 ## Verification
 

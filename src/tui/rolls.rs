@@ -33,12 +33,13 @@ use ratatui::{
 
 use super::output::{self, Followup, JobDone, JobProgress};
 use super::queue::{self, Pending, Queue};
+use super::rebuild_menu::{self, Readiness};
 use crate::core::{
     branches::{
         self, BranchLocation, HotfixInfo, HotfixState, PullSet, RollInfo, RollState, UpdateSet,
         VerifySet,
     },
-    config::{Config, PullMode},
+    config::{Config, PullMode, RebuildEntry},
     git::{self, TrackState},
     history, ops, proc, rebuild,
     sync::{self, PullPlan, PushOutcome, SyncTarget},
@@ -528,6 +529,15 @@ enum Mode {
         /// `y` then runs the forced push ahead of the queue and releases it.
         rejected: bool,
     },
+    /// `n`: pick a rebuild to run on `branch` — the selected row's, which
+    /// is switched to first when it is not the one checked out. The entries
+    /// are resolved once, when the menu opens (see [`rebuild_menu::entries`]),
+    /// so what it lists is exactly what runs.
+    Rebuild {
+        branch: String,
+        location: BranchLocation,
+        entries: Vec<RebuildEntry>,
+    },
     /// `:`: the lazygit-style command prompt.
     Command {
         /// What the user actually typed. Filters the history list, and
@@ -546,6 +556,14 @@ enum Mode {
         /// prompt.
         cursor: usize,
     },
+}
+
+/// A rebuild picked from the `n` menu: what to run, and the branch it was
+/// picked for, which must be the checked-out one when it starts.
+#[derive(Debug, Clone)]
+struct PendingRebuild {
+    entry: RebuildEntry,
+    branch: String,
 }
 
 /// What the slug-input modal creates. One modal for both, because the input
@@ -869,6 +887,9 @@ struct StatusApp {
     /// When a bare `b` was pressed, waiting to see whether it becomes `bb`.
     /// Same shape as `pending_pull`, timed by [`BUMP_CHORD_WINDOW`].
     pending_bump: Option<Instant>,
+    /// A rebuild picked from the `n` menu, waiting for its branch switch (and
+    /// anything queued behind it) to finish — see [`Self::run_pending_rebuild`].
+    pending_rebuild: Option<PendingRebuild>,
     /// Commands run through `:`, most-recent-first. Loaded once at startup
     /// from [`history::load`] and saved back after every run.
     command_history: Vec<String>,
@@ -1409,6 +1430,14 @@ pub(crate) const BINDINGS: &[Binding] = &[
         group: "tools",
         hint: None,
         replay: &[KeyCode::Char('g'), KeyCode::Char('g')],
+    },
+    Binding {
+        keys: "n",
+        // The words someone reaches for: "nixos", "home-manager", "switch".
+        label: "rebuild nixos / home-manager on the selected branch (switch, test, boot)",
+        group: "tools",
+        hint: None,
+        replay: &[KeyCode::Char('n')],
     },
     Binding {
         keys: "bb",
@@ -2592,6 +2621,7 @@ impl StatusApp {
             pending_push: None,
             pending_pull: None,
             pending_bump: None,
+            pending_rebuild: None,
             command_history: history::load(),
         }
     }
@@ -2606,6 +2636,7 @@ impl StatusApp {
             self.resolve_lapsed_push();
             self.resolve_lapsed_pull();
             self.resolve_lapsed_bump();
+            self.run_pending_rebuild(terminal)?;
 
             if event::poll(Duration::from_millis(50))? {
                 let event = event::read()?;
@@ -2638,6 +2669,8 @@ impl StatusApp {
                         self.handle_pull_many(key.code);
                     } else if matches!(self.mode, Mode::UpdateMany { .. }) {
                         self.handle_update_many(key.code);
+                    } else if matches!(self.mode, Mode::Rebuild { .. }) {
+                        self.handle_rebuild(key.code);
                     } else if matches!(self.mode, Mode::Detail { .. }) {
                         self.handle_detail(key.code);
                     } else if matches!(self.mode, Mode::CreateInput { .. }) {
@@ -3051,6 +3084,7 @@ impl StatusApp {
             KeyCode::Char('f') => self.start_fetch(),
             KeyCode::Char('v') => self.start_verify(),
             KeyCode::Char('V') => self.request_verify_many(),
+            KeyCode::Char('n') => self.request_rebuild_menu(),
             KeyCode::Char('G') => self.request(Action::Graduate),
             KeyCode::Char('i') => self.request_integrate(),
             KeyCode::Char('I') => self.request_integrate_rolling(),
@@ -4515,6 +4549,143 @@ impl StatusApp {
         })
     }
 
+    /// `n` — open the rebuild menu for the selected row's branch (the
+    /// checked-out one when nothing is selected).
+    ///
+    /// Refused unless nothing is running *or queued*: the rebuild takes the
+    /// terminal and commits onto the checked-out branch, so it must not land
+    /// in the middle of other work, and a switch queued behind something else
+    /// would leave it building whatever that something left checked out.
+    fn request_rebuild_menu(&mut self) {
+        if self.busy() {
+            return;
+        }
+        if !self.queue.is_empty() {
+            self.message = Some(
+                "commands are queued — a rebuild waits for an idle queue ([s] resume, [S] drop)"
+                    .to_string(),
+            );
+            return;
+        }
+        let entries = match rebuild_menu::entries(&self.config, self.host_id.as_deref()) {
+            Ok(entries) if !entries.is_empty() => entries,
+            Ok(_) => {
+                self.message = Some("rebuild_menu in .roll-flow.toml has no entries".to_string());
+                return;
+            }
+            Err(why) => {
+                self.message = Some(why);
+                return;
+            }
+        };
+        let (branch, location) = match self.selected_row() {
+            Some(RowKind::Roll(i)) => {
+                (self.rolls[i].branch.clone(), self.rolls[i].location.clone())
+            }
+            Some(RowKind::Base(i)) => {
+                (self.bases[i].branch.clone(), self.bases[i].location.clone())
+            }
+            Some(RowKind::Hotfix(i)) => (
+                self.hotfixes[i].branch.clone(),
+                self.hotfixes[i].location.clone(),
+            ),
+            None => (self.current_branch.clone(), BranchLocation::Local),
+        };
+        self.mode = Mode::Rebuild {
+            branch,
+            location,
+            entries,
+        };
+    }
+
+    /// A key in the `n` menu. An entry's own key wins over the cancel keys,
+    /// so a configured entry on `n` or `q` still works.
+    fn handle_rebuild(&mut self, code: KeyCode) {
+        let Mode::Rebuild {
+            branch,
+            location,
+            entries,
+        } = &self.mode
+        else {
+            return;
+        };
+        let picked = match code {
+            KeyCode::Char(c) => entries.iter().find(|e| e.key == c).cloned(),
+            _ => None,
+        };
+        let Some(entry) = picked else {
+            if matches!(code, KeyCode::Esc | KeyCode::Char('n') | KeyCode::Char('q')) {
+                self.mode = Mode::Browsing;
+            }
+            return;
+        };
+        let (branch, location) = (branch.clone(), location.clone());
+        self.mode = Mode::Browsing;
+        if branch != self.current_branch {
+            self.execute_switch(branch.clone(), location);
+        }
+        self.pending_rebuild = Some(PendingRebuild { entry, branch });
+    }
+
+    /// Start a picked rebuild once its switch has run — see
+    /// [`rebuild_menu::readiness`]. Called every loop iteration; also waits
+    /// for any open modal to close, so a rebuild never yanks the terminal out
+    /// from under a question the user is answering.
+    fn run_pending_rebuild(&mut self, terminal: &mut super::Tui) -> Result<()> {
+        let Some(pending) = &self.pending_rebuild else {
+            return Ok(());
+        };
+        if !matches!(self.mode, Mode::Browsing) {
+            return Ok(());
+        }
+        match rebuild_menu::readiness(
+            self.job.is_some(),
+            self.queue.is_empty(),
+            &self.current_branch,
+            &pending.branch,
+        ) {
+            Readiness::Wait => Ok(()),
+            Readiness::Abandon => {
+                let pending = self.pending_rebuild.take().expect("checked above");
+                self.message = Some(format!(
+                    "{} is not checked out — '{}' not started",
+                    pending.branch, pending.entry.label
+                ));
+                Ok(())
+            }
+            Readiness::Run => {
+                let pending = self.pending_rebuild.take().expect("checked above");
+                self.run_rebuild(terminal, pending)
+            }
+        }
+    }
+
+    /// Hand the terminal to a rebuild's commands, then take it back. Shaped
+    /// like [`Self::run_command_in_shell`] rather than
+    /// [`Self::hand_over_terminal`]: a rebuild is a sequence of one-shot
+    /// commands whose output is worth reading, not a full-screen program, so
+    /// it pauses before the screen is redrawn over that output.
+    fn run_rebuild(&mut self, terminal: &mut super::Tui, pending: PendingRebuild) -> Result<()> {
+        let repo = self.config.repo_root.clone();
+        super::suspend(terminal)?;
+        println!("rf: {} on {}", pending.entry.label, pending.branch);
+        let result = rebuild_menu::run(&pending.entry, &repo);
+        match &result {
+            Ok(()) => println!("\n✓ {} finished", pending.entry.label),
+            Err(why) => println!("\n✗ {why}"),
+        }
+        println!("press enter to return to rf...");
+        let mut discard = String::new();
+        let _ = std::io::stdin().read_line(&mut discard);
+        super::resume(terminal)?;
+
+        self.message = Some(match result {
+            Ok(()) => format!("{} finished on {}", pending.entry.label, pending.branch),
+            Err(why) => why,
+        });
+        self.reload()
+    }
+
     /// Route a mouse event to the output panel. A no-op with no panel up —
     /// there is nothing else on this view a click or scroll drives.
     fn handle_mouse(&mut self, mouse: MouseEvent) {
@@ -4781,6 +4952,9 @@ impl StatusApp {
             Mode::VerifyMany { counts } => render_verify_many_modal(f, area, counts),
             Mode::PullMany { counts } => render_pull_many_modal(f, area, counts),
             Mode::UpdateMany { counts } => render_update_many_modal(f, area, counts),
+            Mode::Rebuild {
+                branch, entries, ..
+            } => render_rebuild_modal(f, area, branch, &self.current_branch, entries),
             Mode::ForcePush { branch, remote, .. } => {
                 render_force_push_modal(f, area, branch, remote, self.tracking.get(branch))
             }
@@ -5784,6 +5958,62 @@ fn render_verify_many_modal(f: &mut Frame, area: Rect, counts: &[(VerifySet, usi
     f.render_widget(Clear, modal);
     f.render_widget(
         Paragraph::new(lines).block(Block::bordered().title(" verify all ")),
+        modal,
+    );
+}
+
+/// The `n` menu: one line per entry, with the commands it runs dimmed
+/// beneath, so what a key does is never a surprise — the defaults and a
+/// configured menu read the same way.
+fn render_rebuild_modal(
+    f: &mut Frame,
+    area: Rect,
+    branch: &str,
+    current: &str,
+    entries: &[RebuildEntry],
+) {
+    let mut lines = vec![Line::from(Span::styled(
+        format!("Rebuild {branch}"),
+        Style::default().add_modifier(Modifier::BOLD),
+    ))];
+    if branch != current {
+        lines.push(Line::from(Span::styled(
+            format!("switches from {current} to {branch} first"),
+            Style::default().fg(Color::DarkGray),
+        )));
+    }
+    lines.push(Line::from(""));
+    for entry in entries {
+        lines.push(Line::from(vec![
+            Span::styled(
+                format!("[{}] ", entry.key),
+                Style::default().fg(Color::Yellow),
+            ),
+            Span::raw(entry.label.clone()),
+        ]));
+        for command in &entry.commands {
+            lines.push(Line::from(Span::styled(
+                format!("      {command}"),
+                Style::default().fg(Color::DarkGray),
+            )));
+        }
+    }
+    lines.push(Line::from(""));
+    lines.push(Line::from(Span::styled(
+        "[esc] cancel",
+        Style::default().fg(Color::Yellow),
+    )));
+
+    let width = lines
+        .iter()
+        .map(|l| l.width())
+        .max()
+        .unwrap_or(32)
+        .clamp(28, 90) as u16;
+    let modal = centered_rect(area, width + 4, lines.len() as u16 + 2);
+    f.render_widget(Clear, modal);
+    f.render_widget(
+        Paragraph::new(lines).block(Block::bordered().title(" rebuild ")),
         modal,
     );
 }
@@ -7237,6 +7467,7 @@ mod tests {
             lazygit_command: "lazygit".to_string(),
             bacon_command: "bacon".to_string(),
             version_manifest: Default::default(),
+            rebuild_menu: vec![],
         }
     }
 
@@ -7355,6 +7586,7 @@ mod tests {
             pending_push: None,
             pending_pull: None,
             pending_bump: None,
+            pending_rebuild: None,
             command_history: Vec::new(),
         };
 
@@ -7419,6 +7651,7 @@ mod tests {
             pending_push: None,
             pending_pull: None,
             pending_bump: None,
+            pending_rebuild: None,
             command_history: Vec::new(),
         };
 
@@ -7463,6 +7696,7 @@ mod tests {
             pending_push: None,
             pending_pull: None,
             pending_bump: None,
+            pending_rebuild: None,
             command_history: Vec::new(),
         };
         app.toggle_maximize();
@@ -9473,6 +9707,7 @@ mod tests {
             pending_push: None,
             pending_pull: None,
             pending_bump: None,
+            pending_rebuild: None,
             command_history: Vec::new(),
         };
         let out = draw(|f, area| app.render_table(f, area));
@@ -9568,6 +9803,7 @@ mod tests {
             lazygit_command: "lazygit".to_string(),
             bacon_command: "bacon".to_string(),
             version_manifest: Default::default(),
+            rebuild_menu: vec![],
         }
     }
 
@@ -9873,6 +10109,7 @@ mod tests {
             pending_push: None,
             pending_pull: None,
             pending_bump: None,
+            pending_rebuild: None,
             command_history: Vec::new(),
         };
 
@@ -9936,6 +10173,7 @@ mod tests {
             pending_push: None,
             pending_pull: None,
             pending_bump: None,
+            pending_rebuild: None,
             command_history: Vec::new(),
         };
 
@@ -9996,6 +10234,7 @@ mod tests {
             pending_push: None,
             pending_pull: None,
             pending_bump: None,
+            pending_rebuild: None,
             command_history: Vec::new(),
         };
         let out = draw(|f, area| app.render_table(f, area));
@@ -10067,6 +10306,7 @@ mod tests {
             pending_push: None,
             pending_pull: None,
             pending_bump: None,
+            pending_rebuild: None,
             command_history: Vec::new(),
         };
         let out = draw(|f, area| app.render_table(f, area));
@@ -10151,6 +10391,7 @@ mod tests {
             pending_push: None,
             pending_pull: None,
             pending_bump: None,
+            pending_rebuild: None,
             command_history: Vec::new(),
         };
         let out = draw(|f, area| app.render_table(f, area));
@@ -10202,6 +10443,7 @@ mod tests {
             pending_push: None,
             pending_pull: None,
             pending_bump: None,
+            pending_rebuild: None,
             command_history: Vec::new(),
         };
         let out = draw(|f, area| app.render_table(f, area));
@@ -10258,6 +10500,7 @@ mod tests {
             pending_push: None,
             pending_pull: None,
             pending_bump: None,
+            pending_rebuild: None,
             command_history: Vec::new(),
         };
         let out = draw(|f, area| app.render_table(f, area));
@@ -11467,6 +11710,7 @@ mod tests {
             pending_push: None,
             pending_pull: None,
             pending_bump: None,
+            pending_rebuild: None,
             command_history: Vec::new(),
         }
     }
@@ -11740,6 +11984,121 @@ mod tests {
     }
 
     #[test]
+    fn a_rebuild_on_another_row_switches_to_it_first_and_waits() {
+        let mut app = idle_app();
+        app.host_id = Some("merlin".to_string());
+        app.rolls = vec![roll_n(2, RollState::Active)];
+        app.table.select(Some(0));
+
+        app.request_rebuild_menu();
+        assert!(
+            matches!(&app.mode, Mode::Rebuild { branch, .. } if branch == "roll/2-0101-x"),
+            "menu should open on the selected roll: {:?}",
+            app.message
+        );
+        app.handle_rebuild(KeyCode::Char('r'));
+
+        assert!(matches!(app.mode, Mode::Browsing));
+        let pending = app.pending_rebuild.as_ref().expect("rebuild pending");
+        assert_eq!(pending.branch, "roll/2-0101-x");
+        assert_eq!(
+            pending.entry.commands,
+            ["sudo nixos-rebuild switch --flake .#merlin"]
+        );
+        assert_eq!(app.job_title, "git switch roll/2-0101-x");
+        assert_eq!(
+            rebuild_menu::readiness(
+                app.job.is_some(),
+                app.queue.is_empty(),
+                &app.current_branch,
+                &pending.branch
+            ),
+            Readiness::Wait,
+            "must not start while the switch runs"
+        );
+    }
+
+    #[test]
+    fn a_rebuild_on_the_checked_out_row_queues_no_switch() {
+        let mut app = idle_app();
+        app.host_id = Some("merlin".to_string());
+        app.request_rebuild_menu();
+        app.handle_rebuild(KeyCode::Char('s'));
+        assert!(app.job.is_none(), "no switch for the checked-out branch");
+        let pending = app.pending_rebuild.as_ref().expect("rebuild pending");
+        assert_eq!(pending.branch, "roll/1-0101-x");
+        assert_eq!(pending.entry.commands.len(), 2, "s is NixOS then home");
+    }
+
+    #[test]
+    fn the_rebuild_menu_cancels_on_esc_or_a_second_n_and_ignores_other_keys() {
+        for cancel in [KeyCode::Esc, KeyCode::Char('n'), KeyCode::Char('q')] {
+            let mut app = idle_app();
+            app.host_id = Some("merlin".to_string());
+            app.request_rebuild_menu();
+            app.handle_rebuild(KeyCode::Char('z'));
+            assert!(matches!(app.mode, Mode::Rebuild { .. }), "z is no entry");
+            app.handle_rebuild(cancel);
+            assert!(matches!(app.mode, Mode::Browsing), "{cancel:?}");
+            assert!(app.pending_rebuild.is_none());
+        }
+    }
+
+    #[test]
+    fn the_rebuild_menu_refuses_unless_the_queue_is_idle() {
+        let mut app = idle_app();
+        app.host_id = Some("merlin".to_string());
+        let (release, gate) = std::sync::mpsc::channel::<()>();
+        app.start_job("rf fetch", move || {
+            gate.recv().ok();
+            Ok(JobDone::default())
+        });
+        app.request_rebuild_menu();
+        assert!(matches!(app.mode, Mode::Browsing), "refused while running");
+
+        app.start_job("rf fetch again", says("queued"));
+        release.send(()).unwrap();
+        while app.job.is_some() {
+            if let (Some(job), Some(panel)) = (&mut app.job, &mut app.panel) {
+                if let JobProgress::Finished { .. } = job.drain(panel) {
+                    app.job = None;
+                }
+            }
+        }
+        assert!(!app.queue.is_empty());
+        app.request_rebuild_menu();
+        assert!(matches!(app.mode, Mode::Browsing), "refused while queued");
+        assert!(app.message.unwrap_or_default().contains("queued"));
+    }
+
+    #[test]
+    fn the_rebuild_menu_shows_each_entrys_commands_and_the_switch() {
+        let entries = rebuild_menu::default_entries("merlin", "gig");
+        let out = draw(|f, area| render_rebuild_modal(f, area, "roll/2-0101-x", "main", &entries));
+        assert!(out.contains("Rebuild roll/2-0101-x"), "{out}");
+        assert!(
+            out.contains("switches from main to roll/2-0101-x first"),
+            "{out}"
+        );
+        assert!(out.contains("[s] switch"), "{out}");
+        assert!(
+            out.contains("home-manager switch --flake .#gig@merlin"),
+            "{out}"
+        );
+    }
+
+    #[test]
+    fn no_host_and_no_configured_menu_says_why() {
+        let mut app = idle_app();
+        app.request_rebuild_menu();
+        assert!(matches!(app.mode, Mode::Browsing));
+        assert!(
+            app.message.unwrap_or_default().contains("rebuild_menu"),
+            "the message should name the config key"
+        );
+    }
+
+    #[test]
     fn v_on_the_checked_out_roll_verifies_without_switching() {
         let mut app = idle_app();
         app.rolls = vec![roll_n(1, RollState::Active)];
@@ -11940,6 +12299,7 @@ mod tests {
             pending_push: None,
             pending_pull: None,
             pending_bump: None,
+            pending_rebuild: None,
             command_history: Vec::new(),
         };
         let out = draw(|f, area| app.render_table(f, area));
@@ -12017,6 +12377,7 @@ mod tests {
             pending_push: None,
             pending_pull: None,
             pending_bump: None,
+            pending_rebuild: None,
             command_history: Vec::new(),
         };
 

@@ -24,6 +24,7 @@ src/
     rolls.rs           the rolls view: state, event loop, table, modals, keymap
     output.rs          background jobs and the floating output panel
     queue.rs           commands queued behind the running job; held on failure
+    rebuild_menu.rs    `n`: rebuild entries, built-in defaults, running one
   core/
     mod.rs
     config.rs          Config struct, auto-detection from flake.nix

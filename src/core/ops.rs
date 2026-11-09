@@ -5065,6 +5065,7 @@ mod tests {
             lazygit_command: "lazygit".to_string(),
             bacon_command: "bacon".to_string(),
             version_manifest: Default::default(),
+            rebuild_menu: vec![],
         }
     }
 
