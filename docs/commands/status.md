@@ -180,7 +180,7 @@ The full list:
 | `q` | quit |
 | `p` / `P` / `f` | pull / push / fetch the selected branch |
 | `PP` | [push every branch that needs it](#pp--push-everything-that-needs-it) |
-| `gg` / `bb` | [lazygit / bacon](#gg-and-bb--hand-over-the-terminal) |
+| `gg` / `bb` / `vv` | [lazygit / bacon / your editor](#gg-bb-and-vv--hand-over-the-terminal) |
 | `c` / `i` | create a roll / integrate one into the checked-out roll |
 | `V` | verify all rolls, or a set of them |
 | `n` | [rebuild NixOS / home-manager](#n--rebuild-nixos-and-home-manager) on the selected branch |
@@ -264,13 +264,13 @@ Two guards keep a chain from doing something you did not ask for:
 - `q` with commands queued only warns the first time; a second `q` quits and
   drops them.
 
-## `gg` and `bb` — hand over the terminal
+## `gg`, `bb` and `vv` — hand over the terminal
 
-`gg` and `bb` are the exceptions to the output panel: lazygit and bacon draw
-their own full-screen UI and own the terminal outright, so there is nothing to
+`gg`, `bb` and `vv` are the exceptions to the output panel: lazygit, bacon
+and your editor draw their own full-screen UI and own the terminal outright, so there is nothing to
 stream. `rf` suspends, hands the terminal over, and redraws when the tool
 exits — then reloads the list, because anything at all may have happened
-inside. Only one of the two is a git tool, which is why they are their own
+inside. Only one of the three is a git tool, which is why they are their own
 `tools` group in `?` rather than sitting under `sync` or `roll`.
 
 `bb` is a chord on the `b` that bumps the version, like `pp` on `p`: a lone `b`
@@ -278,6 +278,11 @@ still bumps, but only after a short window (400ms) with no second `b`. Bacon run
 in the directory of the shallowest `Cargo.toml` in the working tree — the repo
 root when it has one, else the nearest crate below it — and the key says so in
 the status line when there is none.
+
+`vv` is the same kind of chord on `v`: a lone `v` still verifies, after the
+same 400ms window, and still queues behind a running job as before — only the
+editor itself waits for the job to finish. The editor opens on `.` in the repo
+root: `editor_command` if set, else `$VISUAL`, else `$EDITOR`, else `vi`.
 
 The nix package wraps `rf` with bacon and lazygit on a *suffixed* `PATH`, so `bb` and `gg` work
 with nothing else installed while a copy you already have still wins.
