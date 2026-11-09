@@ -235,8 +235,10 @@ informational one that *is* shipped. It answers "what did *this machine*
 most recently rebuild, locally" — for `rf status`/`rf list`'s `build` gutter
 column and `--json` output — and gates nothing. `rf` never shells out to
 `nixos-rebuild`/`home-manager` or reads profile symlinks here; it only reads
-commit messages the dotfiles repo's own rebuild scripts
-(`scripts/nixos-rebuild.sh`, `scripts/home-switch.sh`) already write:
+commit messages the dotfiles repo's rebuild scripts already write
+(`nixos-rebuild.sh`, `home-switch.sh` — packaged in gigpkgs as
+`gig-nixos-rebuild`/`gig-home-switch`, and what the dotfiles repo's own
+`rebuild_menu` runs through its justfile):
 
 - NixOS: `<host-id>: generation <N> (switch|boot|test)`, or
   `<host-id>: unknown generation (switch|boot|test)`.
@@ -320,6 +322,23 @@ made it not. Time is the only ordering two unrelated branches share.
 exactly this. `test` and `boot` are never compared against each other: they
 are parallel states (ran-but-not-persisted vs. staged-for-next-boot), not
 competing ones.
+
+**Freshness.** Each surviving marker then gets a `rebuild::Freshness` —
+`Current`, `DocsOnly`, `Changed`, `Displaced` or `Unknown` — from `git diff --name-only
+<rebuild-commit> <branch-tip>`, which the TUI colours the label by and
+`--json` carries as `freshness`. The net tree diff, not a commit count, on
+purpose: the rebuild scripts commit what was pending *as* the rebuild commit,
+so that commit's tree is the built state, and an empty marker commit from
+another host, a merge that brought nothing, or a change since reverted all
+leave the build exactly as current. `DocsOnly` is the Docs scope from the
+table at the top of this file.
+
+That diff only looks at the marker's own branch, so it cannot see the
+running system move *away* from it. `displace` covers that afterwards: a
+switch is `Displaced` when the channel's surviving `test` (which, past
+`supersede`, is newer) was built from a different branch. Only `test` — a
+`boot` changes the next boot, not what is running — and never a same-branch
+test, which the diff already accounts for.
 
 ## Revert detection (`core/branches.rs`)
 

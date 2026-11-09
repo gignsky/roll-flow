@@ -116,6 +116,24 @@ home-manager switch/test — home-manager has no "boot" concept. A
 `NT`/`NB`/`HT` label disappears once a later switch has caught up to or
 passed it, since it then tells you nothing the switch doesn't.
 
+In the TUI each label is coloured by whether its branch has moved since that
+rebuild, judged by the net diff between the rebuild commit and the branch's
+tip:
+
+| colour | meaning |
+|---|---|
+| green | the tip is exactly what was rebuilt |
+| yellow | only docs changed since (`docs/**`, `operations/**`, `*.md`) |
+| red | something a rebuild would pick up changed since |
+| blue | a switch you have since moved off: a newer `NT`/`HT` was built from a different branch, so what is running is that test, not this switch |
+
+An empty commit on top — another host's rebuild marker, a merge that brought
+nothing new — leaves a label green; a change later reverted turns it green
+again. Blue wins over the others — `N` on `main` turns blue once you switch
+to a roll and run a test there, whatever `main` has done since. A newer
+`NB` does not do this, since the running system is still the switch's until
+you reboot.
+
 `--no-tui` prints a one-line summary above the table instead of relying on
 the column alone — the common case, a plain switch directly on
 `rolling`/`main`, has no roll row to attach a column cell to at all:
@@ -126,7 +144,8 @@ last rebuild (merlin): nixos switch→rolling · nixos test→roll/41-x · home 
 
 `--json` carries the same data as a top-level `local_rebuild` object
 (`host`, `nixos`/`home`, each `{switch, test, boot}` as branch-name strings
-or `null`) — see [`list`](list.md) for the per-roll echo of this in `rf list
+or `null`, plus a `freshness` object with the same three slots as
+`"current"`/`"docs_only"`/`"changed"`/`"displaced"`/`"unknown"`) — see [`list`](list.md) for the per-roll echo of this in `rf list
 --json`. See
 [Local rebuild markers](../internals/algorithms.md#local-rebuild-markers-corerebuildrs)
 for how a commit is attributed to a roll vs. a branch.
@@ -180,9 +199,10 @@ The full list:
 | `q` | quit |
 | `p` / `P` / `f` | pull / push / fetch the selected branch |
 | `PP` | [push every branch that needs it](#pp--push-everything-that-needs-it) |
-| `gg` / `bb` | [lazygit / bacon](#gg-and-bb--hand-over-the-terminal) |
+| `gg` / `bb` / `vv` | [lazygit / bacon / your editor](#gg-bb-and-vv--hand-over-the-terminal) |
 | `c` / `i` | create a roll / integrate one into the checked-out roll |
 | `V` | verify all rolls, or a set of them |
+| `n` | [rebuild NixOS / home-manager](#n--rebuild-nixos-and-home-manager) on the selected branch |
 | `G` / `m` / `u` | graduate / promote / update from stable |
 | `b` | bump the version |
 | `h` / `H` | create a hotfix off stable / land the checked-out hotfix |
@@ -263,13 +283,13 @@ Two guards keep a chain from doing something you did not ask for:
 - `q` with commands queued only warns the first time; a second `q` quits and
   drops them.
 
-## `gg` and `bb` — hand over the terminal
+## `gg`, `bb` and `vv` — hand over the terminal
 
-`gg` and `bb` are the exceptions to the output panel: lazygit and bacon draw
-their own full-screen UI and own the terminal outright, so there is nothing to
+`gg`, `bb` and `vv` are the exceptions to the output panel: lazygit, bacon
+and your editor draw their own full-screen UI and own the terminal outright, so there is nothing to
 stream. `rf` suspends, hands the terminal over, and redraws when the tool
 exits — then reloads the list, because anything at all may have happened
-inside. Only one of the two is a git tool, which is why they are their own
+inside. Only one of the three is a git tool, which is why they are their own
 `tools` group in `?` rather than sitting under `sync` or `roll`.
 
 `bb` is a chord on the `b` that bumps the version, like `pp` on `p`: a lone `b`
@@ -277,6 +297,11 @@ still bumps, but only after a short window (400ms) with no second `b`. Bacon run
 in the directory of the shallowest `Cargo.toml` in the working tree — the repo
 root when it has one, else the nearest crate below it — and the key says so in
 the status line when there is none.
+
+`vv` is the same kind of chord on `v`: a lone `v` still verifies, after the
+same 400ms window, and still queues behind a running job as before — only the
+editor itself waits for the job to finish. The editor opens on `.` in the repo
+root: `editor_command` if set, else `$VISUAL`, else `$EDITOR`, else `vi`.
 
 The nix package wraps `rf` with bacon and lazygit on a *suffixed* `PATH`, so `bb` and `gg` work
 with nothing else installed while a copy you already have still wins.
@@ -286,6 +311,36 @@ something other than a bare `lazygit`/`bacon` on `PATH`. lazygit is launched as
 `<command> -p <repo_root>`; bacon is launched with no arguments in that Cargo.toml directory,
 because bacon's positional argument is a job name (`check`, `clippy`, `test`)
 and a path passed there would be read as a job that does not exist.
+
+## `n` — rebuild NixOS and home-manager
+
+`n` opens a menu of rebuilds for the selected row's branch. By default:
+
+| key | does |
+|---|---|
+| `s` | switch: NixOS, then home-manager (home-manager is skipped if NixOS fails) |
+| `r` | rebuild: NixOS switch only |
+| `t` / `b` | NixOS test / boot |
+| `h` / `H` | home-manager switch / test (build only) |
+
+The menu lists each entry's commands beneath it. `rebuild_menu` in
+`.roll-flow.toml` replaces the whole menu — see [config](../config.md#rebuild-menu).
+`esc`, `q` or a second `n` closes it.
+
+When the selected row is not checked out, picking an entry queues the ordinary
+`space` switch to it first. The rebuild starts once that switch, and anything
+you pressed after it, has finished, with no modal open. If the branch then
+checked out is not the one you picked — the switch failed, or a later command
+moved HEAD — the rebuild is dropped and the status line says so. It never
+builds a branch you did not pick.
+
+Like `gg`, a rebuild takes the terminal rather than streaming into the panel:
+it asks for a sudo password, scripts prompt, and nix draws live progress. rf
+suspends, runs the commands, waits for enter so you can read the output, and
+reloads — so a rebuild script's marker commit shows up in the `build` column
+straight away. `n` is refused while a job runs *or anything is queued*, since a
+rebuild commits onto the checked-out branch and must not interleave with
+other work.
 
 ## Pulling and pushing
 

@@ -187,6 +187,12 @@ pub struct Config {
     /// `PATH`.
     #[serde(default = "default_bacon")]
     pub bacon_command: String,
+    /// The editor the TUI's `vv` binding opens on the repo. Empty (the
+    /// default) means `$VISUAL`, then `$EDITOR`, then `vi` — the usual Unix
+    /// order — so this is only needed to pick something other than the
+    /// editor every other tool already opens.
+    #[serde(default)]
+    pub editor_command: String,
     /// Which manifest this repo versions through, when it carries both a
     /// `Cargo.toml` and a `package.json`. `Auto` (default) prefers `Cargo` —
     /// the same choice [`version::ManifestKind::detect`] makes with no
@@ -204,6 +210,28 @@ pub struct Config {
     /// actually touches.
     #[serde(default)]
     pub version_manifest: VersionManifest,
+    /// The TUI's `n` rebuild menu. Empty (the default) means the built-in
+    /// plain `nixos-rebuild`/`home-manager` menu — see
+    /// `tui::rebuild_menu::default_entries`. Last in the struct because it
+    /// renders as an array of tables, which TOML requires after every bare
+    /// key.
+    #[serde(default)]
+    pub rebuild_menu: Vec<RebuildEntry>,
+}
+
+/// One `[[rebuild_menu]]` entry: the key that picks it in the `n` menu, what
+/// the menu calls it, and the shell commands it runs, in order, stopping at
+/// the first failure. `{host}` (this machine's flake target) and `{user}`
+/// (`username`) are substituted in each command.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RebuildEntry {
+    pub key: char,
+    pub label: String,
+    pub commands: Vec<String>,
+    /// Ask for the sudo password once before the first command, and keep it
+    /// fresh until the last one finishes.
+    #[serde(default)]
+    pub sudo: bool,
 }
 
 /// The `version_manifest` setting as written: `"auto"`, `"cargo"`, `"npm"`,
@@ -314,7 +342,9 @@ impl Config {
         "pull_mode",
         "lazygit_command",
         "bacon_command",
+        "editor_command",
         "version_manifest",
+        "rebuild_menu",
     ];
 
     /// Hosts that are currently active (inactive ones are offline/rebuilding).
@@ -530,7 +560,9 @@ impl Config {
             pull_mode: PullMode::default(),
             lazygit_command: default_lazygit(),
             bacon_command: default_bacon(),
+            editor_command: String::new(),
             version_manifest: VersionManifest::default(),
+            rebuild_menu: vec![],
         })
     }
 
@@ -824,7 +856,9 @@ mod tests {
             pull_mode: PullMode::default(),
             lazygit_command: default_lazygit(),
             bacon_command: default_bacon(),
+            editor_command: String::new(),
             version_manifest: super::VersionManifest::default(),
+            rebuild_menu: vec![],
         };
         let updated = cfg.with_overrides(
             Some("rolling".to_string()),
@@ -863,7 +897,9 @@ mod tests {
             pull_mode: PullMode::default(),
             lazygit_command: default_lazygit(),
             bacon_command: default_bacon(),
+            editor_command: String::new(),
             version_manifest: super::VersionManifest::default(),
+            rebuild_menu: vec![],
         };
         let rendered = cfg.to_toml_string().expect("render");
         assert!(
@@ -955,6 +991,34 @@ mod tests {
 
     fn parse(text: &str) -> (Config, Vec<String>) {
         Config::parse(text, std::path::Path::new("/real/checkout")).expect("parse")
+    }
+
+    #[test]
+    fn rebuild_menu_entries_parse_and_survive_a_render() {
+        let text = format!(
+            r#"{MINIMAL}
+            [[rebuild_menu]]
+            key = "s"
+            label = "switch"
+            commands = ["just rebuild", "just home"]
+            sudo = true
+
+            [[rebuild_menu]]
+            key = "h"
+            label = "home"
+            commands = ["just home"]
+            "#
+        );
+        let (cfg, warnings) = parse(&text);
+        assert!(warnings.is_empty(), "{warnings:?}");
+        assert_eq!(cfg.rebuild_menu.len(), 2);
+        assert_eq!(cfg.rebuild_menu[0].key, 's');
+        assert!(cfg.rebuild_menu[0].sudo);
+        assert!(!cfg.rebuild_menu[1].sudo, "sudo defaults to off");
+
+        let rendered = cfg.to_toml_string().expect("render");
+        let (again, _) = parse(&rendered);
+        assert_eq!(again.rebuild_menu, cfg.rebuild_menu);
     }
 
     #[test]

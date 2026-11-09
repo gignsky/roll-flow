@@ -186,6 +186,7 @@ cargo test
   - `t` tidy
   - `d` delete
   - `b` bump the version
+  - `n` rebuild NixOS / home-manager
 
   and syncs the selected branch:
   - `p` pull
@@ -194,6 +195,7 @@ cargo test
   - `f` fetch
   - `gg` lazygit
   - `bb` bacon
+  - `vv` your editor (`$VISUAL`/`$EDITOR`)
 
   The status bar carries only the basics; `?` opens a fuzzy-searchable list of
   every key, and enter runs the one under the cursor. A force _push_ is

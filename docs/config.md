@@ -27,6 +27,7 @@ clean_protect = []
 pull_mode = "ff-only"
 lazygit_command = "lazygit"
 bacon_command = "bacon"
+editor_command = ""
 version_manifest = "auto"
 
 [host_active]
@@ -80,7 +81,9 @@ the layers are merged; everything else has a default.
 | `pull_mode`             | `"ff-only"` | fresh file                                                                  | the TUI's `[p]`                                                                                                                                                      |
 | `lazygit_command`       | `"lazygit"` | fresh file                                                                  | the TUI's `gg`                                                                                                                                                       |
 | `bacon_command`         | `"bacon"`   | fresh file                                                                  | the TUI's `bb`                                                                                                                                                       |
+| `editor_command`        | `""`        | fresh file                                                                  | the TUI's `vv`; empty means `$VISUAL`, then `$EDITOR`, then `vi`                                                                                                     |
 | `version_manifest`      | `"auto"`    | fresh file                                                                  | which manifest(s) the version gate and `rf start` / `rf graduate` / `rf promote`'s version writes use: `auto` tracks every one with a version, `cargo`/`npm` pin one |
+| `rebuild_menu`          | `[]`        | fresh file                                                                  | the TUI's `n`; empty means the built-in `nixos-rebuild`/`home-manager` menu — see [Rebuild menu](#rebuild-menu)                                                      |
 
 Gate entries are shell commands run in repo root. Any failure blocks
 verify/graduate/promote.
@@ -190,7 +193,55 @@ want.
 `bacon_command` is the same for the TUI's `[bb]`, except that it is run with no
 arguments in the directory of the working tree's `Cargo.toml` rather than given a path flag — bacon's positional
 argument is a job name, not a path. Defaults to `bacon` on `PATH`. See
-[`status`](commands/status.md#gg-and-bb--hand-over-the-terminal).
+[`status`](commands/status.md#gg-bb-and-vv--hand-over-the-terminal).
+
+`editor_command` is what the TUI's `[vv]` opens, run as `<command> .` in the
+repo root. Left empty — the default — it falls back to `$VISUAL`, then
+`$EDITOR`, then `vi`, so it only needs setting to pick a different editor for
+`rf` than for everything else. Split on whitespace like `$EDITOR`
+(`"code --wait"` works); no shell, so use a wrapper script for anything that
+needs quoting.
+
+## Rebuild menu
+
+`rebuild_menu` is what the TUI's [`n`](commands/status.md#n--rebuild-nixos-and-home-manager)
+offers, as an array of tables. Each entry has a single-character `key`, a
+`label`, the `commands` it runs in order (stopping at the first that fails),
+and `sudo` (default `false`): ask for the password once up front and keep it
+fresh until the last command finishes. In each command `{host}` becomes this
+machine's flake target and `{user}` becomes `username`. Commands run under
+`sh -c` in the repo root, like gates — never your `$SHELL`, since everyone who
+clones the repo shares this config.
+
+Left empty, `n` offers a built-in menu against the flake in the repo root:
+
+- `s`: `sudo nixos-rebuild switch --flake .#{host}`, then `home-manager switch --flake .#{user}@{host}`
+- `r`: `sudo nixos-rebuild switch --flake .#{host}`
+- `t`: `sudo nixos-rebuild test --flake .#{host}`
+- `b`: `sudo nixos-rebuild boot --flake .#{host}`
+- `h`: `home-manager switch --flake .#{user}@{host}`
+- `H`: `home-manager build --flake .#{user}@{host}`
+
+Those write no commit, so the [`build` column](commands/status.md#build-column)
+has nothing to show for them. A repo whose own rebuild scripts write the
+marker commits points its entries at those scripts instead — or at its
+justfile, which keeps whatever the recipes do around them:
+
+```text
+[[rebuild_menu]]
+key = "s"
+label = "switch: NixOS, then home-manager"
+commands = ["just rebuild", "just home"]
+sudo = true
+
+[[rebuild_menu]]
+key = "r"
+label = "rebuild: NixOS switch"
+commands = ["just rebuild"]
+sudo = true
+```
+
+A configured menu replaces the built-in one whole; it is not merged with it.
 
 ## Editing by hand
 
