@@ -235,8 +235,10 @@ informational one that *is* shipped. It answers "what did *this machine*
 most recently rebuild, locally" — for `rf status`/`rf list`'s `build` gutter
 column and `--json` output — and gates nothing. `rf` never shells out to
 `nixos-rebuild`/`home-manager` or reads profile symlinks here; it only reads
-commit messages the dotfiles repo's own rebuild scripts
-(`scripts/nixos-rebuild.sh`, `scripts/home-switch.sh`) already write:
+commit messages the dotfiles repo's rebuild scripts already write
+(`nixos-rebuild.sh`, `home-switch.sh` — packaged in gigpkgs as
+`gig-nixos-rebuild`/`gig-home-switch`, and what the dotfiles repo's own
+`rebuild_menu` runs through its justfile):
 
 - NixOS: `<host-id>: generation <N> (switch|boot|test)`, or
   `<host-id>: unknown generation (switch|boot|test)`.

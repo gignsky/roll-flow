@@ -156,10 +156,13 @@ long list — that keeps two rolls adding rules in different areas from collidin
 
 - `core::rebuild` never shells out to `nixos-rebuild`/`home-manager` and never
   reads `/nix/var/nix/profiles/system` or `/run/current-system`. It only reads
-  commit messages the dotfiles repo's own rebuild scripts
-  (`scripts/nixos-rebuild.sh`, `scripts/home-switch.sh`) already write — pure
-  git-log scanning, the same "core never runs nix" rule config auto-detection
-  follows.
+  commit messages the dotfiles repo's rebuild scripts (`nixos-rebuild.sh`,
+  `home-switch.sh`, packaged in gigpkgs as `gig-nixos-rebuild`/
+  `gig-home-switch`) already write — pure git-log scanning, the same "core
+  never runs nix" rule config auto-detection follows. Those subjects are the
+  scripts' *fallback* shape, used when `commit-enhance-lib.sh` is not beside
+  them; the gigpkgs package leaves it out on purpose, since the enhanced
+  `auto(system): rebuild …` subject is one this parser does not read.
 - Unlike [Verification](#verification) above, this one is **not**
   active-hosts-only on purpose: it is informational, not a gate, so a host
   marked inactive (mid-reinstall, say) still shows what it last rebuilt. It
