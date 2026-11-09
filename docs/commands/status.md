@@ -202,6 +202,7 @@ The full list:
 | `gg` / `bb` / `vv` | [lazygit / bacon / your editor](#gg-bb-and-vv--hand-over-the-terminal) |
 | `c` / `i` | create a roll / integrate one into the checked-out roll |
 | `V` | verify all rolls, or a set of them |
+| `n` | [rebuild NixOS / home-manager](#n--rebuild-nixos-and-home-manager) on the selected branch |
 | `G` / `m` / `u` | graduate / promote / update from stable |
 | `b` | bump the version |
 | `h` / `H` | create a hotfix off stable / land the checked-out hotfix |
@@ -310,6 +311,36 @@ something other than a bare `lazygit`/`bacon` on `PATH`. lazygit is launched as
 `<command> -p <repo_root>`; bacon is launched with no arguments in that Cargo.toml directory,
 because bacon's positional argument is a job name (`check`, `clippy`, `test`)
 and a path passed there would be read as a job that does not exist.
+
+## `n` — rebuild NixOS and home-manager
+
+`n` opens a menu of rebuilds for the selected row's branch. By default:
+
+| key | does |
+|---|---|
+| `s` | switch: NixOS, then home-manager (home-manager is skipped if NixOS fails) |
+| `r` | rebuild: NixOS switch only |
+| `t` / `b` | NixOS test / boot |
+| `h` / `H` | home-manager switch / test (build only) |
+
+The menu lists each entry's commands beneath it. `rebuild_menu` in
+`.roll-flow.toml` replaces the whole menu — see [config](../config.md#rebuild-menu).
+`esc`, `q` or a second `n` closes it.
+
+When the selected row is not checked out, picking an entry queues the ordinary
+`space` switch to it first. The rebuild starts once that switch, and anything
+you pressed after it, has finished, with no modal open. If the branch then
+checked out is not the one you picked — the switch failed, or a later command
+moved HEAD — the rebuild is dropped and the status line says so. It never
+builds a branch you did not pick.
+
+Like `gg`, a rebuild takes the terminal rather than streaming into the panel:
+it asks for a sudo password, scripts prompt, and nix draws live progress. rf
+suspends, runs the commands, waits for enter so you can read the output, and
+reloads — so a rebuild script's marker commit shows up in the `build` column
+straight away. `n` is refused while a job runs *or anything is queued*, since a
+rebuild commits onto the checked-out branch and must not interleave with
+other work.
 
 ## Pulling and pushing
 

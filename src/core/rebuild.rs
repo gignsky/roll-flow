@@ -1,6 +1,8 @@
 //! Detects this machine's most recent local NixOS / home-manager rebuild,
-//! read entirely from commit messages the dotfiles repo's own rebuild
-//! scripts already write (`scripts/nixos-rebuild.sh`, `scripts/home-switch.sh`).
+//! read entirely from commit messages the dotfiles repo's rebuild scripts
+//! already write — `nixos-rebuild.sh` and `home-switch.sh`, packaged in
+//! gigpkgs as `gig-nixos-rebuild`/`gig-home-switch` (they lived in the
+//! dotfiles repo's `scripts/` until then).
 //! `rf` never shells out to `nixos-rebuild`/`home-manager` or reads profile
 //! symlinks here — this is pure git-log scanning, consistent with `rf`'s
 //! "never runs nix" stance.

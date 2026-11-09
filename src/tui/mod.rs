@@ -14,6 +14,7 @@ use std::sync::OnceLock;
 
 pub mod output;
 pub mod queue;
+pub mod rebuild_menu;
 pub mod rolls;
 
 pub type Tui = Terminal<CrosstermBackend<Stdout>>;

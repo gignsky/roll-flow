@@ -5066,6 +5066,7 @@ mod tests {
             bacon_command: "bacon".to_string(),
             editor_command: String::new(),
             version_manifest: Default::default(),
+            rebuild_menu: vec![],
         }
     }
 
