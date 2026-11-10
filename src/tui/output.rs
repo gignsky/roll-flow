@@ -15,6 +15,7 @@
 use std::collections::VecDeque;
 use std::sync::mpsc::{self, Receiver, TryRecvError};
 use std::thread;
+use std::time::{Duration, Instant};
 
 use anyhow::Result;
 use ratatui::{
@@ -195,6 +196,9 @@ struct PanelLine {
     text: String,
 }
 
+/// How long a finished panel sits untouched before it is dismissed on its own.
+pub const AUTOHIDE_AFTER: Duration = Duration::from_secs(15);
+
 /// The floating log. Survives the job that filled it, so the user can read a
 /// result at leisure and dismiss it with `esc`.
 pub struct Panel {
@@ -207,6 +211,9 @@ pub struct Panel {
     /// While set, new output keeps the view pinned to the tail.
     autoscroll: bool,
     tick: usize,
+    /// When output last arrived or the user last touched the panel; the
+    /// auto-hide timeout counts from here.
+    last_activity: Instant,
 }
 
 impl Panel {
@@ -218,7 +225,21 @@ impl Panel {
             scroll: 0,
             autoscroll: true,
             tick: 0,
+            last_activity: Instant::now(),
         }
+    }
+
+    /// Record activity at `now`, restarting the auto-hide countdown.
+    pub fn touch(&mut self, now: Instant) {
+        self.last_activity = now;
+    }
+
+    /// Whether the panel is finished and has been idle for `timeout` as of
+    /// `now`. A running job's panel never expires: silence from a slow command
+    /// is not the user being done with it. Takes `now` so it is testable
+    /// without sleeping.
+    pub fn idle_expired(&self, now: Instant, timeout: Duration) -> bool {
+        !self.is_running() && now.saturating_duration_since(self.last_activity) >= timeout
     }
 
     /// Continue this panel with the next queued command rather than replacing
@@ -231,6 +252,7 @@ impl Panel {
     /// failure ends the chain, so a red panel always ends with the failure.
     pub fn chain(&mut self, title: impl Into<String>) {
         self.title = title.into();
+        self.last_activity = Instant::now();
         self.push(Kind::Header, format!("── {} ──", self.title));
         self.status = Status::Running;
         self.scroll_to_end();
@@ -261,6 +283,7 @@ impl Panel {
     }
 
     fn push_one(&mut self, kind: Kind, text: String) {
+        self.last_activity = Instant::now();
         if self.lines.len() == SCROLLBACK {
             self.lines.pop_front();
         }
@@ -315,6 +338,7 @@ impl Panel {
 
     /// Scroll `n` lines toward the start, pinning to the tail off.
     pub fn scroll_up(&mut self, n: usize) {
+        self.last_activity = Instant::now();
         self.autoscroll = false;
         let max = self.lines.len().saturating_sub(1);
         self.scroll = (self.scroll + n).min(max);
@@ -322,6 +346,7 @@ impl Panel {
 
     /// Scroll `n` lines toward the end, re-arming autoscroll at the tail.
     pub fn scroll_down(&mut self, n: usize) {
+        self.last_activity = Instant::now();
         self.scroll = self.scroll.saturating_sub(n);
         if self.scroll == 0 {
             self.autoscroll = true;
@@ -330,6 +355,7 @@ impl Panel {
 
     /// Jump to the tail and resume following new output.
     pub fn scroll_to_end(&mut self) {
+        self.last_activity = Instant::now();
         self.scroll = 0;
         self.autoscroll = true;
     }
@@ -698,6 +724,64 @@ mod tests {
             assert_ne!(r, panel_rect(area, panel.lines.len()));
         })
         .unwrap();
+    }
+
+    fn long_ago() -> Instant {
+        Instant::now() - Duration::from_secs(600)
+    }
+
+    #[test]
+    fn a_finished_panel_expires_once_idle_past_the_timeout() {
+        let mut p = panel_with(1);
+        p.finish_ok(Vec::new());
+        let t0 = Instant::now();
+        p.touch(t0);
+        assert!(!p.idle_expired(t0 + Duration::from_secs(14), AUTOHIDE_AFTER));
+        assert!(p.idle_expired(t0 + AUTOHIDE_AFTER, AUTOHIDE_AFTER));
+    }
+
+    #[test]
+    fn a_failed_panel_expires_too() {
+        let mut p = panel_with(1);
+        p.fail(vec!["boom".to_string()]);
+        p.touch(long_ago());
+        assert!(p.idle_expired(Instant::now(), AUTOHIDE_AFTER));
+    }
+
+    #[test]
+    fn a_running_panel_never_expires_however_quiet() {
+        let mut p = panel_with(1);
+        p.touch(long_ago());
+        assert!(p.is_running());
+        assert!(!p.idle_expired(Instant::now(), AUTOHIDE_AFTER));
+    }
+
+    #[test]
+    fn new_output_and_scrolling_restart_the_idle_clock() {
+        let mut p = panel_with(30);
+        p.finish_ok(Vec::new());
+        p.touch(long_ago());
+        assert!(p.idle_expired(Instant::now(), AUTOHIDE_AFTER));
+
+        p.push(Kind::Stdout, "late line".to_string());
+        assert!(!p.idle_expired(Instant::now(), AUTOHIDE_AFTER));
+
+        p.touch(long_ago());
+        p.scroll_up(1);
+        assert!(!p.idle_expired(Instant::now(), AUTOHIDE_AFTER));
+
+        p.touch(long_ago());
+        p.scroll_down(1);
+        assert!(!p.idle_expired(Instant::now(), AUTOHIDE_AFTER));
+    }
+
+    #[test]
+    fn chaining_the_next_command_restarts_the_idle_clock() {
+        let mut p = panel_with(1);
+        p.finish_ok(Vec::new());
+        p.touch(long_ago());
+        p.chain("next");
+        assert!(!p.idle_expired(Instant::now() + Duration::from_secs(1), AUTOHIDE_AFTER));
     }
 
     #[test]
