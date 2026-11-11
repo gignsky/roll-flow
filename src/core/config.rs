@@ -187,6 +187,12 @@ pub struct Config {
     /// `PATH`.
     #[serde(default = "default_bacon")]
     pub bacon_command: String,
+    /// The command the TUI's `cc` binding runs in a floating pane (see
+    /// `tui::claude`). Overridable for a wrapper, a flake app, or an absolute
+    /// path, and may carry arguments (`claude --model opus`) — split on
+    /// whitespace, no shell. `cc` only exists when this resolves on `PATH`.
+    #[serde(default = "default_claude")]
+    pub claude_command: String,
     /// The editor the TUI's `vv` binding opens on the repo. Empty (the
     /// default) means `$VISUAL`, then `$EDITOR`, then `vi` — the usual Unix
     /// order — so this is only needed to pick something other than the
@@ -342,6 +348,7 @@ impl Config {
         "pull_mode",
         "lazygit_command",
         "bacon_command",
+        "claude_command",
         "editor_command",
         "version_manifest",
         "rebuild_menu",
@@ -560,6 +567,7 @@ impl Config {
             pull_mode: PullMode::default(),
             lazygit_command: default_lazygit(),
             bacon_command: default_bacon(),
+            claude_command: default_claude(),
             editor_command: String::new(),
             version_manifest: VersionManifest::default(),
             rebuild_menu: vec![],
@@ -651,6 +659,10 @@ fn default_lazygit() -> String {
 
 fn default_bacon() -> String {
     "bacon".to_string()
+}
+
+fn default_claude() -> String {
+    "claude".to_string()
 }
 
 fn default_true() -> bool {
@@ -828,7 +840,8 @@ mod tests {
     use std::path::PathBuf;
 
     use super::{
-        default_bacon, default_lazygit, parse_hosts_nix, Config, PullMode, CONFIG_VERSION,
+        default_bacon, default_claude, default_lazygit, parse_hosts_nix, Config, PullMode,
+        CONFIG_VERSION,
     };
     use std::collections::BTreeMap;
 
@@ -856,6 +869,7 @@ mod tests {
             pull_mode: PullMode::default(),
             lazygit_command: default_lazygit(),
             bacon_command: default_bacon(),
+            claude_command: default_claude(),
             editor_command: String::new(),
             version_manifest: super::VersionManifest::default(),
             rebuild_menu: vec![],
@@ -897,6 +911,7 @@ mod tests {
             pull_mode: PullMode::default(),
             lazygit_command: default_lazygit(),
             bacon_command: default_bacon(),
+            claude_command: default_claude(),
             editor_command: String::new(),
             version_manifest: super::VersionManifest::default(),
             rebuild_menu: vec![],
@@ -931,6 +946,7 @@ mod tests {
         assert_eq!(parsed.pull_mode, PullMode::FfOnly);
         assert_eq!(parsed.lazygit_command, "lazygit");
         assert_eq!(parsed.bacon_command, "bacon");
+        assert_eq!(parsed.claude_command, "claude");
     }
 
     #[test]

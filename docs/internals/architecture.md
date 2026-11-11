@@ -23,6 +23,7 @@ src/
     mod.rs             terminal enter/exit, and suspend/resume for lazygit/bacon
     rolls.rs           the rolls view: state, event loop, table, modals, keymap
     output.rs          background jobs and the floating output panel
+    claude.rs          `cc`: Claude Code on a pty, drawn as a minimizable popup
     queue.rs           commands queued behind the running job; held on failure
     rebuild_menu.rs    `n`: rebuild entries, built-in defaults, running one
   core/
@@ -57,6 +58,16 @@ Three notes on that layout:
   the suspend/spawn/resume bracket, whose failure path (restore the screen, then
   name the config key that overrides the command) is the part that is easy to
   get wrong twice.
+
+- `cc` is the one tool that does *not* go through `hand_over_terminal`, because
+  its point is that `rf` stays live. `tui::claude::Session` runs the command on
+  a `portable-pty` pseudo-terminal; a reader thread feeds a `vt100` parser and
+  `tui-term` draws its screen into a popup. While the pane is visible
+  `run_loop` sends every key but the minimize chord to the child *before* any
+  mode dispatch, so no `rf` binding can fire under it. A minimized session is
+  still polled (`poll_claude`) and its output still parsed. Keep new
+  tools that are full-screen *and* should not block `rf` on this path; keep
+  the ones that are fine to wait on behind `hand_over_terminal`.
 
 - `core` returns data and never prints. The single exception is child-process
   output, which is why `core::proc` exists: it routes a subprocess's stdio to the
