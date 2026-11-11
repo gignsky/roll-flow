@@ -357,7 +357,7 @@ fn sync_error(err: sync::SyncFailure) -> anyhow::Error {
 /// how the branch sits against its upstream. Pure, so the whole table is testable
 /// without a terminal.
 pub(crate) fn sync_cell(track: Option<TrackState>, dirty: bool) -> (String, Color) {
-    let (mut text, mut color) = match track {
+    let (text, mut color) = match track {
         None | Some(TrackState::NoUpstream) => ("—".to_string(), Color::DarkGray),
         Some(TrackState::Gone) => ("gone".to_string(), Color::Red),
         Some(TrackState::InSync) => ("✓".to_string(), Color::Green),
@@ -368,7 +368,6 @@ pub(crate) fn sync_cell(track: Option<TrackState>, dirty: bool) -> (String, Colo
         }
     };
     if dirty {
-        text.push_str(" ⚡");
         // Uncommitted changes always need attention and must not hide behind a
         // green ✓ — but a `gone` upstream is the worse problem, so it keeps red.
         if color != Color::Red {
@@ -376,6 +375,33 @@ pub(crate) fn sync_cell(track: Option<TrackState>, dirty: bool) -> (String, Colo
         }
     }
     (text, color)
+}
+
+/// Marks a branch whose worktree has uncommitted changes.
+///
+/// A plain text-presentation glyph on purpose: the `⚡` it replaced is an emoji,
+/// which terminals draw in their own yellow regardless of the cell's colours —
+/// invisible on the selected row, whose reversed style makes the background
+/// yellow.
+pub(crate) const DIRTY_MARK: &str = "✎";
+
+/// The `sync` cell: the glyph from [`sync_cell`], plus — for a dirty worktree —
+/// a [`DIRTY_MARK`] badge, black on light red and bold. Its own span with its
+/// own colours so it reads on any row, selected or not, whatever colour the
+/// sync glyph beside it is.
+pub(crate) fn sync_line(track: Option<TrackState>, dirty: bool) -> Line<'static> {
+    let (text, color) = sync_cell(track, dirty);
+    let mut spans = vec![Span::styled(text, Style::default().fg(color))];
+    if dirty {
+        spans.push(Span::styled(
+            format!(" {DIRTY_MARK} "),
+            Style::default()
+                .fg(Color::Black)
+                .bg(Color::LightRed)
+                .add_modifier(Modifier::BOLD),
+        ));
+    }
+    Line::from(spans)
 }
 
 /// The marker shown against the checked-out branch.
@@ -824,7 +850,7 @@ struct StatusApp {
     /// one `for-each-ref` rather than an `ahead_behind` call per row.
     tracking: HashMap<String, git::LocalBranch>,
     /// Branches whose worktree has uncommitted changes, refreshed on reload.
-    /// Drawn as a ⚡ in the `sync` column. See [`load_dirty`].
+    /// Drawn as a [`DIRTY_MARK`] badge in the `sync` column. See [`load_dirty`].
     dirty: HashSet<String>,
     /// Every manifest's version at each visible branch's tip, refreshed on
     /// reload — one column per manifest. Sourced in one `cat-file --batch`
@@ -5213,8 +5239,8 @@ impl StatusApp {
             Constraint::Length(4),
             Constraint::Fill(1),
             Constraint::Length(3),
-            // `↑12↓12` at its widest.
-            Constraint::Length(7),
+            // `↑12↓12` at its widest, plus the ` ✎ ` badge.
+            Constraint::Length(9),
             Constraint::Length(13),
         ]);
         // Present only in repos that version through a manifest — so a
@@ -5307,7 +5333,7 @@ impl StatusApp {
                 } else {
                     Style::default()
                 };
-                let (sync_text, sync_color) = sync_cell(
+                let sync = sync_line(
                     track_of(tracking, &base.branch),
                     dirty.contains(&base.branch),
                 );
@@ -5326,7 +5352,7 @@ impl StatusApp {
                     Cell::from(""),
                     Cell::from(base.branch.clone()).style(base_style.fg(base.role.color())),
                     Cell::from(base.location.symbol()).style(base_style),
-                    Cell::from(sync_text).style(Style::default().fg(sync_color)),
+                    Cell::from(sync),
                     Cell::from(base.role.label()).style(Style::default().fg(base.role.color())),
                 ]);
                 cells.extend(version_cells(&base.branch, base_style));
@@ -5344,7 +5370,7 @@ impl StatusApp {
             } else {
                 Style::default()
             };
-            let (sync_text, sync_color) = sync_cell(
+            let sync = sync_line(
                 track_of(tracking, &roll.branch),
                 dirty.contains(&roll.branch),
             );
@@ -5363,7 +5389,7 @@ impl StatusApp {
                 Cell::from(roll.number.to_string()).style(base_style),
                 Cell::from(roll.branch.clone()).style(base_style),
                 Cell::from(roll.location.symbol()).style(base_style),
-                Cell::from(sync_text).style(Style::default().fg(sync_color)),
+                Cell::from(sync),
                 Cell::from(roll.state.label()).style(Style::default().fg(row_state_color)),
             ]);
             cells.extend(version_cells(&roll.branch, base_style));
@@ -5382,7 +5408,7 @@ impl StatusApp {
             } else {
                 Style::default()
             };
-            let (sync_text, sync_color) = sync_cell(
+            let sync = sync_line(
                 track_of(tracking, &hotfix.branch),
                 dirty.contains(&hotfix.branch),
             );
@@ -5402,7 +5428,7 @@ impl StatusApp {
                 Cell::from(format!("h{}", hotfix.number)).style(base_style.fg(color)),
                 Cell::from(hotfix.branch.clone()).style(base_style.fg(color)),
                 Cell::from(hotfix.location.symbol()).style(base_style),
-                Cell::from(sync_text).style(Style::default().fg(sync_color)),
+                Cell::from(sync),
                 Cell::from(hotfix.state.label()).style(Style::default().fg(color)),
             ]);
             cells.extend(version_cells(&hotfix.branch, base_style));
@@ -10396,8 +10422,8 @@ mod tests {
             .find(|l| l.contains("roll/2-0102-clean"))
             .expect("clean roll row");
 
-        assert!(dirty_row.contains('⚡'), "{dirty_row}");
-        assert!(!clean_row.contains('⚡'), "{clean_row}");
+        assert!(dirty_row.contains(DIRTY_MARK), "{dirty_row}");
+        assert!(!clean_row.contains(DIRTY_MARK), "{clean_row}");
     }
 
     #[test]
@@ -10771,13 +10797,44 @@ mod tests {
     }
 
     #[test]
-    fn a_dirty_working_tree_appends_a_lightning_bolt_to_the_sync_glyph() {
-        assert_eq!(sync_cell(Some(TrackState::InSync), true).0, "✓ ⚡");
-        assert_eq!(sync_cell(Some(TrackState::Ahead(2)), true).0, "↑2 ⚡");
-        assert_eq!(sync_cell(Some(TrackState::Gone), true).0, "gone ⚡");
-        // Can't actually happen — a branch with no worktree has no working tree
-        // to be dirty in — but the glyph logic must not assume that invariant.
-        assert_eq!(sync_cell(None, true).0, "— ⚡");
+    fn the_sync_text_never_carries_the_dirty_marker() {
+        // The marker is its own span (see `sync_line`); folding it into the
+        // text would colour it with the sync glyph again.
+        assert_eq!(sync_cell(Some(TrackState::InSync), true).0, "✓");
+        assert_eq!(sync_cell(Some(TrackState::Ahead(2)), true).0, "↑2");
+        assert_eq!(sync_cell(Some(TrackState::Gone), true).0, "gone");
+        assert_eq!(sync_cell(None, true).0, "—");
+    }
+
+    #[test]
+    fn the_dirty_marker_is_a_text_glyph_not_an_emoji() {
+        // `⚡` is drawn by the terminal's emoji font in its own yellow, ignoring
+        // the cell's colours — yellow on the selected row's yellow background.
+        assert_ne!(DIRTY_MARK, "⚡");
+        assert!(DIRTY_MARK
+            .chars()
+            .all(|c| (c as u32) < 0x1F000 && c != '\u{26A1}'));
+    }
+
+    #[test]
+    fn a_dirty_branch_gets_a_separate_high_contrast_badge_span() {
+        let line = sync_line(Some(TrackState::InSync), true);
+        assert_eq!(line.spans.len(), 2);
+        assert_eq!(line.spans[0].content, "✓");
+        let badge = &line.spans[1];
+        assert!(badge.content.contains(DIRTY_MARK));
+        // Neither colour is yellow, so neither the row nor the selection
+        // highlight (which reverses fg and bg) can swallow it.
+        assert_eq!(badge.style.fg, Some(Color::Black));
+        assert_eq!(badge.style.bg, Some(Color::LightRed));
+        assert!(badge.style.add_modifier.contains(Modifier::BOLD));
+    }
+
+    #[test]
+    fn a_clean_branch_has_no_badge() {
+        let line = sync_line(Some(TrackState::InSync), false);
+        assert_eq!(line.spans.len(), 1);
+        assert_eq!(line.spans[0].content, "✓");
     }
 
     #[test]
