@@ -549,8 +549,8 @@ enum Mode {
         /// than what was actually typed, collapsing the candidate list.
         query: String,
         /// What `enter` runs. Starts equal to `query` and is overwritten by
-        /// `Up`/`Down` picking a suggestion (reverse-search-style); any
-        /// further character edit resets it back to `query`.
+        /// `Up`/`Down` picking a suggestion (reverse-search-style); a
+        /// further character edit modifies the picked text, which becomes `query`.
         input: String,
         /// Indexes the fuzzy-filtered (by `query`) history list below the
         /// prompt.
@@ -1831,7 +1831,9 @@ pub(crate) enum CommandOutcome {
 /// Up/Down are reverse-search-style, unlike the `?` list's cursor: there is no
 /// separate "list" to look at here, so moving the highlight also copies that
 /// entry straight into `input`, the way a shell's history search does. Typing
-/// resets the highlight to the top match, same as `?`.
+/// or backspace then *edits that entry* (it becomes the new `query`, so the
+/// list refilters on it) and resets the highlight to the top match — a pick is
+/// a starting point to change, not a command that must run verbatim.
 pub(crate) fn handle_command_key(
     query: &mut String,
     input: &mut String,
@@ -1879,14 +1881,18 @@ pub(crate) fn handle_command_key(
             CommandOutcome::Continue
         }
         KeyCode::Backspace => {
+            // An edit after a pick edits the picked command: adopt it as the
+            // typed text first, so the list refilters on what is being changed.
+            query.clone_from(input);
             query.pop();
-            *input = query.clone();
+            input.clone_from(query);
             *cursor = 0;
             CommandOutcome::Continue
         }
         KeyCode::Char(c) if !c.is_control() => {
+            query.clone_from(input);
             query.push(c);
-            *input = query.clone();
+            input.clone_from(query);
             *cursor = 0;
             CommandOutcome::Continue
         }
@@ -7226,7 +7232,7 @@ fn render_command(
 
     lines.push(Line::from(""));
     lines.push(Line::from(Span::styled(
-        "[↑/↓] history   [enter] run here   [alt+enter] run in shell   [esc] cancel",
+        "[↑/↓] pick, then edit   [enter] run here   [alt+enter] run in shell   [esc] cancel",
         dim,
     )));
 
@@ -8822,36 +8828,41 @@ mod tests {
         assert_eq!(query, "git", "query must stay exactly what was typed");
     }
 
-    #[test]
-    fn typing_after_a_history_pick_resets_the_highlight_and_the_input() {
-        let history = vec!["git push".to_string(), "git status".to_string()];
-        let mut query = "git".to_string();
-        let mut input = "git".to_string();
+    /// Press `code` in a `:` prompt seeded with `query`, after one `Down` pick.
+    fn after_pick(history: &[String], query: &str, code: KeyCode) -> (String, String, usize) {
+        let mut query = query.to_string();
+        let mut input = query.clone();
         let mut cursor = 0;
         handle_command_key(
             &mut query,
             &mut input,
             &mut cursor,
-            &history,
+            history,
             KeyCode::Down,
             false,
         );
-        assert_eq!(cursor, 0);
-        assert_eq!(input, "git push");
+        handle_command_key(&mut query, &mut input, &mut cursor, history, code, false);
+        (query, input, cursor)
+    }
 
-        handle_command_key(
-            &mut query,
-            &mut input,
-            &mut cursor,
-            &history,
-            KeyCode::Char('x'),
-            false,
-        );
+    #[test]
+    fn typing_after_a_history_pick_edits_the_picked_command() {
+        // The point of picking is to start from a similar command and change
+        // it, so a character appends to the pick rather than discarding it.
+        let history = vec!["git push".to_string(), "git status".to_string()];
+        let (query, input, cursor) = after_pick(&history, "git", KeyCode::Char('!'));
+        assert_eq!(input, "git push!");
+        // The list now filters on the edited text, highlight back at the top.
+        assert_eq!(query, "git push!");
         assert_eq!(cursor, 0);
-        assert_eq!(query, "gitx");
-        // Typing overrides whatever was picked — it no longer reflects the
-        // history entry that was highlighted a moment ago.
-        assert_eq!(input, "gitx");
+    }
+
+    #[test]
+    fn backspace_after_a_history_pick_trims_the_picked_command() {
+        let history = vec!["git push".to_string(), "git status".to_string()];
+        let (query, input, _) = after_pick(&history, "git", KeyCode::Backspace);
+        assert_eq!(input, "git pus");
+        assert_eq!(query, "git pus");
     }
 
     #[test]
