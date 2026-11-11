@@ -140,6 +140,14 @@ long list — that keeps two rolls adding rules in different areas from collidin
   when the pass *starts*, never one captured at keypress. Its up-front
   clean-tree refusal applies only when nothing is pending; behind other
   commands the pass's own check is the one that counts.
+- `cc` is outside the queue entirely. Claude Code is an interactive session, not
+  a git command `rf` ordered, so it neither waits for nor blocks a job, and `rf`
+  does not serialize what it does to the repo against one. What `rf` does
+  guarantee is the keyboard: while the pane is visible every key but the
+  minimize chord is Claude's, so a keystroke meant for it can never reach a
+  binding that mutates the repo. It must stay that way — the check lives in
+  `run_loop` ahead of mode dispatch for exactly this reason. `c` only waits
+  for a second key where `cc` exists (`claude::Pane::available`).
 - `gg` is refused only while a job is *running*. A held queue is exactly when
   lazygit is needed.
 - `n` is stricter: refused while anything is running *or queued*, because a

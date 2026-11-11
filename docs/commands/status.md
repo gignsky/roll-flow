@@ -200,6 +200,7 @@ The full list:
 | `p` / `P` / `f` | pull / push / fetch the selected branch |
 | `PP` | [push every branch that needs it](#pp--push-everything-that-needs-it) |
 | `gg` / `bb` / `vv` | [lazygit / bacon / your editor](#gg-bb-and-vv--hand-over-the-terminal) |
+| `cc` | [Claude Code in a floating pane](#cc--claude-code-in-a-floating-pane), when installed |
 | `c` / `i` | create a roll / integrate one into the checked-out roll |
 | `V` | verify all rolls, or a set of them |
 | `n` | [rebuild NixOS / home-manager](#n--rebuild-nixos-and-home-manager) on the selected branch |
@@ -313,6 +314,33 @@ something other than a bare `lazygit`/`bacon` on `PATH`. lazygit is launched as
 `<command> -p <repo_root>`; bacon is launched with no arguments in that Cargo.toml directory,
 because bacon's positional argument is a job name (`check`, `clippy`, `test`)
 and a path passed there would be read as a job that does not exist.
+
+## `cc` — Claude Code in a floating pane
+
+Where `gg`, `bb` and `vv` suspend `rf`, `cc` does not. Claude Code runs on a
+pseudo-terminal in the repo root and is drawn as a popup over the table, so
+`rf` keeps polling, refreshing and running its jobs underneath it.
+
+- **`ctrl-\`** minimizes the pane. Claude keeps running; the header shows
+  `● claude running (cc)`, and `cc` brings it back with the conversation intact.
+  `rf` reloads the list on the way out, since Claude may have changed the repo.
+- **Every other key** goes to Claude while the pane is up — `q` and `esc`
+  included — so none of `rf`'s own bindings can fire while you type to it. The
+  one chord is the only way out; if it clashes with your terminal, say so and it
+  can be made configurable.
+- Claude exiting closes the pane and says so in the status line.
+- Quitting `rf` with Claude still running asks first (press `q` again), the
+  same way it does for queued commands, because quitting closes it.
+
+`cc` exists only where Claude Code does. `claude_command` (default `claude`)
+must resolve on `PATH` when `rf` starts; otherwise a lone `c` opens the new-roll
+prompt immediately, with none of the 400ms chord wait the other chords have, and
+`cc` in the `?` list says what to install or set. The command may carry arguments
+(`claude --model opus`); no shell is involved.
+
+Claude is not part of the command queue and takes no part in its rules: it can
+run git or edit files while an `rf` job runs, exactly as a second terminal
+could. Nothing in `rf` serializes the two.
 
 ## `n` — rebuild NixOS and home-manager
 

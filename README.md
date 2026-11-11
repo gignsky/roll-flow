@@ -196,6 +196,7 @@ cargo test
   - `gg` lazygit
   - `bb` bacon
   - `vv` your editor (`$VISUAL`/`$EDITOR`)
+  - `cc` Claude Code in a floating pane you can minimize (when `claude` is installed)
 
   The status bar carries only the basics; `?` opens a fuzzy-searchable list of
   every key, and enter runs the one under the cursor. A force _push_ is
