@@ -12,6 +12,7 @@ use std::io::{self, Stdout};
 use std::panic;
 use std::sync::OnceLock;
 
+pub mod claude;
 pub mod output;
 pub mod queue;
 pub mod rebuild_menu;

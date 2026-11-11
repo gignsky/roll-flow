@@ -31,6 +31,7 @@ use ratatui::{
     Frame,
 };
 
+use super::claude;
 use super::output::{self, Followup, JobDone, JobProgress};
 use super::queue::{self, Pending, Queue};
 use super::rebuild_menu::{self, Readiness};
@@ -922,6 +923,9 @@ struct StatusApp {
     /// Commands run through `:`, most-recent-first. Loaded once at startup
     /// from [`history::load`] and saved back after every run.
     command_history: Vec<String>,
+    /// `cc`: whether Claude Code is installed, the running session if any, and
+    /// whether its pane is up. See [`super::claude`].
+    claude: claude::Pane,
 }
 
 /// Entry point. Takes ownership of the data so the app can rebuild it after an
@@ -1101,6 +1105,29 @@ pub(crate) fn verify_chord_key(code: KeyCode) -> VerifyChord {
     match code {
         KeyCode::Char('v') => VerifyChord::Editor,
         _ => VerifyChord::Verify,
+    }
+}
+
+/// Same timeout as [`VERIFY_CHORD_WINDOW`]. `cc` makes a lone `c` — create a
+/// roll — wait this long, but only on a machine where Claude Code is installed;
+/// elsewhere `c` is immediate (see [`claude::Pane::available`]).
+pub(crate) const CLAUDE_CHORD_WINDOW: Duration = Duration::from_millis(400);
+
+/// What the key following a bare `c` makes of it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ClaudeChord {
+    /// A second `c`: open (or return to) Claude Code.
+    Claude,
+    /// Anything else: the new roll the first `c` already meant.
+    Create,
+}
+
+/// Decide a pending `c` from the key that followed it. Mirrors
+/// [`verify_chord_key`]: only a second `c` completes the chord.
+pub(crate) fn claude_chord_key(code: KeyCode) -> ClaudeChord {
+    match code {
+        KeyCode::Char('c') => ClaudeChord::Claude,
+        _ => ClaudeChord::Create,
     }
 }
 
@@ -1527,6 +1554,15 @@ pub(crate) const BINDINGS: &[Binding] = &[
         group: "tools",
         hint: None,
         replay: &[KeyCode::Char('v'), KeyCode::Char('v')],
+    },
+    Binding {
+        keys: "cc",
+        // "ai" and "agent" for the same reason "watch" is on `bb`: people type
+        // what they want, not the name of the program.
+        label: "open Claude Code in a floating pane (ai / agent; ctrl-\\ minimizes it, needs claude on PATH)",
+        group: "tools",
+        hint: None,
+        replay: &[KeyCode::Char('c'), KeyCode::Char('c')],
     },
     Binding {
         keys: "c",
@@ -2691,6 +2727,7 @@ impl StatusApp {
         let rebuild_status = host_id
             .as_deref()
             .and_then(|id| rebuild::detect(&config, &config.repo_root, &rolls, id));
+        let claude = claude::Pane::detect(&config.claude_command);
         Self {
             config,
             current_branch,
@@ -2723,6 +2760,7 @@ impl StatusApp {
             pending_rebuild: None,
             pending_verify: None,
             command_history: history::load(),
+            claude,
         }
     }
 
@@ -2732,6 +2770,8 @@ impl StatusApp {
             // Before reading input, so a job that finished during the poll is
             // reflected in this frame rather than the next one.
             self.poll_job()?;
+            self.poll_claude();
+            self.resolve_lapsed_claude();
             self.autohide_panel();
             self.open_deferred_mode();
             self.resolve_lapsed_push();
@@ -2742,6 +2782,20 @@ impl StatusApp {
 
             if event::poll(Duration::from_millis(50))? {
                 let event = event::read()?;
+                // A visible Claude owns the keyboard outright: every key but
+                // the minimize chord is its input, so none of rf's own
+                // bindings — `q` above all — can fire while you are typing to
+                // it. Mouse events are dropped rather than scrolling the table
+                // hidden behind it.
+                if self.claude.visible() {
+                    if let Event::Key(key) = event {
+                        if key.kind != KeyEventKind::Release && self.forward_to_claude(key) {
+                            // Claude may have changed anything while it had focus.
+                            self.reload()?;
+                        }
+                    }
+                    continue;
+                }
                 // Any input counts as the user still being here, so a panel
                 // being read, scrolled or maximized is not pulled away.
                 if let Some(panel) = self.panel.as_mut() {
@@ -3057,15 +3111,22 @@ impl StatusApp {
     /// Whether a quit key should actually quit. With commands queued, the
     /// first press only warns, since quitting drops them.
     fn confirm_quit(&mut self, armed: bool) -> bool {
-        if self.queue.is_empty() || armed {
+        if (self.queue.is_empty() && !self.claude.running()) || armed {
             return true;
         }
         self.quit_armed = true;
         let n = self.queue.len();
-        self.message = Some(format!(
-            "{n} queued command{} will be dropped — press it again to quit",
-            if n == 1 { "" } else { "s" }
-        ));
+        let mut warnings = Vec::new();
+        if n > 0 {
+            warnings.push(format!(
+                "{n} queued command{} will be dropped",
+                if n == 1 { "" } else { "s" }
+            ));
+        }
+        if self.claude.running() {
+            warnings.push("claude is still running and will be closed".to_string());
+        }
+        self.message = Some(format!("{} — press it again to quit", warnings.join("; ")));
         false
     }
 
@@ -3142,6 +3203,16 @@ impl StatusApp {
             return Ok(false);
         }
 
+        // `cc` opens Claude Code; any other key resolves the pending `c` as
+        // the new-roll prompt.
+        if self.claude.pending.take().is_some() {
+            match claude_chord_key(code) {
+                ClaudeChord::Claude => self.open_claude(terminal)?,
+                ClaudeChord::Create => self.open_create_input(),
+            }
+            return Ok(false);
+        }
+
         // `vv` opens the editor; any other key resolves the pending `v` as
         // the verify.
         if self.pending_verify.take().is_some() {
@@ -3184,12 +3255,7 @@ impl StatusApp {
                 self.reload()?;
                 self.message = Some("refreshed".to_string());
             }
-            KeyCode::Char('c') => {
-                self.mode = Mode::CreateInput {
-                    slug: String::new(),
-                    kind: CreateKind::Roll,
-                }
-            }
+            KeyCode::Char('c') => self.press_c(),
             KeyCode::Char('h') => {
                 self.mode = Mode::CreateInput {
                     slug: String::new(),
@@ -3424,6 +3490,12 @@ impl StatusApp {
                 // Closed *before* replaying, so the binding sees the browsing
                 // view it expects — one that can open a modal of its own.
                 self.mode = Mode::Browsing;
+                // Replaying `cc` with no Claude installed would be a `c` and
+                // then a `c` typed into the new-roll prompt.
+                if BINDINGS[index].keys == "cc" && !self.claude.available {
+                    self.refuse_claude_replay();
+                    return Ok(false);
+                }
                 for code in BINDINGS[index].replay {
                     if self.handle_browsing(terminal, *code)? {
                         return Ok(true);
@@ -4415,6 +4487,155 @@ impl StatusApp {
         }
     }
 
+    /// The new-roll prompt, which both a lone `c` and a `c` that did not become
+    /// `cc` open.
+    fn open_create_input(&mut self) {
+        self.mode = Mode::CreateInput {
+            slug: String::new(),
+            kind: CreateKind::Roll,
+        };
+    }
+
+    /// `[c]` — the new-roll prompt, or the first half of `cc`.
+    ///
+    /// Only arms the chord where `cc` exists. On a machine without Claude Code
+    /// a lone `c` must not start waiting for a key that does nothing.
+    fn press_c(&mut self) {
+        if !self.claude.available {
+            self.open_create_input();
+            return;
+        }
+        self.claude.pending = Some(Instant::now());
+        self.message = Some(if self.claude.running() {
+            "c again to return to claude".to_string()
+        } else {
+            "c again to open claude".to_string()
+        });
+    }
+
+    /// Fire a pending `c` that nothing followed.
+    fn resolve_lapsed_claude(&mut self) {
+        let lapsed = self
+            .claude
+            .pending
+            .is_some_and(|armed| armed.elapsed() >= CLAUDE_CHORD_WINDOW);
+        if lapsed {
+            self.claude.pending = None;
+            self.message = None;
+            self.open_create_input();
+        }
+    }
+
+    /// `cc` — bring up Claude Code: back from minimized if it is already
+    /// running, otherwise a fresh session in the repo root.
+    ///
+    /// Unlike `gg`/`bb`/`vv` this does not suspend the terminal: the child runs
+    /// on a pseudo-terminal and is drawn into a popup, so rf's jobs and refresh
+    /// keep going underneath. Nothing here refuses while a job runs for the
+    /// same reason.
+    fn open_claude(&mut self, terminal: &mut super::Tui) -> Result<()> {
+        if self.claude.running() {
+            self.restore_claude();
+            return Ok(());
+        }
+        if !self.claude.available {
+            self.refuse_claude_replay();
+            return Ok(());
+        }
+        let size = terminal.size()?;
+        let popup = claude::popup_rect(Rect::new(0, 0, size.width, size.height));
+        let (rows, cols) = claude::inner_size(popup);
+        match claude::Session::spawn(
+            &self.config.claude_command,
+            &self.config.repo_root,
+            rows,
+            cols,
+        ) {
+            Ok(session) => {
+                self.claude.session = Some(session);
+                self.claude.open = true;
+            }
+            Err(err) => {
+                let mut panel = output::Panel::new(self.config.claude_command.clone());
+                panel.fail(vec![
+                    format!("{err:#}"),
+                    "set claude_command in .roll-flow.toml to override".to_string(),
+                ]);
+                self.panel = Some(panel);
+            }
+        }
+        Ok(())
+    }
+
+    /// Show a minimized Claude again.
+    fn restore_claude(&mut self) {
+        if self.claude.running() {
+            self.claude.open = true;
+        }
+    }
+
+    /// Send one key to the visible Claude. Returns true when the key was the
+    /// minimize chord, so the caller can reload: Claude may have edited, or
+    /// run git, while it had focus.
+    fn forward_to_claude(&mut self, key: KeyEvent) -> bool {
+        if claude::is_minimize(&key) {
+            self.claude.open = false;
+            self.message = Some(format!(
+                "claude minimized, still running — cc to return ({} inside it minimizes)",
+                claude::MINIMIZE_LABEL
+            ));
+            return true;
+        }
+        if let (Some(session), Some(bytes)) =
+            (self.claude.session.as_mut(), claude::encode_key(&key))
+        {
+            session.send(&bytes);
+        }
+        false
+    }
+
+    /// Notice a Claude that exited — quit, crashed, or was killed — and close
+    /// its pane rather than leaving a dead window grabbing the keyboard.
+    fn poll_claude(&mut self) {
+        let Some(session) = self.claude.session.as_mut() else {
+            return;
+        };
+        if let Some(status) = session.exited() {
+            self.claude.session = None;
+            self.claude.open = false;
+            self.message = Some(format!("claude exited ({status})"));
+        }
+    }
+
+    /// `cc` was asked for where there is no Claude to open.
+    fn refuse_claude_replay(&mut self) {
+        self.message = Some(format!(
+            "'{}' not found on PATH — install Claude Code, or set claude_command in .roll-flow.toml",
+            self.config.claude_command
+        ));
+    }
+
+    /// Draw the Claude pane over everything else. Resizes the child's window to
+    /// the popup first, so it always lays itself out for the space it has.
+    fn render_claude(&mut self, f: &mut Frame, area: Rect) {
+        let popup = claude::popup_rect(area);
+        f.render_widget(Clear, popup);
+        let block = Block::bordered()
+            .border_style(Style::default().fg(Color::Cyan))
+            .title(Line::from(" claude ").left_aligned())
+            .title_bottom(
+                Line::from(format!(" {} minimize ", claude::MINIMIZE_LABEL)).right_aligned(),
+            );
+        let inner = block.inner(popup);
+        f.render_widget(block, popup);
+        if let Some(session) = self.claude.session.as_mut() {
+            session.resize(inner.height, inner.width);
+            session.with_screen(|screen| {
+                f.render_widget(tui_term::widget::PseudoTerminal::new(screen), inner)
+            });
+        }
+    }
+
     /// `PP` — plan a push of every branch that needs one and open its modal.
     ///
     /// Nothing is pushed here. The plan is resolved from the tracking data the
@@ -5153,10 +5374,17 @@ impl StatusApp {
             } => render_command(f, area, query, input, *cursor, &self.command_history),
             Mode::Browsing => {}
         }
+
+        // Last, so it is over modals too — though it cannot be up while one is
+        // being typed into, it can be up over one left open when it was
+        // restored.
+        if self.claude.visible() {
+            self.render_claude(f, area);
+        }
     }
 
     fn render_header(&self, f: &mut Frame, area: Rect) {
-        let spans = vec![
+        let mut spans = vec![
             Span::styled("Branch: ", Style::default().add_modifier(Modifier::BOLD)),
             Span::raw(self.current_branch.as_str()),
             Span::raw("   Rolling: "),
@@ -5170,6 +5398,14 @@ impl StatusApp {
                 Style::default().fg(Color::Green),
             ),
         ];
+        // A minimized Claude is easy to forget about; say it is still there.
+        if self.claude.running() && !self.claude.open {
+            spans.push(Span::raw("   "));
+            spans.push(Span::styled(
+                "● claude running (cc)",
+                Style::default().fg(Color::Green),
+            ));
+        }
         let repo_name = self
             .config
             .repo_root
@@ -7652,6 +7888,7 @@ mod tests {
             pull_mode: Default::default(),
             lazygit_command: "lazygit".to_string(),
             bacon_command: "bacon".to_string(),
+            claude_command: "claude".to_string(),
             editor_command: String::new(),
             version_manifest: Default::default(),
             rebuild_menu: vec![],
@@ -7776,6 +8013,7 @@ mod tests {
             pending_rebuild: None,
             pending_verify: None,
             command_history: Vec::new(),
+            claude: claude::Pane::default(),
         };
 
         app.handle_mouse(MouseEvent {
@@ -7842,6 +8080,7 @@ mod tests {
             pending_rebuild: None,
             pending_verify: None,
             command_history: Vec::new(),
+            claude: claude::Pane::default(),
         };
 
         app.handle_mouse(MouseEvent {
@@ -7888,6 +8127,7 @@ mod tests {
             pending_rebuild: None,
             pending_verify: None,
             command_history: Vec::new(),
+            claude: claude::Pane::default(),
         };
         app.toggle_maximize();
         assert!(!app.panel_maximized, "nothing to maximize");
@@ -9941,6 +10181,7 @@ mod tests {
             pending_rebuild: None,
             pending_verify: None,
             command_history: Vec::new(),
+            claude: claude::Pane::default(),
         };
         let out = draw(|f, area| app.render_table(f, area));
 
@@ -10034,6 +10275,7 @@ mod tests {
             pull_mode: Default::default(),
             lazygit_command: "lazygit".to_string(),
             bacon_command: "bacon".to_string(),
+            claude_command: "claude".to_string(),
             editor_command: String::new(),
             version_manifest: Default::default(),
             rebuild_menu: vec![],
@@ -10345,6 +10587,7 @@ mod tests {
             pending_rebuild: None,
             pending_verify: None,
             command_history: Vec::new(),
+            claude: claude::Pane::default(),
         };
 
         let out = draw(|f, area| app.render_table(f, area));
@@ -10410,6 +10653,7 @@ mod tests {
             pending_rebuild: None,
             pending_verify: None,
             command_history: Vec::new(),
+            claude: claude::Pane::default(),
         };
 
         let out = draw(|f, area| app.render_table(f, area));
@@ -10472,6 +10716,7 @@ mod tests {
             pending_rebuild: None,
             pending_verify: None,
             command_history: Vec::new(),
+            claude: claude::Pane::default(),
         };
         let out = draw(|f, area| app.render_table(f, area));
 
@@ -10546,6 +10791,7 @@ mod tests {
             pending_rebuild: None,
             pending_verify: None,
             command_history: Vec::new(),
+            claude: claude::Pane::default(),
         };
         let out = draw(|f, area| app.render_table(f, area));
 
@@ -10632,6 +10878,7 @@ mod tests {
             pending_rebuild: None,
             pending_verify: None,
             command_history: Vec::new(),
+            claude: claude::Pane::default(),
         };
         let out = draw(|f, area| app.render_table(f, area));
 
@@ -10685,6 +10932,7 @@ mod tests {
             pending_rebuild: None,
             pending_verify: None,
             command_history: Vec::new(),
+            claude: claude::Pane::default(),
         };
         let out = draw(|f, area| app.render_table(f, area));
         assert!(!out.contains("version"), "column shown anyway:\n{out}");
@@ -10743,6 +10991,7 @@ mod tests {
             pending_rebuild: None,
             pending_verify: None,
             command_history: Vec::new(),
+            claude: claude::Pane::default(),
         };
         let out = draw(|f, area| app.render_table(f, area));
         let row = out
@@ -11985,6 +12234,7 @@ mod tests {
             pending_rebuild: None,
             pending_verify: None,
             command_history: Vec::new(),
+            claude: claude::Pane::default(),
         }
     }
 
@@ -12132,6 +12382,220 @@ mod tests {
         assert!(app.waits_on_head("[v]"), "still pending while it runs");
         settle(&mut app);
         assert!(!app.waits_on_head("[v]"));
+    }
+
+    // ── cc: Claude Code in a floating pane ───────────────────────────────────
+
+    fn ctrl_backslash() -> KeyEvent {
+        KeyEvent::new(KeyCode::Char('\\'), KeyModifiers::CONTROL)
+    }
+
+    fn typed(c: char) -> KeyEvent {
+        KeyEvent::new(KeyCode::Char(c), KeyModifiers::NONE)
+    }
+
+    /// Poll for up to three seconds; a pty round trip is asynchronous.
+    fn eventually(mut cond: impl FnMut() -> bool) -> bool {
+        for _ in 0..60 {
+            if cond() {
+                return true;
+            }
+            std::thread::sleep(Duration::from_millis(50));
+        }
+        false
+    }
+
+    fn app_with_claude(command: &str) -> StatusApp {
+        let mut app = idle_app();
+        app.claude.available = true;
+        app.claude.session =
+            Some(claude::Session::spawn(command, std::path::Path::new("/"), 10, 40).unwrap());
+        app.claude.open = true;
+        app
+    }
+
+    fn screen_has(app: &StatusApp, needle: &str) -> bool {
+        app.claude
+            .session
+            .as_ref()
+            .and_then(|s| s.with_screen(|screen| screen.contents().contains(needle)))
+            .unwrap_or(false)
+    }
+
+    #[test]
+    fn only_a_second_c_completes_the_claude_chord() {
+        assert_eq!(claude_chord_key(KeyCode::Char('c')), ClaudeChord::Claude);
+        for key in [
+            KeyCode::Char('h'),
+            KeyCode::Enter,
+            KeyCode::Esc,
+            KeyCode::Char('C'),
+        ] {
+            assert_eq!(claude_chord_key(key), ClaudeChord::Create, "{key:?}");
+        }
+    }
+
+    #[test]
+    fn without_claude_installed_c_creates_a_roll_at_once() {
+        let mut app = idle_app();
+        assert!(!app.claude.available);
+        app.press_c();
+        assert!(matches!(
+            app.mode,
+            Mode::CreateInput {
+                kind: CreateKind::Roll,
+                ..
+            }
+        ));
+        assert!(app.claude.pending.is_none(), "nothing to wait for");
+    }
+
+    #[test]
+    fn with_claude_installed_a_lone_c_still_creates_after_the_window() {
+        let mut app = idle_app();
+        app.claude.available = true;
+        app.press_c();
+        assert!(matches!(app.mode, Mode::Browsing), "waiting for a second c");
+        assert!(app.claude.pending.is_some());
+
+        app.resolve_lapsed_claude();
+        assert!(
+            matches!(app.mode, Mode::Browsing),
+            "window has not lapsed yet"
+        );
+
+        app.claude.pending = Some(Instant::now() - CLAUDE_CHORD_WINDOW * 2);
+        app.resolve_lapsed_claude();
+        assert!(matches!(
+            app.mode,
+            Mode::CreateInput {
+                kind: CreateKind::Roll,
+                ..
+            }
+        ));
+        assert!(app.claude.pending.is_none());
+    }
+
+    #[test]
+    fn keys_go_to_claude_until_the_minimize_chord() {
+        let mut app = app_with_claude("cat");
+        for c in ['h', 'i'] {
+            assert!(!app.forward_to_claude(typed(c)));
+        }
+        app.forward_to_claude(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        assert!(eventually(|| screen_has(&app, "hi")), "cat never echoed");
+
+        // `q` is just a letter to Claude, not rf's quit.
+        assert!(!app.forward_to_claude(typed('q')));
+        assert!(app.claude.visible());
+
+        assert!(
+            app.forward_to_claude(ctrl_backslash()),
+            "caller must reload"
+        );
+        assert!(!app.claude.visible(), "minimized");
+        assert!(app.claude.running(), "but still alive");
+        assert!(
+            app.message.as_deref().unwrap().contains("cc"),
+            "{:?}",
+            app.message
+        );
+    }
+
+    #[test]
+    fn a_minimized_claude_keeps_receiving_output() {
+        let mut app = app_with_claude("cat");
+        app.forward_to_claude(ctrl_backslash());
+        // Typed through the session directly: nothing reaches a minimized one
+        // from the keyboard, but what it prints still lands on its screen.
+        app.claude.session.as_mut().unwrap().send(b"later\r");
+        assert!(eventually(|| screen_has(&app, "later")));
+    }
+
+    #[test]
+    fn cc_brings_a_minimized_claude_back_rather_than_starting_another() {
+        let mut app = app_with_claude("cat");
+        app.forward_to_claude(ctrl_backslash());
+        assert!(!app.claude.visible());
+        app.restore_claude();
+        assert!(app.claude.visible());
+        assert!(app.claude.running());
+    }
+
+    #[test]
+    fn an_exited_claude_closes_its_pane_and_says_so() {
+        let mut app = app_with_claude("true");
+        assert!(eventually(|| {
+            app.poll_claude();
+            !app.claude.running()
+        }));
+        assert!(!app.claude.visible());
+        assert!(
+            app.message.as_deref().unwrap().contains("exited"),
+            "{:?}",
+            app.message
+        );
+    }
+
+    #[test]
+    fn the_claude_pane_draws_the_childs_screen_and_sizes_the_child_to_fit() {
+        let mut app = app_with_claude("cat");
+        app.claude.session.as_mut().unwrap().send(b"hello pane\r");
+        assert!(eventually(|| screen_has(&app, "hello pane")));
+
+        let mut terminal =
+            ratatui::Terminal::new(ratatui::backend::TestBackend::new(80, 24)).unwrap();
+        terminal
+            .draw(|f| {
+                let area = f.area();
+                app.render_claude(f, area)
+            })
+            .unwrap();
+
+        let buffer = terminal.backend().buffer().clone();
+        let text: String = buffer.content().iter().map(|c| c.symbol()).collect();
+        assert!(text.contains("hello pane"), "child output not drawn");
+        assert!(text.contains("claude"), "no title");
+        assert!(text.contains("minimize"), "no hint for the way out");
+
+        // The child was told it has the popup's interior, not the 10x40 it
+        // was spawned at.
+        let popup = claude::popup_rect(Rect::new(0, 0, 80, 24));
+        let (rows, cols) = claude::inner_size(popup);
+        let size = app
+            .claude
+            .session
+            .as_ref()
+            .unwrap()
+            .with_screen(|s| s.size());
+        assert_eq!(size, Some((rows, cols)));
+    }
+
+    #[test]
+    fn quitting_with_claude_running_asks_first() {
+        let mut app = app_with_claude("cat");
+        app.forward_to_claude(ctrl_backslash());
+        assert!(!app.confirm_quit(false));
+        assert!(app.quit_armed);
+        assert!(
+            app.message.as_deref().unwrap().contains("claude"),
+            "{:?}",
+            app.message
+        );
+        assert!(app.confirm_quit(true));
+    }
+
+    #[test]
+    fn replaying_cc_from_the_help_list_without_claude_explains_instead_of_creating() {
+        let mut app = idle_app();
+        assert!(!app.claude.available);
+        app.refuse_claude_replay();
+        assert!(matches!(app.mode, Mode::Browsing));
+        assert!(
+            app.message.as_deref().unwrap().contains("claude_command"),
+            "{:?}",
+            app.message
+        );
     }
 
     #[test]
@@ -12575,6 +13039,7 @@ mod tests {
             pending_rebuild: None,
             pending_verify: None,
             command_history: Vec::new(),
+            claude: claude::Pane::default(),
         };
         let out = draw(|f, area| app.render_table(f, area));
         let lines: Vec<&str> = out.lines().collect();
@@ -12654,6 +13119,7 @@ mod tests {
             pending_rebuild: None,
             pending_verify: None,
             command_history: Vec::new(),
+            claude: claude::Pane::default(),
         };
 
         // Tall enough for the header, three table rows and the five-line status

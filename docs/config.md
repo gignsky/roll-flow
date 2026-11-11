@@ -27,6 +27,7 @@ clean_protect = []
 pull_mode = "ff-only"
 lazygit_command = "lazygit"
 bacon_command = "bacon"
+claude_command = "claude"
 editor_command = ""
 version_manifest = "auto"
 
@@ -81,6 +82,7 @@ the layers are merged; everything else has a default.
 | `pull_mode`             | `"ff-only"` | fresh file                                                                  | the TUI's `[p]`                                                                                                                                                      |
 | `lazygit_command`       | `"lazygit"` | fresh file                                                                  | the TUI's `gg`                                                                                                                                                       |
 | `bacon_command`         | `"bacon"`   | fresh file                                                                  | the TUI's `bb`                                                                                                                                                       |
+| `claude_command`        | `"claude"`  | fresh file                                                                  | the TUI's `cc` (only offered when it resolves on `PATH`)                                                                                                             |
 | `editor_command`        | `""`        | fresh file                                                                  | the TUI's `vv`; empty means `$VISUAL`, then `$EDITOR`, then `vi`                                                                                                     |
 | `version_manifest`      | `"auto"`    | fresh file                                                                  | which manifest(s) the version gate and `rf start` / `rf graduate` / `rf promote`'s version writes use: `auto` tracks every one with a version, `cargo`/`npm` pin one |
 | `rebuild_menu`          | `[]`        | fresh file                                                                  | the TUI's `n`; empty means the built-in `nixos-rebuild`/`home-manager` menu — see [Rebuild menu](#rebuild-menu)                                                      |
@@ -194,6 +196,13 @@ want.
 arguments in the directory of the working tree's `Cargo.toml` rather than given a path flag — bacon's positional
 argument is a job name, not a path. Defaults to `bacon` on `PATH`. See
 [`status`](commands/status.md#gg-bb-and-vv--hand-over-the-terminal).
+
+`claude_command` is what the TUI's `[cc]` runs in a floating pane over the table,
+in the repo root. It may carry arguments (`"claude --model opus"`); it is split on
+whitespace, with no shell. `cc` is only offered when the command resolves — a
+bare name on `PATH`, or a path to an executable — so without Claude Code
+installed a lone `c` still creates a roll immediately, with no chord wait. See
+[`status`](commands/status.md#cc--claude-code-in-a-floating-pane).
 
 `editor_command` is what the TUI's `[vv]` opens, run as `<command> .` in the
 repo root. Left empty — the default — it falls back to `$VISUAL`, then
