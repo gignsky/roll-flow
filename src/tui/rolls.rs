@@ -2706,6 +2706,7 @@ impl StatusApp {
             // Before reading input, so a job that finished during the poll is
             // reflected in this frame rather than the next one.
             self.poll_job()?;
+            self.autohide_panel();
             self.open_deferred_mode();
             self.resolve_lapsed_push();
             self.resolve_lapsed_pull();
@@ -2715,6 +2716,11 @@ impl StatusApp {
 
             if event::poll(Duration::from_millis(50))? {
                 let event = event::read()?;
+                // Any input counts as the user still being here, so a panel
+                // being read, scrolled or maximized is not pulled away.
+                if let Some(panel) = self.panel.as_mut() {
+                    panel.touch(std::time::Instant::now());
+                }
                 if let Event::Mouse(mouse) = event {
                     // Clicks only drive the panel, and only while nothing else
                     // is already claiming input — a modal's own keys take
@@ -2793,6 +2799,21 @@ impl StatusApp {
         self.reload()?;
         self.finish_job(ok, next);
         Ok(())
+    }
+
+    /// Dismiss a finished panel the user has left alone for
+    /// [`output::AUTOHIDE_AFTER`]. Never while a job runs (the panel is its
+    /// live log) and never while maximized (the user is reading it).
+    fn autohide_panel(&mut self) {
+        let expired = self.job.is_none()
+            && !self.panel_maximized
+            && self
+                .panel
+                .as_ref()
+                .is_some_and(|p| p.idle_expired(std::time::Instant::now(), output::AUTOHIDE_AFTER));
+        if expired {
+            self.panel = None;
+        }
     }
 
     /// Act on a finished job's outcome — hold the queue on a failure, apply

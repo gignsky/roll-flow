@@ -231,7 +231,9 @@ An action does not take the screen away. Its output streams into a panel in the
 bottom-right corner while the table stays drawn and navigable — `j`/`k` and
 `[enter]` keep working mid-push — and `[esc]` dismisses the panel once the
 command has finished. `PageUp`/`PageDown` scroll its scrollback and `End` returns
-to following new output.
+to following new output. A finished panel also closes by itself after 15 seconds
+without new output or a keypress or click; a running command's panel, and a
+maximized one, stay up.
 
 ### Chaining commands
 
