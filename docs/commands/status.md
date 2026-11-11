@@ -221,7 +221,7 @@ rows: it merges the roll under the cursor into the roll wearing the chevron — 
 [`integrate`](integrate.md#from-the-tui). The `sync` column reports each branch against
 its upstream: `✓` in sync, `↑2` ahead, `↓1` behind, `↑2↓1` diverged, `gone` once
 the upstream is deleted, and `—` when there is nothing to compare (no upstream,
-or no local copy). A `⚡` appended to any of those means that branch's worktree
+or no local copy). A red `✎` badge appended to any of those means that branch's worktree
 has uncommitted changes — only possible for a branch checked out somewhere,
 local or in a linked `git worktree`.
 
@@ -231,7 +231,9 @@ An action does not take the screen away. Its output streams into a panel in the
 bottom-right corner while the table stays drawn and navigable — `j`/`k` and
 `[enter]` keep working mid-push — and `[esc]` dismisses the panel once the
 command has finished. `PageUp`/`PageDown` scroll its scrollback and `End` returns
-to following new output.
+to following new output. A finished panel also closes by itself after 15 seconds
+without new output or a keypress or click; a running command's panel, and a
+maximized one, stay up.
 
 ### Chaining commands
 
