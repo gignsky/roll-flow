@@ -134,7 +134,7 @@ pub fn encode_key(key: &KeyEvent) -> Option<Vec<u8>> {
         KeyCode::PageUp => csi_tilde(5, mods),
         KeyCode::PageDown => csi_tilde(6, mods),
         KeyCode::F(n @ 1..=4) => {
-            let final_byte = [b'P', b'Q', b'R', b'S'][usize::from(n) - 1] as char;
+            let final_byte = b"PQRS"[usize::from(n) - 1] as char;
             match modifier_param(mods) {
                 1 => format!("\x1bO{final_byte}").into_bytes(),
                 m => format!("\x1b[1;{m}{final_byte}").into_bytes(),
