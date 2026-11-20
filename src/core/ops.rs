@@ -676,7 +676,7 @@ fn reconcile_staged_version(repo: &Path, manifest: &Manifest, resolved: Semver) 
 /// no lockfile (fixture crates, libraries that do not commit one) must not
 /// fail the add.
 fn stage_existing(repo: &Path, manifest: &Manifest) -> Result<(), crate::error::RfError> {
-    let paths = manifest.paths();
+    let paths = manifest.paths_in(repo);
     let mut add = vec!["add"];
     add.extend(
         paths
@@ -1575,7 +1575,12 @@ fn commit_version_changes(
     for (manifest, next) in changes {
         version::write_version(repo, manifest, *next)?;
         refresh_lockfile(repo, manifest);
-        paths.extend(manifest.paths());
+        for path in manifest.paths_in(repo) {
+            // Workspace members share the root lockfile: list it once.
+            if !paths.contains(&path) {
+                paths.push(path);
+            }
+        }
     }
     let paths: Vec<&str> = paths.iter().map(String::as_str).collect();
     git::commit_paths(repo, &paths, message).with_context(|| {
@@ -1890,15 +1895,15 @@ fn commit_settled_merge(repo: &Path) -> Result<()> {
 /// never repainted — the table looked out of date until something forced a
 /// full redraw.
 fn refresh_lockfile(repo: &Path, manifest: &Manifest) {
-    if !repo.join(manifest.lockfile()).exists() {
+    if !repo.join(manifest.lockfile_in(repo)).exists() {
         return;
     }
     sync_lockfile_own_entry(repo, manifest);
     if !matches!(manifest.kind, ManifestKind::Cargo) {
         return;
     }
-    // Run from the manifest's own directory, so a crate in a subdirectory
-    // refreshes its own lockfile rather than the root's.
+    // Run from the manifest's own directory: cargo finds the lockfile that
+    // locks it, its own or its workspace root's.
     let dir = repo.join(manifest.dir());
     let offline = proc::run(
         Command::new("cargo")
@@ -1927,7 +1932,7 @@ fn refresh_lockfile(repo: &Path, manifest: &Manifest) {
 /// version, or no unambiguous own entry, and the file is left alone.
 fn sync_lockfile_own_entry(repo: &Path, manifest: &Manifest) {
     let kind = manifest.kind;
-    let lock_path = repo.join(manifest.lockfile());
+    let lock_path = repo.join(manifest.lockfile_in(repo));
     let (Ok(manifest), Ok(lock)) = (
         std::fs::read_to_string(repo.join(manifest.manifest())),
         std::fs::read_to_string(&lock_path),
