@@ -209,9 +209,39 @@ impl Manifest {
         self.join(self.kind.lockfile())
     }
 
+    /// The lockfile that actually locks this manifest in `repo`: the nearest
+    /// one at or above the manifest's directory. A workspace member
+    /// (`crates/rr/Cargo.toml`) has no lockfile of its own; the workspace's
+    /// root `Cargo.lock` locks it. Falls back to [`Manifest::lockfile`] when
+    /// none exists anywhere up the tree.
+    pub fn lockfile_in(&self, repo: &Path) -> String {
+        let name = self.kind.lockfile();
+        let mut dir = self.dir.as_str();
+        loop {
+            let candidate = if dir.is_empty() {
+                name.to_string()
+            } else {
+                format!("{dir}/{name}")
+            };
+            if repo.join(&candidate).exists() {
+                return candidate;
+            }
+            if dir.is_empty() {
+                return self.lockfile();
+            }
+            dir = dir.rsplit_once('/').map_or("", |(parent, _)| parent);
+        }
+    }
+
     /// Both paths, manifest first — what every commit and `git add` lists.
     pub fn paths(&self) -> [String; 2] {
         [self.manifest(), self.lockfile()]
+    }
+
+    /// [`Manifest::paths`] with the lockfile resolved in `repo`
+    /// ([`Manifest::lockfile_in`]).
+    pub fn paths_in(&self, repo: &Path) -> [String; 2] {
+        [self.manifest(), self.lockfile_in(repo)]
     }
 
     /// The order a repo's manifests are listed in: shallowest first, then
@@ -1460,6 +1490,25 @@ version = "1.0.228"
         // A lockfile, or anything else, is not a manifest.
         assert_eq!(Manifest::from_path("keeper/Cargo.lock"), None);
         assert_eq!(Manifest::from_path("README.md"), None);
+    }
+
+    #[test]
+    fn a_workspace_member_is_locked_by_the_nearest_lockfile_above_it() {
+        let repo = tempfile::tempdir().unwrap();
+        let member = Manifest::from_path("crates/rr/Cargo.toml").unwrap();
+        // None anywhere: the beside-the-manifest default.
+        assert_eq!(member.lockfile_in(repo.path()), "crates/rr/Cargo.lock");
+        // The workspace root's lockfile.
+        std::fs::write(repo.path().join("Cargo.lock"), "").unwrap();
+        assert_eq!(member.lockfile_in(repo.path()), "Cargo.lock");
+        assert_eq!(
+            member.paths_in(repo.path()),
+            ["crates/rr/Cargo.toml".to_string(), "Cargo.lock".to_string()]
+        );
+        // A crate's own lockfile wins over the root's.
+        std::fs::create_dir_all(repo.path().join("crates/rr")).unwrap();
+        std::fs::write(repo.path().join("crates/rr/Cargo.lock"), "").unwrap();
+        assert_eq!(member.lockfile_in(repo.path()), "crates/rr/Cargo.lock");
     }
 
     #[test]
