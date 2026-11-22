@@ -84,7 +84,7 @@ the layers are merged; everything else has a default.
 | `bacon_command`         | `"bacon"`   | fresh file                                                                  | the TUI's `bb`                                                                                                                                                       |
 | `claude_command`        | `"claude"`  | fresh file                                                                  | the TUI's `cc` (only offered when it resolves on `PATH`)                                                                                                             |
 | `editor_command`        | `""`        | fresh file                                                                  | the TUI's `vv`; empty means `$VISUAL`, then `$EDITOR`, then `vi`                                                                                                     |
-| `version_manifest`      | `"auto"`    | fresh file                                                                  | which manifest(s) the version gate and `rf start` / `rf graduate` / `rf promote`'s version writes use: `auto` tracks every one with a version, `cargo`/`npm` pin one |
+| `version_manifest`      | `"auto"`    | fresh file                                                                  | which manifest(s) the version gate and `rf start` / `rf graduate` / `rf promote`'s version writes use: `auto` tracks every one with a version, `cargo`/`npm`/`python` pin one |
 | `rebuild_menu`          | `[]`        | fresh file                                                                  | the TUI's `n`; empty means the built-in `nixos-rebuild`/`home-manager` menu — see [Rebuild menu](#rebuild-menu)                                                      |
 
 Gate entries are shell commands run in repo root. Any failure blocks
@@ -139,29 +139,37 @@ repo where `nix eval` would not.
 `version_gate`, `tag_on_promote`, `tag_on_graduate`, `push_tag`, and
 `dev_versions` control the release behavior described in
 [Versioning and release tags](../README.md#versioning-and-release-tags). All
-five default to `true` and are inert in a repo with neither a `Cargo.toml`
-nor a `package.json`.
+five default to `true` and are inert in a repo with no `Cargo.toml`,
+`package.json` or `pyproject.toml`.
 
 `version_manifest` decides which manifests carry the release version. `"auto"`
-(the default) **discovers** them: every tracked `Cargo.toml` and
-`package.json` with a readable version, at the root or in any subdirectory — a
+(the default) **discovers** them: every tracked `Cargo.toml`,
+`package.json` and `pyproject.toml` with a readable version, at the root or in any subdirectory — a
 site's root `package.json` beside a Rust service in `keeper/Cargo.toml`, a Tauri
 app, a Rust backend released with its JS front end. A manifest with no
 `version` (tooling-only, or a workspace member inheriting
-`version.workspace`) is not versioned. Each one found is marked `-roll<N>` on
+`version.workspace`, or a `pyproject.toml` whose version is `dynamic`) is not
+versioned. Each one found is marked `-roll<N>` on
 `rf start`, resolved on `rf graduate`, finalized on `rf promote`, and must clear
 the version gate on its own, so a promotion is refused until _each_ is ahead of
 the stable branch. Their numbers are independent — the gate never compares one
 manifest against another. Where a bump is needed, `rf promote` (and the TUI's
 `[b]`) lets you pick which manifest to raise — see
 [`promote`](commands/promote.md#more-than-one-manifest). A nested manifest's
-lockfile is the one beside it (`keeper/Cargo.lock`).
+lockfile is the nearest one at or above it: `keeper/Cargo.lock`, or the
+workspace root's `Cargo.lock` for a member. A `pyproject.toml`'s version is
+`[project].version` (PEP 621), and its lockfile is `uv.lock`, where the project's
+own entry (`source = { editable = "." }` or `virtual`) moves with it; without a
+`uv.lock` only the manifest moves. Its version is read as `X.Y.Z` like the
+others, so a Python project that is itself built and published should run
+with `dev_versions = false`: `0.2.4-roll9` is not a PEP 440 version.
 
 The release tag, and the `version` field of `--json`, come from the **first**
 manifest: a root manifest before a nested one,
-and `Cargo.toml` before `package.json` at the same depth.
+and `Cargo.toml` before `package.json` before `pyproject.toml` at the same
+depth.
 
-Narrow it with `"cargo"` or `"npm"` (discovery, but of that kind only), or
+Narrow it with `"cargo"`, `"npm"` or `"python"` (discovery, but of that kind only), or
 name the manifests outright with a list of repo-relative paths, which
 discovers nothing — the way to keep a versioned test fixture or vendored crate
 out of the gate:
@@ -170,7 +178,8 @@ out of the gate:
 version_manifest = ["package.json", "keeper/Cargo.toml"]
 ```
 
-A listed path that is not a `Cargo.toml` or `package.json` is refused when the
+A listed path that is not a `Cargo.toml`, `package.json` or `pyproject.toml` is
+refused when the
 config loads. The setting reaches every command that reads or writes a version
 through `Config`, so the files written and the files compared always agree.
 The merge-driver subprocess has no `Config` and matches files by name at any
