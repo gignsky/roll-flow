@@ -1,6 +1,7 @@
 //! Crate-version policy: read, compare, and bump the `version` carried by a
 //! repo's manifest — `Cargo.toml` for a Rust crate, `package.json` for a Node
-//! package — plus its lockfile's own repeated copy of the same value.
+//! package, `pyproject.toml` for a Python project — plus its lockfile's own
+//! repeated copy of the same value.
 //!
 //! This mirrors, by construction, the three CI workflows that own the same
 //! policy today, so `rf` and GitHub Actions can never disagree:
@@ -17,9 +18,8 @@
 //!   annotated `vX.Y.Z` tag, created idempotently.
 //! - `.github/workflows/release-check.yml` — the tag must match the manifest.
 //!
-//! Pure logic only: nothing here prints or prompts. A repo with neither a
-//! `Cargo.toml` nor a `package.json` (the dotfiles repo roll-flow was built
-//! for) yields `VersionStatus::NotApplicable` and every caller silently skips.
+//! Pure logic only: nothing here prints or prompts. A repo with no versioned
+//! manifest at all (the dotfiles repo roll-flow was built for) yields `VersionStatus::NotApplicable` and every caller silently skips.
 
 use std::collections::HashMap;
 use std::fmt;
@@ -35,11 +35,13 @@ use crate::error::RfError;
 /// among manifests at the same depth, a `Cargo.toml` is listed ahead of a
 /// `package.json` (see [`Manifest::precedence`]), so it names the release tag
 /// — every repo that versioned through Cargo alone before npm support existed
-/// keeps its tags.
+/// keeps its tags. `pyproject.toml` comes last for the same reason: a repo
+/// that already versions through either of the others keeps its tag.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum ManifestKind {
     Cargo,
     Npm,
+    Python,
 }
 
 /// Which of a kind's two files a path is — the manifest itself, or the
@@ -51,22 +53,28 @@ pub enum Role {
 }
 
 impl ManifestKind {
-    pub const ALL: [ManifestKind; 2] = [ManifestKind::Cargo, ManifestKind::Npm];
+    pub const ALL: [ManifestKind; 3] =
+        [ManifestKind::Cargo, ManifestKind::Npm, ManifestKind::Python];
 
-    /// The manifest's file name: `Cargo.toml` or `package.json`. A
-    /// [`Manifest`] joins it to the directory it sits in.
+    /// The manifest's file name: `Cargo.toml`, `package.json` or
+    /// `pyproject.toml`. A [`Manifest`] joins it to the directory it sits in.
     pub fn manifest(self) -> &'static str {
         match self {
             ManifestKind::Cargo => "Cargo.toml",
             ManifestKind::Npm => "package.json",
+            ManifestKind::Python => "pyproject.toml",
         }
     }
 
-    /// The lockfile's file name: `Cargo.lock` or `package-lock.json`.
+    /// The lockfile's file name: `Cargo.lock`, `package-lock.json` or
+    /// `uv.lock` — the one Python lockfile that records the project's own
+    /// version. A Python project without one is versioned all the same; the
+    /// lockfile half is skipped wherever the file is absent.
     pub fn lockfile(self) -> &'static str {
         match self {
             ManifestKind::Cargo => "Cargo.lock",
             ManifestKind::Npm => "package-lock.json",
+            ManifestKind::Python => "uv.lock",
         }
     }
 
@@ -91,6 +99,7 @@ impl ManifestKind {
         match self {
             ManifestKind::Cargo => parse_cargo_version(text),
             ManifestKind::Npm => parse_npm_version(text),
+            ManifestKind::Python => parse_python_version(text),
         }
     }
 
@@ -101,6 +110,7 @@ impl ManifestKind {
         match self {
             ManifestKind::Cargo => parse_cargo_name(text),
             ManifestKind::Npm => parse_npm_name(text),
+            ManifestKind::Python => parse_python_name(text),
         }
     }
 
@@ -110,16 +120,18 @@ impl ManifestKind {
         match self {
             ManifestKind::Cargo => replace_cargo_version(text, new),
             ManifestKind::Npm => replace_npm_version(text, new),
+            ManifestKind::Python => replace_python_version(text, new),
         }
     }
 
     /// Read the crate/package's own version from this kind's lockfile text.
-    /// `name` identifies the entry for `Cargo` (required — `None` yields
-    /// `None`) and is ignored for `Npm`, whose root entry needs no name.
+    /// `name` identifies the entry for `Cargo` and `Python` (required — `None`
+    /// yields `None`) and is ignored for `Npm`, whose root entry needs no name.
     pub fn parse_lock_version(self, text: &str, name: Option<&str>) -> Option<Semver> {
         match self {
             ManifestKind::Cargo => parse_cargo_lock_version(text, name?),
             ManifestKind::Npm => parse_npm_lock_version(text),
+            ManifestKind::Python => parse_uv_lock_version(text, name?),
         }
     }
 
@@ -135,6 +147,7 @@ impl ManifestKind {
         match self {
             ManifestKind::Cargo => replace_cargo_lock_version(text, name?, new),
             ManifestKind::Npm => replace_npm_lock_version(text, new),
+            ManifestKind::Python => replace_uv_lock_version(text, name?, new),
         }
     }
 
@@ -143,6 +156,7 @@ impl ManifestKind {
         match self {
             ManifestKind::Cargo => "the [package] table",
             ManifestKind::Npm => "the root",
+            ManifestKind::Python => "the [project] table",
         }
     }
 }
@@ -173,7 +187,7 @@ impl Manifest {
     }
 
     /// The manifest at repo-relative `path`, or `None` when its file name is
-    /// neither `Cargo.toml` nor `package.json`.
+    /// not a kind's manifest (`Cargo.toml`, `package.json`, `pyproject.toml`).
     pub fn from_path(path: &str) -> Option<Manifest> {
         let path = path.trim_start_matches("./");
         let (kind, Role::Manifest) = ManifestKind::for_path(Path::new(path))? else {
@@ -315,8 +329,17 @@ impl Selection {
             return ordered(list.clone());
         }
         let mut found: Vec<Manifest> = ManifestKind::ALL.into_iter().map(Manifest::root).collect();
-        let tracked = git::capture_git(repo, &["ls-files", "--", "*Cargo.toml", "*package.json"])
-            .unwrap_or_default();
+        let tracked = git::capture_git(
+            repo,
+            &[
+                "ls-files",
+                "--",
+                "*Cargo.toml",
+                "*package.json",
+                "*pyproject.toml",
+            ],
+        )
+        .unwrap_or_default();
         found.extend(tracked.lines().filter_map(Manifest::from_path));
         ordered(found.into_iter().filter(|m| self.admits(m)).collect())
     }
@@ -872,6 +895,13 @@ fn parse_cargo_version(cargo_toml: &str) -> Option<Semver> {
 /// behaviour can be unit-tested without touching a repo. Returns `None` if no
 /// version key was found in `[package]`.
 fn replace_cargo_version(text: &str, new: Semver) -> Option<String> {
+    replace_toml_table_version(text, "package", new)
+}
+
+/// Rewrite the first `version = ...` line inside `[<table>]`, line by line so
+/// comments and key order survive. Shared by the Cargo and Python arms.
+fn replace_toml_table_version(text: &str, table: &str, new: Semver) -> Option<String> {
+    let header = format!("[{table}]");
     let mut out = String::with_capacity(text.len());
     let mut in_package = false;
     let mut replaced = false;
@@ -879,9 +909,9 @@ fn replace_cargo_version(text: &str, new: Semver) -> Option<String> {
     for line in text.lines() {
         let trimmed = line.trim_start();
         if trimmed.starts_with('[') {
-            // Section header. `[package]` opens the table we care about; any
-            // other header (including `[package.metadata]`) closes it.
-            in_package = trimmed.starts_with("[package]");
+            // Section header. `[<table>]` opens the table we care about; any
+            // other header (including `[<table>.metadata]`) closes it.
+            in_package = trimmed.starts_with(&header);
         } else if in_package && !replaced && is_version_key(trimmed) {
             let indent = &line[..line.len() - trimmed.len()];
             out.push_str(indent);
@@ -915,9 +945,21 @@ fn parse_cargo_name(cargo_toml: &str) -> Option<String> {
 /// `[[package]]` entry named `name`. `None` when there is no such entry, or
 /// when it cannot be told apart from another (see [`lock_own_version_line`]).
 fn parse_cargo_lock_version(cargo_lock: &str, name: &str) -> Option<Semver> {
-    let lines: Vec<&str> = cargo_lock.lines().collect();
-    let line = lines[lock_own_version_line(&lines, name)?];
+    parse_lock_line(cargo_lock, name, is_cargo_member)
+}
+
+/// The version on the own-entry line [`lock_own_version_line`] finds. Shared
+/// by the Cargo and uv arms, whose lockfiles have the same `[[package]]` shape.
+fn parse_lock_line(lock: &str, name: &str, own: fn(Option<&str>) -> bool) -> Option<Semver> {
+    let lines: Vec<&str> = lock.lines().collect();
+    let line = lines[lock_own_version_line(&lines, name, own)?];
     Semver::parse(line.split('"').nth(1)?)
+}
+
+/// Cargo records a `source` for everything fetched from a registry or git,
+/// and none for a workspace member.
+fn is_cargo_member(source: Option<&str>) -> bool {
+    source.is_none()
 }
 
 /// Rewrite the crate's own `version` in `Cargo.lock` text, leaving every
@@ -930,8 +972,20 @@ fn parse_cargo_lock_version(cargo_lock: &str, name: &str) -> Option<Semver> {
 /// version rewrite, done without cargo: no network, no toolchain, and no
 /// chance of moving a dependency as a side effect.
 fn replace_cargo_lock_version(cargo_lock: &str, name: &str, new: Semver) -> Option<String> {
+    replace_lock_line(cargo_lock, name, is_cargo_member, new)
+}
+
+/// Rewrite the own-entry line [`lock_own_version_line`] finds, touching
+/// nothing else. Shared by the Cargo and uv arms.
+fn replace_lock_line(
+    lock: &str,
+    name: &str,
+    own: fn(Option<&str>) -> bool,
+    new: Semver,
+) -> Option<String> {
+    let cargo_lock = lock;
     let lines: Vec<&str> = cargo_lock.lines().collect();
-    let at = lock_own_version_line(&lines, name)?;
+    let at = lock_own_version_line(&lines, name, own)?;
     let mut out = String::with_capacity(cargo_lock.len());
     for (i, line) in lines.iter().enumerate() {
         if i == at {
@@ -951,13 +1005,18 @@ fn replace_cargo_lock_version(cargo_lock: &str, name: &str, new: Semver) -> Opti
 
 /// Index of the `version = ...` line in the crate's own `[[package]]` entry.
 ///
-/// "Own" is the entry named `name` with no `source` key: cargo records a
-/// `source` for everything fetched from a registry or git, and none for a
-/// workspace member, so a registry crate that happens to share the name is
-/// never mistaken for this one. More than one match counts as no match —
-/// guessing which entry to rewrite is how a real dependency would get
+/// "Own" is the entry named `name` whose `source` (its raw value, `None` when
+/// the key is absent) `own` accepts: for Cargo no `source` at all (see
+/// [`is_cargo_member`]), for uv a source pointing at the project itself (see
+/// [`is_uv_project`]). Either way a registry package that happens to share
+/// the name is never mistaken for this one. More than one match counts as no
+/// match — guessing which entry to rewrite is how a real dependency would get
 /// silently moved.
-fn lock_own_version_line(lines: &[&str], name: &str) -> Option<usize> {
+fn lock_own_version_line(
+    lines: &[&str],
+    name: &str,
+    own: fn(Option<&str>) -> bool,
+) -> Option<usize> {
     let wanted = format!("name = \"{name}\"");
     let mut found = None;
     let mut i = 0;
@@ -966,20 +1025,20 @@ fn lock_own_version_line(lines: &[&str], name: &str) -> Option<usize> {
             i += 1;
             continue;
         }
-        let (mut named, mut sourced, mut version) = (false, false, None);
+        let (mut named, mut source, mut version) = (false, None, None);
         i += 1;
         while i < lines.len() && !lines[i].trim_start().starts_with('[') {
             let trimmed = lines[i].trim();
             if trimmed == wanted {
                 named = true;
             } else if is_key(trimmed, "source") {
-                sourced = true;
+                source = trimmed.split_once('=').map(|(_, v)| v.trim());
             } else if version.is_none() && is_version_key(trimmed) {
                 version = Some(i);
             }
             i += 1;
         }
-        if named && !sourced {
+        if named && own(source) {
             if found.is_some() {
                 return None;
             }
@@ -1000,6 +1059,69 @@ fn is_key(trimmed: &str, key: &str) -> bool {
     trimmed
         .strip_prefix(key)
         .is_some_and(|rest| rest.trim_start().starts_with('='))
+}
+
+// ── Python arm ───────────────────────────────────────────────────────────────
+
+/// Extract `project.version` from `pyproject.toml` text (PEP 621). A project
+/// that declares its version `dynamic` has none here and reads as unversioned,
+/// so discovery passes it by.
+fn parse_python_version(pyproject: &str) -> Option<Semver> {
+    let doc: toml::Value = toml::from_str(pyproject).ok()?;
+    let raw = doc.get("project")?.get("version")?.as_str()?;
+    Semver::parse(raw)
+}
+
+/// Extract `project.name` from `pyproject.toml` text, normalized the way uv
+/// keys its lockfile (PEP 503: lowercase, each run of `-`, `_`, `.` one `-`).
+fn parse_python_name(pyproject: &str) -> Option<String> {
+    let doc: toml::Value = toml::from_str(pyproject).ok()?;
+    let raw = doc.get("project")?.get("name")?.as_str()?;
+    let mut name = String::with_capacity(raw.len());
+    for c in raw.chars() {
+        if matches!(c, '-' | '_' | '.') {
+            if !name.ends_with('-') {
+                name.push('-');
+            }
+        } else {
+            name.push(c.to_ascii_lowercase());
+        }
+    }
+    Some(name)
+}
+
+/// Rewrite `version` in `pyproject.toml`'s `[project]` table, preserving
+/// every other byte. `None` when the table has no version key.
+fn replace_python_version(text: &str, new: Semver) -> Option<String> {
+    replace_toml_table_version(text, "project", new)
+}
+
+/// uv records the project itself with a source at `.` — `{ editable = "." }`
+/// for a package, `{ virtual = "." }` for a bare project; a dependency comes
+/// from a registry, git, or another path.
+fn is_uv_project(source: Option<&str>) -> bool {
+    let Some(inner) = source
+        .and_then(|s| s.strip_prefix('{'))
+        .and_then(|s| s.strip_suffix('}'))
+    else {
+        return false;
+    };
+    matches!(
+        inner.split_once('=').map(|(k, v)| (k.trim(), v.trim())),
+        Some(("editable" | "virtual", "\".\""))
+    )
+}
+
+/// The project's own version as `uv.lock` records it. Same `[[package]]`
+/// shape as `Cargo.lock`, so the same line scan reads it.
+fn parse_uv_lock_version(uv_lock: &str, name: &str) -> Option<Semver> {
+    parse_lock_line(uv_lock, name, is_uv_project)
+}
+
+/// Rewrite the project's own `version` in `uv.lock` text, touching nothing
+/// else — the one change `uv lock` would make after a version rewrite.
+fn replace_uv_lock_version(uv_lock: &str, name: &str, new: Semver) -> Option<String> {
+    replace_lock_line(uv_lock, name, is_uv_project, new)
 }
 
 // ── Npm arm ──────────────────────────────────────────────────────────────────
@@ -1515,6 +1637,7 @@ version = "1.0.228"
     fn manifests_order_root_first_then_cargo_before_npm() {
         let at = |p: &str| Manifest::from_path(p).unwrap();
         let sorted = ordered(vec![
+            at("pyproject.toml"),
             at("keeper/Cargo.toml"),
             at("a/b/package.json"),
             at("package.json"),
@@ -1528,6 +1651,7 @@ version = "1.0.228"
             [
                 "Cargo.toml",
                 "package.json",
+                "pyproject.toml",
                 "keeper/Cargo.toml",
                 "app/package.json",
                 "a/b/package.json",
@@ -1661,5 +1785,88 @@ version = "1.0.228"
             out,
             r#"{"name": "fixture", "version": "0.2.0", "lockfileVersion": 1}"#
         );
+    }
+
+    const PYPROJECT: &str = "[project]\nname = \"Ready_Room.core\"\n# kept in step with the crates\nversion = \"0.6.2\"\ndependencies = [\"fastembed>=0.8\"]\n\n[tool.poetry]\nversion = \"9.9.9\"\n";
+
+    #[test]
+    fn python_version_and_name_come_from_the_project_table() {
+        let k = ManifestKind::Python;
+        assert_eq!(k.parse_version(PYPROJECT), Semver::parse("0.6.2"));
+        // Normalized the way uv keys its lockfile.
+        assert_eq!(k.parse_name(PYPROJECT).as_deref(), Some("ready-room-core"));
+        let out = k
+            .replace_version(PYPROJECT, Semver::parse("0.7.0").unwrap())
+            .unwrap();
+        assert_eq!(out, PYPROJECT.replace("0.6.2", "0.7.0"));
+        // A dynamic version is no version: discovery passes the file by.
+        let dynamic = "[project]\nname = \"x\"\ndynamic = [\"version\"]\n";
+        assert_eq!(k.parse_version(dynamic), None);
+        assert_eq!(
+            k.replace_version(dynamic, Semver::parse("1.0.0").unwrap()),
+            None
+        );
+    }
+
+    #[test]
+    fn pyproject_is_a_manifest_and_uv_lock_its_lockfile() {
+        assert_eq!(
+            ManifestKind::for_path(Path::new("python/pyproject.toml")),
+            Some((ManifestKind::Python, Role::Manifest))
+        );
+        assert_eq!(
+            ManifestKind::for_path(Path::new("uv.lock")),
+            Some((ManifestKind::Python, Role::Lockfile))
+        );
+        let m = Manifest::from_path("python/pyproject.toml").unwrap();
+        assert_eq!(m.kind, ManifestKind::Python);
+        assert_eq!(m.paths(), ["python/pyproject.toml", "python/uv.lock"]);
+    }
+
+    const UV_LOCK: &str = r#"version = 1
+requires-python = ">=3.12"
+
+[[package]]
+name = "ready-room-core"
+version = "0.6.2"
+source = { registry = "https://pypi.org/simple" }
+
+[[package]]
+name = "ready-room-core"
+version = "0.6.2"
+source = { editable = "." }
+dependencies = [
+    { name = "fastembed" },
+]
+
+[[package]]
+name = "fastembed"
+version = "0.6.2"
+source = { registry = "https://pypi.org/simple" }
+"#;
+
+    #[test]
+    fn uv_lock_moves_only_the_project_s_own_entry() {
+        let k = ManifestKind::Python;
+        let name = Some("ready-room-core");
+        assert_eq!(k.parse_lock_version(UV_LOCK, name), Semver::parse("0.6.2"));
+        let out = k
+            .replace_lock_version(UV_LOCK, name, Semver::parse("0.7.0").unwrap())
+            .unwrap();
+        // Exactly one line moved: the editable entry's, not the registry
+        // package of the same name nor the dependency at the same version.
+        let changed: Vec<_> = UV_LOCK
+            .lines()
+            .zip(out.lines())
+            .enumerate()
+            .filter(|(_, (a, b))| a != b)
+            .map(|(i, _)| i)
+            .collect();
+        assert_eq!(changed, vec![10]);
+        assert_eq!(out.lines().nth(10), Some("version = \"0.7.0\""));
+        // A virtual project is its own entry too; no name, no entry.
+        let virt = UV_LOCK.replace("editable", "virtual");
+        assert_eq!(k.parse_lock_version(&virt, name), Semver::parse("0.6.2"));
+        assert_eq!(k.parse_lock_version(UV_LOCK, None), None);
     }
 }

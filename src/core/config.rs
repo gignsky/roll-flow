@@ -178,8 +178,9 @@ pub struct Config {
     pub lazygit_command: String,
     /// Which manifest(s) this repo versions through — see
     /// [`version::Selection`]. `"auto"` (default) discovers every tracked
-    /// `Cargo.toml`/`package.json` with a readable version, at any depth, and
-    /// each must clear the gate ([`Config::manifests`]). `"cargo"`/`"npm"`
+    /// `Cargo.toml`/`package.json`/`pyproject.toml` with a readable version, at
+    /// any depth, and each must clear the gate ([`Config::manifests`]).
+    /// `"cargo"`/`"npm"`/`"python"`
     /// narrow that to one kind; a list of paths names them outright.
     /// The command the TUI's `bb` binding launches, run in the `Cargo.toml` directory.
     /// Overridable for the same reasons as [`Self::lazygit_command`] — a
@@ -240,7 +241,7 @@ pub struct RebuildEntry {
     pub sudo: bool,
 }
 
-/// The `version_manifest` setting as written: `"auto"`, `"cargo"`, `"npm"`,
+/// The `version_manifest` setting as written: `"auto"`, `"cargo"`, `"npm"`, `"python"`,
 /// or a list of repo-relative manifest paths. Resolved by
 /// [`selection`](Self::selection).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
@@ -250,6 +251,7 @@ pub enum VersionManifest {
     Auto,
     Cargo,
     Npm,
+    Python,
     Paths(Vec<String>),
 }
 
@@ -267,6 +269,7 @@ enum VersionManifestKeyword {
     Auto,
     Cargo,
     Npm,
+    Python,
 }
 
 impl TryFrom<RawVersionManifest> for VersionManifest {
@@ -277,6 +280,7 @@ impl TryFrom<RawVersionManifest> for VersionManifest {
             RawVersionManifest::Keyword(VersionManifestKeyword::Auto) => VersionManifest::Auto,
             RawVersionManifest::Keyword(VersionManifestKeyword::Cargo) => VersionManifest::Cargo,
             RawVersionManifest::Keyword(VersionManifestKeyword::Npm) => VersionManifest::Npm,
+            RawVersionManifest::Keyword(VersionManifestKeyword::Python) => VersionManifest::Python,
             RawVersionManifest::Paths(paths) => {
                 // Refused at load rather than skipped later: a typo here would
                 // otherwise quietly drop a manifest out of the gate.
@@ -285,7 +289,7 @@ impl TryFrom<RawVersionManifest> for VersionManifest {
                     .find(|p| version::Manifest::from_path(p).is_none())
                 {
                     return Err(format!(
-                        "version_manifest entry '{bad}' is not a path to a Cargo.toml or package.json"
+                        "version_manifest entry '{bad}' is not a path to a Cargo.toml, package.json or pyproject.toml"
                     ));
                 }
                 VersionManifest::Paths(paths)
@@ -300,6 +304,7 @@ impl From<VersionManifest> for RawVersionManifest {
             VersionManifest::Auto => RawVersionManifest::Keyword(VersionManifestKeyword::Auto),
             VersionManifest::Cargo => RawVersionManifest::Keyword(VersionManifestKeyword::Cargo),
             VersionManifest::Npm => RawVersionManifest::Keyword(VersionManifestKeyword::Npm),
+            VersionManifest::Python => RawVersionManifest::Keyword(VersionManifestKeyword::Python),
             VersionManifest::Paths(paths) => RawVersionManifest::Paths(paths),
         }
     }
@@ -312,6 +317,7 @@ impl VersionManifest {
             VersionManifest::Auto => version::Selection::Auto,
             VersionManifest::Cargo => version::Selection::Kind(version::ManifestKind::Cargo),
             VersionManifest::Npm => version::Selection::Kind(version::ManifestKind::Npm),
+            VersionManifest::Python => version::Selection::Kind(version::ManifestKind::Python),
             VersionManifest::Paths(paths) => version::Selection::Paths(
                 paths
                     .iter()
@@ -1318,5 +1324,27 @@ mod tests {
         let parsed: Config = toml::from_str(&predates).expect("parse without the flag");
         assert!(parsed.dev_versions);
         assert!(parsed.tag_on_graduate);
+    }
+
+    #[test]
+    fn version_manifest_takes_python_as_a_keyword_and_a_path() {
+        #[derive(Debug, serde::Deserialize)]
+        struct Holder {
+            version_manifest: super::VersionManifest,
+        }
+        let read = |text: &str| toml::from_str::<Holder>(text).map(|h| h.version_manifest);
+        assert_eq!(
+            read(r#"version_manifest = "python""#).unwrap(),
+            super::VersionManifest::Python
+        );
+        assert_eq!(
+            read(r#"version_manifest = ["Cargo.toml", "python/pyproject.toml"]"#).unwrap(),
+            super::VersionManifest::Paths(vec![
+                "Cargo.toml".to_string(),
+                "python/pyproject.toml".to_string()
+            ])
+        );
+        let refused = read(r#"version_manifest = ["setup.py"]"#).unwrap_err();
+        assert!(refused.to_string().contains("pyproject.toml"), "{refused}");
     }
 }
